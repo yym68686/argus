@@ -1,0 +1,14 @@
+# Keep Docker build contexts small.
+
+desktop/
+codex/
+
+.git/
+.github/
+
+**/__pycache__/
+**/*.pyc
+
+**/node_modules/
+
+.DS_Store

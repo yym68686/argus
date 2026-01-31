@@ -1,0 +1,37 @@
+services:
+  # Builds the Codex TCP bridge image that the FastAPI gateway will spawn dynamically.
+  # This container exits immediately; the image is what's needed.
+  codex-app-server-image:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: codex-app-server
+    command: ["sh", "-lc", "echo 'codex-app-server image built'"]
+
+  gateway:
+    build:
+      context: .
+      dockerfile: apps/api/Dockerfile
+    image: codex-app-server-gateway
+    depends_on:
+      - codex-app-server-image
+    environment:
+      CODEX_PROVISION_MODE: docker
+      CODEX_IMAGE: codex-app-server
+      CODEX_DOCKER_NETWORK: codex-net
+      CODEX_HOME_HOST_PATH: ${HOME}/.codex
+      WORKSPACE_HOST_PATH: ${PWD}
+      # Optional: set a token to require auth for /ws (Authorization: Bearer ... or ?token=...).
+      GATEWAY_TOKEN: ${GATEWAY_TOKEN:-}
+    volumes:
+      # WARNING: mounting the Docker socket grants root-equivalent access to the host.
+      - ${DOCKER_SOCK:-/var/run/docker.sock}:/var/run/docker.sock
+    ports:
+      - "8080:8080"
+    networks:
+      - codex-net
+    restart: unless-stopped
+
+networks:
+  codex-net:
+    name: codex-net

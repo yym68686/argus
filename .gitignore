@@ -1,0 +1,19 @@
+# Root-level ignores for the Codex gateway project.
+
+.DS_Store
+
+__pycache__/
+*.pyc
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+.venv/
+venv/
+
+.env
+.env.*
+
+*.log
+codex
+desktop
