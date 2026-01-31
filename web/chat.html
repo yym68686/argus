@@ -274,6 +274,7 @@
             </div>
             <div class="meta">
               <span id="connPill" class="pill bad">disconnected</span>
+              <span class="pill">session: <span id="sessionId">-</span></span>
               <span class="pill">thread: <span id="threadId">-</span></span>
               <span class="pill">turn: <span id="turnId">-</span></span>
             </div>
@@ -319,6 +320,7 @@
       const approvalPolicySelect = $("approvalPolicy")
       const sandboxModeSelect = $("sandboxMode")
       const connPill = $("connPill")
+      const sessionIdEl = $("sessionId")
       const threadIdEl = $("threadId")
       const turnIdEl = $("turnId")
       const resumeLastEl = $("resumeLast")
@@ -362,6 +364,7 @@
         nextId: 1,
         pending: new Map(),
         initialized: false,
+        sessionId: null,
         threadId: null,
         activeTurnId: null,
         activeAssistantPre: null,
@@ -492,6 +495,14 @@
       function handleNotification(msg) {
         const method = msg.method
         const params = msg.params || {}
+
+        if (method === "argus/session") {
+          if (params.id) {
+            state.sessionId = String(params.id)
+            sessionIdEl.textContent = state.sessionId
+          }
+          return
+        }
 
         if (method === "turn/started") {
           const turn = params.turn || {}
@@ -643,9 +654,11 @@
           const msg = code ? `disconnected (${code}${reason ? `: ${reason}` : ""})` : "disconnected"
           setConnStatus(false, msg)
           state.initialized = false
+          state.sessionId = null
           state.threadId = null
           state.activeTurnId = null
           state.turnInProgress = false
+          sessionIdEl.textContent = "-"
           threadIdEl.textContent = "-"
           turnIdEl.textContent = "-"
           connectBtn.disabled = false

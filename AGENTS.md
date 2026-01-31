@@ -31,7 +31,7 @@ A skill is a set of local instructions to follow that is stored in a `SKILL.md` 
 
 - `Dockerfile`: app-server runtime → TCP JSONL bridge（用 `socat` 暴露 `7777`）
 - `apps/api/`: FastAPI 网关（HTTP + WebSocket `/ws`）
-  - `ARGUS_PROVISION_MODE=docker` 时：每个 WebSocket 连接自动创建一个 runtime 容器，断开后销毁
+  - `ARGUS_PROVISION_MODE=docker` 时：每个 WebSocket 连接自动创建一个 runtime 容器；断开后默认保留（由客户端调用 `GET /sessions` / `DELETE /sessions/<id>` 管理）
 - `web/`: `chat.html` + 简单本地 `gateway.mjs`（仅用于本机测试）
 - `client_smoke.py`: 最小化 JSON-RPC/JSONL 客户端（用于回归/调试）
 - `docker-compose.yml`: 一键启动网关（并提前 build runtime 镜像）

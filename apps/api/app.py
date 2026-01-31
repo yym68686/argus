@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse, PlainTextResponse
 from starlette.websockets import WebSocketState
 
@@ -31,16 +31,8 @@ class DockerProvisionConfig:
     home_container_path: str = "/agent-home"
     workspace_container_path: str = "/workspace"
     runtime_cmd: Optional[str] = None
-    keep_container: bool = False
     connect_timeout_s: float = 30.0
     container_prefix: str = "argus-session"
-
-
-def _env_truthy(name: str, default: bool = False) -> bool:
-    raw = os.getenv(name)
-    if raw is None:
-        return default
-    return raw.strip().lower() in {"1", "true", "yes", "y", "on"}
 
 
 def _provision_mode() -> str:
@@ -84,6 +76,15 @@ def _extract_token(ws: WebSocket) -> Optional[str]:
     return ws.query_params.get("token")
 
 
+def _extract_token_http(request: Request) -> Optional[str]:
+    auth = request.headers.get("authorization") or request.headers.get("Authorization")
+    if auth:
+        parts = auth.split(" ", 1)
+        if len(parts) == 2 and parts[0].lower() == "bearer":
+            return parts[1].strip() or None
+    return request.query_params.get("token")
+
+
 def _is_token_valid(expected: Optional[str], provided: Optional[str]) -> bool:
     if expected is None:
         return True
@@ -100,6 +101,12 @@ def _html() -> bytes:
 
 
 app = FastAPI(title="Argus gateway", version="0.1.0")
+
+
+@app.on_event("startup")
+async def _startup():
+    app.state.active_sessions_lock = asyncio.Lock()
+    app.state.active_sessions: set[str] = set()
 
 
 @app.get("/healthz")
@@ -122,6 +129,15 @@ async def robots():
     return PlainTextResponse("User-agent: *\nDisallow: /\n")
 
 
+def _http_require_token(request: Request):
+    expected = os.getenv("ARGUS_TOKEN") or None
+    if expected is None:
+        return
+    provided = _extract_token_http(request)
+    if provided != expected:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+
 def _docker_cfg() -> DockerProvisionConfig:
     image = os.getenv("ARGUS_RUNTIME_IMAGE", "argus-runtime")
     network = os.getenv("ARGUS_DOCKER_NETWORK", "argus-net")
@@ -135,7 +151,6 @@ def _docker_cfg() -> DockerProvisionConfig:
     if workspace_host_path and not os.path.isabs(workspace_host_path):
         raise RuntimeError("ARGUS_WORKSPACE_HOST_PATH must be an absolute host path")
 
-    keep_container = _env_truthy("ARGUS_KEEP_CONTAINER", default=False)
     connect_timeout_s = float(os.getenv("ARGUS_CONNECT_TIMEOUT_S", "30"))
     container_prefix = os.getenv("ARGUS_CONTAINER_PREFIX", "argus-session")
 
@@ -145,7 +160,6 @@ def _docker_cfg() -> DockerProvisionConfig:
         home_host_path=home_host_path,
         workspace_host_path=workspace_host_path,
         runtime_cmd=runtime_cmd,
-        keep_container=keep_container,
         connect_timeout_s=connect_timeout_s,
         container_prefix=container_prefix,
     )
@@ -225,6 +239,61 @@ def _docker_remove_container_sync(container):
         pass
 
 
+def _docker_list_argus_containers_sync():
+    try:
+        import docker  # type: ignore
+    except Exception as e:  # pragma: no cover
+        raise RuntimeError("Docker provision mode requires the 'docker' Python package") from e
+
+    client = docker.from_env()
+    containers = client.containers.list(
+        all=True,
+        filters={"label": ["io.argus.gateway=apps/api"]},
+    )
+
+    out = []
+    for c in containers:
+        labels = getattr(c, "labels", None) or {}
+        out.append(
+            {
+                "sessionId": labels.get("io.argus.session_id"),
+                "containerId": c.id,
+                "name": c.name,
+                "status": c.status,
+            }
+        )
+
+    out.sort(key=lambda x: (x.get("status") != "running", x.get("name") or ""))
+    return out
+
+
+def _docker_get_container_by_session_sync(session_id: str):
+    try:
+        import docker  # type: ignore
+    except Exception as e:  # pragma: no cover
+        raise RuntimeError("Docker provision mode requires the 'docker' Python package") from e
+
+    client = docker.from_env()
+    containers = client.containers.list(
+        all=True,
+        filters={
+            "label": [
+                "io.argus.gateway=apps/api",
+                f"io.argus.session_id={session_id}",
+            ]
+        },
+    )
+    return containers[0] if containers else None
+
+
+def _docker_ensure_running_sync(container):
+    container.reload()
+    if container.status != "running":
+        container.start()
+        container.reload()
+    return container
+
+
 async def _docker_wait_for_ip(container, network: str, timeout_s: float) -> str:
     deadline = asyncio.get_running_loop().time() + timeout_s
     last_ip: Optional[str] = None
@@ -250,6 +319,37 @@ async def _wait_for_tcp(host: str, port: int, timeout_s: float):
             await asyncio.sleep(0.2)
 
 
+@app.get("/sessions")
+async def list_sessions(request: Request):
+    _http_require_token(request)
+    if _provision_mode() != "docker":
+        raise HTTPException(status_code=400, detail="Not in docker provision mode")
+    try:
+        sessions = await asyncio.to_thread(_docker_list_argus_containers_sync)
+    except Exception as e:
+        log.exception("Failed to list docker sessions")
+        raise HTTPException(status_code=500, detail=str(e)) from e
+    return {"sessions": sessions}
+
+
+@app.delete("/sessions/{session_id}")
+async def delete_session(session_id: str, request: Request):
+    _http_require_token(request)
+    if _provision_mode() != "docker":
+        raise HTTPException(status_code=400, detail="Not in docker provision mode")
+    try:
+        container = await asyncio.to_thread(_docker_get_container_by_session_sync, session_id)
+        if container is None:
+            raise HTTPException(status_code=404, detail="Session not found")
+        await asyncio.to_thread(_docker_remove_container_sync, container)
+    except HTTPException:
+        raise
+    except Exception as e:
+        log.exception("Failed to delete docker session %s", session_id)
+        raise HTTPException(status_code=500, detail=str(e)) from e
+    return {"ok": True, "sessionId": session_id}
+
+
 @app.websocket("/ws")
 async def ws_proxy(ws: WebSocket):
     provided = _extract_token(ws)
@@ -272,71 +372,106 @@ async def ws_proxy(ws: WebSocket):
         if not cfg.runtime_cmd:
             await ws.close(code=1011, reason="Server misconfigured: ARGUS_RUNTIME_CMD is not set")
             return
-        session_id = uuid.uuid4().hex[:12]
+        requested_session = (ws.query_params.get("session") or "").strip() or None
+        session_id = requested_session or uuid.uuid4().hex[:12]
+
         container = None
+        reader = None
+        writer = None
+
+        async with app.state.active_sessions_lock:
+            if session_id in app.state.active_sessions:
+                await ws.close(code=1008, reason="Session already connected")
+                return
+            app.state.active_sessions.add(session_id)
 
         try:
-            container = await asyncio.to_thread(_docker_create_container_sync, cfg, session_id)
-            host = await _docker_wait_for_ip(container, cfg.network, cfg.connect_timeout_s)
-            reader, writer = await _wait_for_tcp(host, 7777, cfg.connect_timeout_s)
-        except Exception:
-            if container is not None and not cfg.keep_container:
-                await asyncio.to_thread(_docker_remove_container_sync, container)
-            await ws.close(code=1011, reason="Failed to provision upstream container")
-            return
+            try:
+                if requested_session:
+                    container = await asyncio.to_thread(_docker_get_container_by_session_sync, session_id)
+                    if container is None:
+                        await ws.close(code=1008, reason="Unknown session")
+                        return
+                    container = await asyncio.to_thread(_docker_ensure_running_sync, container)
+                else:
+                    container = await asyncio.to_thread(_docker_create_container_sync, cfg, session_id)
 
-        log.info("Provisioned session %s -> %s:%s", session_id, host, 7777)
+                host = await _docker_wait_for_ip(container, cfg.network, cfg.connect_timeout_s)
+                reader, writer = await _wait_for_tcp(host, 7777, cfg.connect_timeout_s)
+            except Exception:
+                await ws.close(code=1011, reason="Failed to provision upstream container")
+                return
 
-        try:
-            async def ws_to_tcp():
-                try:
-                    while True:
-                        text = await ws.receive_text()
-                        if not text.endswith("\n"):
-                            text += "\n"
-                        writer.write(text.encode("utf-8"))
-                        await writer.drain()
-                except WebSocketDisconnect:
-                    pass
-                finally:
+            log.info("Provisioned session %s -> %s:%s", session_id, host, 7777)
+            try:
+                await ws.send_text(
+                    json.dumps(
+                        {
+                            "method": "argus/session",
+                            "params": {
+                                "id": session_id,
+                                "mode": "docker",
+                                "attached": bool(requested_session),
+                            },
+                        }
+                    )
+                )
+            except Exception:
+                pass
+
+            try:
+                async def ws_to_tcp():
                     try:
-                        writer.close()
-                    except Exception:
+                        while True:
+                            text = await ws.receive_text()
+                            if not text.endswith("\n"):
+                                text += "\n"
+                            writer.write(text.encode("utf-8"))
+                            await writer.drain()
+                    except WebSocketDisconnect:
                         pass
-
-            async def tcp_to_ws():
-                try:
-                    while True:
-                        line = await reader.readline()
-                        if not line:
-                            break
-                        await ws.send_text(line.decode("utf-8").rstrip("\n"))
-                finally:
-                    if ws.client_state == WebSocketState.CONNECTED:
+                    finally:
                         try:
-                            await ws.close()
+                            writer.close()
                         except Exception:
                             pass
 
-            a = asyncio.create_task(ws_to_tcp())
-            b = asyncio.create_task(tcp_to_ws())
+                async def tcp_to_ws():
+                    try:
+                        while True:
+                            line = await reader.readline()
+                            if not line:
+                                break
+                            await ws.send_text(line.decode("utf-8").rstrip("\n"))
+                    finally:
+                        if ws.client_state == WebSocketState.CONNECTED:
+                            try:
+                                await ws.close()
+                            except Exception:
+                                pass
 
-            done, pending = await asyncio.wait({a, b}, return_when=asyncio.FIRST_COMPLETED)
-            for task in pending:
-                task.cancel()
-            for task in done:
+                a = asyncio.create_task(ws_to_tcp())
+                b = asyncio.create_task(tcp_to_ws())
+
+                done, pending = await asyncio.wait({a, b}, return_when=asyncio.FIRST_COMPLETED)
+                for task in pending:
+                    task.cancel()
+                for task in done:
+                    try:
+                        task.result()
+                    except Exception:
+                        pass
+            finally:
                 try:
-                    task.result()
+                    if writer is not None:
+                        writer.close()
                 except Exception:
                     pass
+                log.info("Session %s detached (container retained)", session_id)
         finally:
-            try:
-                writer.close()
-            except Exception:
-                pass
-            if container is not None and not cfg.keep_container:
-                await asyncio.to_thread(_docker_remove_container_sync, container)
-            log.info("Session %s cleaned up", session_id)
+            async with app.state.active_sessions_lock:
+                app.state.active_sessions.discard(session_id)
+
         return
 
     upstream_id = ws.query_params.get("id")

@@ -27,6 +27,9 @@ services:
       ARGUS_RUNTIME_CMD: ${ARGUS_RUNTIME_CMD:?set ARGUS_RUNTIME_CMD}
       # Optional: require auth for /ws (Authorization: Bearer ... or ?token=...).
       ARGUS_TOKEN: ${ARGUS_TOKEN:-}
+      # Optional: docker provision tuning.
+      ARGUS_CONNECT_T·IMEOUT_S: ${ARGUS_CONNECT_TIMEOUT_S:-30}
+      ARGUS_CONTAINER_PREFIX: ${ARGUS_CONTAINER_PREFIX:-argus-session}
     volumes:
       # WARNING: mounting the Docker socket grants root-equivalent access to the host.
       - ${DOCKER_SOCK:-/var/run/docker.sock}:/var/run/docker.sock

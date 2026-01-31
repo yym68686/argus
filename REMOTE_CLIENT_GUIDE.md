@@ -31,8 +31,12 @@ export ARGUS_TOKEN="<ARGUS_TOKEN>"
 1) 客户端连接网关的 WebSocket：`/ws`  
 2) 网关把每条 WebSocket 文本消息当作“一行 JSON”（JSON-RPC 风格）转发给后端  
 3) 当前部署模式通常是：**一个 WebSocket 连接 = 网关创建一个 runtime 容器**  
-4) WebSocket 断开后：容器会被销毁（除非服务器设置了 `ARGUS_KEEP_CONTAINER=1`）  
-5) 但对话线程（thread）会写入 runtime 的持久化 home 目录（由 `ARGUS_HOME_HOST_PATH` 挂载），所以你可以通过 `thread/resume` 恢复上下文
+4) 成功连上后，网关会先发一个通知给客户端（可忽略，但建议保存）：
+```json
+{"method":"argus/session","params":{"id":"<SESSION_ID>","mode":"docker","attached":false}}
+```
+5) WebSocket 断开后：容器会被保留（你可以通过 `DELETE /sessions/<SESSION_ID>` 手动删除）  
+6) 对话线程（thread）会写入 runtime 的持久化 home 目录（由 `ARGUS_HOME_HOST_PATH` 挂载），所以你可以通过 `thread/resume` 恢复上下文
 
 ## 3. 最快验证：用浏览器自带网页聊天（无需写代码）
 
@@ -46,6 +50,14 @@ ws://$HOST:8080/ws?token=<ARGUS_TOKEN>
 3) 点 `Connect`，成功后状态会显示 `connected`，并自动初始化 + 新建/恢复 thread  
 4) 输入框里发消息即可（该 UI 会等待 `turn/completed` 后才允许发下一条）
 
+如果你要“重连同一个容器”：
+
+- 通过 `GET /sessions` 拿到 `<SESSION_ID>`
+- 然后用带 `session` 的 URL 连接：
+```
+ws://$HOST:8080/ws?token=<ARGUS_TOKEN>&session=<SESSION_ID>
+```
+
 如果 `Connect` 一闪就断开：
 
 - 先检查 `http://$HOST:8080/healthz` 是否正常
@@ -58,6 +70,20 @@ ws://$HOST:8080/ws?token=<ARGUS_TOKEN>
 - 传输：WebSocket 文本帧（text frame）
 - 每一帧内容：**一个 JSON 对象字符串**（无需手动加 `\n`；网关会自动补 `\n` 再转发给后端）
 - 后端返回：也是一条条 JSON（网关按“行”拆开后逐条作为 WebSocket text frame 发回）
+
+### 4.1.1 Session（容器会话）管理接口（可选）
+
+如果网关运行在 `docker` provisioning 模式，提供两条 HTTP API 便于客户端管理容器：
+
+- 列出当前 sessions：
+```bash
+curl -sS -H "Authorization: Bearer $ARGUS_TOKEN" "http://$HOST:8080/sessions"
+```
+
+- 删除某个 session（等价删除容器）：
+```bash
+curl -sS -X DELETE -H "Authorization: Bearer $ARGUS_TOKEN" "http://$HOST:8080/sessions/<SESSION_ID>"
+```
 
 ### 4.2 初始化握手（必须）
 

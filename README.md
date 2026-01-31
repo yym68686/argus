@@ -45,7 +45,7 @@ docker compose down
 ## 目录结构
 
 - `Dockerfile`: runtime 镜像（app-server JSONL stdio → TCP `:7777`）
-- `apps/api/`: FastAPI 网关（HTTP + WS `/ws`），支持 `ARGUS_PROVISION_MODE=docker` 自动创建/销毁后端容器
+- `apps/api/`: FastAPI 网关（HTTP + WS `/ws`），支持 `ARGUS_PROVISION_MODE=docker` 自动创建后端容器（默认保留；用 `GET/DELETE /sessions` 管理）
 - `docker-compose.yml`: 本机/服务器一键启动（网关会通过挂载的 `docker.sock` 创建容器）
 - `web/`: `chat.html` + 本地调试用 `gateway.mjs`
 - `client_smoke.py`: 最小化 smoke client（用于调试后端 TCP JSONL 端口）
