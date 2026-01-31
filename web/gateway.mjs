@@ -8,8 +8,8 @@ import path from 'node:path'
 const listenHost = process.env.LISTEN_HOST ?? '127.0.0.1'
 const listenPort = Number(process.env.LISTEN_PORT ?? '8080')
 
-const codexHost = process.env.CODEX_TCP_HOST ?? '127.0.0.1'
-const codexPort = Number(process.env.CODEX_TCP_PORT ?? '7777')
+const upstreamHost = process.env.ARGUS_TCP_HOST ?? '127.0.0.1'
+const upstreamPort = Number(process.env.ARGUS_TCP_PORT ?? '7777')
 
 const htmlPath = path.join(
   path.dirname(fileURLToPath(import.meta.url)),
@@ -171,11 +171,11 @@ server.on('upgrade', (req, socket, head) => {
     ].join('\r\n')
   )
 
-  const codex = net.createConnection({ host: codexHost, port: codexPort })
-  codex.setNoDelay(true)
+  const upstream = net.createConnection({ host: upstreamHost, port: upstreamPort })
+  upstream.setNoDelay(true)
 
   let wsBuf = head && head.length ? Buffer.from(head) : Buffer.alloc(0)
-  let codexBuf = ''
+  let upstreamBuf = ''
   let closed = false
 
   function closeBoth() {
@@ -188,24 +188,24 @@ server.on('upgrade', (req, socket, head) => {
       socket.destroy()
     } catch {}
     try {
-      codex.destroy()
+      upstream.destroy()
     } catch {}
   }
 
-  codex.on('data', (chunk) => {
-    codexBuf += chunk.toString('utf8')
+  upstream.on('data', (chunk) => {
+    upstreamBuf += chunk.toString('utf8')
     while (true) {
-      const idx = codexBuf.indexOf('\n')
+      const idx = upstreamBuf.indexOf('\n')
       if (idx === -1) break
-      const line = codexBuf.slice(0, idx).trimEnd()
-      codexBuf = codexBuf.slice(idx + 1)
+      const line = upstreamBuf.slice(0, idx).trimEnd()
+      upstreamBuf = upstreamBuf.slice(idx + 1)
       if (!line) continue
       wsSendText(socket, line)
     }
   })
 
-  codex.on('error', () => closeBoth())
-  codex.on('close', () => closeBoth())
+  upstream.on('error', () => closeBoth())
+  upstream.on('close', () => closeBoth())
 
   socket.on('data', (chunk) => {
     if (closed) return
@@ -215,7 +215,7 @@ server.on('upgrade', (req, socket, head) => {
         wsBuf,
         (text) => {
           if (!text.endsWith('\n')) text += '\n'
-          codex.write(text)
+          upstream.write(text)
         },
         () => closeBoth(),
         (payload) => {
@@ -244,6 +244,6 @@ server.on('upgrade', (req, socket, head) => {
 
 server.listen(listenPort, listenHost, () => {
   console.log(
-    `Gateway listening on http://${listenHost}:${listenPort} (ws: /ws) → TCP ${codexHost}:${codexPort}`
+    `Gateway listening on http://${listenHost}:${listenPort} (ws: /ws) → TCP ${upstreamHost}:${upstreamPort}`
   )
 })

@@ -1,37 +1,41 @@
 services:
-  # Builds the Codex TCP bridge image that the FastAPI gateway will spawn dynamically.
+  # Builds the runtime TCP bridge image that the gateway will spawn dynamically.
   # This container exits immediately; the image is what's needed.
-  codex-app-server-image:
+  runtime-image:
     build:
       context: .
       dockerfile: Dockerfile
-    image: codex-app-server
-    command: ["sh", "-lc", "echo 'codex-app-server image built'"]
+      args:
+        APP_SERVER_INSTALL_CMD: ${ARGUS_RUNTIME_INSTALL_CMD:?set ARGUS_RUNTIME_INSTALL_CMD}
+    image: argus-runtime
+    command: ["sh", "-lc", "echo 'runtime image built'"]
 
   gateway:
     build:
       context: .
       dockerfile: apps/api/Dockerfile
-    image: codex-app-server-gateway
+    image: argus-gateway
     depends_on:
-      - codex-app-server-image
+      - runtime-image
     environment:
-      CODEX_PROVISION_MODE: docker
-      CODEX_IMAGE: codex-app-server
-      CODEX_DOCKER_NETWORK: codex-net
-      CODEX_HOME_HOST_PATH: ${HOME}/.codex
-      WORKSPACE_HOST_PATH: ${PWD}
-      # Optional: set a token to require auth for /ws (Authorization: Bearer ... or ?token=...).
-      GATEWAY_TOKEN: ${GATEWAY_TOKEN:-}
+      ARGUS_PROVISION_MODE: docker
+      ARGUS_RUNTIME_IMAGE: argus-runtime
+      ARGUS_DOCKER_NETWORK: argus-net
+      ARGUS_HOME_HOST_PATH: ${ARGUS_HOME_HOST_PATH:?set ARGUS_HOME_HOST_PATH}
+      ARGUS_WORKSPACE_HOST_PATH: ${ARGUS_WORKSPACE_HOST_PATH:?set ARGUS_WORKSPACE_HOST_PATH}
+      # Command executed inside each spawned runtime container.
+      ARGUS_RUNTIME_CMD: ${ARGUS_RUNTIME_CMD:?set ARGUS_RUNTIME_CMD}
+      # Optional: require auth for /ws (Authorization: Bearer ... or ?token=...).
+      ARGUS_TOKEN: ${ARGUS_TOKEN:-}
     volumes:
       # WARNING: mounting the Docker socket grants root-equivalent access to the host.
       - ${DOCKER_SOCK:-/var/run/docker.sock}:/var/run/docker.sock
     ports:
       - "8080:8080"
     networks:
-      - codex-net
+      - argus-net
     restart: unless-stopped
 
 networks:
-  codex-net:
-    name: codex-net
+  argus-net:
+    name: argus-net

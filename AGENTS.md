@@ -1,11 +1,11 @@
-# Codex Gateway (repo root) — Agent Notes
+# Argus (repo root) — Agent Notes
 
 <INSTRUCTIONS>
 ## Skills
 A skill is a set of local instructions to follow that is stored in a `SKILL.md` file. Below is the list of skills that can be used. Each entry includes a name, description, and file path so you can open the source for full instructions when using a specific skill.
 ### Available skills
-- skill-creator: Guide for creating effective skills. This skill should be used when users want to create a new skill (or update an existing skill) that extends Codex's capabilities with specialized knowledge, workflows, or tool integrations. (file: /Users/yanyuming/.codex/skills/.system/skill-creator/SKILL.md)
-- skill-installer: Install Codex skills into $CODEX_HOME/skills from a curated list or a GitHub repo path. Use when a user asks to list installable skills, install a curated skill, or install a skill from another repo (including private repos). (file: /Users/yanyuming/.codex/skills/.system/skill-installer/SKILL.md)
+- skill-creator: Guide for creating effective skills. Use when users want to create a new skill (or update an existing skill) that extends the agent's capabilities with specialized knowledge, workflows, or tool integrations.
+- skill-installer: Install skills from a curated list or a GitHub repo path. Use when a user asks to list installable skills, install a curated skill, or install a skill from another repo (including private repos).
 ### How to use skills
 - Discovery: The list above is the skills available in this session (name + description + file path). Skill bodies live on disk at the listed paths.
 - Trigger rules: If the user names a skill (with `$SkillName` or plain text) OR the task clearly matches a skill's description shown above, you must use that skill for that turn. Multiple mentions mean use them all. Do not carry skills across turns unless re-mentioned.
@@ -27,14 +27,14 @@ A skill is a set of local instructions to follow that is stored in a `SKILL.md` 
 
 ## 项目目标
 
-这个仓库的根目录现在是一个 **Codex app-server 网关项目**：
+这个仓库的根目录现在是 **Argus 网关项目**（面向“app-server / agent server”一类的 JSONL over stdio 协议）：
 
-- `Dockerfile`: `codex app-server` → TCP JSONL bridge（用 `socat` 暴露 `7777`）
+- `Dockerfile`: app-server runtime → TCP JSONL bridge（用 `socat` 暴露 `7777`）
 - `apps/api/`: FastAPI 网关（HTTP + WebSocket `/ws`）
-  - `CODEX_PROVISION_MODE=docker` 时：每个 WebSocket 连接自动创建一个 `codex-app-server` 容器，断开后销毁
+  - `ARGUS_PROVISION_MODE=docker` 时：每个 WebSocket 连接自动创建一个 runtime 容器，断开后销毁
 - `web/`: `chat.html` + 简单本地 `gateway.mjs`（仅用于本机测试）
 - `client_smoke.py`: 最小化 JSON-RPC/JSONL 客户端（用于回归/调试）
-- `docker-compose.yml`: 一键启动网关（并提前 build `codex-app-server` 镜像）
+- `docker-compose.yml`: 一键启动网关（并提前 build runtime 镜像）
 - `REMOTE_CLIENT_GUIDE.md`: 给外部客户端接入的详细文档
 
 ## 文档职责（避免重复）
@@ -46,12 +46,7 @@ A skill is a set of local instructions to follow that is stored in a `SKILL.md` 
 
 ## 关键约定 / 易踩坑
 
-- `codex-app-server` 容器内默认以 `node` 用户运行（UID 通常是 `1000`）
-  - 因此宿主机挂载的 `CODEX_HOME_HOST_PATH` / `WORKSPACE_HOST_PATH` 需要对 UID `1000` 可读写，否则会出现 `Permission denied (os error 13)`。
+- runtime 容器内默认以 `node` 用户运行（UID 通常是 `1000`）
+  - 因此宿主机挂载的 `ARGUS_HOME_HOST_PATH` / `ARGUS_WORKSPACE_HOST_PATH` 需要对 UID `1000` 可读写，否则会出现 `Permission denied (os error 13)`。
 - 网关的“自动创建容器”模式需要挂载宿主机 `docker.sock`
   - 这在公网环境是高危能力（等价宿主机 root 权限），必须配合认证/授权/限流/审计。
-
-## 子目录（历史/参考）
-
-- `desktop/`: 原来的 e2b-dev/desktop 仓库内容（已整体收纳进这里）
-- `codex/`: Codex 源码（仅用于阅读/参考，不用于本项目构建）

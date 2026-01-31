@@ -3,7 +3,7 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>Codex app-server Chat (JSON-RPC v2)</title>
+    <title>Argus Chat (App Server JSON-RPC v2)</title>
     <style>
       :root {
         color-scheme: light dark;
@@ -332,13 +332,13 @@
       const disconnectBtn = $("disconnectBtn")
 
       const STORAGE = {
-        lastThreadId: "codex_webchat_last_thread_id",
-        resumeLast: "codex_webchat_resume_last",
+        lastThreadId: "argus_webchat_last_thread_id",
+        resumeLast: "argus_webchat_resume_last",
       }
 
       const storage = (() => {
         try {
-          const k = "__codex_webchat_test__"
+          const k = "__argus_webchat_test__"
           localStorage.setItem(k, "1")
           localStorage.removeItem(k)
           return {

@@ -1,9 +1,9 @@
-# Codex Gateway 远程客户端接入/操作文档（给同伴/另一个 Agent 用）
+# Argus 远程客户端接入/操作文档（给同伴/另一个 Agent 用）
 
 > 重要安全提醒：你在聊天里粘贴的 `sk-...` 看起来像“真实密钥/令牌”。这类信息一旦写进文档或代码仓库（或出现在 URL query、代理日志、浏览器历史、截图里）就很容易泄露并被滥用。
 >
 > - 建议立刻**更换网关 Token**（用随机字符串，不要用任何 API Key）并只用私密渠道发给同伴。
-> - 本文档里用 `<GATEWAY_TOKEN>` 占位；把真实 token 通过私信/密码管理器/一次性消息发给同伴即可。
+> - 本文档里用 `<ARGUS_TOKEN>` 占位；把真实 token 通过私信/密码管理器/一次性消息发给同伴即可。
 
 ## 1. 你要连的服务器信息
 
@@ -11,28 +11,28 @@
 
 ```bash
 export HOST="<YOUR_SERVER_HOST>"
-export GATEWAY_TOKEN="<GATEWAY_TOKEN>"
+export ARGUS_TOKEN="<ARGUS_TOKEN>"
 ```
 
 - 服务器 HOST（IP 或域名）：`$HOST`
 - 网关 HTTP（用于健康检查 / 打开内置网页聊天）：`http://$HOST:8080`
 - 网关健康检查：`http://$HOST:8080/healthz`
   - 期望返回：`{"ok":true}`
-- 网关 WebSocket（给程序接入 Codex app-server）：`ws://$HOST:8080/ws`
+- 网关 WebSocket（给程序接入 app-server runtime）：`ws://$HOST:8080/ws`
 
 认证方式（二选一）：
 
-- 推荐（程序端）：HTTP Header `Authorization: Bearer <GATEWAY_TOKEN>`
-- 兼容（浏览器/简单客户端）：URL 参数 `?token=<GATEWAY_TOKEN>`
-  - 完整示例：`ws://$HOST:8080/ws?token=<GATEWAY_TOKEN>`
+- 推荐（程序端）：HTTP Header `Authorization: Bearer <ARGUS_TOKEN>`
+- 兼容（浏览器/简单客户端）：URL 参数 `?token=<ARGUS_TOKEN>`
+  - 完整示例：`ws://$HOST:8080/ws?token=<ARGUS_TOKEN>`
 
 ## 2. 系统架构（你在写客户端时需要知道的）
 
 1) 客户端连接网关的 WebSocket：`/ws`  
 2) 网关把每条 WebSocket 文本消息当作“一行 JSON”（JSON-RPC 风格）转发给后端  
-3) 当前部署模式通常是：**一个 WebSocket 连接 = 网关创建一个 codex-app-server 容器**  
-4) WebSocket 断开后：容器会被销毁（除非服务器设置了 `CODEX_KEEP_CONTAINER=1`）  
-5) 但对话线程（thread）会写入 `CODEX_HOME` 持久化目录，所以你可以通过 `thread/resume` 恢复上下文
+3) 当前部署模式通常是：**一个 WebSocket 连接 = 网关创建一个 runtime 容器**  
+4) WebSocket 断开后：容器会被销毁（除非服务器设置了 `ARGUS_KEEP_CONTAINER=1`）  
+5) 但对话线程（thread）会写入 runtime 的持久化 home 目录（由 `ARGUS_HOME_HOST_PATH` 挂载），所以你可以通过 `thread/resume` 恢复上下文
 
 ## 3. 最快验证：用浏览器自带网页聊天（无需写代码）
 
@@ -40,7 +40,7 @@ export GATEWAY_TOKEN="<GATEWAY_TOKEN>"
 2) 页面上找到 `WebSocket URL` 输入框，填：
 
 ```
-ws://$HOST:8080/ws?token=<GATEWAY_TOKEN>
+ws://$HOST:8080/ws?token=<ARGUS_TOKEN>
 ```
 
 3) 点 `Connect`，成功后状态会显示 `connected`，并自动初始化 + 新建/恢复 thread  
@@ -140,8 +140,8 @@ npm i ws
 ```js
 import WebSocket from "ws";
 
-const token = process.env.GATEWAY_TOKEN;
-if (!token) throw new Error("Missing GATEWAY_TOKEN");
+const token = process.env.ARGUS_TOKEN;
+if (!token) throw new Error("Missing ARGUS_TOKEN");
 
 const host = process.env.HOST;
 if (!host) throw new Error("Missing HOST");
@@ -214,7 +214,7 @@ ws.on("error", (e) => console.error("ws error:", e));
 
 运行：
 ```bash
-GATEWAY_TOKEN="<GATEWAY_TOKEN>" node client.js
+ARGUS_TOKEN="<ARGUS_TOKEN>" node client.js
 ```
 
 ### 5.2 Python（可选）

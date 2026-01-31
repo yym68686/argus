@@ -89,7 +89,7 @@ def wait_for_response(
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Minimal Codex app-server TCP smoke test.")
+    parser = argparse.ArgumentParser(description="Minimal app-server TCP smoke test (Argus).")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=7777)
     parser.add_argument("--cwd", default="/workspace")

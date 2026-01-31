@@ -12,7 +12,7 @@ from fastapi.responses import HTMLResponse, PlainTextResponse
 from starlette.websockets import WebSocketState
 
 
-log = logging.getLogger("codex_app_server_gateway")
+log = logging.getLogger("argus_gateway")
 
 
 @dataclass(frozen=True)
@@ -26,13 +26,14 @@ class Upstream:
 class DockerProvisionConfig:
     image: str
     network: str
-    codex_home_host_path: Optional[str]
+    home_host_path: Optional[str]
     workspace_host_path: Optional[str]
-    codex_home_container_path: str = "/codex-home"
+    home_container_path: str = "/agent-home"
     workspace_container_path: str = "/workspace"
+    runtime_cmd: Optional[str] = None
     keep_container: bool = False
     connect_timeout_s: float = 30.0
-    container_prefix: str = "codex-session"
+    container_prefix: str = "argus-session"
 
 
 def _env_truthy(name: str, default: bool = False) -> bool:
@@ -43,16 +44,16 @@ def _env_truthy(name: str, default: bool = False) -> bool:
 
 
 def _provision_mode() -> str:
-    return os.getenv("CODEX_PROVISION_MODE", "static").strip().lower()
+    return os.getenv("ARGUS_PROVISION_MODE", "static").strip().lower()
 
 
 def _load_upstreams() -> dict[str, Upstream]:
-    raw = os.getenv("CODEX_UPSTREAMS_JSON")
+    raw = os.getenv("ARGUS_UPSTREAMS_JSON")
     if raw:
         try:
             data = json.loads(raw)
         except json.JSONDecodeError as e:
-            raise RuntimeError("Invalid CODEX_UPSTREAMS_JSON; must be valid JSON") from e
+            raise RuntimeError("Invalid ARGUS_UPSTREAMS_JSON; must be valid JSON") from e
 
         out: dict[str, Upstream] = {}
         for key, cfg in data.items():
@@ -62,12 +63,12 @@ def _load_upstreams() -> dict[str, Upstream]:
                 token=(str(cfg["token"]) if "token" in cfg and cfg["token"] is not None else None),
             )
         if not out:
-            raise RuntimeError("CODEX_UPSTREAMS_JSON is empty")
+            raise RuntimeError("ARGUS_UPSTREAMS_JSON is empty")
         return out
 
-    host = os.getenv("CODEX_TCP_HOST", "127.0.0.1")
-    port = int(os.getenv("CODEX_TCP_PORT", "7777"))
-    token = os.getenv("GATEWAY_TOKEN")
+    host = os.getenv("ARGUS_TCP_HOST", "127.0.0.1")
+    port = int(os.getenv("ARGUS_TCP_PORT", "7777"))
+    token = os.getenv("ARGUS_TOKEN")
     return {"default": Upstream(host=host, port=port, token=token)}
 
 
@@ -98,7 +99,7 @@ def _html() -> bytes:
     raise FileNotFoundError("Failed to locate web/chat.html (expected somewhere above this file)")
 
 
-app = FastAPI(title="Codex app-server gateway", version="0.1.0")
+app = FastAPI(title="Argus gateway", version="0.1.0")
 
 
 @app.get("/healthz")
@@ -122,21 +123,28 @@ async def robots():
 
 
 def _docker_cfg() -> DockerProvisionConfig:
-    image = os.getenv("CODEX_IMAGE", "codex-app-server")
-    network = os.getenv("CODEX_DOCKER_NETWORK", "codex-net")
+    image = os.getenv("ARGUS_RUNTIME_IMAGE", "argus-runtime")
+    network = os.getenv("ARGUS_DOCKER_NETWORK", "argus-net")
 
-    codex_home_host_path = os.getenv("CODEX_HOME_HOST_PATH") or None
-    workspace_host_path = os.getenv("WORKSPACE_HOST_PATH") or None
+    home_host_path = os.getenv("ARGUS_HOME_HOST_PATH") or None
+    workspace_host_path = os.getenv("ARGUS_WORKSPACE_HOST_PATH") or None
+    runtime_cmd = os.getenv("ARGUS_RUNTIME_CMD") or None
 
-    keep_container = _env_truthy("CODEX_KEEP_CONTAINER", default=False)
-    connect_timeout_s = float(os.getenv("CODEX_CONNECT_TIMEOUT_S", "30"))
-    container_prefix = os.getenv("CODEX_CONTAINER_PREFIX", "codex-session")
+    if home_host_path and not os.path.isabs(home_host_path):
+        raise RuntimeError("ARGUS_HOME_HOST_PATH must be an absolute host path")
+    if workspace_host_path and not os.path.isabs(workspace_host_path):
+        raise RuntimeError("ARGUS_WORKSPACE_HOST_PATH must be an absolute host path")
+
+    keep_container = _env_truthy("ARGUS_KEEP_CONTAINER", default=False)
+    connect_timeout_s = float(os.getenv("ARGUS_CONNECT_TIMEOUT_S", "30"))
+    container_prefix = os.getenv("ARGUS_CONTAINER_PREFIX", "argus-session")
 
     return DockerProvisionConfig(
         image=image,
         network=network,
-        codex_home_host_path=codex_home_host_path,
+        home_host_path=home_host_path,
         workspace_host_path=workspace_host_path,
+        runtime_cmd=runtime_cmd,
         keep_container=keep_container,
         connect_timeout_s=connect_timeout_s,
         container_prefix=container_prefix,
@@ -162,16 +170,19 @@ def _docker_create_container_sync(cfg: DockerProvisionConfig, session_id: str):
 
     name = f"{cfg.container_prefix}-{session_id}"
 
-    env = {"CODEX_HOME": cfg.codex_home_container_path}
+    env = {}
+    if cfg.runtime_cmd:
+        env["APP_SERVER_CMD"] = cfg.runtime_cmd
+    env["APP_HOME"] = cfg.home_container_path
     volumes = {}
-    if cfg.codex_home_host_path:
-        volumes[cfg.codex_home_host_path] = {"bind": cfg.codex_home_container_path, "mode": "rw"}
+    if cfg.home_host_path:
+        volumes[cfg.home_host_path] = {"bind": cfg.home_container_path, "mode": "rw"}
     if cfg.workspace_host_path:
         volumes[cfg.workspace_host_path] = {"bind": cfg.workspace_container_path, "mode": "rw"}
 
     labels = {
-        "com.openai.codex.gateway": "apps/api",
-        "com.openai.codex.session_id": session_id,
+        "io.argus.gateway": "apps/api",
+        "io.argus.session_id": session_id,
     }
 
     run_kwargs = {}
@@ -244,7 +255,7 @@ async def ws_proxy(ws: WebSocket):
     provided = _extract_token(ws)
 
     if _provision_mode() == "docker":
-        expected = os.getenv("GATEWAY_TOKEN")
+        expected = os.getenv("ARGUS_TOKEN")
         if expected and provided != expected:
             await ws.accept()
             await ws.close(code=1008, reason="Unauthorized")
@@ -252,7 +263,15 @@ async def ws_proxy(ws: WebSocket):
 
         await ws.accept()
 
-        cfg = _docker_cfg()
+        try:
+            cfg = _docker_cfg()
+        except Exception:
+            log.exception("Invalid docker provisioning configuration")
+            await ws.close(code=1011, reason="Server misconfigured")
+            return
+        if not cfg.runtime_cmd:
+            await ws.close(code=1011, reason="Server misconfigured: ARGUS_RUNTIME_CMD is not set")
+            return
         session_id = uuid.uuid4().hex[:12]
         container = None
 

@@ -1,4 +1,4 @@
-# Keep Docker build contexts small.
+# Keep Docker build contexts small (Argus).
 
 desktop/
 codex/
