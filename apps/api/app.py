@@ -4,11 +4,11 @@ import logging
 import os
 import uuid
 from dataclasses import dataclass
-from pathlib import Path
 from typing import Optional
 
 from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
-from fastapi.responses import HTMLResponse, PlainTextResponse
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import PlainTextResponse
 from starlette.websockets import WebSocketState
 
 
@@ -91,16 +91,17 @@ def _is_token_valid(expected: Optional[str], provided: Optional[str]) -> bool:
     return provided == expected
 
 
-def _html() -> bytes:
-    here = Path(__file__).resolve()
-    for root in here.parents:
-        html_path = root / "web" / "chat.html"
-        if html_path.is_file():
-            return html_path.read_bytes()
-    raise FileNotFoundError("Failed to locate web/chat.html (expected somewhere above this file)")
-
-
 app = FastAPI(title="Argus gateway", version="0.1.0")
+
+origins_raw = os.getenv("ARGUS_CORS_ORIGINS") or ""
+cors_origins = [o.strip() for o in origins_raw.split(",") if o.strip()] or ["*"]
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=cors_origins,
+    allow_credentials=False,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 
 @app.on_event("startup")
@@ -116,12 +117,12 @@ async def healthz():
 
 @app.get("/")
 async def index():
-    return HTMLResponse(_html())
+    return PlainTextResponse("Argus gateway is running. Optional web UI runs separately (see README.md).")
 
 
 @app.get("/chat")
 async def chat():
-    return HTMLResponse(_html())
+    return PlainTextResponse("No built-in UI. Start the optional web UI separately (see README.md).")
 
 
 @app.get("/robots.txt")

@@ -16,6 +16,14 @@ venv/
 !.env.example
 
 *.log
+
+# Web frontend (Next.js)
+**/node_modules/
+**/.next/
+**/out/
+**/.turbo/
+**/.swc/
+
 codex
 desktop
 .argus-home

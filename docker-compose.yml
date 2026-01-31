@@ -6,7 +6,7 @@ services:
       context: .
       dockerfile: Dockerfile
       args:
-        APP_SERVER_INSTALL_CMD: ${ARGUS_RUNTIME_INSTALL_CMD:?set ARGUS_RUNTIME_INSTALL_CMD}
+        APP_SERVER_INSTALL_CMD: ${ARGUS_RUNTIME_INSTALL_CMD:-npm i -g @openai/codex}
     image: argus-runtime
     command: ["sh", "-lc", "echo 'runtime image built'"]
 
@@ -21,14 +21,14 @@ services:
       ARGUS_PROVISION_MODE: docker
       ARGUS_RUNTIME_IMAGE: argus-runtime
       ARGUS_DOCKER_NETWORK: argus-net
-      ARGUS_HOME_HOST_PATH: ${ARGUS_HOME_HOST_PATH:?set ARGUS_HOME_HOST_PATH}
-      ARGUS_WORKSPACE_HOST_PATH: ${ARGUS_WORKSPACE_HOST_PATH:?set ARGUS_WORKSPACE_HOST_PATH}
+      ARGUS_HOME_HOST_PATH: ${ARGUS_HOME_HOST_PATH:-/srv/argus}
+      ARGUS_WORKSPACE_HOST_PATH: ${ARGUS_WORKSPACE_HOST_PATH:-/srv/argus/workspace}
       # Command executed inside each spawned runtime container.
-      ARGUS_RUNTIME_CMD: ${ARGUS_RUNTIME_CMD:?set ARGUS_RUNTIME_CMD}
+      ARGUS_RUNTIME_CMD: ${ARGUS_RUNTIME_CMD:-codex app-server}
       # Optional: require auth for /ws (Authorization: Bearer ... or ?token=...).
       ARGUS_TOKEN: ${ARGUS_TOKEN:-}
       # Optional: docker provision tuning.
-      ARGUS_CONNECT_T·IMEOUT_S: ${ARGUS_CONNECT_TIMEOUT_S:-30}
+      ARGUS_CONNECT_TIMEOUT_S: ${ARGUS_CONNECT_TIMEOUT_S:-30}
       ARGUS_CONTAINER_PREFIX: ${ARGUS_CONTAINER_PREFIX:-argus-session}
     volumes:
       # WARNING: mounting the Docker socket grants root-equivalent access to the host.
@@ -37,6 +37,16 @@ services:
       - "8080:8080"
     networks:
       - argus-net
+    restart: unless-stopped
+
+  web:
+    profiles: ["web"]
+    build:
+      context: ./apps/web
+      dockerfile: Dockerfile
+    image: argus-web
+    ports:
+      - "3000:80"
     restart: unless-stopped
 
 networks:

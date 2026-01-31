@@ -15,10 +15,11 @@ export ARGUS_TOKEN="<ARGUS_TOKEN>"
 ```
 
 - 服务器 HOST（IP 或域名）：`$HOST`
-- 网关 HTTP（用于健康检查 / 打开内置网页聊天）：`http://$HOST:8080`
+- 网关 HTTP（用于健康检查 / sessions 管理）：`http://$HOST:8080`
 - 网关健康检查：`http://$HOST:8080/healthz`
   - 期望返回：`{"ok":true}`
 - 网关 WebSocket（给程序接入 app-server runtime）：`ws://$HOST:8080/ws`
+- 可选：Web UI（用于验证后端；需要服务器启动 web 服务）：`http://$HOST:3000`
 
 认证方式（二选一）：
 
@@ -38,9 +39,11 @@ export ARGUS_TOKEN="<ARGUS_TOKEN>"
 5) WebSocket 断开后：容器会被保留（你可以通过 `DELETE /sessions/<SESSION_ID>` 手动删除）  
 6) 对话线程（thread）会写入 runtime 的持久化 home 目录（由 `ARGUS_HOME_HOST_PATH` 挂载），所以你可以通过 `thread/resume` 恢复上下文
 
-## 3. 最快验证：用浏览器自带网页聊天（无需写代码）
+## 3. 最快验证：用浏览器 Web UI（可选）
 
-1) 打开：`http://$HOST:8080`
+> 如果服务器没有启动 Web UI（或你不想依赖 UI），可以跳过本节，直接按第 4 节实现你自己的客户端。
+
+1) 打开：`http://$HOST:3000`
 2) 页面上找到 `WebSocket URL` 输入框，填：
 
 ```
