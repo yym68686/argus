@@ -37,7 +37,9 @@ export ARGUS_TOKEN="<ARGUS_TOKEN>"
 {"method":"argus/session","params":{"id":"<SESSION_ID>","mode":"docker","attached":false}}
 ```
 5) WebSocket 断开后：容器会被保留（你可以通过 `DELETE /sessions/<SESSION_ID>` 手动删除）  
-6) 对话线程（thread）会写入 runtime 的持久化 home 目录（由 `ARGUS_HOME_HOST_PATH` 挂载），所以你可以通过 `thread/resume` 恢复上下文
+6) 对话线程（thread）会写入 runtime 的持久化 home 目录（由 `ARGUS_HOME_HOST_PATH` 挂载）
+   - 恢复“工作上下文”：`thread/resume`
+   - 拉取“历史消息/回放记录”：`thread/read` + `includeTurns: true`（用于 UI/客户端刷新后回填聊天记录）
 
 ## 3. 最快验证：用浏览器 Web UI（可选）
 
@@ -112,7 +114,8 @@ curl -sS -X DELETE -H "Authorization: Bearer $ARGUS_TOKEN" "http://$HOST:8080/se
 你有两种方式：
 
 - 新开对话：`thread/start`
-- 恢复历史对话：`thread/resume`（需要你保存之前拿到的 `thread.id`）
+- 恢复“工作上下文”：`thread/resume`（需要你保存之前拿到的 `thread.id`）
+- 拉取“历史消息/回放记录”：`thread/read`（推荐 `includeTurns: true`，把 `thread.turns[].items[]` 里的 `userMessage/agentMessage` 渲染成聊天）
 
 #### 新开 thread
 ```json
@@ -127,6 +130,11 @@ curl -sS -X DELETE -H "Authorization: Bearer $ARGUS_TOKEN" "http://$HOST:8080/se
 #### 恢复 thread（断线重连继续进度）
 ```json
 {"method":"thread/resume","id":2,"params":{"threadId":"thr_123"}}
+```
+
+#### 读取 thread（不恢复也可，用于回填历史消息）
+```json
+{"method":"thread/read","id":4,"params":{"threadId":"thr_123","includeTurns":true}}
 ```
 
 #### 发起一次对话 turn（发 prompt）

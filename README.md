@@ -85,3 +85,10 @@ npm run dev
 
 前端默认会尝试连接 `ws://<当前主机>:8080/ws`；你也可以在页面里手动改 `WebSocket URL`。
 网关默认对 HTTP 接口开启 CORS（允许任意 Origin），因此浏览器 UI 可以直接调用 `/sessions`（列出/删除容器）。
+
+如果你希望打开页面就自动填好 WebSocket URL，可以在 `.env` 里设置 `NEXT_PUBLIC_ARGUS_WS_URL`，然后重建 web：
+
+```bash
+NEXT_PUBLIC_ARGUS_WS_URL="ws://HOST:8080/ws?token=..."
+docker compose --profile web up --build web
+```

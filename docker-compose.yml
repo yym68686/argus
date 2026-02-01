@@ -44,6 +44,8 @@ services:
     build:
       context: ./apps/web
       dockerfile: Dockerfile
+      args:
+        NEXT_PUBLIC_ARGUS_WS_URL: ${NEXT_PUBLIC_ARGUS_WS_URL:-}
     image: argus-web
     ports:
       - "3000:80"

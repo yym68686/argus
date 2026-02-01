@@ -2,6 +2,9 @@ FROM node:22-bookworm-slim AS build
 
 WORKDIR /app
 
+ARG NEXT_PUBLIC_ARGUS_WS_URL
+ENV NEXT_PUBLIC_ARGUS_WS_URL=$NEXT_PUBLIC_ARGUS_WS_URL
+
 COPY package.json /app/package.json
 RUN npm install
 
