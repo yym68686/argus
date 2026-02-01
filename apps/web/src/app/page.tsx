@@ -1487,17 +1487,17 @@ export default function Page() {
 	                                  const threadKeyId = `${sid}:${t.id}`;
 	                                  const isThreadMenuOpen = threadMenuOpenFor === threadKeyId;
 	                                  return (
-	                                    <div
-	                                      key={t.id}
-	                                      className={cn(
-	                                        "group flex items-center gap-2 rounded-xl border border-transparent",
-	                                        "transition-colors",
-	                                        "focus-within:ring-4 focus-within:ring-ring/25",
-	                                        isCurrentThread
-	                                          ? "border-primary/25 bg-primary/10 text-foreground"
-	                                          : "text-foreground/90 hover:border-primary/25 hover:bg-primary/10 hover:text-foreground"
-	                                      )}
-	                                    >
+		                                    <div
+		                                      key={t.id}
+		                                      className={cn(
+		                                        "group flex items-center gap-2 rounded-xl border border-transparent",
+		                                        "transition-colors",
+		                                        "focus-within:border-primary/25 focus-within:bg-primary/10 focus-within:text-foreground",
+		                                        isCurrentThread
+		                                          ? "border-primary/25 bg-primary/10 text-foreground"
+		                                          : "text-foreground/90 hover:border-primary/25 hover:bg-primary/10 hover:text-foreground"
+		                                      )}
+		                                    >
 	                                      <button
 	                                        type="button"
 	                                        title={label}
