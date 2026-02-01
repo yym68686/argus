@@ -89,6 +89,13 @@ function emptyThreadChatState(): ThreadChatState {
   return { messages: [], turnId: null, turnInProgress: false, hydrated: false };
 }
 
+function promptToThreadPreview(text: string): string {
+  const firstLine = text.trim().split(/\r?\n/, 1)[0] ?? "";
+  const normalized = firstLine.replace(/\s+/g, " ").trim();
+  if (normalized.length <= 160) return normalized;
+  return `${normalized.slice(0, 157)}…`;
+}
+
 function isRecord(v: unknown): v is Record<string, unknown> {
   return typeof v === "object" && v !== null && !Array.isArray(v);
 }
@@ -284,6 +291,7 @@ export default function Page() {
   const autoConnectAttemptedRef = React.useRef<boolean>(false);
 
   const chatScrollRef = React.useRef<HTMLDivElement | null>(null);
+  const composingRef = React.useRef<boolean>(false);
 
   const activeThreadKey =
     activeSessionId && activeThreadId ? `${activeSessionId}:${activeThreadId}` : null;
@@ -300,7 +308,7 @@ export default function Page() {
     return false;
   }, [activeSessionId, chatByThreadKey]);
 
-  const canSend = !!activeConnStatus?.ok && !!activeThreadId && !isActiveSessionBusy;
+  const canSend = !!prompt.trim() && !isActiveSessionBusy;
 
   React.useEffect(() => {
     chatScrollRef.current?.scrollTo({ top: chatScrollRef.current.scrollHeight });
@@ -615,6 +623,7 @@ export default function Page() {
       const turn = isRecord(params["turn"]) ? params["turn"] : {};
       const incomingTurnId = getString(turn["id"]);
       setThreadTurnCompleted(sessionId, incomingThreadId, incomingTurnId);
+      void refreshThreadsForSession(sessionId, { silent: true });
       return;
     }
   }
@@ -784,10 +793,10 @@ export default function Page() {
     setCurrentThreadBySession((prev) => ({ ...prev, [sessionId]: tid }));
     setActiveSessionId(sessionId);
     setActiveThreadId(tid);
+    setExpandedSessions((prev) => ({ ...prev, [sessionId]: true }));
 
     const key = threadKey(sessionId, tid);
     setChatByThreadKey((prev) => ({ ...prev, [key]: emptyThreadChatState() }));
-    void refreshThreadsForSession(sessionId, { silent: true });
     return tid;
   }
 
@@ -853,54 +862,105 @@ export default function Page() {
     await connectNewSession();
   }
 
-  async function sendTurn(): Promise<void> {
-    const text = prompt.trim();
-    if (!text || !activeSessionId || !activeThreadId) return;
-    if (!activeConnStatus?.ok) return;
-    if (isActiveSessionBusy) return;
+	  async function sendTurn(): Promise<void> {
+	    const text = prompt.trim();
+	    if (!text) return;
+	    if (isActiveSessionBusy) return;
 
-    const key = threadKey(activeSessionId, activeThreadId);
-    const userMsg: ChatMessage = { id: nowId("u"), role: "user", text };
-    const assistantMsg: ChatMessage = { id: nowId("a"), role: "assistant", text: "" };
+	    try {
+	      let sessionId = activeSessionId;
+	      if (!isNonEmptyString(sessionId)) {
+	        const list = sessions ?? (await refreshSessions({ silent: true, throwOnError: true }));
+	        const existing = list.find((s) => isNonEmptyString(s.sessionId))?.sessionId ?? null;
+	        if (existing) {
+	          sessionId = existing;
+	          setActiveSessionId(existing);
+	          await ensureSessionReady(existing);
+	        } else {
+	          sessionId = await connectNewSession();
+	        }
+	      } else {
+	        await ensureSessionReady(sessionId);
+	      }
 
-    setChatByThreadKey((prev) => {
-      const current = prev[key] ?? emptyThreadChatState();
-      return {
-        ...prev,
-        [key]: {
-          ...current,
-          messages: [...current.messages, userMsg, assistantMsg],
-          turnInProgress: true,
-          turnId: null,
-          hydrated: true
-        }
-      };
-    });
-    setPrompt("");
+	      let threadId: string | null = null;
+	      if (sessionId === activeSessionId) threadId = activeThreadId;
+	      if (!isNonEmptyString(threadId)) {
+	        const fromMap = currentThreadBySession[sessionId] ?? null;
+	        if (isNonEmptyString(fromMap)) threadId = fromMap;
+	      }
+	      if (!isNonEmptyString(threadId)) {
+	        threadId = await startThreadInSession(sessionId);
+	      }
 
-    try {
-      const result = await rpc(activeSessionId, "turn/start", {
-        threadId: activeThreadId,
-        input: [{ type: "text", text }],
-        cwd,
-        approvalPolicy,
-        sandboxPolicy: { type: "externalSandbox", networkAccess: "enabled" }
-      });
-      const tid = (result as { turn?: { id?: string } })?.turn?.id;
-      if (isNonEmptyString(tid)) {
-        setChatByThreadKey((prev) => {
-          const current = prev[key] ?? { ...emptyThreadChatState(), turnInProgress: true };
-          return { ...prev, [key]: { ...current, turnId: tid } };
-        });
-      }
-    } catch (e) {
-      setChatByThreadKey((prev) => {
-        const current = prev[key] ?? { ...emptyThreadChatState(), turnInProgress: true };
-        return { ...prev, [key]: { ...current, turnInProgress: false, turnId: null } };
-      });
-      toast.error((e as Error)?.message || String(e));
-    }
-  }
+	      setActivePane("chat");
+	      setActiveSessionId(sessionId);
+	      setActiveThreadId(threadId);
+
+	      const key = threadKey(sessionId, threadId);
+	      const userMsg: ChatMessage = { id: nowId("u"), role: "user", text };
+	      const assistantMsg: ChatMessage = { id: nowId("a"), role: "assistant", text: "" };
+	      const preview = promptToThreadPreview(text);
+
+	      setThreadsBySession((prev) => {
+	        const existing = prev[sessionId];
+	        if (!existing || !Array.isArray(existing)) {
+	          return { ...prev, [sessionId]: [{ id: threadId, preview, updatedAt: Date.now() }] };
+	        }
+	        const idx = existing.findIndex((t) => t.id === threadId);
+	        if (idx === -1) {
+	          return { ...prev, [sessionId]: [{ id: threadId, preview }, ...existing] };
+	        }
+	        const row = existing[idx];
+	        const updated: ThreadRow = {
+	          ...row,
+	          preview: row.preview.trim() ? row.preview : preview,
+	          updatedAt: Date.now()
+	        };
+	        return { ...prev, [sessionId]: [updated, ...existing.slice(0, idx), ...existing.slice(idx + 1)] };
+	      });
+
+	      setChatByThreadKey((prev) => {
+	        const current = prev[key] ?? emptyThreadChatState();
+	        return {
+	          ...prev,
+	          [key]: {
+	            ...current,
+	            messages: [...current.messages, userMsg, assistantMsg],
+	            turnInProgress: true,
+	            turnId: null,
+	            hydrated: true
+	          }
+	        };
+	      });
+	      setPrompt("");
+
+	      try {
+	        const result = await rpc(sessionId, "turn/start", {
+	          threadId,
+	          input: [{ type: "text", text }],
+	          cwd,
+	          approvalPolicy,
+	          sandboxPolicy: { type: "externalSandbox", networkAccess: "enabled" }
+	        });
+	        const turnId = (result as { turn?: { id?: string } })?.turn?.id;
+	        if (isNonEmptyString(turnId)) {
+	          setChatByThreadKey((prev) => {
+	            const current = prev[key] ?? { ...emptyThreadChatState(), turnInProgress: true };
+	            return { ...prev, [key]: { ...current, turnId } };
+	          });
+	        }
+	      } catch (e) {
+	        setChatByThreadKey((prev) => {
+	          const current = prev[key] ?? { ...emptyThreadChatState(), turnInProgress: true };
+	          return { ...prev, [key]: { ...current, turnInProgress: false, turnId: null } };
+	        });
+	        throw e;
+	      }
+	    } catch (e) {
+	      toast.error((e as Error)?.message || String(e));
+	    }
+	  }
 
   async function refreshSessions(opts?: { silent?: boolean; throwOnError?: boolean }): Promise<SessionRow[]> {
     setSessionsBusy(true);
@@ -1011,7 +1071,35 @@ export default function Page() {
         });
       }
 
-      setThreadsBySession((prev) => ({ ...prev, [sessionId]: rows }));
+      setThreadsBySession((prev) => {
+        const existing = prev[sessionId];
+        const currentThread = currentThreadBySession[sessionId] ?? null;
+
+        const existingById = new Map<string, ThreadRow>();
+        if (Array.isArray(existing)) {
+          for (const row of existing) existingById.set(row.id, row);
+        }
+
+        const merged = rows.map((row) => {
+          const prevRow = existingById.get(row.id);
+          if (!prevRow) return row;
+          return {
+            ...row,
+            preview: row.preview.trim() ? row.preview : prevRow.preview,
+            modelProvider: row.modelProvider ?? prevRow.modelProvider,
+            createdAt: row.createdAt ?? prevRow.createdAt,
+            updatedAt: row.updatedAt ?? prevRow.updatedAt,
+            path: row.path ?? prevRow.path
+          };
+        });
+
+        if (isNonEmptyString(currentThread) && !merged.some((t) => t.id === currentThread)) {
+          const keep = existingById.get(currentThread);
+          if (keep) return { ...prev, [sessionId]: [keep, ...merged] };
+        }
+
+        return { ...prev, [sessionId]: merged };
+      });
     } catch (e) {
       const msg = (e as Error)?.message || String(e);
       setThreadsErrorBySession((prev) => ({ ...prev, [sessionId]: msg }));
@@ -1083,6 +1171,13 @@ export default function Page() {
         }
       }
 
+      setThreadsBySession((prev) => {
+        const list = prev[sessionId];
+        if (!list) return prev;
+        const next = list.filter((t) => t.id !== threadId);
+        return { ...prev, [sessionId]: next };
+      });
+
       const key = threadKey(sessionId, threadId);
       setChatByThreadKey((prev) => {
         if (!prev[key]) return prev;
@@ -1101,7 +1196,7 @@ export default function Page() {
       }
 
       toast.success("Thread archived");
-      await refreshThreadsForSession(sessionId, { silent: true });
+      void refreshThreadsForSession(sessionId, { silent: true });
     } catch (e) {
       toast.error((e as Error)?.message || String(e));
     }
@@ -1234,18 +1329,23 @@ export default function Page() {
                     const threadsBusy = sid ? !!threadsBusyBySession[sid] : false;
                     const threadsError = sid ? threadsErrorBySession[sid] : null;
 
-                    return (
-                      <React.Fragment key={sid || s.containerId || Math.random().toString(16)}>
-                        <div className="flex items-center gap-2">
-                          <button
-                            type="button"
-                            className={cn(
-                              "flex min-w-0 flex-1 items-center gap-2 rounded-xl px-2 py-2 text-left",
-                              "transition-colors hover:bg-background/50",
-                              "focus-visible:outline-none focus-visible:ring-4 focus-visible:ring-ring/25",
-                              isCurrent ? "bg-primary/10" : null,
-                              canToggle ? "cursor-pointer" : "cursor-default"
-                            )}
+	                    return (
+	                      <React.Fragment key={sid || s.containerId || Math.random().toString(16)}>
+	                        <div
+	                          className={cn(
+	                            "group flex items-center gap-2 rounded-xl border border-transparent",
+	                            "transition-colors",
+	                            "focus-within:ring-4 focus-within:ring-ring/25",
+	                            isCurrent ? "border-primary/25 bg-primary/10" : "hover:border-border/60 hover:bg-background/50"
+	                          )}
+	                        >
+	                          <button
+	                            type="button"
+	                            className={cn(
+	                              "flex min-w-0 flex-1 items-center gap-2 px-2 py-2 text-left",
+	                              "focus-visible:outline-none",
+	                              canToggle ? "cursor-pointer" : "cursor-default"
+	                            )}
                             onClick={() => {
                               if (!sid) return;
                               setActivePane("chat");
@@ -1278,20 +1378,26 @@ export default function Page() {
                             {isCurrent ? <span className="text-xs font-medium text-primary">current</span> : null}
                           </button>
 
-                          <div className="relative shrink-0">
-                            <Button
-                              type="button"
-                              size="sm"
-                              variant="ghost"
-                              disabled={!sid}
-                              onClick={(e) => {
-                                e.stopPropagation();
-                                if (!sid) return;
-                                setSessionMenuOpenFor((prev) => (prev === sid ? null : sid));
-                              }}
-                            >
-                              <MoreHorizontal className="h-4 w-4" />
-                            </Button>
+	                          <div className="relative shrink-0 pr-1">
+	                            <Button
+	                              type="button"
+	                              size="sm"
+	                              variant="ghost"
+	                              disabled={!sid}
+	                              className={cn(
+	                                "h-8 w-8 rounded-xl border border-transparent p-0",
+	                                "text-muted-foreground transition-colors hover:border-border/60 hover:bg-background/60 hover:text-foreground group-hover:text-foreground",
+	                                isMenuOpen ? "border-border/60 bg-background/60 text-foreground" : null
+	                              )}
+	                              onClick={(e) => {
+	                                e.stopPropagation();
+	                                if (!sid) return;
+	                                setSessionMenuOpenFor((prev) => (prev === sid ? null : sid));
+	                              }}
+	                              aria-label="Session menu"
+	                            >
+	                              <MoreHorizontal className="h-4 w-4" />
+	                            </Button>
                             {sid && isMenuOpen ? (
                               <div
                                 className={cn(
@@ -1375,45 +1481,55 @@ export default function Page() {
                               </div>
                             ) : (
                               <div className="flex flex-col gap-1">
-                                {threads.map((t) => {
-                                  const isCurrentThread = t.id === (currentThreadBySession[sid] ?? null);
-                                  const label = t.preview?.trim() ? t.preview.trim() : "(no preview)";
-                                  const threadKeyId = `${sid}:${t.id}`;
-                                  const isThreadMenuOpen = threadMenuOpenFor === threadKeyId;
-                                  return (
-                                    <div key={t.id} className="group relative flex items-center gap-2">
-                                      <button
-                                        type="button"
-                                        title={t.id}
-                                        className={cn(
-                                          "w-full min-w-0 rounded-xl py-2 pl-9 pr-10 text-left text-sm",
-                                          "transition-colors hover:bg-background/50",
-                                          "focus-visible:outline-none focus-visible:ring-4 focus-visible:ring-ring/25",
-                                          isCurrentThread ? "bg-primary/10 text-foreground" : "text-foreground/90"
-                                        )}
-                                        onClick={() => {
-                                          setThreadMenuOpenFor(null);
-                                          void openThreadInSession(sid, t.id);
-                                        }}
-                                      >
-                                        <span className="block truncate">{label}</span>
-                                      </button>
-
-                                      <div className="absolute right-1 top-1/2 -translate-y-1/2">
-                                        <Button
-                                          type="button"
-                                          variant="ghost"
-                                          size="sm"
-                                          className={cn(
-                                            "h-8 w-8 rounded-xl border border-transparent p-0",
-                                            "text-muted-foreground transition-colors hover:border-border/60 hover:bg-background/60 hover:text-foreground",
-                                            isThreadMenuOpen ? "border-border/60 bg-background/60 text-foreground" : "",
-                                            "opacity-0 group-hover:opacity-100 focus-visible:opacity-100"
-                                          )}
-                                          onClick={(e) => {
-                                            e.stopPropagation();
-                                            setSessionMenuOpenFor(null);
-                                            setThreadMenuOpenFor((prev) => (prev === threadKeyId ? null : threadKeyId));
+	                                {threads.map((t) => {
+	                                  const isCurrentThread = t.id === (currentThreadBySession[sid] ?? null);
+	                                  const label = t.preview?.trim() ? t.preview.trim() : "(no preview)";
+	                                  const threadKeyId = `${sid}:${t.id}`;
+	                                  const isThreadMenuOpen = threadMenuOpenFor === threadKeyId;
+	                                  return (
+	                                    <div
+	                                      key={t.id}
+	                                      className={cn(
+	                                        "group flex items-center gap-2 rounded-xl border border-transparent",
+	                                        "transition-colors",
+	                                        "focus-within:ring-4 focus-within:ring-ring/25",
+	                                        isCurrentThread
+	                                          ? "border-primary/25 bg-primary/10 text-foreground"
+	                                          : "text-foreground/90 hover:border-primary/25 hover:bg-primary/10 hover:text-foreground"
+	                                      )}
+	                                    >
+	                                      <button
+	                                        type="button"
+	                                        title={label}
+	                                        className={cn(
+	                                          "min-w-0 flex-1 cursor-pointer px-2 py-2 text-left",
+	                                          "focus-visible:outline-none"
+	                                        )}
+	                                        onClick={() => {
+	                                          setThreadMenuOpenFor(null);
+	                                          void openThreadInSession(sid, t.id);
+	                                        }}
+	                                      >
+	                                        <span className="flex min-w-0 items-center gap-2">
+	                                          <span className="h-1.5 w-1.5 shrink-0 rounded-full bg-muted-foreground/60" />
+	                                          <span className="min-w-0 flex-1 truncate text-sm">{label}</span>
+	                                        </span>
+	                                      </button>
+	
+	                                      <div className="relative shrink-0 pr-1">
+	                                        <Button
+	                                          type="button"
+	                                          variant="ghost"
+	                                          size="sm"
+	                                          className={cn(
+	                                            "h-8 w-8 rounded-xl border border-transparent p-0",
+	                                            "text-muted-foreground transition-colors hover:border-border/60 hover:bg-background/60 hover:text-foreground group-hover:text-foreground",
+	                                            isThreadMenuOpen ? "border-border/60 bg-background/60 text-foreground" : ""
+	                                          )}
+	                                          onClick={(e) => {
+	                                            e.stopPropagation();
+	                                            setSessionMenuOpenFor(null);
+	                                            setThreadMenuOpenFor((prev) => (prev === threadKeyId ? null : threadKeyId));
                                           }}
                                           aria-label="Thread menu"
                                         >
@@ -1429,6 +1545,21 @@ export default function Page() {
                                             )}
                                             onClick={(e) => e.stopPropagation()}
                                           >
+                                            <button
+                                              type="button"
+                                              className={cn(
+                                                "flex w-full items-center gap-2 px-3 py-2 text-left text-sm text-foreground",
+                                                "transition-colors hover:bg-background/60"
+                                              )}
+                                              onClick={(e) => {
+                                                e.stopPropagation();
+                                                setThreadMenuOpenFor(null);
+                                                copyText(t.id);
+                                              }}
+                                            >
+                                              <Copy className="h-4 w-4 text-primary" />
+                                              Copy thread id
+                                            </button>
                                             <button
                                               type="button"
                                               className={cn(
@@ -1606,26 +1737,11 @@ export default function Page() {
                 <div
                   ref={chatScrollRef}
                   className="flex-1 overflow-auto p-4 pt-12 pb-40 scrollbar-hide md:p-5 md:pt-14 md:pb-44"
-                >
-                  <div className="mx-auto grid w-full max-w-3xl grid-cols-1 gap-3">
-                    {!activeSessionId ? (
-                      <div className="rounded-2xl border border-border/60 bg-background/60 p-4 text-sm text-muted-foreground">
-                        Create a session, then pick a thread from the sidebar.
-                      </div>
-                    ) : !activeThreadId ? (
-                      <div className="rounded-2xl border border-border/60 bg-background/60 p-4 text-sm text-muted-foreground">
-                        Pick a thread under a session to attach.
-                      </div>
-                    ) : (activeChat?.messages?.length ?? 0) === 0 ? (
-                      <div className="rounded-2xl border border-border/60 bg-background/60 p-4 text-sm text-muted-foreground">
-                        Ready. Send a prompt. Turns are sequential per session (wait for{" "}
-                        <code className="font-mono">turn/completed</code>).
-                      </div>
-                    ) : (
-                      (activeChat?.messages ?? []).map((m) => <Bubble key={m.id} role={m.role} text={m.text} />)
-                    )}
-                  </div>
-                </div>
+	                >
+	                  <div className="mx-auto grid w-full max-w-3xl grid-cols-1 gap-3">
+	                    {(activeChat?.messages ?? []).map((m) => <Bubble key={m.id} role={m.role} text={m.text} />)}
+	                  </div>
+	                </div>
 
 	                <div className="sticky bottom-0 z-10 bg-gradient-to-t from-background/90 via-background/30 to-transparent px-4 pb-5 pt-10 backdrop-blur-md md:px-5">
 	                  <div className="pointer-events-none mx-auto w-full max-w-3xl">
@@ -1644,23 +1760,33 @@ export default function Page() {
                       <Paperclip className="h-4 w-4" />
                     </button>
 
-                    <textarea
-                      value={prompt}
-                      onChange={(e) => setPrompt(e.target.value)}
-                      placeholder="Message Argus…"
-                      disabled={!canSend}
-                      rows={1}
-                      className={cn(
-                        "min-h-10 flex-1 resize-none bg-transparent px-2 py-2 text-sm text-foreground outline-none",
-                        "placeholder:text-muted-foreground/70"
-                      )}
-                      onKeyDown={(e) => {
-                        if (e.key === "Enter" && !e.shiftKey) {
-                          e.preventDefault();
-                          void sendTurn();
-                        }
-                      }}
-                    />
+	                    <textarea
+	                      value={prompt}
+	                      onChange={(e) => setPrompt(e.target.value)}
+	                      onCompositionStart={() => {
+	                        composingRef.current = true;
+	                      }}
+	                      onCompositionEnd={() => {
+	                        composingRef.current = false;
+	                      }}
+	                      placeholder="Message Argus…"
+	                      disabled={isActiveSessionBusy}
+	                      rows={1}
+	                      className={cn(
+	                        "min-h-10 flex-1 resize-none bg-transparent px-2 py-2 text-sm text-foreground outline-none",
+	                        "placeholder:text-muted-foreground/70"
+	                      )}
+	                      onKeyDown={(e) => {
+	                        if (e.key === "Enter" && !e.shiftKey) {
+	                          // Avoid sending while using IME (e.g. Chinese/Japanese input). Enter should commit composition.
+	                          const native = e.nativeEvent as KeyboardEvent;
+	                          const keyCode = (native as unknown as { keyCode?: number }).keyCode;
+	                          if (composingRef.current || native.isComposing || keyCode === 229) return;
+	                          e.preventDefault();
+	                          void sendTurn();
+	                        }
+	                      }}
+	                    />
 
 	                    <Button
 	                      type="button"
