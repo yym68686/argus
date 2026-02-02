@@ -3,8 +3,9 @@ import json
 import logging
 import os
 import uuid
+from collections import deque
 from dataclasses import dataclass
-from typing import Optional
+from typing import Any, Optional
 
 from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
@@ -33,6 +34,91 @@ class DockerProvisionConfig:
     runtime_cmd: Optional[str] = None
     connect_timeout_s: float = 30.0
     container_prefix: str = "argus-session"
+
+
+@dataclass
+class LiveDockerSession:
+    session_id: str
+    container_id: str
+    container_name: str
+    upstream_host: str
+    upstream_port: int
+    reader: asyncio.StreamReader
+    writer: asyncio.StreamWriter
+    cfg: DockerProvisionConfig
+    pump_task: Optional[asyncio.Task[None]]
+
+    attach_lock: asyncio.Lock
+    attached_ws: Optional[WebSocket]
+
+    initialized_result: Optional[dict[str, Any]]
+    handshake_done: bool
+    pending_initialize_ids: set[str]
+
+    pending_server_requests: dict[str, str]
+    outbox: deque[str]
+
+    closed: bool = False
+
+    async def attach(self, ws: WebSocket) -> bool:
+        async with self.attach_lock:
+            if self.attached_ws is not None and self.attached_ws.client_state == WebSocketState.CONNECTED:
+                return False
+            self.attached_ws = ws
+            return True
+
+    async def detach(self, ws: WebSocket) -> None:
+        async with self.attach_lock:
+            if self.attached_ws is ws:
+                self.attached_ws = None
+
+    async def _send_ws(self, text: str) -> None:
+        async with self.attach_lock:
+            ws = self.attached_ws
+        if ws is None or ws.client_state != WebSocketState.CONNECTED:
+            raise RuntimeError("no websocket attached")
+        await ws.send_text(text)
+
+    async def deliver_or_buffer(self, text: str, *, buffer_when_detached: bool = True) -> None:
+        async with self.attach_lock:
+            ws = self.attached_ws
+        if ws is not None and ws.client_state == WebSocketState.CONNECTED:
+            try:
+                await ws.send_text(text)
+                return
+            except Exception:
+                async with self.attach_lock:
+                    if self.attached_ws is ws:
+                        self.attached_ws = None
+        if not buffer_when_detached:
+            return
+        self.outbox.append(text)
+        while len(self.outbox) > 2000:
+            self.outbox.popleft()
+
+    async def flush_pending(self) -> None:
+        async with self.attach_lock:
+            ws = self.attached_ws
+        if ws is None or ws.client_state != WebSocketState.CONNECTED:
+            return
+        for raw in list(self.pending_server_requests.values()):
+            try:
+                await ws.send_text(raw)
+            except Exception:
+                break
+        while self.outbox:
+            raw = self.outbox.popleft()
+            try:
+                await ws.send_text(raw)
+            except Exception:
+                self.outbox.appendleft(raw)
+                break
+
+    async def write_upstream(self, text: str) -> None:
+        if not text.endswith("\n"):
+            text += "\n"
+        self.writer.write(text.encode("utf-8"))
+        await self.writer.drain()
 
 
 def _provision_mode() -> str:
@@ -106,8 +192,8 @@ app.add_middleware(
 
 @app.on_event("startup")
 async def _startup():
-    app.state.active_sessions_lock = asyncio.Lock()
-    app.state.active_sessions: set[str] = set()
+    app.state.sessions_lock = asyncio.Lock()
+    app.state.sessions: dict[str, LiveDockerSession] = {}
 
 
 @app.get("/healthz")
@@ -342,6 +428,21 @@ async def delete_session(session_id: str, request: Request):
         container = await asyncio.to_thread(_docker_get_container_by_session_sync, session_id)
         if container is None:
             raise HTTPException(status_code=404, detail="Session not found")
+        async with app.state.sessions_lock:
+            live = app.state.sessions.pop(session_id, None)
+        if live is not None:
+            try:
+                live.closed = True
+                try:
+                    live.writer.close()
+                except Exception:
+                    pass
+                try:
+                    live.pump_task.cancel()
+                except Exception:
+                    pass
+            except Exception:
+                pass
         await asyncio.to_thread(_docker_remove_container_sync, container)
     except HTTPException:
         raise
@@ -375,18 +476,12 @@ async def ws_proxy(ws: WebSocket):
             return
         requested_session = (ws.query_params.get("session") or "").strip() or None
         session_id = requested_session or uuid.uuid4().hex[:12]
+        created = False
 
-        container = None
-        reader = None
-        writer = None
+        async with app.state.sessions_lock:
+            live = app.state.sessions.get(session_id)
 
-        async with app.state.active_sessions_lock:
-            if session_id in app.state.active_sessions:
-                await ws.close(code=1008, reason="Session already connected")
-                return
-            app.state.active_sessions.add(session_id)
-
-        try:
+        if live is None or live.closed:
             try:
                 if requested_session:
                     container = await asyncio.to_thread(_docker_get_container_by_session_sync, session_id)
@@ -395,6 +490,7 @@ async def ws_proxy(ws: WebSocket):
                         return
                     container = await asyncio.to_thread(_docker_ensure_running_sync, container)
                 else:
+                    created = True
                     container = await asyncio.to_thread(_docker_create_container_sync, cfg, session_id)
 
                 host = await _docker_wait_for_ip(container, cfg.network, cfg.connect_timeout_s)
@@ -403,7 +499,85 @@ async def ws_proxy(ws: WebSocket):
                 await ws.close(code=1011, reason="Failed to provision upstream container")
                 return
 
+            live = LiveDockerSession(
+                session_id=session_id,
+                container_id=container.id,
+                container_name=container.name,
+                upstream_host=host,
+                upstream_port=7777,
+                reader=reader,
+                writer=writer,
+                cfg=cfg,
+                pump_task=None,
+                attach_lock=asyncio.Lock(),
+                attached_ws=None,
+                initialized_result=None,
+                handshake_done=False,
+                pending_initialize_ids=set(),
+                pending_server_requests={},
+                outbox=deque(),
+            )
+
+            async def pump() -> None:
+                try:
+                    while True:
+                        line = await live.reader.readline()
+                        if not line:
+                            break
+                        text = line.decode("utf-8", errors="replace").rstrip("\n")
+
+                        msg: Any = None
+                        try:
+                            msg = json.loads(text)
+                        except Exception:
+                            msg = None
+
+                        if isinstance(msg, dict):
+                            if "id" in msg and "method" in msg:
+                                rid = str(msg.get("id"))
+                                if rid not in live.pending_server_requests:
+                                    live.pending_server_requests[rid] = text
+                                await live.deliver_or_buffer(text, buffer_when_detached=False)
+                                continue
+
+                            if "id" in msg and "method" not in msg:
+                                rid = str(msg.get("id"))
+                                if rid in live.pending_initialize_ids:
+                                    live.pending_initialize_ids.discard(rid)
+                                    if isinstance(msg.get("result"), dict):
+                                        live.initialized_result = msg["result"]
+                                async with live.attach_lock:
+                                    ws_attached = live.attached_ws
+                                if ws_attached is not None and ws_attached.client_state == WebSocketState.CONNECTED:
+                                    await live.deliver_or_buffer(text, buffer_when_detached=False)
+                                continue
+
+                        await live.deliver_or_buffer(text)
+                except Exception:
+                    log.exception("Upstream pump failed for session %s", session_id)
+                finally:
+                    live.closed = True
+                    try:
+                        live.writer.close()
+                    except Exception:
+                        pass
+                    async with app.state.sessions_lock:
+                        current = app.state.sessions.get(session_id)
+                        if current is live:
+                            app.state.sessions.pop(session_id, None)
+
+            live.pump_task = asyncio.create_task(pump())
+
+            async with app.state.sessions_lock:
+                app.state.sessions[session_id] = live
+
             log.info("Provisioned session %s -> %s:%s", session_id, host, 7777)
+
+        if not await live.attach(ws):
+            await ws.close(code=1008, reason="Session already connected")
+            return
+
+        try:
             try:
                 await ws.send_text(
                     json.dumps(
@@ -413,6 +587,7 @@ async def ws_proxy(ws: WebSocket):
                                 "id": session_id,
                                 "mode": "docker",
                                 "attached": bool(requested_session),
+                                "created": created,
                             },
                         }
                     )
@@ -420,58 +595,51 @@ async def ws_proxy(ws: WebSocket):
             except Exception:
                 pass
 
-            try:
-                async def ws_to_tcp():
-                    try:
-                        while True:
-                            text = await ws.receive_text()
-                            if not text.endswith("\n"):
-                                text += "\n"
-                            writer.write(text.encode("utf-8"))
-                            await writer.drain()
-                    except WebSocketDisconnect:
-                        pass
-                    finally:
+            await live.flush_pending()
+
+            while True:
+                try:
+                    text = await ws.receive_text()
+                except WebSocketDisconnect:
+                    break
+
+                msg: Any = None
+                try:
+                    msg = json.loads(text)
+                except Exception:
+                    msg = None
+
+                if isinstance(msg, dict) and msg.get("method") == "initialize":
+                    req_id = msg.get("id")
+                    if live.initialized_result is not None:
                         try:
-                            writer.close()
+                            await live._send_ws(json.dumps({"id": req_id, "result": live.initialized_result}))
                         except Exception:
                             pass
+                        continue
+                    if req_id is not None:
+                        live.pending_initialize_ids.add(str(req_id))
+                    await live.write_upstream(text)
+                    continue
 
-                async def tcp_to_ws():
-                    try:
-                        while True:
-                            line = await reader.readline()
-                            if not line:
-                                break
-                            await ws.send_text(line.decode("utf-8").rstrip("\n"))
-                    finally:
-                        if ws.client_state == WebSocketState.CONNECTED:
-                            try:
-                                await ws.close()
-                            except Exception:
-                                pass
+                if isinstance(msg, dict) and msg.get("method") == "initialized":
+                    if live.handshake_done:
+                        continue
+                    await live.write_upstream(text)
+                    live.handshake_done = True
+                    continue
 
-                a = asyncio.create_task(ws_to_tcp())
-                b = asyncio.create_task(tcp_to_ws())
+                if isinstance(msg, dict) and "id" in msg and "method" not in msg:
+                    rid = str(msg.get("id"))
+                    if rid in live.pending_server_requests:
+                        live.pending_server_requests.pop(rid, None)
+                    await live.write_upstream(text)
+                    continue
 
-                done, pending = await asyncio.wait({a, b}, return_when=asyncio.FIRST_COMPLETED)
-                for task in pending:
-                    task.cancel()
-                for task in done:
-                    try:
-                        task.result()
-                    except Exception:
-                        pass
-            finally:
-                try:
-                    if writer is not None:
-                        writer.close()
-                except Exception:
-                    pass
-                log.info("Session %s detached (container retained)", session_id)
+                await live.write_upstream(text)
         finally:
-            async with app.state.active_sessions_lock:
-                app.state.active_sessions.discard(session_id)
+            await live.detach(ws)
+            log.info("Session %s detached (codex process retained)", session_id)
 
         return
 
