@@ -54,7 +54,6 @@ interface RpcNotification {
 type AnyWireMessage = Partial<RpcRequest & RpcResponse & RpcNotification>;
 
 type ApprovalPolicy = "never" | "on-request" | "on-failure" | "untrusted";
-type SandboxMode = "workspace-write" | "read-only" | "danger-full-access";
 
 interface ChatMessage {
   id: string;
@@ -241,7 +240,6 @@ export default function Page() {
   const [wsUrl, setWsUrl] = React.useState<string>("");
   const [cwd, setCwd] = React.useState<string>("/workspace");
   const [approvalPolicy, setApprovalPolicy] = React.useState<ApprovalPolicy>("never");
-  const [sandboxMode, setSandboxMode] = React.useState<SandboxMode>("workspace-write");
 
   const [activePane, setActivePane] = React.useState<ActivePane>("chat");
 
@@ -786,7 +784,7 @@ export default function Page() {
 
   async function startThreadInSession(sessionId: string): Promise<string> {
     await ensureSessionReady(sessionId);
-    const result = await rpc(sessionId, "thread/start", { cwd, approvalPolicy, sandbox: sandboxMode });
+    const result = await rpc(sessionId, "thread/start", { cwd, approvalPolicy, sandbox: "danger-full-access" });
     const tid = (result as { thread?: { id?: string } })?.thread?.id;
     if (!isNonEmptyString(tid)) throw new Error("Invalid thread/start response");
 
@@ -1642,34 +1640,20 @@ export default function Page() {
                             <Input value={cwd} onChange={(e) => setCwd(e.target.value)} spellCheck={false} />
                           </div>
                           <div className="grid gap-1.5">
-                            <FieldLabel label="Approval / Sandbox" />
-                            <div className="grid grid-cols-2 gap-2">
-                              <select
-                                className={cn(
-                                  "h-10 w-full rounded-xl border border-input bg-background/70 px-3 text-sm text-foreground outline-none",
-                                  "focus-visible:ring-4 focus-visible:ring-ring/25"
-                                )}
-                                value={approvalPolicy}
-                                onChange={(e) => setApprovalPolicy(e.target.value as ApprovalPolicy)}
-                              >
-                                <option value="never">never</option>
-                                <option value="on-request">on-request</option>
-                                <option value="on-failure">on-failure</option>
-                                <option value="untrusted">untrusted</option>
-                              </select>
-                              <select
-                                className={cn(
-                                  "h-10 w-full rounded-xl border border-input bg-background/70 px-3 text-sm text-foreground outline-none",
-                                  "focus-visible:ring-4 focus-visible:ring-ring/25"
-                                )}
-                                value={sandboxMode}
-                                onChange={(e) => setSandboxMode(e.target.value as SandboxMode)}
-                              >
-                                <option value="workspace-write">workspace-write</option>
-                                <option value="read-only">read-only</option>
-                                <option value="danger-full-access">danger-full-access</option>
-                              </select>
-                            </div>
+                            <FieldLabel label="Approval" />
+                            <select
+                              className={cn(
+                                "h-10 w-full rounded-xl border border-input bg-background/70 px-3 text-sm text-foreground outline-none",
+                                "focus-visible:ring-4 focus-visible:ring-ring/25"
+                              )}
+                              value={approvalPolicy}
+                              onChange={(e) => setApprovalPolicy(e.target.value as ApprovalPolicy)}
+                            >
+                              <option value="never">never</option>
+                              <option value="on-request">on-request</option>
+                              <option value="on-failure">on-failure</option>
+                              <option value="untrusted">untrusted</option>
+                            </select>
                           </div>
                         </div>
 
