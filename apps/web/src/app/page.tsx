@@ -55,11 +55,46 @@ type AnyWireMessage = Partial<RpcRequest & RpcResponse & RpcNotification>;
 
 type ApprovalPolicy = "never" | "on-request" | "on-failure" | "untrusted";
 
-interface ChatMessage {
-  id: string;
-  role: "user" | "assistant";
-  text: string;
-}
+type ToolMessageKind = "commandExecution" | "fileChange" | "mcpToolCall" | "webSearch" | "imageView";
+
+type ToolMessageStatus = "inProgress" | "completed" | "failed" | "declined" | "unknown";
+
+type ToolMessageMeta =
+  | {
+      kind: "commandExecution";
+      status: ToolMessageStatus;
+      command: string;
+      cwd?: string;
+      exitCode?: number | null;
+      durationMs?: number | null;
+    }
+  | {
+      kind: "fileChange";
+      status: ToolMessageStatus;
+      files: { path: string; kind: string }[];
+      diffs: string;
+    }
+  | {
+      kind: "mcpToolCall";
+      status: ToolMessageStatus;
+      server: string;
+      tool: string;
+    }
+  | {
+      kind: "webSearch";
+      status: ToolMessageStatus;
+      query: string;
+    }
+  | {
+      kind: "imageView";
+      status: ToolMessageStatus;
+      path: string;
+    };
+
+type ChatMessage =
+  | { id: string; role: "user"; text: string }
+  | { id: string; role: "assistant"; text: string }
+  | { id: string; role: "tool"; text: string; meta: ToolMessageMeta };
 
 interface SessionRow {
   sessionId?: string;
@@ -82,10 +117,19 @@ interface ThreadChatState {
   turnId: string | null;
   turnInProgress: boolean;
   hydrated: boolean;
+  reasoningSummary: string;
+  reasoningSummaryIndex: number | null;
 }
 
 function emptyThreadChatState(): ThreadChatState {
-  return { messages: [], turnId: null, turnInProgress: false, hydrated: false };
+  return {
+    messages: [],
+    turnId: null,
+    turnInProgress: false,
+    hydrated: false,
+    reasoningSummary: "",
+    reasoningSummaryIndex: null
+  };
 }
 
 function promptToThreadPreview(text: string): string {
@@ -105,6 +149,26 @@ function getString(v: unknown): string | null {
 
 function getNumber(v: unknown): number | null {
   return typeof v === "number" && Number.isFinite(v) ? v : null;
+}
+
+function toolStatusFromString(v: unknown): ToolMessageStatus {
+  const raw = getString(v);
+  if (!raw) return "unknown";
+  const normalized = raw.replace(/_/g, "");
+  if (normalized === "inProgress" || normalized === "inprogress") return "inProgress";
+  if (normalized === "completed") return "completed";
+  if (normalized === "failed") return "failed";
+  if (normalized === "declined") return "declined";
+  return "unknown";
+}
+
+function patchKindLabel(v: unknown): string {
+  if (isRecord(v)) {
+    const t = getString(v["type"]);
+    if (t) return t;
+  }
+  const s = getString(v);
+  return s ?? "update";
 }
 
 function stripSessionFromWsUrl(url: string): string {
@@ -132,6 +196,14 @@ function safeJsonParse(text: string): AnyWireMessage | null {
     return JSON.parse(text) as AnyWireMessage;
   } catch {
     return null;
+  }
+}
+
+function safeJsonStringify(value: unknown): string {
+  try {
+    return JSON.stringify(value, null, 2) ?? "";
+  } catch {
+    return "";
   }
 }
 
@@ -171,6 +243,89 @@ function isNonEmptyString(v: unknown): v is string {
 
 function nowId(prefix: string): string {
   return `${prefix}_${Date.now()}_${Math.random().toString(16).slice(2)}`;
+}
+
+function toolMessageFromThreadItem(rawItem: Record<string, unknown>): ChatMessage | null {
+  const type = getString(rawItem["type"]);
+  const id = getString(rawItem["id"]) ?? nowId("itm");
+
+  if (type === "commandExecution") {
+    const command = getString(rawItem["command"]) ?? "";
+    const cwd = getString(rawItem["cwd"]) ?? undefined;
+    const status = toolStatusFromString(rawItem["status"]);
+    const aggregatedOutput = getString(rawItem["aggregatedOutput"]) ?? "";
+    const exitCode = getNumber(rawItem["exitCode"]);
+    const durationMs = getNumber(rawItem["durationMs"]);
+
+    return {
+      id,
+      role: "tool",
+      text: aggregatedOutput,
+      meta: { kind: "commandExecution", status, command, cwd, exitCode, durationMs }
+    };
+  }
+
+  if (type === "fileChange") {
+    const status = toolStatusFromString(rawItem["status"]);
+    const changesRaw = rawItem["changes"];
+    const files: { path: string; kind: string }[] = [];
+    const diffParts: string[] = [];
+
+    if (Array.isArray(changesRaw)) {
+      for (const rawChange of changesRaw) {
+        if (!isRecord(rawChange)) continue;
+        const path = getString(rawChange["path"]);
+        const kind = patchKindLabel(rawChange["kind"]);
+        const diff = getString(rawChange["diff"]) ?? "";
+        if (path) files.push({ path, kind });
+        if (diff.trim()) {
+          diffParts.push(`${kind.toUpperCase()}: ${path ?? ""}\n${diff}`.trim());
+        }
+      }
+    }
+
+    return {
+      id,
+      role: "tool",
+      text: "",
+      meta: { kind: "fileChange", status, files, diffs: diffParts.join("\n\n") }
+    };
+  }
+
+  if (type === "mcpToolCall") {
+    const status = toolStatusFromString(rawItem["status"]);
+    const server = getString(rawItem["server"]) ?? "";
+    const tool = getString(rawItem["tool"]) ?? "";
+
+    let text = "";
+    const error = isRecord(rawItem["error"]) ? getString(rawItem["error"]["message"]) : null;
+    if (error) {
+      text = error;
+    } else if (rawItem["result"] !== undefined && rawItem["result"] !== null) {
+      text = safeJsonStringify(rawItem["result"]);
+    } else if (rawItem["arguments"] !== undefined && rawItem["arguments"] !== null) {
+      text = safeJsonStringify(rawItem["arguments"]);
+    }
+
+    return {
+      id,
+      role: "tool",
+      text,
+      meta: { kind: "mcpToolCall", status, server, tool }
+    };
+  }
+
+  if (type === "webSearch") {
+    const query = getString(rawItem["query"]) ?? "";
+    return { id, role: "tool", text: "", meta: { kind: "webSearch", status: "completed", query } };
+  }
+
+  if (type === "imageView") {
+    const path = getString(rawItem["path"]) ?? "";
+    return { id, role: "tool", text: "", meta: { kind: "imageView", status: "completed", path } };
+  }
+
+  return null;
 }
 
 function isArchivedThreadPath(p: string | null | undefined): boolean {
@@ -227,6 +382,11 @@ function turnsToChatMessages(turns: unknown): ChatMessage[] {
         if (!text.trim()) continue;
         messages.push({ id, role: "assistant", text });
         continue;
+      }
+
+      const toolMsg = toolMessageFromThreadItem(rawItem);
+      if (toolMsg) {
+        messages.push(toolMsg);
       }
     }
   }
@@ -478,7 +638,13 @@ export default function Page() {
       const nextTurnId = current.turnId ?? incomingTurnId;
       return {
         ...prev,
-        [key]: { ...current, turnInProgress: true, turnId: nextTurnId ?? null }
+        [key]: {
+          ...current,
+          turnInProgress: true,
+          turnId: nextTurnId ?? null,
+          reasoningSummary: "",
+          reasoningSummaryIndex: null
+        }
       };
     });
   }
@@ -508,6 +674,35 @@ export default function Page() {
     });
   }
 
+  function appendReasoningSummaryDelta(
+    sessionId: string,
+    incomingThreadId: string,
+    incomingTurnId: string | null,
+    delta: string,
+    summaryIndex: number | null
+  ): void {
+    const key = threadKey(sessionId, incomingThreadId);
+    setChatByThreadKey((prev) => {
+      const current = prev[key] ?? emptyThreadChatState();
+      const turnId = current.turnId;
+      if (turnId && incomingTurnId && incomingTurnId !== turnId) return prev;
+
+      const nextIndex = summaryIndex ?? current.reasoningSummaryIndex;
+      const needsBreak =
+        current.reasoningSummary &&
+        summaryIndex !== null &&
+        current.reasoningSummaryIndex !== null &&
+        summaryIndex !== current.reasoningSummaryIndex;
+
+      const nextText = `${current.reasoningSummary}${needsBreak ? "\n\n" : ""}${delta}`;
+
+      return {
+        ...prev,
+        [key]: { ...current, reasoningSummary: nextText, reasoningSummaryIndex: nextIndex, hydrated: true }
+      };
+    });
+  }
+
   function setAssistantFullText(sessionId: string, incomingThreadId: string, incomingTurnId: string | null, fullText: string): void {
     const key = threadKey(sessionId, incomingThreadId);
     setChatByThreadKey((prev) => {
@@ -533,20 +728,158 @@ export default function Page() {
     });
   }
 
-  function setThreadTurnCompleted(sessionId: string, incomingThreadId: string, incomingTurnId: string | null): void {
+	  function setThreadTurnCompleted(sessionId: string, incomingThreadId: string, incomingTurnId: string | null): void {
+	    const key = threadKey(sessionId, incomingThreadId);
+	    setChatByThreadKey((prev) => {
+	      const current = prev[key] ?? emptyThreadChatState();
+	      if (!current.turnInProgress) return prev;
+	      if (current.turnId && incomingTurnId && incomingTurnId !== current.turnId) return prev;
+	      return {
+	        ...prev,
+	        [key]: { ...current, turnInProgress: false, turnId: null, reasoningSummary: "", reasoningSummaryIndex: null }
+	      };
+	    });
+	  }
+
+  function mergeToolMeta(prevMeta: ToolMessageMeta, nextMeta: ToolMessageMeta): ToolMessageMeta {
+    if (prevMeta.kind !== nextMeta.kind) return nextMeta;
+
+    if (prevMeta.kind === "commandExecution" && nextMeta.kind === "commandExecution") {
+      return {
+        kind: "commandExecution",
+        status: nextMeta.status !== "unknown" ? nextMeta.status : prevMeta.status,
+        command: nextMeta.command.trim() ? nextMeta.command : prevMeta.command,
+        cwd: nextMeta.cwd ?? prevMeta.cwd,
+        exitCode: nextMeta.exitCode ?? prevMeta.exitCode,
+        durationMs: nextMeta.durationMs ?? prevMeta.durationMs
+      };
+    }
+    if (prevMeta.kind === "fileChange" && nextMeta.kind === "fileChange") {
+      return {
+        kind: "fileChange",
+        status: nextMeta.status !== "unknown" ? nextMeta.status : prevMeta.status,
+        files: nextMeta.files.length > 0 ? nextMeta.files : prevMeta.files,
+        diffs: nextMeta.diffs.trim() ? nextMeta.diffs : prevMeta.diffs
+      };
+    }
+    if (prevMeta.kind === "mcpToolCall" && nextMeta.kind === "mcpToolCall") {
+      return {
+        kind: "mcpToolCall",
+        status: nextMeta.status !== "unknown" ? nextMeta.status : prevMeta.status,
+        server: nextMeta.server.trim() ? nextMeta.server : prevMeta.server,
+        tool: nextMeta.tool.trim() ? nextMeta.tool : prevMeta.tool
+      };
+    }
+    if (prevMeta.kind === "webSearch" && nextMeta.kind === "webSearch") {
+      return {
+        kind: "webSearch",
+        status: nextMeta.status !== "unknown" ? nextMeta.status : prevMeta.status,
+        query: nextMeta.query.trim() ? nextMeta.query : prevMeta.query
+      };
+    }
+    if (prevMeta.kind === "imageView" && nextMeta.kind === "imageView") {
+      return {
+        kind: "imageView",
+        status: nextMeta.status !== "unknown" ? nextMeta.status : prevMeta.status,
+        path: nextMeta.path.trim() ? nextMeta.path : prevMeta.path
+      };
+    }
+    return nextMeta;
+  }
+
+  function upsertToolFromItem(
+    sessionId: string,
+    incomingThreadId: string,
+    incomingTurnId: string | null,
+    item: Record<string, unknown>
+  ): void {
+    const msg = toolMessageFromThreadItem(item);
+    if (!msg || msg.role !== "tool") return;
+
     const key = threadKey(sessionId, incomingThreadId);
     setChatByThreadKey((prev) => {
       const current = prev[key] ?? emptyThreadChatState();
-      if (!current.turnInProgress) return prev;
-      if (current.turnId && incomingTurnId && incomingTurnId !== current.turnId) return prev;
-      return { ...prev, [key]: { ...current, turnInProgress: false, turnId: null } };
+      const turnId = current.turnId;
+      if (turnId && incomingTurnId && incomingTurnId !== turnId) return prev;
+
+      const nextTurnId =
+        current.turnInProgress && !current.turnId && incomingTurnId ? incomingTurnId : current.turnId;
+
+      const msgs = current.messages;
+      const idx = msgs.findIndex((m) => m.id === msg.id && m.role === "tool");
+      if (idx === -1) {
+        return {
+          ...prev,
+          [key]: { ...current, messages: [...msgs, msg], hydrated: true, turnId: nextTurnId ?? null }
+        };
+      }
+
+      const existing = msgs[idx];
+      if (existing.role !== "tool") return prev;
+      const mergedMeta = mergeToolMeta(existing.meta, msg.meta);
+      const nextText = existing.text.trim() ? existing.text : msg.text;
+      const nextMsg: ChatMessage = { ...existing, text: nextText, meta: mergedMeta };
+
+      return {
+        ...prev,
+        [key]: {
+          ...current,
+          messages: [...msgs.slice(0, idx), nextMsg, ...msgs.slice(idx + 1)],
+          hydrated: true,
+          turnId: nextTurnId ?? null
+        }
+      };
     });
   }
 
-  function handleNotification(sessionId: string, msg: AnyWireMessage): void {
-    if (!isNonEmptyString(msg.method)) return;
-    const method = msg.method;
-    const params = isRecord(msg.params) ? msg.params : {};
+  function appendToolDelta(
+    sessionId: string,
+    incomingThreadId: string,
+    incomingTurnId: string | null,
+    itemId: string,
+    delta: string,
+    stubMeta: ToolMessageMeta
+  ): void {
+    const key = threadKey(sessionId, incomingThreadId);
+    setChatByThreadKey((prev) => {
+      const current = prev[key] ?? emptyThreadChatState();
+      const turnId = current.turnId;
+      if (turnId && incomingTurnId && incomingTurnId !== turnId) return prev;
+
+      const nextTurnId =
+        current.turnInProgress && !current.turnId && incomingTurnId ? incomingTurnId : current.turnId;
+
+      const msgs = current.messages;
+      const idx = msgs.findIndex((m) => m.id === itemId && m.role === "tool");
+      if (idx === -1) {
+        const nextMsg: ChatMessage = { id: itemId, role: "tool", text: delta, meta: stubMeta };
+        return {
+          ...prev,
+          [key]: { ...current, messages: [...msgs, nextMsg], hydrated: true, turnId: nextTurnId ?? null }
+        };
+      }
+
+      const existing = msgs[idx];
+      if (existing.role !== "tool") return prev;
+      const mergedMeta = mergeToolMeta(existing.meta, stubMeta);
+      const nextMsg: ChatMessage = { ...existing, text: existing.text + delta, meta: mergedMeta };
+
+      return {
+        ...prev,
+        [key]: {
+          ...current,
+          messages: [...msgs.slice(0, idx), nextMsg, ...msgs.slice(idx + 1)],
+          hydrated: true,
+          turnId: nextTurnId ?? null
+        }
+      };
+    });
+  }
+
+	  function handleNotification(sessionId: string, msg: AnyWireMessage): void {
+	    if (!isNonEmptyString(msg.method)) return;
+	    const method = msg.method;
+	    const params = isRecord(msg.params) ? msg.params : {};
 
     if (method === "argus/session") {
       const id = params["id"];
@@ -581,39 +914,116 @@ export default function Page() {
       return;
     }
 
-    if (method === "turn/started") {
-      const incomingThreadId = getString(params["threadId"]);
-      if (!isNonEmptyString(incomingThreadId)) return;
-      const turn = isRecord(params["turn"]) ? params["turn"] : {};
-      const incomingTurnId = getString(turn["id"]);
-      setThreadTurnStarted(sessionId, incomingThreadId, incomingTurnId);
-      return;
-    }
+	    if (method === "turn/started") {
+	      const incomingThreadId = getString(params["threadId"]);
+	      if (!isNonEmptyString(incomingThreadId)) return;
+	      const turn = isRecord(params["turn"]) ? params["turn"] : {};
+	      const incomingTurnId = getString(turn["id"]);
+	      setThreadTurnStarted(sessionId, incomingThreadId, incomingTurnId);
+	      return;
+	    }
 
-    if (method === "item/agentMessage/delta") {
+    if (method === "item/started") {
       const incomingThreadId = getString(params["threadId"]);
       if (!isNonEmptyString(incomingThreadId)) return;
       const incomingTurnId = getString(params["turnId"]);
+      const item = isRecord(params["item"]) ? params["item"] : null;
+      if (!item) return;
+      upsertToolFromItem(sessionId, incomingThreadId, incomingTurnId, item);
+      return;
+    }
+
+	    if (method === "item/agentMessage/delta") {
+	      const incomingThreadId = getString(params["threadId"]);
+	      if (!isNonEmptyString(incomingThreadId)) return;
+	      const incomingTurnId = getString(params["turnId"]);
       const delta = getString(params["delta"]);
       if (!isNonEmptyString(delta)) return;
       appendAssistantDelta(sessionId, incomingThreadId, incomingTurnId, delta);
       return;
     }
 
-    if (method === "item/completed") {
+    if (method === "item/reasoning/summaryTextDelta") {
       const incomingThreadId = getString(params["threadId"]);
       if (!isNonEmptyString(incomingThreadId)) return;
       const incomingTurnId = getString(params["turnId"]);
+      const delta = getString(params["delta"]);
+      if (!isNonEmptyString(delta)) return;
+      const summaryIndex = getNumber(params["summaryIndex"]);
+	      appendReasoningSummaryDelta(sessionId, incomingThreadId, incomingTurnId, delta, summaryIndex);
+	      return;
+	    }
 
-      const item = isRecord(params["item"]) ? params["item"] : {};
-      if (item["type"] === "agentMessage") {
-        const fullText = getString(item["text"]);
-        if (isNonEmptyString(fullText)) {
-          setAssistantFullText(sessionId, incomingThreadId, incomingTurnId, fullText);
-        }
-      }
+    if (method === "item/commandExecution/outputDelta") {
+      const incomingThreadId = getString(params["threadId"]);
+      if (!isNonEmptyString(incomingThreadId)) return;
+      const incomingTurnId = getString(params["turnId"]);
+      const itemId = getString(params["itemId"]);
+      const delta = getString(params["delta"]);
+      if (!isNonEmptyString(itemId) || !isNonEmptyString(delta)) return;
+      appendToolDelta(sessionId, incomingThreadId, incomingTurnId, itemId, delta, {
+        kind: "commandExecution",
+        status: "inProgress",
+        command: "",
+        cwd: undefined,
+        exitCode: null,
+        durationMs: null
+      });
       return;
     }
+
+    if (method === "item/fileChange/outputDelta") {
+      const incomingThreadId = getString(params["threadId"]);
+      if (!isNonEmptyString(incomingThreadId)) return;
+      const incomingTurnId = getString(params["turnId"]);
+      const itemId = getString(params["itemId"]);
+      const delta = getString(params["delta"]);
+      if (!isNonEmptyString(itemId) || !isNonEmptyString(delta)) return;
+      appendToolDelta(sessionId, incomingThreadId, incomingTurnId, itemId, delta, {
+        kind: "fileChange",
+        status: "inProgress",
+        files: [],
+        diffs: ""
+      });
+      return;
+    }
+
+    if (method === "item/mcpToolCall/progress") {
+      const incomingThreadId = getString(params["threadId"]);
+      if (!isNonEmptyString(incomingThreadId)) return;
+      const incomingTurnId = getString(params["turnId"]);
+      const itemId = getString(params["itemId"]);
+      const message = getString(params["message"]);
+      if (!isNonEmptyString(itemId) || !isNonEmptyString(message)) return;
+      appendToolDelta(sessionId, incomingThreadId, incomingTurnId, itemId, message + "\n", {
+        kind: "mcpToolCall",
+        status: "inProgress",
+        server: "",
+        tool: ""
+      });
+      return;
+    }
+
+	    if (method === "item/completed") {
+	      const incomingThreadId = getString(params["threadId"]);
+	      if (!isNonEmptyString(incomingThreadId)) return;
+	      const incomingTurnId = getString(params["turnId"]);
+
+	      const item = isRecord(params["item"]) ? params["item"] : {};
+	      if (item["type"] === "agentMessage") {
+	        const fullText = getString(item["text"]);
+	        if (isNonEmptyString(fullText)) {
+	          setAssistantFullText(sessionId, incomingThreadId, incomingTurnId, fullText);
+	        }
+          return;
+	      }
+
+        if (item["type"] === "commandExecution" || item["type"] === "fileChange" || item["type"] === "mcpToolCall") {
+          upsertToolFromItem(sessionId, incomingThreadId, incomingTurnId, item);
+          return;
+        }
+	      return;
+	    }
 
     if (method === "turn/completed") {
       const incomingThreadId = getString(params["threadId"]);
@@ -897,7 +1307,6 @@ export default function Page() {
 
 	      const key = threadKey(sessionId, threadId);
 	      const userMsg: ChatMessage = { id: nowId("u"), role: "user", text };
-	      const assistantMsg: ChatMessage = { id: nowId("a"), role: "assistant", text: "" };
 	      const preview = promptToThreadPreview(text);
 
 	      setThreadsBySession((prev) => {
@@ -924,27 +1333,29 @@ export default function Page() {
 	          ...prev,
 	          [key]: {
 	            ...current,
-	            messages: [...current.messages, userMsg, assistantMsg],
+	            messages: [...current.messages, userMsg],
 	            turnInProgress: true,
 	            turnId: null,
+	            reasoningSummary: "",
+	            reasoningSummaryIndex: null,
 	            hydrated: true
 	          }
 	        };
 	      });
 	      setPrompt("");
 
-	      try {
-	        const result = await rpc(sessionId, "turn/start", {
-	          threadId,
-	          input: [{ type: "text", text }],
-	          cwd,
-	          approvalPolicy,
-	          sandboxPolicy: { type: "externalSandbox", networkAccess: "enabled" }
-	        });
-	        const turnId = (result as { turn?: { id?: string } })?.turn?.id;
-	        if (isNonEmptyString(turnId)) {
-	          setChatByThreadKey((prev) => {
-	            const current = prev[key] ?? { ...emptyThreadChatState(), turnInProgress: true };
+		      try {
+		        const result = await rpc(sessionId, "turn/start", {
+		          threadId,
+		          input: [{ type: "text", text }],
+		          cwd,
+		          approvalPolicy,
+		          sandboxPolicy: { type: "dangerFullAccess" }
+		        });
+		        const turnId = (result as { turn?: { id?: string } })?.turn?.id;
+		        if (isNonEmptyString(turnId)) {
+		          setChatByThreadKey((prev) => {
+		            const current = prev[key] ?? { ...emptyThreadChatState(), turnInProgress: true };
 	            return { ...prev, [key]: { ...current, turnId } };
 	          });
 	        }
@@ -1722,9 +2133,14 @@ export default function Page() {
                   ref={chatScrollRef}
                   className="flex-1 overflow-auto p-4 pt-12 pb-40 scrollbar-hide md:p-5 md:pt-14 md:pb-44"
 	                >
-	                  <div className="mx-auto grid w-full max-w-3xl grid-cols-1 gap-3">
-	                    {(activeChat?.messages ?? []).map((m) => <Bubble key={m.id} role={m.role} text={m.text} />)}
-	                  </div>
+		                  <div className="mx-auto grid w-full max-w-3xl grid-cols-1 gap-3">
+		                    {(activeChat?.messages ?? [])
+	                        .filter((m) => m.role !== "assistant" || m.text.trim().length > 0)
+	                        .map((m) => <Bubble key={m.id} message={m} />)}
+	                      {activeChat?.turnInProgress ? (
+	                        <TurnProgress summary={activeChat.reasoningSummary} />
+	                      ) : null}
+		                  </div>
 	                </div>
 
 	                <div className="sticky bottom-0 z-10 bg-gradient-to-t from-background/90 via-background/30 to-transparent px-4 pb-5 pt-10 backdrop-blur-md md:px-5">
@@ -1848,9 +2264,101 @@ function IdPill({ label, value }: { label: string; value: string | null }) {
   );
 }
 
-function Bubble({ role, text }: { role: "user" | "assistant"; text: string }) {
+const markdownComponents = {
+  p: ({ children }: any) => <p className="my-2 whitespace-pre-wrap">{children}</p>,
+  a: ({ href, children }: any) => (
+    <a href={href} target="_blank" rel="noreferrer" className="underline underline-offset-4 hover:text-foreground">
+      {children}
+    </a>
+  ),
+  ul: ({ children }: any) => <ul className="my-2 list-disc space-y-1 pl-5">{children}</ul>,
+  ol: ({ children }: any) => <ol className="my-2 list-decimal space-y-1 pl-5">{children}</ol>,
+  li: ({ children }: any) => <li className="min-w-0">{children}</li>,
+  blockquote: ({ children }: any) => (
+    <blockquote className="my-3 border-l-2 border-border/70 pl-4 text-foreground/85">{children}</blockquote>
+  ),
+  h1: ({ children }: any) => <h1 className="my-3 text-lg font-semibold text-foreground">{children}</h1>,
+  h2: ({ children }: any) => <h2 className="my-3 text-base font-semibold text-foreground">{children}</h2>,
+  h3: ({ children }: any) => <h3 className="my-3 text-sm font-semibold text-foreground">{children}</h3>,
+  hr: () => <hr className="my-4 border-border/70" />,
+  code: ({ className, children, ...props }: any) => {
+    const isBlock = typeof className === "string" && className.includes("language-");
+    if (!isBlock) {
+      return (
+        <code
+          className="rounded-md border border-border/60 bg-background/50 px-1.5 py-0.5 font-mono text-[0.85em] text-foreground"
+          {...props}
+        >
+          {children}
+        </code>
+      );
+    }
+    return (
+      <code className={cn("font-mono text-[0.85em] text-foreground", className)} {...props}>
+        {children}
+      </code>
+    );
+  },
+  pre: ({ children }: any) => (
+    <pre className="my-3 overflow-x-auto rounded-2xl border border-border/60 bg-background/55 p-4 font-mono text-[0.85em] leading-relaxed text-foreground shadow-[inset_0_1px_0_0_oklch(var(--foreground)/0.06)]">
+      {children}
+    </pre>
+  ),
+  table: ({ children }: any) => (
+    <div className="my-3 overflow-x-auto rounded-2xl border border-border/60 bg-background/55">
+      <table className="w-full border-collapse text-sm">{children}</table>
+    </div>
+  ),
+  thead: ({ children }: any) => <thead className="bg-background/40">{children}</thead>,
+  th: ({ children }: any) => (
+    <th className="border-b border-border/60 px-3 py-2 text-left font-medium text-foreground">{children}</th>
+  ),
+  td: ({ children }: any) => <td className="border-b border-border/60 px-3 py-2 align-top">{children}</td>
+};
+
+function TurnProgress({ summary }: { summary: string }) {
+  const hasSummary = summary.trim().length > 0;
   return (
-    role === "user" ? (
+    <div className="w-full">
+      <div className="max-w-[72ch]">
+        <div className="inline-flex items-center gap-2 text-xs text-muted-foreground">
+          <RefreshCw className="h-3.5 w-3.5 animate-spin text-primary" />
+          <span>正在生成…</span>
+        </div>
+        {hasSummary ? (
+          <div className="mt-2 break-words text-sm leading-relaxed text-foreground/80">
+            <ReactMarkdown remarkPlugins={[remarkGfm]} components={markdownComponents}>
+              {summary}
+            </ReactMarkdown>
+          </div>
+        ) : null}
+      </div>
+    </div>
+  );
+}
+
+function ToolStatusBadge({ status }: { status: ToolMessageStatus }) {
+  const label =
+    status === "inProgress" ? "running" : status === "completed" ? "done" : status === "failed" ? "failed" : status;
+  const className =
+    status === "inProgress"
+      ? "border-primary/25 bg-primary/10 text-primary"
+      : status === "completed"
+        ? "border-emerald-500/25 bg-emerald-500/10 text-emerald-400"
+        : status === "failed"
+          ? "border-destructive/45 bg-destructive/15 text-destructive"
+          : status === "declined"
+            ? "border-border/60 bg-background/40 text-muted-foreground"
+            : "border-border/60 bg-background/40 text-muted-foreground";
+
+  return (
+    <span className={cn("shrink-0 rounded-full border px-2 py-0.5 text-[11px] font-medium", className)}>{label}</span>
+  );
+}
+
+function Bubble({ message }: { message: ChatMessage }) {
+  if (message.role === "user") {
+    return (
       <div className="flex w-full justify-end">
         <div
           className={cn(
@@ -1858,79 +2366,98 @@ function Bubble({ role, text }: { role: "user" | "assistant"; text: string }) {
             "shadow-[inset_0_1px_0_0_oklch(var(--foreground)/0.06)]"
           )}
         >
-          <div className="whitespace-pre-wrap break-words text-sm leading-relaxed text-foreground">{text}</div>
+          <div className="whitespace-pre-wrap break-words text-sm leading-relaxed text-foreground">{message.text}</div>
         </div>
       </div>
-    ) : (
+    );
+  }
+
+  if (message.role === "assistant") {
+    return (
       <div className="w-full">
         <div className="max-w-[72ch] break-words text-sm leading-relaxed text-foreground/90">
-          <ReactMarkdown
-            remarkPlugins={[remarkGfm]}
-            components={{
-              p: ({ children }) => <p className="my-2 whitespace-pre-wrap">{children}</p>,
-              a: ({ href, children }) => (
-                <a
-                  href={href}
-                  target="_blank"
-                  rel="noreferrer"
-                  className="underline underline-offset-4 hover:text-foreground"
-                >
-                  {children}
-                </a>
-              ),
-              ul: ({ children }) => <ul className="my-2 list-disc space-y-1 pl-5">{children}</ul>,
-              ol: ({ children }) => <ol className="my-2 list-decimal space-y-1 pl-5">{children}</ol>,
-              li: ({ children }) => <li className="min-w-0">{children}</li>,
-              blockquote: ({ children }) => (
-                <blockquote className="my-3 border-l-2 border-border/70 pl-4 text-foreground/85">
-                  {children}
-                </blockquote>
-              ),
-              h1: ({ children }) => <h1 className="my-3 text-lg font-semibold text-foreground">{children}</h1>,
-              h2: ({ children }) => <h2 className="my-3 text-base font-semibold text-foreground">{children}</h2>,
-              h3: ({ children }) => <h3 className="my-3 text-sm font-semibold text-foreground">{children}</h3>,
-              hr: () => <hr className="my-4 border-border/70" />,
-              code: ({ className, children, ...props }) => {
-                const isBlock = typeof className === "string" && className.includes("language-");
-                if (!isBlock) {
-                  return (
-                    <code
-                      className="rounded-md border border-border/60 bg-background/50 px-1.5 py-0.5 font-mono text-[0.85em] text-foreground"
-                      {...props}
-                    >
-                      {children}
-                    </code>
-                  );
-                }
-                return (
-                  <code className={cn("font-mono text-[0.85em] text-foreground", className)} {...props}>
-                    {children}
-                  </code>
-                );
-              },
-              pre: ({ children }) => (
-                <pre className="my-3 overflow-x-auto rounded-2xl border border-border/60 bg-background/55 p-4 font-mono text-[0.85em] leading-relaxed text-foreground shadow-[inset_0_1px_0_0_oklch(var(--foreground)/0.06)]">
-                  {children}
-                </pre>
-              ),
-              table: ({ children }) => (
-                <div className="my-3 overflow-x-auto rounded-2xl border border-border/60 bg-background/55">
-                  <table className="w-full border-collapse text-sm">{children}</table>
-                </div>
-              ),
-              thead: ({ children }) => <thead className="bg-background/40">{children}</thead>,
-              th: ({ children }) => (
-                <th className="border-b border-border/60 px-3 py-2 text-left font-medium text-foreground">
-                  {children}
-                </th>
-              ),
-              td: ({ children }) => <td className="border-b border-border/60 px-3 py-2 align-top">{children}</td>
-            }}
-          >
-            {text}
+          <ReactMarkdown remarkPlugins={[remarkGfm]} components={markdownComponents}>
+            {message.text}
           </ReactMarkdown>
         </div>
       </div>
-    )
+    );
+  }
+
+  const meta = message.meta;
+  return (
+    <div className="w-full">
+      <div className="max-w-[72ch] rounded-2xl border border-border/60 bg-background/55 p-4 shadow-[inset_0_1px_0_0_oklch(var(--foreground)/0.06)]">
+        <div className="flex items-start justify-between gap-3">
+          <div className="min-w-0 flex-1">
+            <div className="text-xs text-muted-foreground">
+              {meta.kind === "commandExecution"
+                ? "Command"
+                : meta.kind === "fileChange"
+                  ? "File changes"
+                  : meta.kind === "mcpToolCall"
+                    ? "Tool"
+                    : meta.kind === "webSearch"
+                      ? "Web search"
+                      : meta.kind === "imageView"
+                        ? "Image view"
+                        : "Item"}
+            </div>
+
+            {meta.kind === "commandExecution" ? (
+              <>
+                <div className="mt-1 break-words font-mono text-xs text-foreground">
+                  {meta.command.trim() ? meta.command : "(command)"}
+                </div>
+                {meta.cwd ? (
+                  <div className="mt-1 break-words font-mono text-[11px] text-muted-foreground">{meta.cwd}</div>
+                ) : null}
+                {meta.exitCode !== undefined && meta.exitCode !== null ? (
+                  <div className="mt-1 text-[11px] text-muted-foreground">exit {meta.exitCode}</div>
+                ) : null}
+              </>
+            ) : null}
+
+            {meta.kind === "fileChange" ? (
+              <>
+                <div className="mt-1 text-xs text-foreground">{meta.files.length ? `${meta.files.length} file(s)` : "file changes"}</div>
+                {meta.files.length ? (
+                  <div className="mt-1 break-words font-mono text-[11px] text-muted-foreground">
+                    {meta.files.map((f) => `${f.kind}: ${f.path}`).join("\n")}
+                  </div>
+                ) : null}
+              </>
+            ) : null}
+
+            {meta.kind === "mcpToolCall" ? (
+              <div className="mt-1 break-words font-mono text-xs text-foreground">
+                {meta.server && meta.tool ? `${meta.server} · ${meta.tool}` : "mcp tool"}
+              </div>
+            ) : null}
+
+            {meta.kind === "webSearch" ? <div className="mt-1 break-words text-xs text-foreground">{meta.query}</div> : null}
+
+            {meta.kind === "imageView" ? <div className="mt-1 break-words font-mono text-xs text-foreground">{meta.path}</div> : null}
+          </div>
+
+          <ToolStatusBadge status={meta.status} />
+        </div>
+
+        {message.text.trim() ? (
+          <pre className="mt-3 max-h-64 overflow-auto whitespace-pre-wrap rounded-2xl border border-border/60 bg-background/50 p-3 font-mono text-[11px] leading-relaxed text-foreground">
+            {message.text}
+          </pre>
+        ) : null}
+
+        {meta.kind === "fileChange" && meta.diffs.trim() ? (
+          <details className="mt-3">
+            <summary className="cursor-pointer select-none text-xs text-muted-foreground hover:text-foreground">View diffs</summary>
+            <pre className="mt-2 max-h-80 overflow-auto whitespace-pre-wrap rounded-2xl border border-border/60 bg-background/50 p-3 font-mono text-[11px] leading-relaxed text-foreground">
+              {meta.diffs}
+            </pre>
+          </details>
+        ) : null}
+      </div>
+    </div>
   );
 }
