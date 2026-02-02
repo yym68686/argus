@@ -94,6 +94,7 @@ type ToolMessageMeta =
 type ChatMessage =
   | { id: string; role: "user"; text: string }
   | { id: string; role: "assistant"; text: string }
+  | { id: string; role: "reasoning"; text: string }
   | { id: string; role: "tool"; text: string; meta: ToolMessageMeta };
 
 interface SessionRow {
@@ -252,10 +253,14 @@ function toolMessageFromThreadItem(rawItem: Record<string, unknown>): ChatMessag
   if (type === "commandExecution") {
     const command = getString(rawItem["command"]) ?? "";
     const cwd = getString(rawItem["cwd"]) ?? undefined;
-    const status = toolStatusFromString(rawItem["status"]);
+    let status = toolStatusFromString(rawItem["status"]);
     const aggregatedOutput = getString(rawItem["aggregatedOutput"]) ?? "";
     const exitCode = getNumber(rawItem["exitCode"]);
     const durationMs = getNumber(rawItem["durationMs"]);
+
+    if (status === "completed" && exitCode !== null && exitCode !== 0) {
+      status = "failed";
+    }
 
     return {
       id,
@@ -381,6 +386,15 @@ function turnsToChatMessages(turns: unknown): ChatMessage[] {
         const text = getString(rawItem["text"]) ?? "";
         if (!text.trim()) continue;
         messages.push({ id, role: "assistant", text });
+        continue;
+      }
+      if (type === "reasoning") {
+        const rawSummary = rawItem["summary"];
+        if (!Array.isArray(rawSummary)) continue;
+        const parts = rawSummary.map((v) => getString(v)).filter((v): v is string => isNonEmptyString(v));
+        const text = parts.join("\n\n").trim();
+        if (!text) continue;
+        messages.push({ id, role: "reasoning", text });
         continue;
       }
 
@@ -2129,84 +2143,88 @@ export default function Page() {
                   </Button>
                 </div>
 
-                <div
-                  ref={chatScrollRef}
-                  className="flex-1 overflow-auto p-4 pt-12 pb-40 scrollbar-hide md:p-5 md:pt-14 md:pb-44"
-	                >
-		                  <div className="mx-auto grid w-full max-w-3xl grid-cols-1 gap-3">
-		                    {(activeChat?.messages ?? [])
+	                <div className="relative flex-1 min-h-0">
+	                  <div
+	                    ref={chatScrollRef}
+	                    className="h-full overflow-auto p-4 pt-12 pb-44 scrollbar-hide md:p-5 md:pt-14 md:pb-48"
+	                  >
+	                    <div className="mx-auto grid w-full max-w-3xl grid-cols-1 gap-3">
+	                      {(activeChat?.messages ?? [])
 	                        .filter((m) => m.role !== "assistant" || m.text.trim().length > 0)
 	                        .map((m) => <Bubble key={m.id} message={m} />)}
 	                      {activeChat?.turnInProgress ? (
 	                        <TurnProgress summary={activeChat.reasoningSummary} />
 	                      ) : null}
-		                  </div>
-	                </div>
-
-	                <div className="sticky bottom-0 z-10 bg-gradient-to-t from-background/90 via-background/30 to-transparent px-4 pb-5 pt-10 backdrop-blur-md md:px-5">
-	                  <div className="pointer-events-none mx-auto w-full max-w-3xl">
-	                    <div className="pointer-events-auto flex items-center gap-3 rounded-full border border-border/60 bg-background/55 px-3 py-2 shadow-[0_0_0_1px_oklch(var(--border)/0.55),0_14px_40px_oklch(0%_0_0/0.35)] backdrop-blur-xl">
-	                    <button
-	                      type="button"
-	                      className={cn(
-	                        "flex h-10 w-10 items-center justify-center rounded-full border border-border/60 bg-background/50 text-muted-foreground",
-                        "transition-colors hover:bg-background/70 hover:text-foreground",
-                        "focus-visible:outline-none focus-visible:ring-4 focus-visible:ring-ring/25",
-                        "disabled:opacity-50"
-                      )}
-                      disabled={!canSend}
-                      aria-label="Attach"
-                    >
-                      <Paperclip className="h-4 w-4" />
-                    </button>
-
-	                    <textarea
-	                      value={prompt}
-	                      onChange={(e) => setPrompt(e.target.value)}
-	                      onCompositionStart={() => {
-	                        composingRef.current = true;
-	                      }}
-	                      onCompositionEnd={() => {
-	                        composingRef.current = false;
-	                      }}
-	                      placeholder="Message Argus…"
-	                      disabled={isActiveSessionBusy}
-	                      rows={1}
-	                      className={cn(
-	                        "min-h-10 flex-1 resize-none bg-transparent px-2 py-2 text-sm text-foreground outline-none",
-	                        "placeholder:text-muted-foreground/70"
-	                      )}
-	                      onKeyDown={(e) => {
-	                        if (e.key === "Enter" && !e.shiftKey) {
-	                          // Avoid sending while using IME (e.g. Chinese/Japanese input). Enter should commit composition.
-	                          const native = e.nativeEvent as KeyboardEvent;
-	                          const keyCode = (native as unknown as { keyCode?: number }).keyCode;
-	                          if (composingRef.current || native.isComposing || keyCode === 229) return;
-	                          e.preventDefault();
-	                          void sendTurn();
-	                        }
-	                      }}
-	                    />
-
-	                    <Button
-	                      type="button"
-	                      onClick={() => void sendTurn()}
-	                      disabled={!canSend}
-	                      className="h-10 w-10 rounded-full p-0"
-	                      aria-label="Send"
-	                    >
-	                      <ArrowUp className="h-4 w-4" />
-	                    </Button>
 	                    </div>
 	                  </div>
-	                  <div className="mx-auto mt-2 w-full max-w-3xl px-2 text-xs text-muted-foreground">
-	                    Enter to send, Shift+Enter for newline.
+	
+	                  <div className="pointer-events-none absolute inset-x-0 bottom-0 z-10 px-4 pb-5 md:px-5">
+	                    <div className="relative mx-auto w-full max-w-3xl">
+			                      <div className="pointer-events-auto flex items-center gap-3 rounded-full bg-background/55 px-3 py-2 backdrop-blur-xl">
+		                        <button
+		                          type="button"
+		                          className={cn(
+		                            "flex h-10 w-10 items-center justify-center rounded-full bg-background/50 text-muted-foreground",
+		                            "transition-colors hover:bg-background/70 hover:text-foreground",
+		                            "focus-visible:outline-none focus-visible:ring-4 focus-visible:ring-ring/25",
+		                            "disabled:opacity-50"
+		                          )}
+	                          disabled={!canSend}
+	                          aria-label="Attach"
+	                        >
+	                          <Paperclip className="h-4 w-4" />
+	                        </button>
+	
+	                        <textarea
+	                          value={prompt}
+	                          onChange={(e) => setPrompt(e.target.value)}
+	                          onCompositionStart={() => {
+	                            composingRef.current = true;
+	                          }}
+	                          onCompositionEnd={() => {
+	                            composingRef.current = false;
+	                          }}
+	                          placeholder="Message Argus…"
+	                          disabled={isActiveSessionBusy}
+	                          rows={1}
+	                          className={cn(
+	                            "min-h-10 flex-1 resize-none bg-transparent px-2 py-2 text-sm text-foreground outline-none",
+	                            "placeholder:text-muted-foreground/70"
+	                          )}
+	                          onKeyDown={(e) => {
+	                            if (e.key === "Enter" && !e.shiftKey) {
+	                              // Avoid sending while using IME (e.g. Chinese/Japanese input). Enter should commit composition.
+	                              const native = e.nativeEvent as KeyboardEvent;
+	                              const keyCode = (native as unknown as { keyCode?: number }).keyCode;
+	                              if (composingRef.current || native.isComposing || keyCode === 229) return;
+	                              e.preventDefault();
+	                              void sendTurn();
+	                            }
+	                          }}
+	                        />
+	
+		                        <Button
+		                          type="button"
+		                          variant="ghost"
+		                          onClick={() => void sendTurn()}
+		                          disabled={!canSend}
+		                          className={cn(
+		                            "h-10 w-10 rounded-full p-0",
+		                            "bg-background/50 text-muted-foreground",
+		                            "hover:bg-background/70 hover:text-foreground"
+		                          )}
+		                          aria-label="Send"
+		                        >
+		                          <ArrowUp className="h-4 w-4" />
+		                        </Button>
+	                      </div>
+	                    </div>
 	                  </div>
 	                </div>
-              </>
-            )}
-          </section>
-        </div>
+	              </>
+	            )}
+	          </section>
+	        </div>
       </main>
     </div>
   );
@@ -2326,11 +2344,22 @@ function TurnProgress({ summary }: { summary: string }) {
           <span>正在生成…</span>
         </div>
         {hasSummary ? (
-          <div className="mt-2 break-words text-sm leading-relaxed text-foreground/80">
-            <ReactMarkdown remarkPlugins={[remarkGfm]} components={markdownComponents}>
-              {summary}
-            </ReactMarkdown>
-          </div>
+          <details className="group mt-2" open>
+            <summary
+              className={cn(
+                "flex cursor-pointer list-none items-center gap-2 text-xs text-muted-foreground",
+                "select-none [&::-webkit-details-marker]:hidden"
+              )}
+            >
+              <ChevronRight className="h-3.5 w-3.5 transition-transform group-open:rotate-90" />
+              <span>思考摘要</span>
+            </summary>
+            <div className="mt-2 break-words text-sm leading-relaxed text-foreground/70">
+              <ReactMarkdown remarkPlugins={[remarkGfm]} components={markdownComponents}>
+                {summary}
+              </ReactMarkdown>
+            </div>
+          </details>
         ) : null}
       </div>
     </div>
@@ -2352,7 +2381,12 @@ function ToolStatusBadge({ status }: { status: ToolMessageStatus }) {
             : "border-border/60 bg-background/40 text-muted-foreground";
 
   return (
-    <span className={cn("shrink-0 rounded-full border px-2 py-0.5 text-[11px] font-medium", className)}>{label}</span>
+    <span className={cn("inline-flex shrink-0 items-center gap-1.5 rounded-full border px-2 py-0.5 text-[11px] font-medium", className)}>
+      {status === "inProgress" ? <RefreshCw className="h-3 w-3 animate-spin" /> : null}
+      {status === "completed" ? <CheckCircle2 className="h-3 w-3" /> : null}
+      {status === "failed" ? <XCircle className="h-3 w-3" /> : null}
+      <span>{label}</span>
+    </span>
   );
 }
 
@@ -2384,79 +2418,101 @@ function Bubble({ message }: { message: ChatMessage }) {
     );
   }
 
+  if (message.role === "reasoning") {
+    return (
+      <div className="w-full">
+        <details className="group max-w-[72ch] rounded-2xl border border-border/60 bg-background/40 px-4 py-3">
+          <summary
+            className={cn(
+              "flex cursor-pointer list-none items-center gap-2 text-xs font-medium text-muted-foreground",
+              "select-none [&::-webkit-details-marker]:hidden"
+            )}
+          >
+            <ChevronRight className="h-3.5 w-3.5 transition-transform group-open:rotate-90" />
+            <span>思考摘要</span>
+          </summary>
+          <div className="mt-2 break-words text-sm leading-relaxed text-foreground/70">
+            <ReactMarkdown remarkPlugins={[remarkGfm]} components={markdownComponents}>
+              {message.text}
+            </ReactMarkdown>
+          </div>
+        </details>
+      </div>
+    );
+  }
+
   const meta = message.meta;
+  const label =
+    meta.kind === "commandExecution"
+      ? "bash"
+      : meta.kind === "fileChange"
+        ? "patch"
+        : meta.kind === "mcpToolCall"
+          ? "tool"
+          : meta.kind === "webSearch"
+            ? "search"
+            : meta.kind === "imageView"
+              ? "image"
+              : "tool";
+
+  const commandLine =
+    meta.kind === "commandExecution" && meta.command.trim().length > 0 ? `$ ${meta.command.trim()}` : "";
+
+  const preBody =
+    meta.kind === "commandExecution"
+      ? `${commandLine}${commandLine && message.text.trim() ? "\n" : ""}${message.text}`.trimEnd()
+      : message.text.trimEnd();
+
   return (
     <div className="w-full">
-      <div className="max-w-[72ch] rounded-2xl border border-border/60 bg-background/55 p-4 shadow-[inset_0_1px_0_0_oklch(var(--foreground)/0.06)]">
-        <div className="flex items-start justify-between gap-3">
-          <div className="min-w-0 flex-1">
-            <div className="text-xs text-muted-foreground">
-              {meta.kind === "commandExecution"
-                ? "Command"
-                : meta.kind === "fileChange"
-                  ? "File changes"
-                  : meta.kind === "mcpToolCall"
-                    ? "Tool"
-                    : meta.kind === "webSearch"
-                      ? "Web search"
-                      : meta.kind === "imageView"
-                        ? "Image view"
-                        : "Item"}
-            </div>
+      <div className="max-w-[72ch]">
+        <div className="relative overflow-hidden rounded-2xl border border-border/60 bg-background/55 shadow-[inset_0_1px_0_0_oklch(var(--foreground)/0.06)]">
+          <div className="pointer-events-none absolute left-4 top-3 text-xs font-medium text-muted-foreground">
+            {label}
+          </div>
+          <div className="absolute right-4 top-3">
+            <ToolStatusBadge status={meta.status} />
+          </div>
 
-            {meta.kind === "commandExecution" ? (
-              <>
-                <div className="mt-1 break-words font-mono text-xs text-foreground">
-                  {meta.command.trim() ? meta.command : "(command)"}
-                </div>
-                {meta.cwd ? (
-                  <div className="mt-1 break-words font-mono text-[11px] text-muted-foreground">{meta.cwd}</div>
-                ) : null}
-                {meta.exitCode !== undefined && meta.exitCode !== null ? (
-                  <div className="mt-1 text-[11px] text-muted-foreground">exit {meta.exitCode}</div>
-                ) : null}
-              </>
-            ) : null}
-
-            {meta.kind === "fileChange" ? (
-              <>
-                <div className="mt-1 text-xs text-foreground">{meta.files.length ? `${meta.files.length} file(s)` : "file changes"}</div>
-                {meta.files.length ? (
-                  <div className="mt-1 break-words font-mono text-[11px] text-muted-foreground">
-                    {meta.files.map((f) => `${f.kind}: ${f.path}`).join("\n")}
-                  </div>
-                ) : null}
-              </>
-            ) : null}
-
-            {meta.kind === "mcpToolCall" ? (
-              <div className="mt-1 break-words font-mono text-xs text-foreground">
-                {meta.server && meta.tool ? `${meta.server} · ${meta.tool}` : "mcp tool"}
+          <div className="px-4 pb-4 pt-10">
+            {meta.kind === "mcpToolCall" && (meta.server.trim() || meta.tool.trim()) ? (
+              <div className="text-xs text-muted-foreground">
+                <span className="font-mono">{meta.server}</span>
+                {meta.server && meta.tool ? <span> · </span> : null}
+                <span className="font-mono">{meta.tool}</span>
               </div>
             ) : null}
 
-            {meta.kind === "webSearch" ? <div className="mt-1 break-words text-xs text-foreground">{meta.query}</div> : null}
+            {meta.kind === "fileChange" && meta.files.length ? (
+              <div className="text-xs text-muted-foreground">
+                {meta.files.slice(0, 3).map((f) => f.path).join(", ")}
+                {meta.files.length > 3 ? ` +${meta.files.length - 3}` : ""}
+              </div>
+            ) : null}
 
-            {meta.kind === "imageView" ? <div className="mt-1 break-words font-mono text-xs text-foreground">{meta.path}</div> : null}
+            {preBody.trim() ? (
+              <pre
+                className={cn(
+                  "max-h-64 overflow-auto whitespace-pre-wrap font-mono text-[11px] leading-relaxed text-foreground",
+                  meta.kind === "mcpToolCall" || (meta.kind === "fileChange" && meta.files.length) ? "mt-2" : "mt-0"
+                )}
+              >
+                {preBody}
+              </pre>
+            ) : null}
           </div>
 
-          <ToolStatusBadge status={meta.status} />
+          {meta.kind === "fileChange" && meta.diffs.trim() ? (
+            <details className="border-t border-border/60 px-4 py-3">
+              <summary className="cursor-pointer select-none text-xs text-muted-foreground hover:text-foreground">
+                View diffs
+              </summary>
+              <pre className="mt-2 max-h-80 overflow-auto whitespace-pre-wrap font-mono text-[11px] leading-relaxed text-foreground">
+                {meta.diffs}
+              </pre>
+            </details>
+          ) : null}
         </div>
-
-        {message.text.trim() ? (
-          <pre className="mt-3 max-h-64 overflow-auto whitespace-pre-wrap rounded-2xl border border-border/60 bg-background/50 p-3 font-mono text-[11px] leading-relaxed text-foreground">
-            {message.text}
-          </pre>
-        ) : null}
-
-        {meta.kind === "fileChange" && meta.diffs.trim() ? (
-          <details className="mt-3">
-            <summary className="cursor-pointer select-none text-xs text-muted-foreground hover:text-foreground">View diffs</summary>
-            <pre className="mt-2 max-h-80 overflow-auto whitespace-pre-wrap rounded-2xl border border-border/60 bg-background/50 p-3 font-mono text-[11px] leading-relaxed text-foreground">
-              {meta.diffs}
-            </pre>
-          </details>
-        ) : null}
       </div>
     </div>
   );
