@@ -483,8 +483,12 @@ async def mcp_post(request: Request):
                 _jsonrpc_error(request_id=request_id, code=-32602, message="Invalid params"),
                 status_code=200,
             )
-        client_proto = str(params.get("protocolVersion") or "").strip() or MCP_PROTOCOL_VERSION
-        negotiated = MCP_PROTOCOL_VERSION if client_proto != MCP_PROTOCOL_VERSION else client_proto
+        client_proto = str(params.get("protocolVersion") or "").strip() or MCP_PROTOCOL_VERSION_LATEST
+        negotiated = (
+            client_proto
+            if client_proto in SUPPORTED_MCP_PROTOCOL_VERSIONS
+            else MCP_PROTOCOL_VERSION_LATEST
+        )
         client_info = params.get("clientInfo") if isinstance(params.get("clientInfo"), dict) else None
 
         session_id = uuid.uuid4().hex
@@ -673,7 +677,13 @@ def _http_require_token(request: Request):
         raise HTTPException(status_code=401, detail="Unauthorized")
 
 
-MCP_PROTOCOL_VERSION = "2025-11-25"
+SUPPORTED_MCP_PROTOCOL_VERSIONS = [
+    # Latest MCP spec revision in /contextify/txt/mcp.txt
+    "2025-11-25",
+    # Current Codex MCP client references this revision.
+    "2025-06-18",
+]
+MCP_PROTOCOL_VERSION_LATEST = SUPPORTED_MCP_PROTOCOL_VERSIONS[0]
 
 
 def _mcp_require_token(request: Request):
