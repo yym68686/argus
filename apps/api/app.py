@@ -378,7 +378,7 @@ app.add_middleware(
     allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
-    expose_headers=["MCP-Session-Id"],
+    expose_headers=["MCP-Session-Id", "MCP-Protocol-Version"],
 )
 
 
@@ -438,8 +438,258 @@ async def mcp_post(request: Request):
         body = await request.json()
     except Exception as e:
         raise HTTPException(status_code=400, detail="Invalid JSON body") from e
+    if isinstance(body, list):
+        # JSON-RPC batch: process each message and return an array of responses.
+        # Notifications produce no entry in the response array.
+        responses: list[dict[str, Any]] = []
+        mcp_session_id_header: Optional[str] = None
+        mcp_protocol_version_header: Optional[str] = None
+
+        for item in body:
+            if not isinstance(item, dict):
+                responses.append(_jsonrpc_error(request_id=None, code=-32600, message="Invalid JSON-RPC message"))
+                continue
+            resp = await _mcp_handle_single_message(request, item)
+            if resp is None:
+                continue
+            resp_body, hdrs = resp
+            responses.append(resp_body)
+            mcp_session_id_header = mcp_session_id_header or hdrs.get("MCP-Session-Id")
+            mcp_protocol_version_header = mcp_protocol_version_header or hdrs.get("MCP-Protocol-Version")
+
+        if not responses:
+            return Response(status_code=202)
+        out = JSONResponse(responses, status_code=200)
+        if mcp_session_id_header:
+            out.headers["MCP-Session-Id"] = mcp_session_id_header
+        if mcp_protocol_version_header:
+            out.headers["MCP-Protocol-Version"] = mcp_protocol_version_header
+        return out
+
     if not isinstance(body, dict):
         raise HTTPException(status_code=400, detail="Invalid JSON body")
+
+    single = await _mcp_handle_single_message(request, body)
+    if single is None:
+        return Response(status_code=202)
+    payload, headers = single
+    out = JSONResponse(payload, status_code=200)
+    for k, v in headers.items():
+        out.headers[k] = v
+    return out
+
+
+async def _mcp_handle_single_message(request: Request, body: dict[str, Any]) -> Optional[tuple[dict[str, Any], dict[str, str]]]:
+    jsonrpc = body.get("jsonrpc")
+    if jsonrpc is not None and jsonrpc != "2.0":
+        return (_jsonrpc_error(request_id=body.get("id"), code=-32600, message="Invalid JSON-RPC version"), {})
+
+    has_method = "method" in body
+    has_id = "id" in body
+
+    # JSON-RPC notification or response: accept (202) if session is valid, otherwise ignore.
+    if not has_method and has_id:
+        await _mcp_get_session(request, allow_missing=True)
+        return None
+    if has_method and not has_id:
+        method = str(body.get("method") or "")
+        if method == "notifications/initialized":
+            sess = await _mcp_get_session(request, allow_missing=True)
+            if sess is not None:
+                sess.initialized = True
+            return None
+        if method.startswith("notifications/"):
+            await _mcp_get_session(request, allow_missing=True)
+            return None
+        return None
+
+    if not has_method or not has_id:
+        return (_jsonrpc_error(request_id=body.get("id"), code=-32600, message="Invalid JSON-RPC message"), {})
+
+    request_id = body.get("id")
+    method = str(body.get("method") or "")
+    params = body.get("params")
+
+    if method == "initialize":
+        if not isinstance(params, dict):
+            return (_jsonrpc_error(request_id=request_id, code=-32602, message="Invalid params"), {})
+        client_proto = str(params.get("protocolVersion") or "").strip() or MCP_PROTOCOL_VERSION_LATEST
+        negotiated = (
+            client_proto
+            if client_proto in SUPPORTED_MCP_PROTOCOL_VERSIONS
+            else MCP_PROTOCOL_VERSION_LATEST
+        )
+        client_info = params.get("clientInfo") if isinstance(params.get("clientInfo"), dict) else None
+
+        session_id = uuid.uuid4().hex
+        now_ms = int(time.time() * 1000)
+        sess = McpSessionState(
+            session_id=session_id,
+            protocol_version=negotiated,
+            # We don't emit server-side notifications, so we can treat initialize as sufficient.
+            initialized=True,
+            client_info=client_info,
+            created_at_ms=now_ms,
+            last_seen_ms=now_ms,
+        )
+        async with app.state.mcp_lock:
+            app.state.mcp_sessions[session_id] = sess
+
+        result = {
+            "protocolVersion": negotiated,
+            "capabilities": {
+                "tools": {"listChanged": False},
+            },
+            "serverInfo": {
+                "name": "argus_gateway",
+                "title": "Argus Gateway MCP",
+                "version": "0.1.0",
+            },
+            "instructions": "This MCP server exposes tools for listing and invoking connected nodes.",
+        }
+        return (
+            _jsonrpc_result(request_id=request_id, result=result),
+            {"MCP-Session-Id": session_id, "MCP-Protocol-Version": negotiated},
+        )
+
+    sess = await _mcp_get_session(request, allow_missing=True)
+    if sess is None:
+        return (_jsonrpc_error(request_id=request_id, code=-32000, message="Not initialized"), {})
+
+    if method == "ping":
+        return (_jsonrpc_result(request_id=request_id, result={}), {"MCP-Protocol-Version": sess.protocol_version})
+
+    if method == "tools/list":
+        tools = [
+            {
+                "name": "nodes_list",
+                "title": "Nodes List",
+                "description": "List connected nodes (devices) and their advertised commands.",
+                "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False},
+            },
+            {
+                "name": "node_invoke",
+                "title": "Node Invoke",
+                "description": "Invoke a command on a connected node (device).",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "node": {"type": "string", "description": "nodeId or displayName"},
+                        "command": {"type": "string", "description": "Command name to invoke (must be supported by the node)"},
+                        "params": {"type": ["object", "array", "string", "number", "boolean", "null"]},
+                        "timeoutMs": {"type": "number"},
+                        "idempotencyKey": {"type": "string"},
+                    },
+                    "required": ["node", "command"],
+                    "additionalProperties": False,
+                },
+            },
+        ]
+        return (
+            _jsonrpc_result(request_id=request_id, result={"tools": tools}),
+            {"MCP-Protocol-Version": sess.protocol_version},
+        )
+
+    if method == "tools/call":
+        if not isinstance(params, dict):
+            return (_jsonrpc_error(request_id=request_id, code=-32602, message="Invalid params"), {"MCP-Protocol-Version": sess.protocol_version})
+        tool_name = str(params.get("name") or "")
+        arguments = params.get("arguments")
+        args = arguments if isinstance(arguments, dict) else {}
+
+        if tool_name == "nodes_list":
+            nodes = await app.state.node_registry.list_connected()
+            return (
+                _jsonrpc_result(
+                    request_id=request_id,
+                    result=_mcp_call_tool_result(
+                        content=[{"type": "text", "text": json.dumps({"nodes": nodes}, ensure_ascii=False)}],
+                        structured={"nodes": nodes},
+                    ),
+                ),
+                {"MCP-Protocol-Version": sess.protocol_version},
+            )
+
+        if tool_name == "node_invoke":
+            node_raw = str(args.get("node") or args.get("nodeId") or "").strip()
+            cmd = str(args.get("command") or "").strip()
+            invoke_params = args.get("params")
+            timeout_ms = args.get("timeoutMs")
+            if timeout_ms is not None and not isinstance(timeout_ms, (int, float)):
+                return (
+                    _jsonrpc_result(
+                        request_id=request_id,
+                        result=_mcp_call_tool_result(
+                            content=[{"type": "text", "text": "timeoutMs must be a number (milliseconds)"}],
+                            structured={"ok": False, "error": {"code": "INVALID_ARGUMENT", "field": "timeoutMs"}},
+                            is_error=True,
+                        ),
+                    ),
+                    {"MCP-Protocol-Version": sess.protocol_version},
+                )
+
+            if not node_raw or not cmd:
+                return (
+                    _jsonrpc_result(
+                        request_id=request_id,
+                        result=_mcp_call_tool_result(
+                            content=[{"type": "text", "text": "Missing required fields: node, command"}],
+                            structured={"ok": False, "error": {"code": "INVALID_ARGUMENT"}},
+                            is_error=True,
+                        ),
+                    ),
+                    {"MCP-Protocol-Version": sess.protocol_version},
+                )
+
+            node_id = await app.state.node_registry.resolve_node_id(node_raw)
+            if not node_id:
+                return (
+                    _jsonrpc_result(
+                        request_id=request_id,
+                        result=_mcp_call_tool_result(
+                            content=[{"type": "text", "text": "Node not found (or ambiguous display name)"}],
+                            structured={"ok": False, "error": {"code": "NODE_NOT_FOUND", "node": node_raw}},
+                            is_error=True,
+                        ),
+                    ),
+                    {"MCP-Protocol-Version": sess.protocol_version},
+                )
+
+            res: NodeInvokeResult = await app.state.node_registry.invoke(
+                node_id=node_id,
+                command=cmd,
+                params=invoke_params,
+                timeout_ms=int(timeout_ms) if isinstance(timeout_ms, (int, float)) else None,
+            )
+            payload = res.payload if res.payload is not None else None
+            return (
+                _jsonrpc_result(
+                    request_id=request_id,
+                    result=_mcp_call_tool_result(
+                        content=[{"type": "text", "text": json.dumps(payload, ensure_ascii=False)}],
+                        structured={"ok": res.ok, "nodeId": node_id, "command": cmd, "payload": payload, "error": res.error},
+                        is_error=not res.ok,
+                    ),
+                ),
+                {"MCP-Protocol-Version": sess.protocol_version},
+            )
+
+        return (
+            _jsonrpc_result(
+                request_id=request_id,
+                result=_mcp_call_tool_result(
+                    content=[{"type": "text", "text": f"Unknown tool: {tool_name}"}],
+                    structured={"ok": False, "error": {"code": "UNKNOWN_TOOL", "message": tool_name}},
+                    is_error=True,
+                ),
+            ),
+            {"MCP-Protocol-Version": sess.protocol_version},
+        )
+
+    return (
+        _jsonrpc_error(request_id=request_id, code=-32601, message=f"Method not found: {method}"),
+        {"MCP-Protocol-Version": sess.protocol_version},
+    )
 
     jsonrpc = body.get("jsonrpc")
     if jsonrpc is not None and jsonrpc != "2.0":
@@ -727,10 +977,16 @@ async def _mcp_get_session(request: Request, *, allow_missing: bool = False) -> 
     if sess is None:
         raise HTTPException(status_code=404, detail="Unknown MCP session")
     proto = request.headers.get("mcp-protocol-version") or ""
-    if not proto:
-        raise HTTPException(status_code=400, detail="Missing MCP-Protocol-Version header")
-    if proto != sess.protocol_version:
-        raise HTTPException(status_code=400, detail="MCP-Protocol-Version mismatch")
+    # Some clients omit MCP-Protocol-Version on streamable HTTP requests.
+    # Prefer compatibility: accept missing/mismatched values (we still track the
+    # negotiated protocol version from initialize()).
+    if proto and proto != sess.protocol_version:
+        log.warning(
+            "MCP protocol header mismatch for session %s (got %s, expected %s)",
+            session_id,
+            proto,
+            sess.protocol_version,
+        )
     sess.last_seen_ms = int(time.time() * 1000)
     return sess
 
