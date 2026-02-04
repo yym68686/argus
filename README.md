@@ -113,7 +113,6 @@ open http://127.0.0.1:3000/nodes
 ```toml
 [mcp_servers.argus]
 url = "http://gateway:8080/mcp"
-transport = "streamable_http"
 bearer_token_env_var = "ARGUS_MCP_TOKEN" # or "ARGUS_TOKEN"
 ```
 
