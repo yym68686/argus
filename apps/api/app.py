@@ -790,6 +790,17 @@ def _docker_create_container_sync(cfg: DockerProvisionConfig, session_id: str):
     if cfg.runtime_cmd:
         env["APP_SERVER_CMD"] = cfg.runtime_cmd
     env["APP_HOME"] = cfg.home_container_path
+    # Pass gateway tokens through to the runtime so the agent can authenticate
+    # against gateway-provided services (e.g. MCP at /mcp).
+    #
+    # NOTE: Codex rejects inline bearer tokens in config.toml for streamable_http;
+    # use `bearer_token_env_var` and read from these env vars instead.
+    gateway_token = os.getenv("ARGUS_TOKEN") or None
+    mcp_token = os.getenv("ARGUS_MCP_TOKEN") or gateway_token
+    if gateway_token:
+        env["ARGUS_TOKEN"] = gateway_token
+    if mcp_token:
+        env["ARGUS_MCP_TOKEN"] = mcp_token
     volumes = {}
     if cfg.home_host_path:
         volumes[cfg.home_host_path] = {"bind": cfg.home_container_path, "mode": "rw"}

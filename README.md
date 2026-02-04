@@ -113,7 +113,8 @@ open http://127.0.0.1:3000/nodes
 ```toml
 [mcp_servers.argus]
 url = "http://gateway:8080/mcp"
-bearer_token = "change-me"
+transport = "streamable_http"
+bearer_token_env_var = "ARGUS_MCP_TOKEN" # or "ARGUS_TOKEN"
 ```
 
 然后在对话里让 agent 调用 MCP tool `node_invoke` 即可（例如调用 `system.run`）。
