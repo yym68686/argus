@@ -307,7 +307,30 @@ function toolMessageFromThreadItem(rawItem: Record<string, unknown>): ChatMessag
     if (error) {
       text = error;
     } else if (rawItem["result"] !== undefined && rawItem["result"] !== null) {
-      text = safeJsonStringify(rawItem["result"]);
+      const result = rawItem["result"];
+      if (isRecord(result)) {
+        const structured = result["structuredContent"];
+        if (structured !== undefined && structured !== null) {
+          text = safeJsonStringify(structured);
+        } else {
+          const content = result["content"];
+          if (Array.isArray(content)) {
+            const parts: string[] = [];
+            for (const block of content) {
+              if (!isRecord(block)) continue;
+              if (getString(block["type"]) === "text") {
+                const t = getString(block["text"]);
+                if (t) parts.push(t);
+              }
+            }
+            text = parts.join("\n").trim() || safeJsonStringify(result);
+          } else {
+            text = safeJsonStringify(result);
+          }
+        }
+      } else {
+        text = safeJsonStringify(result);
+      }
     } else if (rawItem["arguments"] !== undefined && rawItem["arguments"] !== null) {
       text = safeJsonStringify(rawItem["arguments"]);
     }
@@ -831,7 +854,13 @@ export default function Page() {
       const existing = msgs[idx];
       if (existing.role !== "tool") return prev;
       const mergedMeta = mergeToolMeta(existing.meta, msg.meta);
-      const nextText = existing.text.trim() ? existing.text : msg.text;
+      let nextText = existing.text.trim() ? existing.text : msg.text;
+      if (msg.meta.kind === "mcpToolCall") {
+        // Prefer the final result/error over the initial arguments placeholder.
+        if (msg.meta.status !== "inProgress" && msg.text.trim()) {
+          nextText = msg.text;
+        }
+      }
       const nextMsg: ChatMessage = { ...existing, text: nextText, meta: mergedMeta };
 
       return {
