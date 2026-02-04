@@ -2,14 +2,15 @@ import asyncio
 import json
 import logging
 import os
+import time
 import uuid
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Optional
 
-from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, HTTPException, Request, Response, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import PlainTextResponse
+from fastapi.responses import JSONResponse, PlainTextResponse
 from starlette.websockets import WebSocketState
 
 
@@ -121,6 +122,193 @@ class LiveDockerSession:
         await self.writer.drain()
 
 
+@dataclass
+class NodeSession:
+    node_id: str
+    conn_id: str
+    ws: WebSocket
+    display_name: Optional[str] = None
+    platform: Optional[str] = None
+    version: Optional[str] = None
+    caps: list[str] = field(default_factory=list)
+    commands: list[str] = field(default_factory=list)
+    connected_at_ms: int = 0
+    last_seen_ms: int = 0
+
+
+@dataclass
+class NodeInvokeResult:
+    ok: bool
+    payload: Optional[Any] = None
+    payload_json: Optional[str] = None
+    error: Optional[dict[str, Any]] = None
+
+
+class NodeRegistry:
+    def __init__(self) -> None:
+        self._lock = asyncio.Lock()
+        self._nodes_by_id: dict[str, NodeSession] = {}
+        self._nodes_by_conn: dict[str, str] = {}
+        self._pending: dict[str, tuple[str, asyncio.Future[NodeInvokeResult]]] = {}
+
+    async def register(self, session: NodeSession) -> None:
+        async with self._lock:
+            existing = self._nodes_by_id.get(session.node_id)
+            if existing is not None:
+                self._nodes_by_conn.pop(existing.conn_id, None)
+                self._nodes_by_id.pop(existing.node_id, None)
+                for rid, (pending_node_id, fut) in list(self._pending.items()):
+                    if pending_node_id != session.node_id:
+                        continue
+                    if not fut.done():
+                        fut.set_result(
+                            NodeInvokeResult(
+                                ok=False,
+                                error={"code": "NODE_REPLACED", "message": "node replaced by a new connection"},
+                            )
+                        )
+                    self._pending.pop(rid, None)
+                try:
+                    await existing.ws.close(code=1012, reason="replaced")
+                except Exception:
+                    pass
+            self._nodes_by_id[session.node_id] = session
+            self._nodes_by_conn[session.conn_id] = session.node_id
+
+    async def unregister(self, conn_id: str) -> Optional[str]:
+        async with self._lock:
+            node_id = self._nodes_by_conn.pop(conn_id, None)
+            if not node_id:
+                return None
+            self._nodes_by_id.pop(node_id, None)
+            for rid, (pending_node_id, fut) in list(self._pending.items()):
+                if pending_node_id != node_id:
+                    continue
+                if fut.done():
+                    self._pending.pop(rid, None)
+                    continue
+                fut.set_result(
+                    NodeInvokeResult(ok=False, error={"code": "NODE_DISCONNECTED", "message": "node disconnected"})
+                )
+                self._pending.pop(rid, None)
+            return node_id
+
+    async def list_connected(self) -> list[dict[str, Any]]:
+        async with self._lock:
+            sessions = list(self._nodes_by_id.values())
+        out: list[dict[str, Any]] = []
+        for s in sessions:
+            out.append(
+                {
+                    "nodeId": s.node_id,
+                    "displayName": s.display_name,
+                    "platform": s.platform,
+                    "version": s.version,
+                    "caps": s.caps,
+                    "commands": s.commands,
+                    "connectedAtMs": s.connected_at_ms,
+                    "lastSeenMs": s.last_seen_ms,
+                }
+            )
+        out.sort(key=lambda x: x.get("displayName") or x.get("nodeId") or "")
+        return out
+
+    async def resolve_node_id(self, ident: str) -> Optional[str]:
+        key = (ident or "").strip()
+        if not key:
+            return None
+        async with self._lock:
+            if key in self._nodes_by_id:
+                return key
+            matches = [
+                s.node_id
+                for s in self._nodes_by_id.values()
+                if (s.display_name or "").strip().lower() == key.lower()
+            ]
+        if len(matches) == 1:
+            return matches[0]
+        return None
+
+    async def touch(self, node_id: str) -> None:
+        now_ms = int(time.time() * 1000)
+        async with self._lock:
+            s = self._nodes_by_id.get(node_id)
+            if s is not None:
+                s.last_seen_ms = now_ms
+
+    async def invoke(self, *, node_id: str, command: str, params: Any = None, timeout_ms: Optional[int] = None) -> NodeInvokeResult:
+        async with self._lock:
+            session = self._nodes_by_id.get(node_id)
+        if session is None or session.ws.client_state != WebSocketState.CONNECTED:
+            return NodeInvokeResult(ok=False, error={"code": "NOT_CONNECTED", "message": "node not connected"})
+        if session.commands and command not in session.commands:
+            return NodeInvokeResult(ok=False, error={"code": "UNSUPPORTED", "message": f"command not supported: {command}"})
+
+        request_id = uuid.uuid4().hex
+        params_json = None
+        if params is not None:
+            try:
+                params_json = json.dumps(params)
+            except Exception:
+                return NodeInvokeResult(ok=False, error={"code": "BAD_PARAMS", "message": "params must be JSON-serializable"})
+
+        payload = {
+            "id": request_id,
+            "nodeId": node_id,
+            "command": command,
+            "paramsJSON": params_json,
+            "timeoutMs": timeout_ms,
+        }
+
+        fut: asyncio.Future[NodeInvokeResult] = asyncio.get_running_loop().create_future()
+        async with self._lock:
+            self._pending[request_id] = (node_id, fut)
+        try:
+            await session.ws.send_text(json.dumps({"type": "event", "event": "node.invoke.request", "payload": payload}))
+        except Exception:
+            async with self._lock:
+                self._pending.pop(request_id, None)
+            return NodeInvokeResult(ok=False, error={"code": "UNAVAILABLE", "message": "failed to send invoke to node"})
+
+        try:
+            if timeout_ms is None:
+                timeout_ms = 30_000
+            return await asyncio.wait_for(fut, timeout_ms / 1000.0)
+        except asyncio.TimeoutError:
+            async with self._lock:
+                self._pending.pop(request_id, None)
+            return NodeInvokeResult(ok=False, error={"code": "TIMEOUT", "message": "node invoke timed out"})
+
+    async def handle_invoke_result(self, payload: dict[str, Any]) -> bool:
+        request_id = str(payload.get("id") or "")
+        if not request_id:
+            return False
+        async with self._lock:
+            pending = self._pending.pop(request_id, None)
+        if pending is None:
+            return False
+        _, fut = pending
+        if fut.done():
+            return False
+        fut.set_result(
+            NodeInvokeResult(
+                ok=bool(payload.get("ok")),
+                payload=payload.get("payload"),
+                payload_json=payload.get("payloadJSON"),
+                error=(payload.get("error") if isinstance(payload.get("error"), dict) else None),
+            )
+        )
+        return True
+
+@dataclass
+class McpSessionState:
+    session_id: str
+    protocol_version: str
+    initialized: bool
+    client_info: Optional[dict[str, Any]]
+    created_at_ms: int
+    last_seen_ms: int
+
 def _provision_mode() -> str:
     return os.getenv("ARGUS_PROVISION_MODE", "static").strip().lower()
 
@@ -159,6 +347,7 @@ def _extract_token(ws: WebSocket) -> Optional[str]:
         parts = auth.split(" ", 1)
         if len(parts) == 2 and parts[0].lower() == "bearer":
             return parts[1].strip() or None
+        return auth.strip() or None
     return ws.query_params.get("token")
 
 
@@ -168,6 +357,7 @@ def _extract_token_http(request: Request) -> Optional[str]:
         parts = auth.split(" ", 1)
         if len(parts) == 2 and parts[0].lower() == "bearer":
             return parts[1].strip() or None
+        return auth.strip() or None
     return request.query_params.get("token")
 
 
@@ -187,6 +377,7 @@ app.add_middleware(
     allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
+    expose_headers=["MCP-Session-Id"],
 )
 
 
@@ -194,6 +385,9 @@ app.add_middleware(
 async def _startup():
     app.state.sessions_lock = asyncio.Lock()
     app.state.sessions: dict[str, LiveDockerSession] = {}
+    app.state.node_registry = NodeRegistry()
+    app.state.mcp_lock = asyncio.Lock()
+    app.state.mcp_sessions: dict[str, McpSessionState] = {}
 
 
 @app.get("/healthz")
@@ -216,6 +410,260 @@ async def robots():
     return PlainTextResponse("User-agent: *\nDisallow: /\n")
 
 
+@app.get("/mcp")
+async def mcp_get(request: Request):
+    _mcp_require_token(request)
+    raise HTTPException(status_code=405, detail="Streamable HTTP GET is not supported on this MCP endpoint")
+
+
+@app.delete("/mcp")
+async def mcp_delete(request: Request):
+    _mcp_require_token(request)
+    session_id = request.headers.get("mcp-session-id") or ""
+    if not session_id:
+        raise HTTPException(status_code=400, detail="Missing MCP-Session-Id header")
+    async with app.state.mcp_lock:
+        existed = session_id in app.state.mcp_sessions
+        app.state.mcp_sessions.pop(session_id, None)
+    if not existed:
+        raise HTTPException(status_code=404, detail="Unknown MCP session")
+    return {"ok": True}
+
+
+@app.post("/mcp")
+async def mcp_post(request: Request):
+    _mcp_require_token(request)
+    try:
+        body = await request.json()
+    except Exception as e:
+        raise HTTPException(status_code=400, detail="Invalid JSON body") from e
+    if not isinstance(body, dict):
+        raise HTTPException(status_code=400, detail="Invalid JSON body")
+
+    jsonrpc = body.get("jsonrpc")
+    if jsonrpc is not None and jsonrpc != "2.0":
+        return JSONResponse(
+            _jsonrpc_error(request_id=body.get("id"), code=-32600, message="Invalid JSON-RPC version"),
+            status_code=200,
+        )
+
+    has_method = "method" in body
+    has_id = "id" in body
+
+    # JSON-RPC notification or response: accept (202) if session is valid, otherwise error.
+    if not has_method and has_id:
+        await _mcp_get_session(request)
+        return Response(status_code=202)
+    if has_method and not has_id:
+        method = str(body.get("method") or "")
+        if method != "initialize":
+            await _mcp_get_session(request)
+        if method == "notifications/initialized":
+            sess = await _mcp_get_session(request)
+            if sess is not None:
+                sess.initialized = True
+            return Response(status_code=202)
+        if method.startswith("notifications/"):
+            return Response(status_code=202)
+        return Response(status_code=202)
+
+    if not has_method or not has_id:
+        return JSONResponse(
+            _jsonrpc_error(request_id=body.get("id"), code=-32600, message="Invalid JSON-RPC message"),
+            status_code=200,
+        )
+
+    request_id = body.get("id")
+    method = str(body.get("method") or "")
+    params = body.get("params")
+
+    if method == "initialize":
+        if not isinstance(params, dict):
+            return JSONResponse(
+                _jsonrpc_error(request_id=request_id, code=-32602, message="Invalid params"),
+                status_code=200,
+            )
+        client_proto = str(params.get("protocolVersion") or "").strip() or MCP_PROTOCOL_VERSION
+        negotiated = MCP_PROTOCOL_VERSION if client_proto != MCP_PROTOCOL_VERSION else client_proto
+        client_info = params.get("clientInfo") if isinstance(params.get("clientInfo"), dict) else None
+
+        session_id = uuid.uuid4().hex
+        now_ms = int(time.time() * 1000)
+        sess = McpSessionState(
+            session_id=session_id,
+            protocol_version=negotiated,
+            initialized=False,
+            client_info=client_info,
+            created_at_ms=now_ms,
+            last_seen_ms=now_ms,
+        )
+        async with app.state.mcp_lock:
+            app.state.mcp_sessions[session_id] = sess
+
+        result = {
+            "protocolVersion": negotiated,
+            "capabilities": {
+                "tools": {"listChanged": False},
+            },
+            "serverInfo": {
+                "name": "argus_gateway",
+                "title": "Argus Gateway MCP",
+                "version": "0.1.0",
+            },
+            "instructions": "This MCP server exposes tools for listing and invoking connected nodes.",
+        }
+        resp = JSONResponse(_jsonrpc_result(request_id=request_id, result=result), status_code=200)
+        resp.headers["MCP-Session-Id"] = session_id
+        return resp
+
+    sess = await _mcp_get_session(request)
+    if sess is None:
+        return JSONResponse(_jsonrpc_error(request_id=request_id, code=-32000, message="Not initialized"), status_code=200)
+    if not sess.initialized and method != "ping":
+        return JSONResponse(_jsonrpc_error(request_id=request_id, code=-32000, message="Not initialized"), status_code=200)
+
+    if method == "ping":
+        return JSONResponse(_jsonrpc_result(request_id=request_id, result={}), status_code=200)
+
+    if method == "tools/list":
+        tools = [
+            {
+                "name": "nodes_list",
+                "title": "Nodes List",
+                "description": "List connected nodes (devices) and their advertised commands.",
+                "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False},
+            },
+            {
+                "name": "node_invoke",
+                "title": "Node Invoke",
+                "description": "Invoke a command on a connected node (device).",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "node": {"type": "string", "description": "nodeId or displayName"},
+                        "command": {"type": "string", "description": "Command name to invoke (must be supported by the node)"},
+                        "params": {"type": ["object", "array", "string", "number", "boolean", "null"]},
+                        "timeoutMs": {"type": "number"},
+                        "idempotencyKey": {"type": "string"},
+                    },
+                    "required": ["node", "command"],
+                    "additionalProperties": False,
+                },
+            },
+        ]
+        return JSONResponse(_jsonrpc_result(request_id=request_id, result={"tools": tools}), status_code=200)
+
+    if method == "tools/call":
+        if not isinstance(params, dict):
+            return JSONResponse(_jsonrpc_error(request_id=request_id, code=-32602, message="Invalid params"), status_code=200)
+        tool_name = str(params.get("name") or "").strip()
+        args = params.get("arguments")
+        if not isinstance(args, dict):
+            args = {}
+
+        if tool_name == "nodes_list":
+            nodes = await app.state.node_registry.list_connected()
+            return JSONResponse(
+                _jsonrpc_result(
+                    request_id=request_id,
+                    result=_mcp_call_tool_result(
+                        content=[{"type": "text", "text": f"{len(nodes)} node(s) connected"}],
+                        structured={"nodes": nodes},
+                    ),
+                ),
+                status_code=200,
+            )
+
+        if tool_name == "node_invoke":
+            node_raw = str(args.get("node") or "").strip()
+            cmd = str(args.get("command") or "").strip()
+            timeout_ms = args.get("timeoutMs")
+            if timeout_ms is not None:
+                try:
+                    timeout_ms = int(timeout_ms)
+                except Exception:
+                    timeout_ms = None
+            invoke_params = args.get("params")
+
+            if not node_raw or not cmd:
+                return JSONResponse(
+                    _jsonrpc_result(
+                        request_id=request_id,
+                        result=_mcp_call_tool_result(
+                            content=[{"type": "text", "text": "node_invoke requires 'node' and 'command'"}],
+                            structured={"ok": False, "error": {"code": "BAD_INPUT", "message": "missing node/command"}},
+                            is_error=True,
+                        ),
+                    ),
+                    status_code=200,
+                )
+
+            node_id = await app.state.node_registry.resolve_node_id(node_raw)
+            if not node_id:
+                return JSONResponse(
+                    _jsonrpc_result(
+                        request_id=request_id,
+                        result=_mcp_call_tool_result(
+                            content=[{"type": "text", "text": "Node not found (or ambiguous display name)"}],
+                            structured={"ok": False, "error": {"code": "NOT_FOUND", "message": "node not found"}},
+                            is_error=True,
+                        ),
+                    ),
+                    status_code=200,
+                )
+
+            res: NodeInvokeResult = await app.state.node_registry.invoke(
+                node_id=node_id,
+                command=cmd,
+                params=invoke_params,
+                timeout_ms=timeout_ms,
+            )
+
+            if not res.ok:
+                return JSONResponse(
+                    _jsonrpc_result(
+                        request_id=request_id,
+                        result=_mcp_call_tool_result(
+                            content=[{"type": "text", "text": res.error.get("message") if res.error else "node invoke failed"}],
+                            structured={"ok": False, "nodeId": node_id, "command": cmd, "error": res.error},
+                            is_error=True,
+                        ),
+                    ),
+                    status_code=200,
+                )
+
+            payload: Any = res.payload
+            if payload is None and res.payload_json:
+                try:
+                    payload = json.loads(res.payload_json)
+                except Exception:
+                    payload = res.payload_json
+            return JSONResponse(
+                _jsonrpc_result(
+                    request_id=request_id,
+                    result=_mcp_call_tool_result(
+                        content=[{"type": "text", "text": "ok"}],
+                        structured={"ok": True, "nodeId": node_id, "command": cmd, "payload": payload},
+                    ),
+                ),
+                status_code=200,
+            )
+
+        return JSONResponse(
+            _jsonrpc_result(
+                request_id=request_id,
+                result=_mcp_call_tool_result(
+                    content=[{"type": "text", "text": f"Unknown tool: {tool_name}"}],
+                    structured={"ok": False, "error": {"code": "UNKNOWN_TOOL", "message": tool_name}},
+                    is_error=True,
+                ),
+            ),
+            status_code=200,
+        )
+
+    return JSONResponse(_jsonrpc_error(request_id=request_id, code=-32601, message=f"Method not found: {method}"), status_code=200)
+
+
 def _http_require_token(request: Request):
     expected = os.getenv("ARGUS_TOKEN") or None
     if expected is None:
@@ -223,6 +671,57 @@ def _http_require_token(request: Request):
     provided = _extract_token_http(request)
     if provided != expected:
         raise HTTPException(status_code=401, detail="Unauthorized")
+
+
+MCP_PROTOCOL_VERSION = "2025-11-25"
+
+
+def _mcp_require_token(request: Request):
+    expected = os.getenv("ARGUS_MCP_TOKEN") or os.getenv("ARGUS_TOKEN") or None
+    if expected is None:
+        return
+    provided = _extract_token_http(request)
+    if provided != expected:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+
+def _jsonrpc_error(*, request_id: Any, code: int, message: str, data: Any = None) -> dict[str, Any]:
+    err: dict[str, Any] = {"code": code, "message": message}
+    if data is not None:
+        err["data"] = data
+    return {"jsonrpc": "2.0", "id": request_id, "error": err}
+
+
+def _jsonrpc_result(*, request_id: Any, result: Any) -> dict[str, Any]:
+    return {"jsonrpc": "2.0", "id": request_id, "result": result}
+
+
+def _mcp_call_tool_result(*, content: list[dict[str, Any]], structured: Any = None, is_error: bool = False) -> dict[str, Any]:
+    out: dict[str, Any] = {"content": content}
+    if structured is not None:
+        out["structuredContent"] = structured
+    if is_error:
+        out["isError"] = True
+    return out
+
+
+async def _mcp_get_session(request: Request, *, allow_missing: bool = False) -> Optional[McpSessionState]:
+    session_id = request.headers.get("mcp-session-id") or ""
+    if not session_id:
+        if allow_missing:
+            return None
+        raise HTTPException(status_code=400, detail="Missing MCP-Session-Id header")
+    async with app.state.mcp_lock:
+        sess = app.state.mcp_sessions.get(session_id)
+    if sess is None:
+        raise HTTPException(status_code=404, detail="Unknown MCP session")
+    proto = request.headers.get("mcp-protocol-version") or ""
+    if not proto:
+        raise HTTPException(status_code=400, detail="Missing MCP-Protocol-Version header")
+    if proto != sess.protocol_version:
+        raise HTTPException(status_code=400, detail="MCP-Protocol-Version mismatch")
+    sess.last_seen_ms = int(time.time() * 1000)
+    return sess
 
 
 def _docker_cfg() -> DockerProvisionConfig:
@@ -419,6 +918,49 @@ async def list_sessions(request: Request):
     return {"sessions": sessions}
 
 
+@app.get("/nodes")
+async def list_nodes(request: Request):
+    _http_require_token(request)
+    nodes = await app.state.node_registry.list_connected()
+    return {"nodes": nodes}
+
+
+@app.post("/nodes/invoke")
+async def invoke_node(request: Request):
+    _http_require_token(request)
+    try:
+        body = await request.json()
+    except Exception as e:
+        raise HTTPException(status_code=400, detail="Invalid JSON body") from e
+
+    if not isinstance(body, dict):
+        raise HTTPException(status_code=400, detail="Invalid JSON body")
+
+    node_raw = str(body.get("node") or body.get("nodeId") or "").strip()
+    command = str(body.get("command") or "").strip()
+    params = body.get("params")
+    timeout_ms = body.get("timeoutMs")
+
+    if not node_raw:
+        raise HTTPException(status_code=400, detail="Missing 'node' (or 'nodeId')")
+    if not command:
+        raise HTTPException(status_code=400, detail="Missing 'command'")
+    if timeout_ms is not None and not isinstance(timeout_ms, int):
+        raise HTTPException(status_code=400, detail="'timeoutMs' must be an integer (milliseconds)")
+
+    node_id = await app.state.node_registry.resolve_node_id(node_raw)
+    if not node_id:
+        raise HTTPException(status_code=404, detail="Node not found (or ambiguous display name)")
+
+    res: NodeInvokeResult = await app.state.node_registry.invoke(
+        node_id=node_id,
+        command=command,
+        params=params,
+        timeout_ms=timeout_ms,
+    )
+    return {"ok": res.ok, "nodeId": node_id, "command": command, "payload": res.payload, "payloadJSON": res.payload_json, "error": res.error}
+
+
 @app.delete("/sessions/{session_id}")
 async def delete_session(session_id: str, request: Request):
     _http_require_token(request)
@@ -450,6 +992,88 @@ async def delete_session(session_id: str, request: Request):
         log.exception("Failed to delete docker session %s", session_id)
         raise HTTPException(status_code=500, detail=str(e)) from e
     return {"ok": True, "sessionId": session_id}
+
+
+@app.websocket("/nodes/ws")
+async def ws_nodes(ws: WebSocket):
+    provided = _extract_token(ws)
+    expected = os.getenv("ARGUS_NODE_TOKEN") or os.getenv("ARGUS_TOKEN") or None
+    if expected and provided != expected:
+        await ws.accept()
+        await ws.close(code=1008, reason="Unauthorized")
+        return
+
+    await ws.accept()
+    conn_id = uuid.uuid4().hex[:12]
+
+    try:
+        raw = await ws.receive_text()
+    except WebSocketDisconnect:
+        return
+
+    try:
+        msg = json.loads(raw)
+    except Exception:
+        msg = None
+
+    if not isinstance(msg, dict) or msg.get("type") != "connect":
+        await ws.close(code=1008, reason="First message must be {type:'connect', ...}")
+        return
+
+    node_id = str(msg.get("nodeId") or "").strip()
+    if not node_id:
+        await ws.close(code=1008, reason="Missing nodeId")
+        return
+
+    display_name = (str(msg.get("displayName")) if msg.get("displayName") is not None else None) or None
+    platform = (str(msg.get("platform")) if msg.get("platform") is not None else None) or None
+    version = (str(msg.get("version")) if msg.get("version") is not None else None) or None
+    caps = [str(x) for x in (msg.get("caps") or [])] if isinstance(msg.get("caps"), list) else []
+    commands = [str(x) for x in (msg.get("commands") or [])] if isinstance(msg.get("commands"), list) else []
+
+    now_ms = int(time.time() * 1000)
+    session = NodeSession(
+        node_id=node_id,
+        conn_id=conn_id,
+        ws=ws,
+        display_name=display_name,
+        platform=platform,
+        version=version,
+        caps=caps,
+        commands=commands,
+        connected_at_ms=now_ms,
+        last_seen_ms=now_ms,
+    )
+    await app.state.node_registry.register(session)
+
+    try:
+        await ws.send_text(json.dumps({"type": "event", "event": "node.connected", "payload": {"nodeId": node_id}}))
+    except Exception:
+        pass
+
+    try:
+        while True:
+            raw = await ws.receive_text()
+            try:
+                msg = json.loads(raw)
+            except Exception:
+                msg = None
+            if not isinstance(msg, dict):
+                continue
+            if msg.get("type") == "event" and msg.get("event") == "node.invoke.result" and isinstance(msg.get("payload"), dict):
+                payload = msg["payload"]
+                if str(payload.get("nodeId") or "") != node_id:
+                    continue
+                await app.state.node_registry.touch(node_id)
+                await app.state.node_registry.handle_invoke_result(payload)
+                continue
+            if msg.get("type") == "event" and msg.get("event") == "node.heartbeat":
+                await app.state.node_registry.touch(node_id)
+                continue
+    except WebSocketDisconnect:
+        pass
+    finally:
+        await app.state.node_registry.unregister(conn_id)
 
 
 @app.websocket("/ws")

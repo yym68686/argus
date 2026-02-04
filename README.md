@@ -73,6 +73,51 @@ docker compose down
 python3 -m py_compile apps/api/app.py client_smoke.py
 ```
 
+## Nodes + MCP（可选）
+
+Argus 还支持一个“Node（设备）”通道与一个内置 MCP endpoint：
+
+- Node Host（例如你的 Mac）通过 `WS /nodes/ws` 连接到网关并注册能力（示例实现：`system.run`）。
+- 网关通过 `HTTP /mcp`（MCP Streamable HTTP）对 runtime 容器里的 Codex 暴露工具：`nodes_list` / `node_invoke`。
+
+### 启动 Node Host（在 Mac 上）
+
+```bash
+cd apps/node-host
+npm i
+
+node index.mjs \
+  --url "ws://127.0.0.1:8080/nodes/ws?token=$ARGUS_TOKEN" \
+  --node-id "mac" \
+  --display-name "My Mac"
+```
+
+### Web 测试页（可选）
+
+启动 web profile 后打开：
+
+```bash
+open http://127.0.0.1:3000/nodes
+```
+
+在页面里点击 “Refresh nodes”，然后用 `system.run` + `{"argv":["echo","hello"]}` 测试。
+
+### 让容器内 Codex 通过 MCP 调用 Node
+
+在宿主机的 `ARGUS_HOME_HOST_PATH` 下创建（或编辑）：
+
+`$ARGUS_HOME_HOST_PATH/.codex/config.toml`
+
+示例（docker compose 场景下，runtime 容器通过 service 名 `gateway` 访问网关）：
+
+```toml
+[mcp_servers.argus]
+url = "http://gateway:8080/mcp"
+bearer_token = "change-me"
+```
+
+然后在对话里让 agent 调用 MCP tool `node_invoke` 即可（例如调用 `system.run`）。
+
 ## Frontend Dev（可选）
 
 如果你想改 React 前端而不每次都 rebuild 网关镜像：

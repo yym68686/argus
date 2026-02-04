@@ -27,6 +27,9 @@ services:
       ARGUS_RUNTIME_CMD: ${ARGUS_RUNTIME_CMD:-codex app-server}
       # Optional: require auth for /ws (Authorization: Bearer ... or ?token=...).
       ARGUS_TOKEN: ${ARGUS_TOKEN:-}
+      # Optional: separate auth scopes (fallback to ARGUS_TOKEN when unset).
+      ARGUS_NODE_TOKEN: ${ARGUS_NODE_TOKEN:-}
+      ARGUS_MCP_TOKEN: ${ARGUS_MCP_TOKEN:-}
       # Optional: docker provision tuning.
       ARGUS_CONNECT_TIMEOUT_S: ${ARGUS_CONNECT_TIMEOUT_S:-30}
       ARGUS_CONTAINER_PREFIX: ${ARGUS_CONTAINER_PREFIX:-argus-session}

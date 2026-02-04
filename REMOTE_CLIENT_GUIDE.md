@@ -19,6 +19,8 @@ export ARGUS_TOKEN="<ARGUS_TOKEN>"
 - 网关健康检查：`http://$HOST:8080/healthz`
   - 期望返回：`{"ok":true}`
 - 网关 WebSocket（给程序接入 app-server runtime）：`ws://$HOST:8080/ws`
+- Node Host WebSocket（可选；设备能力注册）：`ws://$HOST:8080/nodes/ws`
+- 网关 MCP（可选；给容器内 agent 作为 MCP Server）：`http://$HOST:8080/mcp`
 - 可选：Web UI（用于验证后端；需要服务器启动 web 服务）：`http://$HOST:3000`
 
 认证方式（二选一）：
@@ -26,6 +28,8 @@ export ARGUS_TOKEN="<ARGUS_TOKEN>"
 - 推荐（程序端）：HTTP Header `Authorization: Bearer <ARGUS_TOKEN>`
 - 兼容（浏览器/简单客户端）：URL 参数 `?token=<ARGUS_TOKEN>`
   - 完整示例：`ws://$HOST:8080/ws?token=<ARGUS_TOKEN>`
+
+> 备注：如果服务端配置了分离 token（`ARGUS_NODE_TOKEN` / `ARGUS_MCP_TOKEN`），则 Node Host 与 MCP 端点需要用对应 token；未配置时默认复用 `ARGUS_TOKEN`。
 
 ## 2. 系统架构（你在写客户端时需要知道的）
 
