@@ -34,6 +34,7 @@ class DockerProvisionConfig:
     workspace_container_path: str = "/workspace"
     runtime_cmd: Optional[str] = None
     connect_timeout_s: float = 30.0
+    jsonl_line_limit_bytes: int = 8 * 1024 * 1024
     container_prefix: str = "argus-session"
 
 
@@ -748,6 +749,10 @@ def _docker_cfg() -> DockerProvisionConfig:
         raise RuntimeError("ARGUS_WORKSPACE_HOST_PATH must be an absolute host path")
 
     connect_timeout_s = float(os.getenv("ARGUS_CONNECT_TIMEOUT_S", "30"))
+    try:
+        jsonl_line_limit_bytes = int(os.getenv("ARGUS_JSONL_LINE_LIMIT_BYTES", str(8 * 1024 * 1024)))
+    except Exception:
+        jsonl_line_limit_bytes = 8 * 1024 * 1024
     container_prefix = os.getenv("ARGUS_CONTAINER_PREFIX", "argus-session")
 
     return DockerProvisionConfig(
@@ -757,6 +762,7 @@ def _docker_cfg() -> DockerProvisionConfig:
         workspace_host_path=workspace_host_path,
         runtime_cmd=runtime_cmd,
         connect_timeout_s=connect_timeout_s,
+        jsonl_line_limit_bytes=jsonl_line_limit_bytes,
         container_prefix=container_prefix,
     )
 
@@ -913,6 +919,31 @@ async def _wait_for_tcp(host: str, port: int, timeout_s: float):
             if asyncio.get_running_loop().time() >= deadline:
                 raise last_err
             await asyncio.sleep(0.2)
+
+
+async def _read_jsonl_line(
+    reader: asyncio.StreamReader,
+    buffer: bytearray,
+    *,
+    max_line_bytes: int,
+    chunk_size: int = 4096,
+) -> Optional[bytes]:
+    while True:
+        nl = buffer.find(b"\n")
+        if nl != -1:
+            line = bytes(buffer[:nl])
+            del buffer[: nl + 1]
+            return line
+        if len(buffer) > max_line_bytes:
+            raise ValueError(f"JSONL line exceeded {max_line_bytes} bytes without newline")
+        chunk = await reader.read(chunk_size)
+        if not chunk:
+            if buffer:
+                line = bytes(buffer)
+                buffer.clear()
+                return line
+            return None
+        buffer.extend(chunk)
 
 
 @app.get("/sessions")
@@ -1153,12 +1184,13 @@ async def ws_proxy(ws: WebSocket):
             )
 
             async def pump() -> None:
+                buf = bytearray()
                 try:
                     while True:
-                        line = await live.reader.readline()
-                        if not line:
+                        raw = await _read_jsonl_line(live.reader, buf, max_line_bytes=cfg.jsonl_line_limit_bytes)
+                        if raw is None:
                             break
-                        text = line.decode("utf-8", errors="replace").rstrip("\n")
+                        text = raw.decode("utf-8", errors="replace").rstrip("\r")
 
                         msg: Any = None
                         try:
@@ -1326,11 +1358,16 @@ async def ws_proxy(ws: WebSocket):
 
     async def tcp_to_ws():
         try:
+            line_limit = int(os.getenv("ARGUS_JSONL_LINE_LIMIT_BYTES", str(8 * 1024 * 1024)))
+        except Exception:
+            line_limit = 8 * 1024 * 1024
+        buf = bytearray()
+        try:
             while True:
-                line = await reader.readline()
-                if not line:
+                raw = await _read_jsonl_line(reader, buf, max_line_bytes=line_limit)
+                if raw is None:
                     break
-                await ws.send_text(line.decode("utf-8").rstrip("\n"))
+                await ws.send_text(raw.decode("utf-8", errors="replace").rstrip("\r"))
         finally:
             if ws.client_state == WebSocketState.CONNECTED:
                 try:
