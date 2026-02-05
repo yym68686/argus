@@ -92,10 +92,10 @@ type ToolMessageMeta =
     };
 
 type ChatMessage =
-  | { id: string; role: "user"; text: string }
-  | { id: string; role: "assistant"; text: string }
-  | { id: string; role: "reasoning"; text: string }
-  | { id: string; role: "tool"; text: string; meta: ToolMessageMeta };
+  | { id: string; role: "user"; text: string; turnId?: string }
+  | { id: string; role: "assistant"; text: string; turnId?: string }
+  | { id: string; role: "reasoning"; text: string; turnId?: string }
+  | { id: string; role: "tool"; text: string; meta: ToolMessageMeta; turnId?: string };
 
 interface SessionRow {
   sessionId?: string;
@@ -180,6 +180,52 @@ function stripSessionFromWsUrl(url: string): string {
   } catch {
     return url;
   }
+}
+
+type MarkdownToolSegment =
+  | { kind: "markdown"; text: string }
+  | { kind: "tool"; toolId: string };
+
+function toolMarker(toolId: string): string {
+  return `<!--tool:${toolId}-->`;
+}
+
+function appendToolMarkerMarkdown(markdown: string, toolId: string): string {
+  const marker = toolMarker(toolId);
+  if (markdown.includes(marker)) return markdown;
+  const sep = markdown.trim().length ? "\n\n" : "";
+  return `${markdown}${sep}${marker}\n\n`;
+}
+
+function parseMarkdownToolSegments(markdown: string): MarkdownToolSegment[] {
+  const segments: MarkdownToolSegment[] = [];
+  const re = /<!--tool:([A-Za-z0-9_-]+)-->/g;
+  let last = 0;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(markdown)) !== null) {
+    const before = markdown.slice(last, m.index);
+    if (before.trim()) segments.push({ kind: "markdown", text: before.trim() });
+    segments.push({ kind: "tool", toolId: m[1] });
+    last = m.index + m[0].length;
+  }
+  const after = markdown.slice(last);
+  if (after.trim()) segments.push({ kind: "markdown", text: after.trim() });
+  return segments;
+}
+
+function interleaveMarkdownWithToolMarkers(parts: string[], toolIds: string[]): string {
+  const out: string[] = [];
+  for (let i = 0; i < parts.length; i++) {
+    const part = parts[i]?.trim();
+    if (part) out.push(part);
+    const toolId = toolIds[i];
+    if (isNonEmptyString(toolId)) out.push(toolMarker(toolId));
+  }
+  for (let i = parts.length; i < toolIds.length; i++) {
+    const toolId = toolIds[i];
+    if (isNonEmptyString(toolId)) out.push(toolMarker(toolId));
+  }
+  return out.join("\n\n").trim();
 }
 
 function defaultWsUrl(): string {
@@ -392,40 +438,76 @@ function turnsToChatMessages(turns: unknown): ChatMessage[] {
 
   for (const rawTurn of turns) {
     if (!isRecord(rawTurn)) continue;
+    const turnId = getString(rawTurn["id"]) ?? undefined;
     const items = rawTurn["items"];
     if (!Array.isArray(items)) continue;
+
+    let pendingReasoningId: string | null = null;
+    let pendingReasoningParts: string[] | null = null;
+    const pendingToolIds: string[] = [];
+
+    function flushReasoning(): void {
+      if (!pendingReasoningParts || !pendingReasoningParts.length) {
+        pendingReasoningId = null;
+        pendingReasoningParts = null;
+        pendingToolIds.length = 0;
+        return;
+      }
+
+      const interleaved = interleaveMarkdownWithToolMarkers(pendingReasoningParts, pendingToolIds);
+      if (interleaved.trim()) {
+        messages.push({
+          id: pendingReasoningId ?? nowId("rsn"),
+          role: "reasoning",
+          text: interleaved,
+          turnId
+        });
+      }
+
+      pendingReasoningId = null;
+      pendingReasoningParts = null;
+      pendingToolIds.length = 0;
+    }
 
     for (const rawItem of items) {
       if (!isRecord(rawItem)) continue;
       const type = getString(rawItem["type"]);
       const id = getString(rawItem["id"]) ?? nowId("itm");
       if (type === "userMessage") {
+        flushReasoning();
         const text = userInputsToText(rawItem["content"]);
         if (!text) continue;
-        messages.push({ id, role: "user", text });
+        messages.push({ id, role: "user", text, turnId });
         continue;
       }
       if (type === "agentMessage") {
+        flushReasoning();
         const text = getString(rawItem["text"]) ?? "";
         if (!text.trim()) continue;
-        messages.push({ id, role: "assistant", text });
+        messages.push({ id, role: "assistant", text, turnId });
         continue;
       }
       if (type === "reasoning") {
+        flushReasoning();
         const rawSummary = rawItem["summary"];
         if (!Array.isArray(rawSummary)) continue;
         const parts = rawSummary.map((v) => getString(v)).filter((v): v is string => isNonEmptyString(v));
-        const text = parts.join("\n\n").trim();
-        if (!text) continue;
-        messages.push({ id, role: "reasoning", text });
+        if (!parts.length) continue;
+        pendingReasoningId = id;
+        pendingReasoningParts = parts;
         continue;
       }
 
       const toolMsg = toolMessageFromThreadItem(rawItem);
-      if (toolMsg) {
-        messages.push(toolMsg);
+      if (toolMsg && toolMsg.role === "tool") {
+        messages.push({ ...toolMsg, turnId });
+        if (pendingReasoningParts) {
+          pendingToolIds.push(toolMsg.id);
+        }
       }
     }
+
+    flushReasoning();
   }
 
   return messages;
@@ -492,6 +574,47 @@ export default function Page() {
     activeSessionId && activeThreadId ? `${activeSessionId}:${activeThreadId}` : null;
   const activeChat = activeThreadKey ? chatByThreadKey[activeThreadKey] : null;
   const activeConnStatus = activeSessionId ? connBySession[activeSessionId] : undefined;
+
+  const toolsByTurnId = React.useMemo(() => {
+    const map: Record<string, Array<Extract<ChatMessage, { role: "tool" }>>> = {};
+    for (const msg of activeChat?.messages ?? []) {
+      if (msg.role !== "tool") continue;
+      if (!isNonEmptyString(msg.turnId)) continue;
+      if (!map[msg.turnId]) map[msg.turnId] = [];
+      map[msg.turnId].push(msg);
+    }
+    return map;
+  }, [activeChat?.messages]);
+
+  const reasoningTurnIds = React.useMemo(() => {
+    const ids = new Set<string>();
+    for (const msg of activeChat?.messages ?? []) {
+      if (msg.role !== "reasoning") continue;
+      if (!isNonEmptyString(msg.turnId)) continue;
+      ids.add(msg.turnId);
+    }
+    return ids;
+  }, [activeChat?.messages]);
+
+  const activeTurnTools = React.useMemo(() => {
+    if (!activeChat?.turnInProgress) return [];
+    if (!isNonEmptyString(activeChat.turnId)) return [];
+    return toolsByTurnId[activeChat.turnId] ?? [];
+  }, [activeChat?.turnInProgress, activeChat?.turnId, toolsByTurnId]);
+
+  const displayMessages = React.useMemo(() => {
+    const msgs = activeChat?.messages ?? [];
+    return msgs.filter((msg) => {
+      if (msg.role === "assistant" && msg.text.trim().length === 0) return false;
+      if (msg.role === "tool") {
+        if (activeChat?.turnInProgress && isNonEmptyString(activeChat.turnId) && msg.turnId === activeChat.turnId) {
+          return false;
+        }
+        if (isNonEmptyString(msg.turnId) && reasoningTurnIds.has(msg.turnId)) return false;
+      }
+      return true;
+    });
+  }, [activeChat?.messages, activeChat?.turnInProgress, activeChat?.turnId, reasoningTurnIds]);
 
   const isActiveSessionBusy = React.useMemo(() => {
     if (!activeSessionId) return false;
@@ -668,23 +791,28 @@ export default function Page() {
     });
   }
 
-  function setThreadTurnStarted(sessionId: string, incomingThreadId: string, incomingTurnId: string | null): void {
-    const key = threadKey(sessionId, incomingThreadId);
-    setChatByThreadKey((prev) => {
-      const current = prev[key] ?? emptyThreadChatState();
-      const nextTurnId = current.turnId ?? incomingTurnId;
-      return {
-        ...prev,
-        [key]: {
-          ...current,
-          turnInProgress: true,
-          turnId: nextTurnId ?? null,
-          reasoningSummary: "",
-          reasoningSummaryIndex: null
-        }
-      };
-    });
-  }
+	  function setThreadTurnStarted(sessionId: string, incomingThreadId: string, incomingTurnId: string | null): void {
+	    const key = threadKey(sessionId, incomingThreadId);
+	    setChatByThreadKey((prev) => {
+	      const current = prev[key] ?? emptyThreadChatState();
+	      const isDifferentTurn =
+	        isNonEmptyString(current.turnId) &&
+	        isNonEmptyString(incomingTurnId) &&
+	        current.turnId !== incomingTurnId;
+	      const shouldResetSummary = !current.turnInProgress || isDifferentTurn;
+	      const nextTurnId = current.turnId ?? incomingTurnId;
+	      return {
+	        ...prev,
+	        [key]: {
+	          ...current,
+	          turnInProgress: true,
+	          turnId: nextTurnId ?? null,
+	          reasoningSummary: shouldResetSummary ? "" : current.reasoningSummary,
+	          reasoningSummaryIndex: shouldResetSummary ? null : current.reasoningSummaryIndex
+	        }
+	      };
+	    });
+	  }
 
   function appendAssistantDelta(sessionId: string, incomingThreadId: string, incomingTurnId: string | null, delta: string): void {
     const key = threadKey(sessionId, incomingThreadId);
@@ -698,10 +826,13 @@ export default function Page() {
 
       const msgs = current.messages;
       const last = msgs[msgs.length - 1];
-      const newAssistant: ChatMessage = { id: nowId("a"), role: "assistant", text: delta };
+      const expectedTurnId = incomingTurnId ?? nextTurnId ?? undefined;
+      const newAssistant: ChatMessage = { id: nowId("a"), role: "assistant", text: delta, turnId: expectedTurnId };
       const nextMessages =
-        last && last.role === "assistant"
-          ? [...msgs.slice(0, -1), { ...last, text: last.text + delta }]
+        last &&
+        last.role === "assistant" &&
+        (!expectedTurnId || !last.turnId || last.turnId === expectedTurnId)
+          ? [...msgs.slice(0, -1), { ...last, text: last.text + delta, turnId: expectedTurnId ?? last.turnId }]
           : [...msgs, newAssistant];
 
       return {
@@ -751,12 +882,39 @@ export default function Page() {
         current.turnInProgress && !current.turnId && incomingTurnId ? incomingTurnId : current.turnId;
 
       const msgs = current.messages;
-      const last = msgs[msgs.length - 1];
-      const newAssistant: ChatMessage = { id: nowId("a"), role: "assistant", text: fullText };
-      const nextMessages =
-        last && last.role === "assistant"
-          ? [...msgs.slice(0, -1), { ...last, text: fullText }]
-          : [...msgs, newAssistant];
+      const expectedTurnId = incomingTurnId ?? nextTurnId ?? undefined;
+      const idx = (() => {
+        if (expectedTurnId) {
+          for (let i = msgs.length - 1; i >= 0; i--) {
+            const m = msgs[i];
+            if (m.role === "assistant" && m.turnId === expectedTurnId) return i;
+          }
+          for (let i = msgs.length - 1; i >= 0; i--) {
+            const m = msgs[i];
+            if (m.role === "assistant" && !m.turnId) return i;
+          }
+          return -1;
+        }
+
+        for (let i = msgs.length - 1; i >= 0; i--) {
+          const m = msgs[i];
+          if (m.role === "assistant") return i;
+        }
+        return -1;
+      })();
+
+      let nextMessages = msgs;
+      if (idx >= 0 && msgs[idx]?.role === "assistant") {
+        const existing = msgs[idx] as Extract<ChatMessage, { role: "assistant" }>;
+        nextMessages = [
+          ...msgs.slice(0, idx),
+          { ...existing, text: fullText, turnId: expectedTurnId ?? existing.turnId },
+          ...msgs.slice(idx + 1)
+        ];
+      } else {
+        const newAssistant: ChatMessage = { id: nowId("a"), role: "assistant", text: fullText, turnId: expectedTurnId };
+        nextMessages = [...msgs, newAssistant];
+      }
 
       return {
         ...prev,
@@ -771,9 +929,52 @@ export default function Page() {
 	      const current = prev[key] ?? emptyThreadChatState();
 	      if (!current.turnInProgress) return prev;
 	      if (current.turnId && incomingTurnId && incomingTurnId !== current.turnId) return prev;
+
+	      const completedTurnId = current.turnId ?? incomingTurnId ?? null;
+	      const hasSummary = current.reasoningSummary.trim().length > 0;
+	      const hasTools =
+	        isNonEmptyString(completedTurnId) &&
+	        current.messages.some((m) => m.role === "tool" && m.turnId === completedTurnId);
+		      const alreadyHasReasoning =
+		        isNonEmptyString(completedTurnId) &&
+		        current.messages.some((m) => m.role === "reasoning" && m.turnId === completedTurnId);
+
+		      let nextMessages = current.messages;
+		      if (!alreadyHasReasoning && isNonEmptyString(completedTurnId) && (hasSummary || hasTools)) {
+		        const reasoningMsg: ChatMessage = {
+		          id: nowId("rsn"),
+		          role: "reasoning",
+		          text: current.reasoningSummary,
+		          turnId: completedTurnId
+		        };
+		        let insertAt = current.messages.findIndex(
+		          (m) => m.role === "assistant" && m.turnId === completedTurnId
+		        );
+		        if (insertAt === -1) {
+		          for (let i = current.messages.length - 1; i >= 0; i--) {
+		            const m = current.messages[i];
+		            if (m.role === "assistant") {
+		              insertAt = i;
+		              break;
+		            }
+		          }
+		        }
+		        nextMessages =
+		          insertAt === -1
+		            ? [...current.messages, reasoningMsg]
+		            : [...current.messages.slice(0, insertAt), reasoningMsg, ...current.messages.slice(insertAt)];
+		      }
+
 	      return {
 	        ...prev,
-	        [key]: { ...current, turnInProgress: false, turnId: null, reasoningSummary: "", reasoningSummaryIndex: null }
+	        [key]: {
+	          ...current,
+	          messages: nextMessages,
+	          turnInProgress: false,
+	          turnId: null,
+	          reasoningSummary: "",
+	          reasoningSummaryIndex: null
+	        }
 	      };
 	    });
 	  }
@@ -824,44 +1025,65 @@ export default function Page() {
     return nextMeta;
   }
 
-  function upsertToolFromItem(
-    sessionId: string,
-    incomingThreadId: string,
-    incomingTurnId: string | null,
-    item: Record<string, unknown>
-  ): void {
-    const msg = toolMessageFromThreadItem(item);
-    if (!msg || msg.role !== "tool") return;
+	  function upsertToolFromItem(
+	    sessionId: string,
+	    incomingThreadId: string,
+	    incomingTurnId: string | null,
+	    item: Record<string, unknown>
+	  ): void {
+	    const msg = toolMessageFromThreadItem(item);
+	    if (!msg || msg.role !== "tool") return;
 
-    const key = threadKey(sessionId, incomingThreadId);
-    setChatByThreadKey((prev) => {
-      const current = prev[key] ?? emptyThreadChatState();
-      const turnId = current.turnId;
-      if (turnId && incomingTurnId && incomingTurnId !== turnId) return prev;
+	    const key = threadKey(sessionId, incomingThreadId);
+	    setChatByThreadKey((prev) => {
+	      const current = prev[key] ?? emptyThreadChatState();
+	      const turnId = current.turnId;
+	      if (turnId && incomingTurnId && incomingTurnId !== turnId) return prev;
 
-      const nextTurnId =
-        current.turnInProgress && !current.turnId && incomingTurnId ? incomingTurnId : current.turnId;
+	      const msgWithTurn: Extract<ChatMessage, { role: "tool" }> = {
+	        ...msg,
+	        turnId: msg.turnId ?? (incomingTurnId ?? current.turnId ?? undefined)
+	      };
+
+	      const nextTurnId =
+	        current.turnInProgress && !current.turnId && incomingTurnId ? incomingTurnId : current.turnId;
+
+	      const nextReasoningSummary =
+	        current.turnInProgress
+	          ? appendToolMarkerMarkdown(current.reasoningSummary, msgWithTurn.id)
+	          : current.reasoningSummary;
 
       const msgs = current.messages;
-      const idx = msgs.findIndex((m) => m.id === msg.id && m.role === "tool");
+      const idx = msgs.findIndex((m) => m.id === msgWithTurn.id && m.role === "tool");
       if (idx === -1) {
         return {
           ...prev,
-          [key]: { ...current, messages: [...msgs, msg], hydrated: true, turnId: nextTurnId ?? null }
+          [key]: {
+            ...current,
+            messages: [...msgs, msgWithTurn],
+            hydrated: true,
+            turnId: nextTurnId ?? null,
+            reasoningSummary: nextReasoningSummary
+          }
         };
       }
 
       const existing = msgs[idx];
       if (existing.role !== "tool") return prev;
-      const mergedMeta = mergeToolMeta(existing.meta, msg.meta);
-      let nextText = existing.text.trim() ? existing.text : msg.text;
-      if (msg.meta.kind === "mcpToolCall") {
+      const mergedMeta = mergeToolMeta(existing.meta, msgWithTurn.meta);
+      let nextText = existing.text.trim() ? existing.text : msgWithTurn.text;
+      if (msgWithTurn.meta.kind === "mcpToolCall") {
         // Prefer the final result/error over the initial arguments placeholder.
-        if (msg.meta.status !== "inProgress" && msg.text.trim()) {
-          nextText = msg.text;
+        if (msgWithTurn.meta.status !== "inProgress" && msgWithTurn.text.trim()) {
+          nextText = msgWithTurn.text;
         }
       }
-      const nextMsg: ChatMessage = { ...existing, text: nextText, meta: mergedMeta };
+      const nextMsg: ChatMessage = {
+        ...existing,
+        text: nextText,
+        meta: mergedMeta,
+        turnId: existing.turnId ?? msgWithTurn.turnId
+      };
 
       return {
         ...prev,
@@ -869,43 +1091,66 @@ export default function Page() {
           ...current,
           messages: [...msgs.slice(0, idx), nextMsg, ...msgs.slice(idx + 1)],
           hydrated: true,
-          turnId: nextTurnId ?? null
+          turnId: nextTurnId ?? null,
+          reasoningSummary: nextReasoningSummary
         }
       };
     });
   }
 
-  function appendToolDelta(
-    sessionId: string,
-    incomingThreadId: string,
-    incomingTurnId: string | null,
-    itemId: string,
-    delta: string,
-    stubMeta: ToolMessageMeta
-  ): void {
-    const key = threadKey(sessionId, incomingThreadId);
-    setChatByThreadKey((prev) => {
-      const current = prev[key] ?? emptyThreadChatState();
-      const turnId = current.turnId;
-      if (turnId && incomingTurnId && incomingTurnId !== turnId) return prev;
+	  function appendToolDelta(
+	    sessionId: string,
+	    incomingThreadId: string,
+	    incomingTurnId: string | null,
+	    itemId: string,
+	    delta: string,
+	    stubMeta: ToolMessageMeta
+	  ): void {
+	    const key = threadKey(sessionId, incomingThreadId);
+	    setChatByThreadKey((prev) => {
+	      const current = prev[key] ?? emptyThreadChatState();
+	      const turnId = current.turnId;
+	      if (turnId && incomingTurnId && incomingTurnId !== turnId) return prev;
 
-      const nextTurnId =
-        current.turnInProgress && !current.turnId && incomingTurnId ? incomingTurnId : current.turnId;
+	      const nextTurnId =
+	        current.turnInProgress && !current.turnId && incomingTurnId ? incomingTurnId : current.turnId;
+
+	      const nextReasoningSummary =
+	        current.turnInProgress
+	          ? appendToolMarkerMarkdown(current.reasoningSummary, itemId)
+	          : current.reasoningSummary;
 
       const msgs = current.messages;
-      const idx = msgs.findIndex((m) => m.id === itemId && m.role === "tool");
-      if (idx === -1) {
-        const nextMsg: ChatMessage = { id: itemId, role: "tool", text: delta, meta: stubMeta };
-        return {
-          ...prev,
-          [key]: { ...current, messages: [...msgs, nextMsg], hydrated: true, turnId: nextTurnId ?? null }
+	      const idx = msgs.findIndex((m) => m.id === itemId && m.role === "tool");
+	      if (idx === -1) {
+	        const nextMsg: ChatMessage = {
+	          id: itemId,
+	          role: "tool",
+	          text: delta,
+	          meta: stubMeta,
+	          turnId: incomingTurnId ?? current.turnId ?? undefined
+	        };
+	        return {
+	          ...prev,
+	          [key]: {
+            ...current,
+            messages: [...msgs, nextMsg],
+            hydrated: true,
+            turnId: nextTurnId ?? null,
+            reasoningSummary: nextReasoningSummary
+          }
         };
       }
 
       const existing = msgs[idx];
       if (existing.role !== "tool") return prev;
       const mergedMeta = mergeToolMeta(existing.meta, stubMeta);
-      const nextMsg: ChatMessage = { ...existing, text: existing.text + delta, meta: mergedMeta };
+	      const nextMsg: ChatMessage = {
+	        ...existing,
+	        text: existing.text + delta,
+	        meta: mergedMeta,
+	        turnId: existing.turnId ?? (incomingTurnId ?? current.turnId ?? undefined)
+	      };
 
       return {
         ...prev,
@@ -913,7 +1158,8 @@ export default function Page() {
           ...current,
           messages: [...msgs.slice(0, idx), nextMsg, ...msgs.slice(idx + 1)],
           hydrated: true,
-          turnId: nextTurnId ?? null
+          turnId: nextTurnId ?? null,
+          reasoningSummary: nextReasoningSummary
         }
       };
     });
@@ -2175,17 +2421,21 @@ export default function Page() {
 	                <div className="relative flex-1 min-h-0">
 	                  <div
 	                    ref={chatScrollRef}
-	                    className="h-full overflow-auto p-4 pt-12 pb-44 scrollbar-hide md:p-5 md:pt-14 md:pb-48"
-	                  >
-	                    <div className="mx-auto grid w-full max-w-3xl grid-cols-1 gap-3">
-	                      {(activeChat?.messages ?? [])
-	                        .filter((m) => m.role !== "assistant" || m.text.trim().length > 0)
-	                        .map((m) => <Bubble key={m.id} message={m} />)}
-	                      {activeChat?.turnInProgress ? (
-	                        <TurnProgress summary={activeChat.reasoningSummary} />
-	                      ) : null}
-	                    </div>
-	                  </div>
+		                    className="h-full overflow-auto p-4 pt-12 pb-44 scrollbar-hide md:p-5 md:pt-14 md:pb-48"
+		                  >
+		                    <div className="mx-auto grid w-full max-w-3xl grid-cols-1 gap-3">
+		                      {displayMessages.map((m) => (
+		                        <Bubble
+		                          key={m.id}
+		                          message={m}
+		                          turnTools={m.role === "reasoning" && isNonEmptyString(m.turnId) ? toolsByTurnId[m.turnId] : undefined}
+		                        />
+		                      ))}
+		                      {activeChat?.turnInProgress ? (
+		                        <TurnProgress summary={activeChat.reasoningSummary} tools={activeTurnTools} />
+		                      ) : null}
+		                    </div>
+		                  </div>
 	
 	                  <div className="pointer-events-none absolute inset-x-0 bottom-0 z-10 px-4 pb-5 md:px-5">
 	                    <div className="relative mx-auto w-full max-w-3xl">
@@ -2363,30 +2613,68 @@ const markdownComponents = {
   td: ({ children }: any) => <td className="border-b border-border/60 px-3 py-2 align-top">{children}</td>
 };
 
-function TurnProgress({ summary }: { summary: string }) {
-  const hasSummary = summary.trim().length > 0;
-  return (
-    <div className="w-full">
-      <div className="max-w-[72ch]">
-        <div className="inline-flex items-center gap-2 text-xs text-muted-foreground">
-          <RefreshCw className="h-3.5 w-3.5 animate-spin text-primary" />
-          <span>正在生成…</span>
-        </div>
-        {hasSummary ? (
-          <details className="group mt-2" open>
-            <summary
-              className={cn(
-                "flex cursor-pointer list-none items-center gap-2 text-xs text-muted-foreground",
-                "select-none [&::-webkit-details-marker]:hidden"
-              )}
-            >
-              <ChevronRight className="h-3.5 w-3.5 transition-transform group-open:rotate-90" />
-              <span>思考摘要</span>
-            </summary>
-            <div className="mt-2 break-words text-sm leading-relaxed text-foreground/70">
-              <ReactMarkdown remarkPlugins={[remarkGfm]} components={markdownComponents}>
-                {summary}
-              </ReactMarkdown>
+	function TurnProgress({
+	  summary,
+	  tools
+	}: {
+	  summary: string;
+	  tools: Array<Extract<ChatMessage, { role: "tool" }>>;
+	}) {
+	  const hasSummary = summary.trim().length > 0;
+	  const hasTools = tools.length > 0;
+  const toolById = new Map<string, Extract<ChatMessage, { role: "tool" }>>();
+  for (const t of tools) toolById.set(t.id, t);
+  const segments = parseMarkdownToolSegments(summary);
+  const referencedToolIds = new Set<string>();
+	  return (
+	    <div className="w-full">
+	      <div className="max-w-[72ch]">
+	        <div className="inline-flex items-center gap-2 text-xs text-muted-foreground">
+	          <RefreshCw className="h-3.5 w-3.5 animate-spin text-primary" />
+	          <span>正在生成…</span>
+	        </div>
+	        {hasSummary || hasTools ? (
+	          <details className="group mt-2 rounded-2xl border border-border/60 bg-background/40 px-4 py-3" open>
+	            <summary
+	              className={cn(
+	                "flex cursor-pointer list-none items-center gap-2 text-xs font-medium text-muted-foreground",
+	                "select-none [&::-webkit-details-marker]:hidden"
+	              )}
+	            >
+	              <ChevronRight className="h-3.5 w-3.5 transition-transform group-open:rotate-90" />
+	              <span>思考摘要</span>
+	            </summary>
+            <div className="mt-2 space-y-2">
+              {segments.map((seg, idx) => {
+                if (seg.kind === "markdown") {
+                  return (
+                    <div key={`md_${idx}`} className="break-words text-sm leading-relaxed text-foreground/70">
+                      <ReactMarkdown remarkPlugins={[remarkGfm]} components={markdownComponents}>
+                        {seg.text}
+                      </ReactMarkdown>
+                    </div>
+                  );
+                }
+                referencedToolIds.add(seg.toolId);
+                const msg = toolById.get(seg.toolId);
+                if (!msg) return null;
+                return <ToolBubble key={msg.id} message={msg} />;
+              })}
+              {!segments.length && hasSummary ? (
+                <div className="break-words text-sm leading-relaxed text-foreground/70">
+                  <ReactMarkdown remarkPlugins={[remarkGfm]} components={markdownComponents}>
+                    {summary}
+                  </ReactMarkdown>
+                </div>
+              ) : null}
+              {!segments.length && !hasSummary && hasTools ? (
+                tools.map((t) => <ToolBubble key={t.id} message={t} />)
+              ) : null}
+              {segments.length && hasTools
+                ? tools
+                    .filter((t) => !referencedToolIds.has(t.id))
+                    .map((t) => <ToolBubble key={t.id} message={t} />)
+                : null}
             </div>
           </details>
         ) : null}
@@ -2419,57 +2707,7 @@ function ToolStatusBadge({ status }: { status: ToolMessageStatus }) {
   );
 }
 
-function Bubble({ message }: { message: ChatMessage }) {
-  if (message.role === "user") {
-    return (
-      <div className="flex w-full justify-end">
-        <div
-          className={cn(
-            "w-fit max-w-[80%] rounded-2xl border border-primary/25 bg-primary/10 px-4 py-3",
-            "shadow-[inset_0_1px_0_0_oklch(var(--foreground)/0.06)]"
-          )}
-        >
-          <div className="whitespace-pre-wrap break-words text-sm leading-relaxed text-foreground">{message.text}</div>
-        </div>
-      </div>
-    );
-  }
-
-  if (message.role === "assistant") {
-    return (
-      <div className="w-full">
-        <div className="max-w-[72ch] break-words text-sm leading-relaxed text-foreground/90">
-          <ReactMarkdown remarkPlugins={[remarkGfm]} components={markdownComponents}>
-            {message.text}
-          </ReactMarkdown>
-        </div>
-      </div>
-    );
-  }
-
-  if (message.role === "reasoning") {
-    return (
-      <div className="w-full">
-        <details className="group max-w-[72ch] rounded-2xl border border-border/60 bg-background/40 px-4 py-3">
-          <summary
-            className={cn(
-              "flex cursor-pointer list-none items-center gap-2 text-xs font-medium text-muted-foreground",
-              "select-none [&::-webkit-details-marker]:hidden"
-            )}
-          >
-            <ChevronRight className="h-3.5 w-3.5 transition-transform group-open:rotate-90" />
-            <span>思考摘要</span>
-          </summary>
-          <div className="mt-2 break-words text-sm leading-relaxed text-foreground/70">
-            <ReactMarkdown remarkPlugins={[remarkGfm]} components={markdownComponents}>
-              {message.text}
-            </ReactMarkdown>
-          </div>
-        </details>
-      </div>
-    );
-  }
-
+function ToolBubble({ message }: { message: Extract<ChatMessage, { role: "tool" }> }) {
   const meta = message.meta;
   const label =
     meta.kind === "commandExecution"
@@ -2545,4 +2783,97 @@ function Bubble({ message }: { message: ChatMessage }) {
       </div>
     </div>
   );
+}
+
+function Bubble({
+  message,
+  turnTools
+}: {
+  message: ChatMessage;
+  turnTools?: Array<Extract<ChatMessage, { role: "tool" }>>;
+}) {
+  if (message.role === "user") {
+    return (
+      <div className="flex w-full justify-end">
+        <div
+          className={cn(
+            "w-fit max-w-[80%] rounded-2xl border border-primary/25 bg-primary/10 px-4 py-3",
+            "shadow-[inset_0_1px_0_0_oklch(var(--foreground)/0.06)]"
+          )}
+        >
+          <div className="whitespace-pre-wrap break-words text-sm leading-relaxed text-foreground">{message.text}</div>
+        </div>
+      </div>
+    );
+  }
+
+  if (message.role === "assistant") {
+    return (
+      <div className="w-full">
+        <div className="max-w-[72ch] break-words text-sm leading-relaxed text-foreground/90">
+          <ReactMarkdown remarkPlugins={[remarkGfm]} components={markdownComponents}>
+            {message.text}
+          </ReactMarkdown>
+        </div>
+      </div>
+    );
+  }
+
+  if (message.role === "reasoning") {
+    const toolById = new Map<string, Extract<ChatMessage, { role: "tool" }>>();
+    for (const t of turnTools ?? []) toolById.set(t.id, t);
+    const segments = parseMarkdownToolSegments(message.text);
+    const referencedToolIds = new Set<string>();
+    return (
+      <div className="w-full">
+        <details className="group max-w-[72ch] rounded-2xl border border-border/60 bg-background/40 px-4 py-3">
+          <summary
+            className={cn(
+              "flex cursor-pointer list-none items-center gap-2 text-xs font-medium text-muted-foreground",
+              "select-none [&::-webkit-details-marker]:hidden"
+            )}
+          >
+            <ChevronRight className="h-3.5 w-3.5 transition-transform group-open:rotate-90" />
+            <span>思考摘要</span>
+          </summary>
+          <div className="mt-2 space-y-2">
+            {segments.length
+              ? segments.map((seg, idx) => {
+                  if (seg.kind === "markdown") {
+                    return (
+                      <div key={`md_${idx}`} className="break-words text-sm leading-relaxed text-foreground/70">
+                        <ReactMarkdown remarkPlugins={[remarkGfm]} components={markdownComponents}>
+                          {seg.text}
+                        </ReactMarkdown>
+                      </div>
+                    );
+                  }
+                  referencedToolIds.add(seg.toolId);
+                  const msg = toolById.get(seg.toolId);
+                  if (!msg) return null;
+                  return <ToolBubble key={msg.id} message={msg} />;
+                })
+              : (
+                  <div className="break-words text-sm leading-relaxed text-foreground/70">
+                    <ReactMarkdown remarkPlugins={[remarkGfm]} components={markdownComponents}>
+                      {message.text}
+                    </ReactMarkdown>
+                  </div>
+                )}
+            {turnTools && turnTools.length
+              ? turnTools
+                  .filter((t) => !referencedToolIds.has(t.id))
+                  .map((t) => <ToolBubble key={t.id} message={t} />)
+              : null}
+          </div>
+        </details>
+      </div>
+    );
+  }
+
+  if (message.role === "tool") {
+    return <ToolBubble message={message} />;
+  }
+
+  return null;
 }
