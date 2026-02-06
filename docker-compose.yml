@@ -54,6 +54,26 @@ services:
       - "3000:80"
     restart: unless-stopped
 
+  telegram-bot:
+    profiles: ["tg"]
+    build:
+      context: ./apps/telegram-bot
+      dockerfile: Dockerfile
+    image: argus-telegram-bot
+    environment:
+      TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:-}
+      ARGUS_TOKEN: ${ARGUS_TOKEN:-}
+      HOST: ${HOST:-gateway}
+    volumes:
+      - telegram-bot-data:/data
+    networks:
+      - argus-net
+    restart: unless-stopped
+
 networks:
   argus-net:
     name: argus-net
+
+volumes:
+  telegram-bot-data:
+    name: argus-telegram-bot-data

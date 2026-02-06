@@ -51,69 +51,173 @@ class LiveDockerSession:
     pump_task: Optional[asyncio.Task[None]]
 
     attach_lock: asyncio.Lock
-    attached_ws: Optional[WebSocket]
+    attached_wss: set[WebSocket]
+    request_handler_ws: Optional[WebSocket]
 
     initialized_result: Optional[dict[str, Any]]
     handshake_done: bool
     pending_initialize_ids: set[str]
+    initialize_waiters: list[tuple[WebSocket, Any]]
+
+    pending_client_requests: dict[str, tuple[WebSocket, Any]]
+    next_upstream_id: int
 
     pending_server_requests: dict[str, str]
     outbox: deque[str]
 
+    turn_owners_by_thread: dict[str, WebSocket]
+
     closed: bool = False
 
-    async def attach(self, ws: WebSocket) -> bool:
+    async def attach(self, ws: WebSocket) -> None:
         async with self.attach_lock:
-            if self.attached_ws is not None and self.attached_ws.client_state == WebSocketState.CONNECTED:
-                return False
-            self.attached_ws = ws
-            return True
+            self.attached_wss.add(ws)
+            if self.request_handler_ws is None or self.request_handler_ws.client_state != WebSocketState.CONNECTED:
+                self.request_handler_ws = ws
 
     async def detach(self, ws: WebSocket) -> None:
         async with self.attach_lock:
-            if self.attached_ws is ws:
-                self.attached_ws = None
+            self.attached_wss.discard(ws)
+            if self.request_handler_ws is ws:
+                self.request_handler_ws = None
+                for candidate in list(self.attached_wss):
+                    if candidate.client_state == WebSocketState.CONNECTED:
+                        self.request_handler_ws = candidate
+                        break
 
-    async def _send_ws(self, text: str) -> None:
-        async with self.attach_lock:
-            ws = self.attached_ws
-        if ws is None or ws.client_state != WebSocketState.CONNECTED:
-            raise RuntimeError("no websocket attached")
-        await ws.send_text(text)
+            for tid, owner in list(self.turn_owners_by_thread.items()):
+                if owner is ws:
+                    self.turn_owners_by_thread.pop(tid, None)
 
-    async def deliver_or_buffer(self, text: str, *, buffer_when_detached: bool = True) -> None:
+            for rid, (pending_ws, _) in list(self.pending_client_requests.items()):
+                if pending_ws is ws:
+                    self.pending_client_requests.pop(rid, None)
+
+            if self.initialize_waiters:
+                self.initialize_waiters = [(w, did) for (w, did) in self.initialize_waiters if w is not ws]
+
+    async def reserve_upstream_id(self, ws: WebSocket, downstream_id: Any) -> int:
         async with self.attach_lock:
-            ws = self.attached_ws
-        if ws is not None and ws.client_state == WebSocketState.CONNECTED:
-            try:
-                await ws.send_text(text)
+            rid = self.next_upstream_id
+            self.next_upstream_id += 1
+            self.pending_client_requests[str(rid)] = (ws, downstream_id)
+            return rid
+
+    async def _send_ws(self, ws: WebSocket, text: str) -> bool:
+        if ws.client_state != WebSocketState.CONNECTED:
+            return False
+        try:
+            await ws.send_text(text)
+            return True
+        except Exception:
+            return False
+
+    async def broadcast(self, text: str, *, buffer_when_detached: bool = True) -> None:
+        async with self.attach_lock:
+            targets = [w for w in self.attached_wss if w.client_state == WebSocketState.CONNECTED]
+
+        if not targets:
+            if not buffer_when_detached:
                 return
-            except Exception:
-                async with self.attach_lock:
-                    if self.attached_ws is ws:
-                        self.attached_ws = None
-        if not buffer_when_detached:
+            self.outbox.append(text)
+            while len(self.outbox) > 2000:
+                self.outbox.popleft()
             return
-        self.outbox.append(text)
-        while len(self.outbox) > 2000:
-            self.outbox.popleft()
 
-    async def flush_pending(self) -> None:
-        async with self.attach_lock:
-            ws = self.attached_ws
-        if ws is None or ws.client_state != WebSocketState.CONNECTED:
-            return
-        for raw in list(self.pending_server_requests.values()):
+        dead: list[WebSocket] = []
+        for w in targets:
             try:
-                await ws.send_text(raw)
+                await w.send_text(text)
             except Exception:
-                break
+                dead.append(w)
+
+        for w in dead:
+            await self.detach(w)
+
+    async def deliver_response(self, msg: dict[str, Any]) -> bool:
+        rid = str(msg.get("id"))
+        async with self.attach_lock:
+            pending = self.pending_client_requests.pop(rid, None)
+        if pending is None:
+            return False
+        ws, downstream_id = pending
+        if ws.client_state != WebSocketState.CONNECTED:
+            return True
+        try:
+            rewritten = dict(msg)
+            rewritten["id"] = downstream_id
+            await ws.send_text(json.dumps(rewritten))
+            return True
+        except Exception:
+            await self.detach(ws)
+            return True
+
+    async def resolve_initialize_waiters(self) -> None:
+        if self.initialized_result is None:
+            return
+        async with self.attach_lock:
+            waiters = list(self.initialize_waiters)
+            self.initialize_waiters.clear()
+        if not waiters:
+            return
+        for ws, downstream_id in waiters:
+            if ws.client_state != WebSocketState.CONNECTED:
+                continue
+            try:
+                await ws.send_text(json.dumps({"id": downstream_id, "result": self.initialized_result}))
+            except Exception:
+                await self.detach(ws)
+
+    async def set_turn_owner(self, *, thread_id: Optional[str], ws: WebSocket) -> None:
+        if not thread_id:
+            return
+        async with self.attach_lock:
+            self.turn_owners_by_thread[thread_id] = ws
+            self.request_handler_ws = ws
+
+    async def clear_turn_owner(self, thread_id: Optional[str]) -> None:
+        if not thread_id:
+            return
+        async with self.attach_lock:
+            self.turn_owners_by_thread.pop(thread_id, None)
+
+    async def deliver_server_request(self, text: str, *, thread_id: Optional[str]) -> None:
+        ws: Optional[WebSocket] = None
+        async with self.attach_lock:
+            if thread_id and thread_id in self.turn_owners_by_thread:
+                candidate = self.turn_owners_by_thread.get(thread_id)
+                if candidate and candidate.client_state == WebSocketState.CONNECTED:
+                    ws = candidate
+                    self.request_handler_ws = candidate
+            if ws is None and self.request_handler_ws is not None and self.request_handler_ws.client_state == WebSocketState.CONNECTED:
+                ws = self.request_handler_ws
+            if ws is None:
+                for candidate in list(self.attached_wss):
+                    if candidate.client_state == WebSocketState.CONNECTED:
+                        ws = candidate
+                        self.request_handler_ws = candidate
+                        break
+        if ws is None:
+            return
+        ok = await self._send_ws(ws, text)
+        if not ok:
+            await self.detach(ws)
+
+    async def flush_pending(self, ws: WebSocket) -> None:
+        if ws.client_state != WebSocketState.CONNECTED:
+            return
+        async with self.attach_lock:
+            is_handler = self.request_handler_ws is ws
+            pending_requests = list(self.pending_server_requests.values()) if is_handler else []
+        for raw in pending_requests:
+            if not await self._send_ws(ws, raw):
+                await self.detach(ws)
+                return
         while self.outbox:
             raw = self.outbox.popleft()
-            try:
-                await ws.send_text(raw)
-            except Exception:
+            if not await self._send_ws(ws, raw):
                 self.outbox.appendleft(raw)
+                await self.detach(ws)
                 break
 
     async def write_upstream(self, text: str) -> None:
@@ -1442,12 +1546,17 @@ async def ws_proxy(ws: WebSocket):
                 cfg=cfg,
                 pump_task=None,
                 attach_lock=asyncio.Lock(),
-                attached_ws=None,
+                attached_wss=set(),
+                request_handler_ws=None,
                 initialized_result=None,
                 handshake_done=False,
                 pending_initialize_ids=set(),
+                initialize_waiters=[],
+                pending_client_requests={},
+                next_upstream_id=1_000_000_000,
                 pending_server_requests={},
                 outbox=deque(),
+                turn_owners_by_thread={},
             )
 
             async def pump() -> None:
@@ -1470,22 +1579,37 @@ async def ws_proxy(ws: WebSocket):
                                 rid = str(msg.get("id"))
                                 if rid not in live.pending_server_requests:
                                     live.pending_server_requests[rid] = text
-                                await live.deliver_or_buffer(text, buffer_when_detached=False)
+                                params = msg.get("params")
+                                thread_id: Optional[str] = None
+                                if isinstance(params, dict):
+                                    tid = params.get("threadId")
+                                    if isinstance(tid, str) and tid.strip():
+                                        thread_id = tid.strip()
+                                await live.deliver_server_request(text, thread_id=thread_id)
                                 continue
 
                             if "id" in msg and "method" not in msg:
                                 rid = str(msg.get("id"))
-                                if rid in live.pending_initialize_ids:
-                                    live.pending_initialize_ids.discard(rid)
-                                    if isinstance(msg.get("result"), dict):
-                                        live.initialized_result = msg["result"]
+                                should_resolve = False
                                 async with live.attach_lock:
-                                    ws_attached = live.attached_ws
-                                if ws_attached is not None and ws_attached.client_state == WebSocketState.CONNECTED:
-                                    await live.deliver_or_buffer(text, buffer_when_detached=False)
+                                    if rid in live.pending_initialize_ids:
+                                        live.pending_initialize_ids.discard(rid)
+                                        if isinstance(msg.get("result"), dict):
+                                            live.initialized_result = msg["result"]
+                                            should_resolve = True
+                                if should_resolve:
+                                    await live.resolve_initialize_waiters()
+                                await live.deliver_response(msg)
                                 continue
 
-                        await live.deliver_or_buffer(text)
+                            if msg.get("method") == "turn/completed":
+                                params = msg.get("params")
+                                if isinstance(params, dict):
+                                    tid = params.get("threadId")
+                                    if isinstance(tid, str) and tid.strip():
+                                        await live.clear_turn_owner(tid.strip())
+
+                        await live.broadcast(text)
                 except Exception:
                     log.exception("Upstream pump failed for session %s", session_id)
                 finally:
@@ -1506,9 +1630,7 @@ async def ws_proxy(ws: WebSocket):
 
             log.info("Provisioned session %s -> %s:%s", session_id, host, 7777)
 
-        if not await live.attach(ws):
-            await ws.close(code=1008, reason="Session already connected")
-            return
+        await live.attach(ws)
 
         try:
             try:
@@ -1528,7 +1650,7 @@ async def ws_proxy(ws: WebSocket):
             except Exception:
                 pass
 
-            await live.flush_pending()
+            await live.flush_pending(ws)
 
             while True:
                 try:
@@ -1544,15 +1666,33 @@ async def ws_proxy(ws: WebSocket):
 
                 if isinstance(msg, dict) and msg.get("method") == "initialize":
                     req_id = msg.get("id")
-                    if live.initialized_result is not None:
+                    if req_id is None:
+                        await live.write_upstream(text)
+                        continue
+                    cached_result: Optional[dict[str, Any]] = None
+                    forward: Optional[str] = None
+                    async with live.attach_lock:
+                        if live.initialized_result is not None:
+                            cached_result = live.initialized_result
+                        elif live.pending_initialize_ids:
+                            live.initialize_waiters.append((ws, req_id))
+                        else:
+                            upstream_id = live.next_upstream_id
+                            live.next_upstream_id += 1
+                            live.pending_client_requests[str(upstream_id)] = (ws, req_id)
+                            live.pending_initialize_ids.add(str(upstream_id))
+                            rewritten = dict(msg)
+                            rewritten["id"] = upstream_id
+                            forward = json.dumps(rewritten)
+                    if cached_result is not None:
                         try:
-                            await live._send_ws(json.dumps({"id": req_id, "result": live.initialized_result}))
+                            await ws.send_text(json.dumps({"id": req_id, "result": cached_result}))
                         except Exception:
                             pass
                         continue
-                    if req_id is not None:
-                        live.pending_initialize_ids.add(str(req_id))
-                    await live.write_upstream(text)
+                    if forward is None:
+                        continue
+                    await live.write_upstream(forward)
                     continue
 
                 if isinstance(msg, dict) and msg.get("method") == "initialized":
@@ -1567,6 +1707,20 @@ async def ws_proxy(ws: WebSocket):
                     if rid in live.pending_server_requests:
                         live.pending_server_requests.pop(rid, None)
                     await live.write_upstream(text)
+                    continue
+
+                if isinstance(msg, dict) and "id" in msg and "method" in msg:
+                    downstream_id = msg.get("id")
+                    upstream_id = await live.reserve_upstream_id(ws, downstream_id)
+                    rewritten = dict(msg)
+                    rewritten["id"] = upstream_id
+                    if rewritten.get("method") == "turn/start":
+                        params = rewritten.get("params")
+                        if isinstance(params, dict):
+                            tid = params.get("threadId")
+                            if isinstance(tid, str) and tid.strip():
+                                await live.set_turn_owner(thread_id=tid.strip(), ws=ws)
+                    await live.write_upstream(json.dumps(rewritten))
                     continue
 
                 await live.write_upstream(text)

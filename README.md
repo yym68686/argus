@@ -50,6 +50,40 @@ docker compose --profile web up --build web
 open http://127.0.0.1:3000
 ```
 
+可选：启动 Telegram Bot（v0；仅在 `turn/completed` 后回 1 条最终文本）
+
+```bash
+export TELEGRAM_BOT_TOKEN="123:abc..."
+docker compose --profile tg up --build telegram-bot
+```
+
+> 如果你希望 bot 在群里“任何消息都触发回复”，需要在 BotFather 里关闭 Group Privacy。
+
+> `telegram-bot` 不会自动拉起 `gateway`；如需一起启动：
+>
+> `docker compose --profile tg up --build gateway telegram-bot`
+
+该 bot 默认复用仓库已有的连接配置：
+
+- `HOST`（默认 `127.0.0.1`；在 Docker Compose 内若 `HOST=127.0.0.1/localhost` 会自动改用 `gateway` 以连接网关容器）
+- `ARGUS_TOKEN`（可选；用于访问网关 `/ws` 与 `/sessions`）
+
+你也可以把 bot 跑在 Docker 之外（例如跑在你的 Mac 上），只要能访问网关即可：
+
+```bash
+cd apps/telegram-bot
+npm i
+export TELEGRAM_BOT_TOKEN="123:abc..."
+export HOST="your.gateway.host:8080"
+export ARGUS_TOKEN="change-me"
+node index.mjs
+```
+
+最小命令：
+
+- `/where`：查看当前 `sessionId` / `threadId`
+- `/new`：为当前 chat/topic 新开 thread
+
 停止：
 
 ```bash
@@ -61,6 +95,7 @@ docker compose down
 - `Dockerfile`: runtime 镜像（app-server JSONL stdio → TCP `:7777`）
 - `apps/api/`: FastAPI 网关（HTTP + WS `/ws`），支持 `ARGUS_PROVISION_MODE=docker` 自动创建后端容器（默认保留；用 `GET/DELETE /sessions` 管理）
 - `apps/web/`: React 前端（Next.js + Tailwind v4），可选启动（`docker compose --profile web ...`）
+- `apps/telegram-bot/`: Telegram Bot（v0；可选启动：`docker compose --profile tg ...`）
 - `docker-compose.yml`: 本机/服务器一键启动（网关会通过挂载的 `docker.sock` 创建容器）
 - `client_smoke.py`: 最小化 smoke client（用于调试后端 TCP JSONL 端口）
 - `REMOTE_CLIENT_GUIDE.md`: 外部客户端接入文档（协议/示例/重连）
