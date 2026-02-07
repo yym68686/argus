@@ -37,7 +37,7 @@ services:
     volumes:
       # WARNING: mounting the Docker socket grants root-equivalent access to the host.
       - ${DOCKER_SOCK:-/var/run/docker.sock}:/var/run/docker.sock
-      # Persist gateway automation state + HEARTBEAT.md under ARGUS_HOME_HOST_PATH.
+      # Persist gateway automation state under ARGUS_HOME_HOST_PATH.
       - ${ARGUS_HOME_HOST_PATH:-${HOME}/.argus}:${ARGUS_HOME_HOST_PATH:-${HOME}/.argus}
     ports:
       - "8080:8080"

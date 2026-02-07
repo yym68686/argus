@@ -116,7 +116,8 @@ python3 -m py_compile apps/api/app.py client_smoke.py
 Gateway 内置一个最小的自动化机制（用于 cron/heartbeat 触发“后台 turn”）：
 
 - 持久化位置：`$ARGUS_HOME_HOST_PATH/gateway/state.json`（未设置 `ARGUS_HOME_HOST_PATH` 时会落到 `/tmp` 并打印 warning）
-- Heartbeat 提示词：会读取并内嵌 `$ARGUS_HOME_HOST_PATH/HEARTBEAT.md`（首次启动若不存在，会用 `docs/templates/HEARTBEAT.md` 初始化）
+- Workspace 初始化：首次启动会在 workspace 根目录生成 `AGENTS.md` / `SOUL.md` / `USER.md` / `HEARTBEAT.md`（来自 `docs/templates/*`；若文件已存在则不覆盖）
+- Project Context：每次通过 `argus/input/enqueue`/follow-up/heartbeat 启动 turn 时，会把 workspace 里的 `AGENTS.md` / `SOUL.md` / `USER.md` 拼到 user prompt 的 `# Project Context`；heartbeat 会额外拼 `HEARTBEAT.md`
 
 常用接口（都需要 `Authorization: Bearer $ARGUS_TOKEN`）：
 

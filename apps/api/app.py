@@ -282,6 +282,19 @@ def _atomic_write_text(path: Path, content: str) -> None:
 HEARTBEAT_FILENAME = "HEARTBEAT.md"
 HEARTBEAT_TASKS_INTERVAL_MS = 30 * 60 * 1000
 
+AGENTS_FILENAME = "AGENTS.md"
+AGENTS_TEMPLATE_FILENAME = "AGENTS.default.md"
+SOUL_FILENAME = "SOUL.md"
+USER_FILENAME = "USER.md"
+
+PROJECT_CONTEXT_FILENAMES: list[str] = [AGENTS_FILENAME, SOUL_FILENAME, USER_FILENAME]
+WORKSPACE_BOOTSTRAP_TEMPLATES: list[tuple[str, str]] = [
+    (AGENTS_TEMPLATE_FILENAME, AGENTS_FILENAME),
+    (SOUL_FILENAME, SOUL_FILENAME),
+    (USER_FILENAME, USER_FILENAME),
+    (HEARTBEAT_FILENAME, HEARTBEAT_FILENAME),
+]
+
 
 def _strip_yaml_front_matter(raw: str) -> str:
     text = raw.lstrip("\ufeff")
@@ -321,13 +334,21 @@ def _resolve_repo_root() -> Path:
     return Path(__file__).resolve().parents[2]
 
 
-def _load_heartbeat_template_text() -> str:
-    template_path = _resolve_repo_root() / "docs" / "templates" / HEARTBEAT_FILENAME
+def _load_template_text(template_filename: str) -> Optional[str]:
+    if not isinstance(template_filename, str) or not template_filename.strip():
+        return None
+    name = template_filename.strip()
+    if "/" in name or "\\" in name:
+        return None
+    template_path = _resolve_repo_root() / "docs" / "templates" / name
     try:
         return template_path.read_text(encoding="utf-8")
     except Exception:
-        # Keep a safe fallback; don't fail gateway startup if template is missing.
-        return "# HEARTBEAT.md\n\n"
+        return None
+
+
+def _load_heartbeat_template_text() -> str:
+    return _load_template_text(HEARTBEAT_FILENAME) or "# HEARTBEAT.md\n\n"
 
 
 @dataclass
@@ -576,9 +597,16 @@ class ThreadLane:
 
 
 class AutomationManager:
-    def __init__(self, *, state_store: AutomationStateStore, home_host_path: Optional[str]) -> None:
+    def __init__(
+        self,
+        *,
+        state_store: AutomationStateStore,
+        home_host_path: Optional[str],
+        workspace_host_path: Optional[str],
+    ) -> None:
         self._store = state_store
         self._home_host_path = home_host_path
+        self._workspace_host_path = workspace_host_path
 
         self._lanes: dict[tuple[str, str], ThreadLane] = {}
         self._cron_wakeup = asyncio.Event()
@@ -591,33 +619,50 @@ class AutomationManager:
 
     async def start(self) -> None:
         await self._store.load()
-        await self._ensure_heartbeat_files()
+        await self._ensure_workspace_files()
         self._tasks.append(asyncio.create_task(self._bootstrap_loop()))
         self._tasks.append(asyncio.create_task(self._cron_loop()))
         self._tasks.append(asyncio.create_task(self._heartbeat_loop()))
 
-    async def _ensure_heartbeat_files(self) -> None:
-        if not self._home_host_path:
-            return
-        home = Path(self._home_host_path)
-        template_raw = _load_heartbeat_template_text()
-        template_clean = _strip_yaml_front_matter(template_raw).strip()
-        if template_clean:
-            template_clean += "\n"
+    def _workspace_root(self) -> Optional[Path]:
+        if self._workspace_host_path:
+            return Path(self._workspace_host_path)
+        if self._home_host_path:
+            return Path(self._home_host_path) / "workspace"
+        return None
 
-        template_path = home / "docs" / "templates" / HEARTBEAT_FILENAME
-        heartbeat_path = home / HEARTBEAT_FILENAME
+    async def _ensure_workspace_files(self) -> None:
+        root = self._workspace_root()
+        if root is None:
+            return
 
         def _ensure() -> None:
-            if not template_path.exists():
-                _atomic_write_text(template_path, template_raw)
-            if not heartbeat_path.exists():
-                _atomic_write_text(heartbeat_path, template_clean or "# HEARTBEAT.md\n")
+            root.mkdir(parents=True, exist_ok=True)
+            legacy_home = Path(self._home_host_path) if self._home_host_path else None
+            for template_name, target_name in WORKSPACE_BOOTSTRAP_TEMPLATES:
+                target_path = root / target_name
+                if target_path.exists():
+                    continue
+                # Migration: if legacy HEARTBEAT.md exists in home, keep it.
+                if legacy_home is not None and target_name == HEARTBEAT_FILENAME:
+                    legacy_heartbeat = legacy_home / HEARTBEAT_FILENAME
+                    if legacy_heartbeat.exists():
+                        try:
+                            _atomic_write_text(target_path, legacy_heartbeat.read_text(encoding="utf-8"))
+                            continue
+                        except Exception:
+                            pass
+
+                template_raw = _load_template_text(template_name) or f"# {target_name}\n"
+                template_clean = _strip_yaml_front_matter(template_raw).strip()
+                if template_clean:
+                    template_clean += "\n"
+                _atomic_write_text(target_path, template_clean or f"# {target_name}\n")
 
         try:
             await asyncio.to_thread(_ensure)
         except Exception:
-            log.exception("Failed to initialize heartbeat files under %s", self._home_host_path)
+            log.exception("Failed to initialize workspace templates under %s", str(root))
 
     async def stop(self) -> None:
         for t in self._tasks:
@@ -939,15 +984,49 @@ class AutomationManager:
             lines.append(f"{i}) {t.strip()}")
         return "\n".join(lines).strip()
 
+    async def _read_project_context_block(self, *, include_heartbeat: bool) -> str:
+        root = self._workspace_root()
+        if root is None:
+            return ""
+
+        filenames = list(PROJECT_CONTEXT_FILENAMES)
+        if include_heartbeat:
+            filenames.append(HEARTBEAT_FILENAME)
+
+        def _read() -> str:
+            blocks: list[str] = []
+            for name in filenames:
+                p = root / name
+                try:
+                    content = p.read_text(encoding="utf-8")
+                except FileNotFoundError:
+                    continue
+                except Exception as e:  # noqa: BLE001
+                    blocks.append(f"[{name}]\n(failed to read {name}: {e})\n[/{name}]")
+                    continue
+
+                blocks.append(f"[{name}]\n{content.strip()}\n[/{name}]")
+
+            if not blocks:
+                return ""
+            return "# Project Context\n\n" + "\n\n".join(blocks)
+
+        try:
+            return await asyncio.to_thread(_read)
+        except Exception:
+            log.exception("Failed to read project context from workspace")
+            return ""
+
     async def _assemble_turn_input(self, session_id: str, thread_id: str, *, user_text: str, heartbeat: bool) -> str:
         drained = await self._drain_system_events(session_id, thread_id, max_events=20)
         blocks: list[str] = []
 
+        project_context = await self._read_project_context_block(include_heartbeat=heartbeat)
+        if project_context:
+            blocks.append(project_context)
+
         if heartbeat:
-            blocks.append(
-                "HEARTBEAT: You are running a background heartbeat. Read and follow HEARTBEAT.md (embedded below)."
-            )
-            blocks.append(self._read_heartbeat_md_block())
+            blocks.append("HEARTBEAT: You are running a background heartbeat. Read and follow HEARTBEAT.md in # Project Context.")
         elif user_text.strip():
             blocks.append(user_text.strip())
 
@@ -993,13 +1072,22 @@ class AutomationManager:
         return out
 
     def _read_heartbeat_md_block(self) -> str:
-        if not self._home_host_path:
-            return "[HEARTBEAT.md]\n(missing ARGUS_HOME_HOST_PATH)\n[/HEARTBEAT.md]"
-        p = Path(self._home_host_path) / "HEARTBEAT.md"
+        root = self._workspace_root()
+        if root is None:
+            return "[HEARTBEAT.md]\n(missing workspace)\n[/HEARTBEAT.md]"
+        p = root / HEARTBEAT_FILENAME
         try:
             content = p.read_text(encoding="utf-8")
         except FileNotFoundError:
-            content = "(missing HEARTBEAT.md)"
+            # Back-compat: older setups stored HEARTBEAT.md under `$ARGUS_HOME_HOST_PATH/HEARTBEAT.md`.
+            legacy = Path(self._home_host_path) / HEARTBEAT_FILENAME if self._home_host_path else None
+            if legacy is not None and legacy.exists():
+                try:
+                    content = legacy.read_text(encoding="utf-8")
+                except Exception as e:  # noqa: BLE001
+                    content = f"(failed to read legacy HEARTBEAT.md: {e})"
+            else:
+                content = "(missing HEARTBEAT.md)"
         except Exception as e:  # noqa: BLE001
             content = f"(failed to read HEARTBEAT.md: {e})"
         return "[HEARTBEAT.md]\n" + content.strip() + "\n[/HEARTBEAT.md]"
@@ -1124,13 +1212,24 @@ class AutomationManager:
         return now_ms - last >= HEARTBEAT_TASKS_INTERVAL_MS
 
     async def _heartbeat_has_actionable_content(self) -> bool:
-        if not self._home_host_path:
+        root = self._workspace_root()
+        if root is None:
             return False
-        p = Path(self._home_host_path) / HEARTBEAT_FILENAME
+        p = root / HEARTBEAT_FILENAME
         try:
             raw = await asyncio.to_thread(p.read_text, "utf-8")
         except FileNotFoundError:
-            return False
+            # Back-compat: older setups stored HEARTBEAT.md under `$ARGUS_HOME_HOST_PATH/HEARTBEAT.md`.
+            if not self._home_host_path:
+                return False
+            legacy = Path(self._home_host_path) / HEARTBEAT_FILENAME
+            try:
+                raw = await asyncio.to_thread(legacy.read_text, "utf-8")
+            except FileNotFoundError:
+                return False
+            except Exception:
+                log.exception("Failed to read legacy %s for heartbeat gating", str(legacy))
+                return False
         except Exception:
             log.exception("Failed to read %s for heartbeat gating", str(p))
             return False
@@ -1471,6 +1570,7 @@ async def _startup():
     app.state.mcp_sessions: dict[str, McpSessionState] = {}
 
     home_host_path = os.getenv("ARGUS_HOME_HOST_PATH") or None
+    workspace_host_path = os.getenv("ARGUS_WORKSPACE_HOST_PATH") or None
     if home_host_path:
         state_path = Path(home_host_path) / "gateway" / "state.json"
     else:
@@ -1478,7 +1578,11 @@ async def _startup():
         log.warning("ARGUS_HOME_HOST_PATH is not set; automation state will be stored at %s", str(state_path))
 
     app.state.automation_store = AutomationStateStore(state_path)
-    app.state.automation = AutomationManager(state_store=app.state.automation_store, home_host_path=home_host_path)
+    app.state.automation = AutomationManager(
+        state_store=app.state.automation_store,
+        home_host_path=home_host_path,
+        workspace_host_path=workspace_host_path,
+    )
     await app.state.automation.start()
 
 

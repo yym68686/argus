@@ -18,6 +18,8 @@ RUN mkdir -p /root/.argus/workspace /app \
   && if [ -e /workspace ]; then rm -rf /workspace; fi \
   && ln -s /root/.argus/workspace /workspace
 
+COPY docs/templates /app/docs/templates
+
 COPY run_app_server.sh /app/run_app_server.sh
 RUN chmod +x /app/run_app_server.sh
 
