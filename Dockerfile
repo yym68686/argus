@@ -12,16 +12,16 @@ RUN if [ -z "${APP_SERVER_INSTALL_CMD:-}" ]; then \
     fi \
     && sh -lc "$APP_SERVER_INSTALL_CMD"
 
-ENV APP_HOME=/agent-home
+ENV APP_HOME=/root/.argus
 
-RUN mkdir -p /agent-home /workspace /app \
-  && chown -R node:node /agent-home /workspace /app
+RUN mkdir -p /root/.argus/workspace /app \
+  && if [ -e /workspace ]; then rm -rf /workspace; fi \
+  && ln -s /root/.argus/workspace /workspace
 
 COPY run_app_server.sh /app/run_app_server.sh
 RUN chmod +x /app/run_app_server.sh
 
-USER node
-WORKDIR /workspace
+WORKDIR /root/.argus/workspace
 
 EXPOSE 7777
 

@@ -12,14 +12,17 @@ FastAPI 网关 + WebSocket `/ws`，用于把“app-server runtime”（JSONL ove
 
 - 已安装 `docker` + `docker compose`
 - 已配置 runtime 安装命令与启动命令（见 `docker-compose.yml` 里的 `ARGUS_RUNTIME_INSTALL_CMD` / `ARGUS_RUNTIME_CMD`）
-- 已准备好 `ARGUS_HOME_HOST_PATH`（runtime 的 home 目录挂载点；用于持久化配置/凭据）
+- `ARGUS_HOME_HOST_PATH`（runtime 的 home 目录挂载点；用于持久化配置/凭据；默认 workspace 也会落在其子目录 `workspace/`；未设置时默认 `${HOME}/.argus`）
+- 可选（高级）：`ARGUS_WORKSPACE_HOST_PATH`（把一个现成目录挂到 runtime 的 workspace；不设置则使用 `${ARGUS_HOME_HOST_PATH}/workspace`）
 
 最小环境变量示例（按你的 runtime 实际情况填写）：
 
 ```bash
 export ARGUS_RUNTIME_INSTALL_CMD="<install your agent/app-server runtime>"
 export ARGUS_RUNTIME_CMD="<start your app-server command>"
-export ARGUS_HOME_HOST_PATH="$(pwd)/.argus-home"
+# 可选：不设置则默认 `${HOME}/.argus`
+export ARGUS_HOME_HOST_PATH="${HOME}/.argus"
+# Optional (advanced):
 export ARGUS_WORKSPACE_HOST_PATH="$(pwd)"
 ```
 
@@ -107,6 +110,27 @@ docker compose down
 ```bash
 python3 -m py_compile apps/api/app.py client_smoke.py
 ```
+
+## Automation（systemEvent / followup queue / heartbeat / cron）
+
+Gateway 内置一个最小的自动化机制（用于 cron/heartbeat 触发“后台 turn”）：
+
+- 持久化位置：`$ARGUS_HOME_HOST_PATH/gateway/state.json`（未设置 `ARGUS_HOME_HOST_PATH` 时会落到 `/tmp` 并打印 warning）
+- Heartbeat 提示词：会读取并内嵌 `$ARGUS_HOME_HOST_PATH/HEARTBEAT.md`（首次启动若不存在，会用 `docs/templates/HEARTBEAT.md` 初始化）
+
+常用接口（都需要 `Authorization: Bearer $ARGUS_TOKEN`）：
+
+- 立即触发 heartbeat：`POST /automation/heartbeat/now`
+- 入队一个 systemEvent（默认进 main thread）：`POST /automation/systemEvent/enqueue`
+- Cron jobs：
+  - 列表：`GET /automation/cron/jobs`
+  - 创建/更新：`POST /automation/cron/jobs`（`expr` 直接用 cron 表达式）
+  - 删除：`DELETE /automation/cron/jobs/{jobId}`
+
+WebSocket `/ws` 也提供同名的 JSON-RPC helper（推荐客户端用）：
+
+- `argus/input/enqueue`：如果 thread 正在执行 turn，则排队为 “follow-up（下一个 turn）”，并在当前 turn 完成后自动批量执行
+- `argus/systemEvent/enqueue` / `argus/heartbeat/request` / `argus/thread/main/ensure`
 
 ## Nodes + MCP（可选）
 

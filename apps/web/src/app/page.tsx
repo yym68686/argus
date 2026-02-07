@@ -517,7 +517,7 @@ export default function Page() {
   type ActivePane = "chat" | "connection";
 
   const [wsUrl, setWsUrl] = React.useState<string>("");
-  const [cwd, setCwd] = React.useState<string>("/workspace");
+  const [cwd, setCwd] = React.useState<string>("/root/.argus/workspace");
   const [approvalPolicy, setApprovalPolicy] = React.useState<ApprovalPolicy>("never");
 
   const [activePane, setActivePane] = React.useState<ActivePane>("chat");
@@ -557,6 +557,7 @@ export default function Page() {
     nextId: number;
     pending: Map<number, { resolve: (v: JsonValue) => void; reject: (e: Error) => void }>;
     initialized: boolean;
+    gatewayEnqueueSupported: boolean | null;
     sessionIdPromise: Promise<string>;
     resolveSessionId: (id: string) => void;
     rejectSessionId: (e: Error) => void;
@@ -569,6 +570,8 @@ export default function Page() {
 
   const chatScrollRef = React.useRef<HTMLDivElement | null>(null);
   const composingRef = React.useRef<boolean>(false);
+  const followupQueuesRef = React.useRef<Map<string, string[]>>(new Map());
+  const followupStartInFlightRef = React.useRef<Set<string>>(new Set());
 
   const activeThreadKey =
     activeSessionId && activeThreadId ? `${activeSessionId}:${activeThreadId}` : null;
@@ -616,17 +619,7 @@ export default function Page() {
     });
   }, [activeChat?.messages, activeChat?.turnInProgress, activeChat?.turnId, reasoningTurnIds]);
 
-  const isActiveSessionBusy = React.useMemo(() => {
-    if (!activeSessionId) return false;
-    const prefix = `${activeSessionId}:`;
-    for (const [k, v] of Object.entries(chatByThreadKey)) {
-      if (!k.startsWith(prefix)) continue;
-      if (v.turnInProgress) return true;
-    }
-    return false;
-  }, [activeSessionId, chatByThreadKey]);
-
-  const canSend = !!prompt.trim() && !isActiveSessionBusy;
+  const canSend = !!prompt.trim();
 
   React.useEffect(() => {
     chatScrollRef.current?.scrollTo({ top: chatScrollRef.current.scrollHeight });
@@ -707,6 +700,7 @@ export default function Page() {
       nextId: 1,
       pending: new Map(),
       initialized: false,
+      gatewayEnqueueSupported: null,
       sessionIdPromise,
       resolveSessionId,
       rejectSessionId
@@ -758,6 +752,109 @@ export default function Page() {
         reject(new Error(`Timeout waiting for response to ${method} (${id})`));
       }, 120000);
     });
+  }
+
+  function isArgusEnqueueUnsupportedError(err: unknown): boolean {
+    const msg = (err as Error)?.message || String(err);
+    return (
+      msg.includes("unknown variant `argus/input/enqueue`") ||
+      msg.includes("Method not found: argus/input/enqueue") ||
+      msg.includes("Automation is not available")
+    );
+  }
+
+  async function startTurnDirect(sessionId: string, threadId: string, text: string): Promise<string | null> {
+    const result = await rpc(sessionId, "turn/start", {
+      threadId,
+      input: [{ type: "text", text }],
+      cwd,
+      approvalPolicy,
+      sandboxPolicy: { type: "dangerFullAccess" }
+    });
+    const tid = (result as { turn?: { id?: string } })?.turn?.id;
+    return isNonEmptyString(tid) ? tid : null;
+  }
+
+  async function sendOrQueueUserInput(
+    sessionId: string,
+    threadId: string,
+    text: string,
+    opts: { wasBusy: boolean }
+  ): Promise<string | null> {
+    const rt = runtimesRef.current.get(sessionId);
+    if (!rt) throw new Error("Not connected");
+
+    if (rt.gatewayEnqueueSupported !== false) {
+      try {
+        const result = await rpc(sessionId, "argus/input/enqueue", { threadId, text });
+        rt.gatewayEnqueueSupported = true;
+        const turnId = (result as { turnId?: string | null })?.turnId;
+        return isNonEmptyString(turnId) ? turnId : null;
+      } catch (e) {
+        if (!isArgusEnqueueUnsupportedError(e)) throw e;
+        rt.gatewayEnqueueSupported = false;
+      }
+    }
+
+    if (opts.wasBusy) {
+      const key = threadKey(sessionId, threadId);
+      const q = followupQueuesRef.current.get(key) ?? [];
+      q.push(text);
+      followupQueuesRef.current.set(key, q);
+      return null;
+    }
+
+    return await startTurnDirect(sessionId, threadId, text);
+  }
+
+  async function maybeStartQueuedFollowupTurn(sessionId: string, threadId: string): Promise<void> {
+    const rt = runtimesRef.current.get(sessionId);
+    if (!rt || rt.gatewayEnqueueSupported !== false) return;
+
+    const key = threadKey(sessionId, threadId);
+    if (followupStartInFlightRef.current.has(key)) return;
+
+    const queued = followupQueuesRef.current.get(key);
+    if (!queued || queued.length === 0) return;
+
+    const merged = queued.join("\n\n").trim();
+    followupQueuesRef.current.delete(key);
+    if (!merged) return;
+
+    followupStartInFlightRef.current.add(key);
+
+    setChatByThreadKey((prev) => {
+      const current = prev[key] ?? emptyThreadChatState();
+      return {
+        ...prev,
+        [key]: {
+          ...current,
+          turnInProgress: true,
+          turnId: null,
+          reasoningSummary: "",
+          reasoningSummaryIndex: null,
+          hydrated: true
+        }
+      };
+    });
+
+    try {
+      const turnId = await startTurnDirect(sessionId, threadId, merged);
+      if (isNonEmptyString(turnId)) {
+        setChatByThreadKey((prev) => {
+          const current = prev[key] ?? { ...emptyThreadChatState(), turnInProgress: true };
+          return { ...prev, [key]: { ...current, turnId } };
+        });
+      }
+    } catch (e) {
+      setChatByThreadKey((prev) => {
+        const current = prev[key] ?? emptyThreadChatState();
+        return { ...prev, [key]: { ...current, turnInProgress: false, turnId: null } };
+      });
+      toast.error((e as Error)?.message || String(e));
+    } finally {
+      followupStartInFlightRef.current.delete(key);
+    }
   }
 
   async function initializeSession(sessionId: string): Promise<void> {
@@ -1321,6 +1418,7 @@ export default function Page() {
       const incomingTurnId = getString(turn["id"]);
       setThreadTurnCompleted(sessionId, incomingThreadId, incomingTurnId);
       void refreshThreadsForSession(sessionId, { silent: true });
+      void maybeStartQueuedFollowupTurn(sessionId, incomingThreadId);
       return;
     }
   }
@@ -1360,6 +1458,7 @@ export default function Page() {
       rt.initialized = false;
       rt.nextId = 1;
       rt.pending.clear();
+      rt.gatewayEnqueueSupported = null;
 
       const prev = rt.ws;
       if (prev && (prev.readyState === WebSocket.OPEN || prev.readyState === WebSocket.CONNECTING)) {
@@ -1456,6 +1555,7 @@ export default function Page() {
       nextId: 1,
       pending: new Map(),
       initialized: false,
+      gatewayEnqueueSupported: null,
       sessionIdPromise,
       resolveSessionId,
       rejectSessionId
@@ -1559,12 +1659,11 @@ export default function Page() {
     await connectNewSession();
   }
 
-	  async function sendTurn(): Promise<void> {
-	    const text = prompt.trim();
-	    if (!text) return;
-	    if (isActiveSessionBusy) return;
+		  async function sendTurn(): Promise<void> {
+		    const text = prompt.trim();
+		    if (!text) return;
 
-	    try {
+		    try {
 	      let sessionId = activeSessionId;
 	      if (!isNonEmptyString(sessionId)) {
 	        const list = sessions ?? (await refreshSessions({ silent: true, throwOnError: true }));
@@ -1592,11 +1691,12 @@ export default function Page() {
 
 	      setActivePane("chat");
 	      setActiveSessionId(sessionId);
-	      setActiveThreadId(threadId);
+		      setActiveThreadId(threadId);
 
-	      const key = threadKey(sessionId, threadId);
-	      const userMsg: ChatMessage = { id: nowId("u"), role: "user", text };
-	      const preview = promptToThreadPreview(text);
+		      const key = threadKey(sessionId, threadId);
+		      const wasBusy = chatByThreadKey[key]?.turnInProgress ?? false;
+		      const userMsg: ChatMessage = { id: nowId("u"), role: "user", text };
+		      const preview = promptToThreadPreview(text);
 
 	      setThreadsBySession((prev) => {
 	        const existing = prev[sessionId];
@@ -1631,31 +1731,26 @@ export default function Page() {
 	          }
 	        };
 	      });
-	      setPrompt("");
+		      setPrompt("");
 
-		      try {
-		        const result = await rpc(sessionId, "turn/start", {
-		          threadId,
-		          input: [{ type: "text", text }],
-		          cwd,
-		          approvalPolicy,
-		          sandboxPolicy: { type: "dangerFullAccess" }
-		        });
-		        const turnId = (result as { turn?: { id?: string } })?.turn?.id;
-		        if (isNonEmptyString(turnId)) {
+			      try {
+			        const turnId = await sendOrQueueUserInput(sessionId, threadId, text, { wasBusy });
+			        if (isNonEmptyString(turnId)) {
+			          setChatByThreadKey((prev) => {
+			            const current = prev[key] ?? { ...emptyThreadChatState(), turnInProgress: true };
+		            return { ...prev, [key]: { ...current, turnId } };
+		          });
+		        }
+		      } catch (e) {
+		        if (!wasBusy) {
 		          setChatByThreadKey((prev) => {
 		            const current = prev[key] ?? { ...emptyThreadChatState(), turnInProgress: true };
-	            return { ...prev, [key]: { ...current, turnId } };
-	          });
-	        }
-	      } catch (e) {
-	        setChatByThreadKey((prev) => {
-	          const current = prev[key] ?? { ...emptyThreadChatState(), turnInProgress: true };
-	          return { ...prev, [key]: { ...current, turnInProgress: false, turnId: null } };
-	        });
-	        throw e;
-	      }
-	    } catch (e) {
+		            return { ...prev, [key]: { ...current, turnInProgress: false, turnId: null } };
+		          });
+		        }
+		        throw e;
+		      }
+		    } catch (e) {
 	      toast.error((e as Error)?.message || String(e));
 	    }
 	  }
@@ -2454,19 +2549,18 @@ export default function Page() {
 	                          <Paperclip className="h-4 w-4" />
 	                        </button>
 	
-	                        <textarea
-	                          value={prompt}
-	                          onChange={(e) => setPrompt(e.target.value)}
+		                        <textarea
+		                          value={prompt}
+		                          onChange={(e) => setPrompt(e.target.value)}
 	                          onCompositionStart={() => {
 	                            composingRef.current = true;
 	                          }}
-	                          onCompositionEnd={() => {
-	                            composingRef.current = false;
-	                          }}
-	                          placeholder="Message Argus…"
-	                          disabled={isActiveSessionBusy}
-	                          rows={1}
-	                          className={cn(
+		                          onCompositionEnd={() => {
+		                            composingRef.current = false;
+		                          }}
+		                          placeholder="Message Argus…"
+		                          rows={1}
+		                          className={cn(
 	                            "min-h-10 flex-1 resize-none bg-transparent px-2 py-2 text-sm text-foreground outline-none",
 	                            "placeholder:text-muted-foreground/70"
 	                          )}

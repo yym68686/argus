@@ -21,8 +21,9 @@ services:
       ARGUS_PROVISION_MODE: docker
       ARGUS_RUNTIME_IMAGE: argus-runtime
       ARGUS_DOCKER_NETWORK: argus-net
-      ARGUS_HOME_HOST_PATH: ${ARGUS_HOME_HOST_PATH:-/srv/argus}
-      ARGUS_WORKSPACE_HOST_PATH: ${ARGUS_WORKSPACE_HOST_PATH:-/srv/argus/workspace}
+      ARGUS_HOME_HOST_PATH: ${ARGUS_HOME_HOST_PATH:-${HOME}/.argus}
+      # Optional (advanced): mount a separate host workspace; when unset, runtime uses `${ARGUS_HOME_HOST_PATH}/workspace`.
+      ARGUS_WORKSPACE_HOST_PATH: ${ARGUS_WORKSPACE_HOST_PATH:-}
       # Command executed inside each spawned runtime container.
       ARGUS_RUNTIME_CMD: ${ARGUS_RUNTIME_CMD:-codex app-server}
       # Optional: require auth for /ws (Authorization: Bearer ... or ?token=...).
@@ -36,6 +37,8 @@ services:
     volumes:
       # WARNING: mounting the Docker socket grants root-equivalent access to the host.
       - ${DOCKER_SOCK:-/var/run/docker.sock}:/var/run/docker.sock
+      # Persist gateway automation state + HEARTBEAT.md under ARGUS_HOME_HOST_PATH.
+      - ${ARGUS_HOME_HOST_PATH:-${HOME}/.argus}:${ARGUS_HOME_HOST_PATH:-${HOME}/.argus}
     ports:
       - "8080:8080"
     networks:

@@ -92,7 +92,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="Minimal app-server TCP smoke test (Argus).")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=7777)
-    parser.add_argument("--cwd", default="/workspace")
+    parser.add_argument("--cwd", default="/root/.argus/workspace")
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument("--cmd", help="Run command/exec with a single argv0 (e.g. pwd).")
     mode.add_argument("--prompt", help="Start a thread and send a turn (chat).")

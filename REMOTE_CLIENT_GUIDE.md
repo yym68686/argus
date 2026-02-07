@@ -57,7 +57,7 @@ ws://$HOST:8080/ws?token=<ARGUS_TOKEN>
 ```
 
 3) 点 `Connect`，成功后状态会显示 `connected`，并自动初始化 + 新建/恢复 thread  
-4) 输入框里发消息即可（该 UI 会等待 `turn/completed` 后才允许发下一条）
+4) 输入框里发消息即可（UI 支持连续发送；同一 thread 忙时会排队成 follow-up，在当前 turn 完成后自动触发下一次 turn）
 
 如果你要“重连同一个容器”：
 
@@ -123,7 +123,7 @@ curl -sS -X DELETE -H "Authorization: Bearer $ARGUS_TOKEN" "http://$HOST:8080/se
 
 #### 新开 thread
 ```json
-{"method":"thread/start","id":1,"params":{"cwd":"/workspace","approvalPolicy":"never","sandbox":"workspace-write"}}
+{"method":"thread/start","id":1,"params":{"cwd":"/root/.argus/workspace","approvalPolicy":"never","sandbox":"workspace-write"}}
 ```
 
 响应示例（拿到 `thread.id`，务必保存）：
@@ -143,7 +143,7 @@ curl -sS -X DELETE -H "Authorization: Bearer $ARGUS_TOKEN" "http://$HOST:8080/se
 
 #### 发起一次对话 turn（发 prompt）
 ```json
-{"method":"turn/start","id":3,"params":{"threadId":"thr_123","input":[{"type":"text","text":"say test"}],"cwd":"/workspace","approvalPolicy":"never","sandboxPolicy":{"type":"externalSandbox","networkAccess":"enabled"}}}
+{"method":"turn/start","id":3,"params":{"threadId":"thr_123","input":[{"type":"text","text":"say test"}],"cwd":"/root/.argus/workspace","approvalPolicy":"never","sandboxPolicy":{"type":"externalSandbox","networkAccess":"enabled"}}}
 ```
 
 之后你会收到大量 `notification`（`method` 字段存在、没有 `id`），典型包括：
@@ -151,6 +151,28 @@ curl -sS -X DELETE -H "Authorization: Bearer $ARGUS_TOKEN" "http://$HOST:8080/se
 - `item/agentMessage/delta`：流式输出的增量文本（你需要拼接显示）
 - `item/completed`：某个 item 完成
 - `turn/completed`：本次 turn 完成（UI/客户端应在这里“解锁下一次发送”）
+
+#### 推荐：用网关的 `argus/input/enqueue`（支持 followup queue + 自动合并 systemEvent）
+
+如果你的 UI/客户端希望支持“同一 thread 忙时不打断、而是排队为下一次 turn（follow-up）”，建议不要直接调用 `turn/start`，而是调用网关内置 helper：
+
+```json
+{"method":"argus/input/enqueue","id":3,"params":{"threadId":"thr_123","text":"say test"}}
+```
+
+响应示例（立即开始 turn）：
+
+```json
+{"id":3,"result":{"ok":true,"threadId":"thr_123","queued":false,"started":true,"turnId":"turn_abc"}}
+```
+
+响应示例（thread 忙 → 排队为 follow-up）：
+
+```json
+{"id":3,"result":{"ok":true,"threadId":"thr_123","queued":true,"started":false,"followupDepth":2}}
+```
+
+之后仍然是等 `turn/completed`（notification）来判断“这一轮结束”，并渲染最后的 agent message。
 
 ### 4.4 Approvals（可能会出现的审批请求）
 
@@ -207,14 +229,14 @@ ws.on("open", async () => {
   await rpc("initialize", { clientInfo: { name: "node_client", title: "Node Client", version: "0.0.1" } });
   send({ method: "initialized", params: {} });
 
-  const t = await rpc("thread/start", { cwd: "/workspace", approvalPolicy: "never", sandbox: "workspace-write" });
+  const t = await rpc("thread/start", { cwd: "/root/.argus/workspace", approvalPolicy: "never", sandbox: "workspace-write" });
   const threadId = t.thread.id;
   console.log("threadId =", threadId);
 
   await rpc("turn/start", {
     threadId,
     input: [{ type: "text", text: "say test" }],
-    cwd: "/workspace",
+    cwd: "/root/.argus/workspace",
     approvalPolicy: "never",
     sandboxPolicy: { type: "externalSandbox", networkAccess: "enabled" },
   });

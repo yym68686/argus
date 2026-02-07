@@ -9,6 +9,7 @@ COPY apps/api/requirements.txt /app/apps/api/requirements.txt
 RUN python -m pip install --no-cache-dir -r /app/apps/api/requirements.txt
 
 COPY apps/api/app.py /app/apps/api/app.py
+COPY docs/templates/HEARTBEAT.md /app/docs/templates/HEARTBEAT.md
 
 EXPOSE 8080
 WORKDIR /app/apps/api

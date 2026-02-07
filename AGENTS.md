@@ -46,7 +46,7 @@ A skill is a set of local instructions to follow that is stored in a `SKILL.md` 
 
 ## 关键约定 / 易踩坑
 
-- runtime 容器内默认以 `node` 用户运行（UID 通常是 `1000`）
-  - 因此宿主机挂载的 `ARGUS_HOME_HOST_PATH` / `ARGUS_WORKSPACE_HOST_PATH` 需要对 UID `1000` 可读写，否则会出现 `Permission denied (os error 13)`。
+- runtime 容器内默认以 `root` 用户运行（UID `0`）
+  - 挂载目录通常不会再遇到 “UID `1000` 不可写” 的问题，但会产生 root-owned 文件；如果你希望宿主机的非 root 用户可直接读写，建议改成宿主机同 UID/GID 或显式调整权限。
 - 网关的“自动创建容器”模式需要挂载宿主机 `docker.sock`
   - 这在公网环境是高危能力（等价宿主机 root 权限），必须配合认证/授权/限流/审计。

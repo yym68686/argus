@@ -7,10 +7,13 @@ if [ -z "${APP_SERVER_CMD:-}" ]; then
   exit 2
 fi
 
-APP_HOME_DIR="${APP_HOME:-/agent-home}"
-mkdir -p "$APP_HOME_DIR" /workspace
+APP_HOME_DIR="${APP_HOME:-/root/.argus}"
+APP_WORKSPACE_DIR="${APP_WORKSPACE:-$APP_HOME_DIR/workspace}"
+
+mkdir -p "$APP_HOME_DIR" "$APP_WORKSPACE_DIR"
 
 export HOME="$APP_HOME_DIR"
 
-exec sh -lc "$APP_SERVER_CMD"
+cd "$APP_WORKSPACE_DIR"
 
+exec sh -lc "$APP_SERVER_CMD"

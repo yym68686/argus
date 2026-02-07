@@ -2,10 +2,13 @@ import asyncio
 import json
 import logging
 import os
+import re
 import time
 import uuid
 from collections import deque
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, Optional
 
 from fastapi import FastAPI, HTTPException, Request, Response, WebSocket, WebSocketDisconnect
@@ -13,8 +16,12 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, PlainTextResponse
 from starlette.websockets import WebSocketState
 
+from croniter import croniter
+
 
 log = logging.getLogger("argus_gateway")
+
+RUNTIME_LAYOUT = "root_argus_v1"
 
 
 @dataclass(frozen=True)
@@ -30,8 +37,8 @@ class DockerProvisionConfig:
     network: str
     home_host_path: Optional[str]
     workspace_host_path: Optional[str]
-    home_container_path: str = "/agent-home"
-    workspace_container_path: str = "/workspace"
+    home_container_path: str = "/root/.argus"
+    workspace_container_path: str = "/root/.argus/workspace"
     runtime_cmd: Optional[str] = None
     connect_timeout_s: float = 30.0
     jsonl_line_limit_bytes: int = 8 * 1024 * 1024
@@ -60,6 +67,7 @@ class LiveDockerSession:
     initialize_waiters: list[tuple[WebSocket, Any]]
 
     pending_client_requests: dict[str, tuple[WebSocket, Any]]
+    pending_internal_requests: dict[str, asyncio.Future[dict[str, Any]]]
     next_upstream_id: int
 
     pending_server_requests: dict[str, str]
@@ -102,6 +110,24 @@ class LiveDockerSession:
             self.next_upstream_id += 1
             self.pending_client_requests[str(rid)] = (ws, downstream_id)
             return rid
+
+    async def reserve_internal_id(self) -> tuple[int, asyncio.Future[dict[str, Any]]]:
+        async with self.attach_lock:
+            rid = self.next_upstream_id
+            self.next_upstream_id += 1
+            fut: asyncio.Future[dict[str, Any]] = asyncio.get_running_loop().create_future()
+            self.pending_internal_requests[str(rid)] = fut
+            return rid, fut
+
+    async def resolve_internal_response(self, msg: dict[str, Any]) -> bool:
+        rid = str(msg.get("id"))
+        async with self.attach_lock:
+            fut = self.pending_internal_requests.pop(rid, None)
+        if fut is None:
+            return False
+        if not fut.done():
+            fut.set_result(msg)
+        return True
 
     async def _send_ws(self, ws: WebSocket, text: str) -> bool:
         if ws.client_state != WebSocketState.CONNECTED:
@@ -225,6 +251,956 @@ class LiveDockerSession:
             text += "\n"
         self.writer.write(text.encode("utf-8"))
         await self.writer.drain()
+
+
+def _now_ms() -> int:
+    return int(time.time() * 1000)
+
+
+def _ms_to_dt_utc(ms: int) -> datetime:
+    return datetime.fromtimestamp(ms / 1000.0, tz=timezone.utc)
+
+
+def _dt_to_ms(dt: datetime) -> int:
+    return int(dt.timestamp() * 1000)
+
+
+def _atomic_write_json(path: Path, data: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    tmp.replace(path)
+
+
+def _atomic_write_text(path: Path, content: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(content, encoding="utf-8")
+    tmp.replace(path)
+
+
+HEARTBEAT_FILENAME = "HEARTBEAT.md"
+HEARTBEAT_TASKS_INTERVAL_MS = 30 * 60 * 1000
+
+
+def _strip_yaml_front_matter(raw: str) -> str:
+    text = raw.lstrip("\ufeff")
+    lines = text.splitlines()
+    if not lines or lines[0].strip() != "---":
+        return raw
+    for i in range(1, len(lines)):
+        if lines[i].strip() == "---":
+            return "\n".join(lines[i + 1 :]).lstrip("\n")
+    return raw
+
+
+def _is_heartbeat_content_effectively_empty(content: Optional[str]) -> bool:
+    # Mirror OpenClaw's semantics: treat whitespace/headers/comments/empty checklist as empty.
+    if content is None or not isinstance(content, str):
+        return True
+    text = _strip_yaml_front_matter(content)
+    for line in text.splitlines():
+        trimmed = line.strip()
+        if not trimmed:
+            continue
+        # Skip markdown headers like "# Title" / "## ..." (requires space or EOL after #).
+        if re.match(r"^#+(\s|$)", trimmed):
+            continue
+        # Skip empty markdown list items like "- [ ]" / "- " / "* [x]" with no text.
+        if re.match(r"^[-*+]\s*(\[[\sXx]?\]\s*)?$", trimmed):
+            continue
+        # Skip one-line HTML comments.
+        if trimmed.startswith("<!--") and trimmed.endswith("-->"):
+            continue
+        return False
+    return True
+
+
+def _resolve_repo_root() -> Path:
+    # apps/api/app.py -> repo root (or /app in container image)
+    return Path(__file__).resolve().parents[2]
+
+
+def _load_heartbeat_template_text() -> str:
+    template_path = _resolve_repo_root() / "docs" / "templates" / HEARTBEAT_FILENAME
+    try:
+        return template_path.read_text(encoding="utf-8")
+    except Exception:
+        # Keep a safe fallback; don't fail gateway startup if template is missing.
+        return "# HEARTBEAT.md\n\n"
+
+
+@dataclass
+class PersistedSystemEvent:
+    event_id: str
+    kind: str
+    text: str
+    created_at_ms: int
+    meta: dict[str, Any] = field(default_factory=dict)
+
+    def to_json(self) -> dict[str, Any]:
+        out: dict[str, Any] = {
+            "eventId": self.event_id,
+            "kind": self.kind,
+            "text": self.text,
+            "createdAtMs": self.created_at_ms,
+        }
+        if self.meta:
+            out["meta"] = self.meta
+        return out
+
+    @staticmethod
+    def from_json(obj: Any) -> Optional["PersistedSystemEvent"]:
+        if not isinstance(obj, dict):
+            return None
+        event_id = str(obj.get("eventId") or "").strip()
+        kind = str(obj.get("kind") or "").strip()
+        text = str(obj.get("text") or "")
+        created_at_ms = obj.get("createdAtMs")
+        if not event_id or not kind or created_at_ms is None:
+            return None
+        try:
+            created_at_ms_int = int(created_at_ms)
+        except Exception:
+            return None
+        meta = obj.get("meta")
+        if not isinstance(meta, dict):
+            meta = {}
+        return PersistedSystemEvent(
+            event_id=event_id,
+            kind=kind,
+            text=text,
+            created_at_ms=created_at_ms_int,
+            meta=meta,
+        )
+
+
+@dataclass
+class PersistedCronJob:
+    job_id: str
+    expr: str
+    text: str
+    enabled: bool = True
+    last_run_at_ms: Optional[int] = None
+    next_run_at_ms: Optional[int] = None
+
+    def to_json(self) -> dict[str, Any]:
+        out: dict[str, Any] = {
+            "jobId": self.job_id,
+            "expr": self.expr,
+            "text": self.text,
+            "enabled": bool(self.enabled),
+        }
+        if self.last_run_at_ms is not None:
+            out["lastRunAtMs"] = self.last_run_at_ms
+        if self.next_run_at_ms is not None:
+            out["nextRunAtMs"] = self.next_run_at_ms
+        return out
+
+    @staticmethod
+    def from_json(obj: Any) -> Optional["PersistedCronJob"]:
+        if not isinstance(obj, dict):
+            return None
+        job_id = str(obj.get("jobId") or "").strip()
+        expr = str(obj.get("expr") or "").strip()
+        text = str(obj.get("text") or "")
+        if not job_id or not expr:
+            return None
+        enabled = bool(obj.get("enabled", True))
+
+        last_run_at_ms = obj.get("lastRunAtMs")
+        if last_run_at_ms is not None:
+            try:
+                last_run_at_ms = int(last_run_at_ms)
+            except Exception:
+                last_run_at_ms = None
+
+        next_run_at_ms = obj.get("nextRunAtMs")
+        if next_run_at_ms is not None:
+            try:
+                next_run_at_ms = int(next_run_at_ms)
+            except Exception:
+                next_run_at_ms = None
+
+        return PersistedCronJob(
+            job_id=job_id,
+            expr=expr,
+            text=text,
+            enabled=enabled,
+            last_run_at_ms=last_run_at_ms,
+            next_run_at_ms=next_run_at_ms,
+        )
+
+
+@dataclass
+class PersistedSessionAutomation:
+    main_thread_id: Optional[str] = None
+    cron_jobs: list[PersistedCronJob] = field(default_factory=list)
+    system_event_queues: dict[str, list[PersistedSystemEvent]] = field(default_factory=dict)
+
+    def to_json(self) -> dict[str, Any]:
+        queues: dict[str, Any] = {}
+        for tid, events in self.system_event_queues.items():
+            if not tid:
+                continue
+            queues[tid] = [e.to_json() for e in events]
+        return {
+            "mainThreadId": self.main_thread_id,
+            "cronJobs": [j.to_json() for j in self.cron_jobs],
+            "systemEventQueues": queues,
+        }
+
+    @staticmethod
+    def from_json(obj: Any) -> "PersistedSessionAutomation":
+        if not isinstance(obj, dict):
+            return PersistedSessionAutomation()
+        main_thread_id = obj.get("mainThreadId")
+        if not isinstance(main_thread_id, str) or not main_thread_id.strip():
+            main_thread_id = None
+        cron_jobs_raw = obj.get("cronJobs")
+        cron_jobs: list[PersistedCronJob] = []
+        if isinstance(cron_jobs_raw, list):
+            for j in cron_jobs_raw:
+                pj = PersistedCronJob.from_json(j)
+                if pj is not None:
+                    cron_jobs.append(pj)
+        queues_raw = obj.get("systemEventQueues")
+        queues: dict[str, list[PersistedSystemEvent]] = {}
+        if isinstance(queues_raw, dict):
+            for tid, raw_events in queues_raw.items():
+                if not isinstance(tid, str) or not tid.strip():
+                    continue
+                if not isinstance(raw_events, list):
+                    continue
+                out_events: list[PersistedSystemEvent] = []
+                for ev in raw_events:
+                    pe = PersistedSystemEvent.from_json(ev)
+                    if pe is not None:
+                        out_events.append(pe)
+                if out_events:
+                    queues[tid.strip()] = out_events
+        return PersistedSessionAutomation(
+            main_thread_id=main_thread_id.strip() if isinstance(main_thread_id, str) else None,
+            cron_jobs=cron_jobs,
+            system_event_queues=queues,
+        )
+
+
+@dataclass
+class PersistedGatewayAutomationState:
+    version: int = 1
+    default_session_id: Optional[str] = None
+    sessions: dict[str, PersistedSessionAutomation] = field(default_factory=dict)
+
+    def to_json(self) -> dict[str, Any]:
+        return {
+            "version": int(self.version),
+            "defaultSessionId": self.default_session_id,
+            "sessions": {sid: sess.to_json() for sid, sess in self.sessions.items()},
+        }
+
+    @staticmethod
+    def from_json(obj: Any) -> "PersistedGatewayAutomationState":
+        if not isinstance(obj, dict):
+            return PersistedGatewayAutomationState()
+        version = obj.get("version")
+        try:
+            version_int = int(version) if version is not None else 1
+        except Exception:
+            version_int = 1
+        default_session_id = obj.get("defaultSessionId")
+        if not isinstance(default_session_id, str) or not default_session_id.strip():
+            default_session_id = None
+        sessions_raw = obj.get("sessions")
+        sessions: dict[str, PersistedSessionAutomation] = {}
+        if isinstance(sessions_raw, dict):
+            for sid, v in sessions_raw.items():
+                if not isinstance(sid, str) or not sid.strip():
+                    continue
+                sessions[sid.strip()] = PersistedSessionAutomation.from_json(v)
+        return PersistedGatewayAutomationState(
+            version=version_int,
+            default_session_id=default_session_id.strip() if isinstance(default_session_id, str) else None,
+            sessions=sessions,
+        )
+
+
+class AutomationStateStore:
+    def __init__(self, state_path: Path) -> None:
+        self._path = state_path
+        self._lock = asyncio.Lock()
+        self._state = PersistedGatewayAutomationState()
+
+    @property
+    def state(self) -> PersistedGatewayAutomationState:
+        return self._state
+
+    async def load(self) -> PersistedGatewayAutomationState:
+        async with self._lock:
+            try:
+                raw = await asyncio.to_thread(self._path.read_text, "utf-8")
+                parsed = json.loads(raw)
+                self._state = PersistedGatewayAutomationState.from_json(parsed)
+            except FileNotFoundError:
+                self._state = PersistedGatewayAutomationState()
+            except Exception:
+                log.exception("Failed to load automation state from %s", str(self._path))
+                self._state = PersistedGatewayAutomationState()
+            return self._state
+
+    async def save(self) -> None:
+        async with self._lock:
+            data = self._state.to_json()
+            try:
+                await asyncio.to_thread(_atomic_write_json, self._path, data)
+            except Exception:
+                log.exception("Failed to save automation state to %s", str(self._path))
+
+    async def update(self, fn) -> PersistedGatewayAutomationState:
+        async with self._lock:
+            fn(self._state)
+            data = self._state.to_json()
+            try:
+                await asyncio.to_thread(_atomic_write_json, self._path, data)
+            except Exception:
+                log.exception("Failed to save automation state to %s", str(self._path))
+            return self._state
+
+
+@dataclass
+class ThreadLane:
+    lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    busy: bool = False
+    active_turn_id: Optional[str] = None
+    followups: deque[str] = field(default_factory=deque)
+
+
+class AutomationManager:
+    def __init__(self, *, state_store: AutomationStateStore, home_host_path: Optional[str]) -> None:
+        self._store = state_store
+        self._home_host_path = home_host_path
+
+        self._lanes: dict[tuple[str, str], ThreadLane] = {}
+        self._cron_wakeup = asyncio.Event()
+        self._heartbeat_wakeup = asyncio.Event()
+        self._last_heartbeat_run_at_ms: dict[tuple[str, str], int] = {}
+
+        self._tasks: list[asyncio.Task[None]] = []
+        self._bootstrapped = False
+        self._bootstrap_lock = asyncio.Lock()
+
+    async def start(self) -> None:
+        await self._store.load()
+        await self._ensure_heartbeat_files()
+        self._tasks.append(asyncio.create_task(self._bootstrap_loop()))
+        self._tasks.append(asyncio.create_task(self._cron_loop()))
+        self._tasks.append(asyncio.create_task(self._heartbeat_loop()))
+
+    async def _ensure_heartbeat_files(self) -> None:
+        if not self._home_host_path:
+            return
+        home = Path(self._home_host_path)
+        template_raw = _load_heartbeat_template_text()
+        template_clean = _strip_yaml_front_matter(template_raw).strip()
+        if template_clean:
+            template_clean += "\n"
+
+        template_path = home / "docs" / "templates" / HEARTBEAT_FILENAME
+        heartbeat_path = home / HEARTBEAT_FILENAME
+
+        def _ensure() -> None:
+            if not template_path.exists():
+                _atomic_write_text(template_path, template_raw)
+            if not heartbeat_path.exists():
+                _atomic_write_text(heartbeat_path, template_clean or "# HEARTBEAT.md\n")
+
+        try:
+            await asyncio.to_thread(_ensure)
+        except Exception:
+            log.exception("Failed to initialize heartbeat files under %s", self._home_host_path)
+
+    async def stop(self) -> None:
+        for t in self._tasks:
+            t.cancel()
+        for t in self._tasks:
+            try:
+                await t
+            except Exception:
+                pass
+
+    def lane(self, session_id: str, thread_id: str) -> ThreadLane:
+        key = (session_id, thread_id)
+        lane = self._lanes.get(key)
+        if lane is None:
+            lane = ThreadLane()
+            self._lanes[key] = lane
+        return lane
+
+    def on_upstream_notification(self, session_id: str, msg: dict[str, Any]) -> None:
+        method = msg.get("method")
+        params = msg.get("params")
+        if not isinstance(params, dict):
+            params = {}
+
+        if method == "turn/started":
+            thread_id = params.get("threadId")
+            if isinstance(thread_id, str) and thread_id.strip():
+                turn = params.get("turn")
+                turn_id = None
+                if isinstance(turn, dict):
+                    tid = turn.get("id")
+                    if isinstance(tid, str) and tid.strip():
+                        turn_id = tid.strip()
+                lane = self.lane(session_id, thread_id.strip())
+                lane.busy = True
+                if turn_id:
+                    lane.active_turn_id = turn_id
+            return
+
+        if method == "turn/completed":
+            thread_id = params.get("threadId")
+            if isinstance(thread_id, str) and thread_id.strip():
+                lane = self.lane(session_id, thread_id.strip())
+                lane.busy = False
+                lane.active_turn_id = None
+                asyncio.create_task(self._process_lane_after_turn(session_id, thread_id.strip()))
+                asyncio.create_task(self._maybe_request_heartbeat(session_id, thread_id.strip()))
+            return
+
+    async def _bootstrap_loop(self) -> None:
+        # Keep trying to ensure the default session + main thread are ready.
+        while True:
+            try:
+                await self.ensure_default_ready()
+                self._bootstrapped = True
+                await asyncio.sleep(10.0)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                log.exception("Automation bootstrap failed; will retry")
+                await asyncio.sleep(2.0)
+
+    async def ensure_default_ready(self) -> str:
+        if _provision_mode() != "docker":
+            raise RuntimeError("Automation is only supported in docker provision mode")
+
+        async with self._bootstrap_lock:
+            session_id = await self._choose_default_session_id()
+            live, _ = await _ensure_live_docker_session(session_id, allow_create=True)
+            await self._ensure_initialized(live)
+            await self.ensure_main_thread(session_id)
+            return session_id
+
+    async def _choose_default_session_id(self) -> str:
+        existing = self._store.state.default_session_id
+        if isinstance(existing, str) and existing.strip():
+            try:
+                container = await asyncio.to_thread(_docker_get_container_by_session_sync, existing.strip())
+                if container is not None:
+                    labels = getattr(container, "labels", None) or {}
+                    if labels.get("io.argus.runtime_layout") == RUNTIME_LAYOUT:
+                        return existing.strip()
+            except Exception:
+                log.exception("Failed to validate persisted default_session_id=%s", existing)
+
+        sessions: list[dict[str, Any]] = []
+        try:
+            sessions = await asyncio.to_thread(_docker_list_argus_containers_sync)
+        except Exception:
+            log.exception("Failed to list docker sessions for automation bootstrap")
+
+        sid: Optional[str] = None
+        for s in sessions:
+            cand = s.get("sessionId")
+            layout = s.get("runtimeLayout")
+            if isinstance(cand, str) and cand.strip() and layout == RUNTIME_LAYOUT:
+                sid = cand.strip()
+                break
+
+        if sid is None:
+            sid = uuid.uuid4().hex[:12]
+            cfg = _docker_cfg()
+            await asyncio.to_thread(_docker_create_container_sync, cfg, sid)
+
+        await self._store.update(lambda st: setattr(st, "default_session_id", sid))
+        return sid
+
+    async def ensure_main_thread(self, session_id: str) -> str:
+        def get_existing(st: PersistedGatewayAutomationState) -> Optional[str]:
+            sess = st.sessions.get(session_id)
+            return sess.main_thread_id if sess else None
+
+        existing = get_existing(self._store.state)
+        live, _ = await _ensure_live_docker_session(session_id, allow_create=True)
+        await self._ensure_initialized(live)
+
+        if isinstance(existing, str) and existing.strip():
+            try:
+                await self._rpc(live, "thread/resume", {"threadId": existing.strip()})
+                return existing.strip()
+            except Exception:
+                log.warning("Failed to resume mainThreadId=%s; will create a new main thread", existing)
+
+        result = await self._rpc(
+            live,
+            "thread/start",
+            {"cwd": live.cfg.workspace_container_path, "approvalPolicy": "never", "sandbox": "danger-full-access"},
+        )
+        tid = None
+        if isinstance(result, dict):
+            thread = result.get("thread")
+            if isinstance(thread, dict):
+                tid_val = thread.get("id")
+                if isinstance(tid_val, str) and tid_val.strip():
+                    tid = tid_val.strip()
+        if not tid:
+            raise RuntimeError("Invalid thread/start response (missing thread.id)")
+
+        def _save_main(st: PersistedGatewayAutomationState) -> None:
+            sess = st.sessions.get(session_id)
+            if sess is None:
+                sess = PersistedSessionAutomation()
+                st.sessions[session_id] = sess
+            sess.main_thread_id = tid
+
+        await self._store.update(_save_main)
+        return tid
+
+    async def enqueue_user_input(
+        self,
+        *,
+        session_id: str,
+        thread_id: Optional[str],
+        target: Optional[str],
+        text: str,
+    ) -> dict[str, Any]:
+        if not text.strip():
+            raise ValueError("text must not be empty")
+
+        live, _ = await _ensure_live_docker_session(session_id, allow_create=True)
+        await self._ensure_initialized(live)
+
+        if target == "main" or not (isinstance(thread_id, str) and thread_id.strip()):
+            thread_id = await self.ensure_main_thread(session_id)
+        else:
+            thread_id = thread_id.strip()
+
+        lane = self.lane(session_id, thread_id)
+
+        # If busy, enqueue follow-up (next turn).
+        if lane.busy:
+            lane.followups.append(text)
+            return {
+                "ok": True,
+                "threadId": thread_id,
+                "queued": True,
+                "started": False,
+                "followupDepth": len(lane.followups),
+            }
+
+        async with lane.lock:
+            if lane.busy:
+                lane.followups.append(text)
+                return {
+                    "ok": True,
+                    "threadId": thread_id,
+                    "queued": True,
+                    "started": False,
+                    "followupDepth": len(lane.followups),
+                }
+            lane.busy = True
+
+            try:
+                assembled = await self._assemble_turn_input(session_id, thread_id, user_text=text, heartbeat=False)
+                resp = await self._rpc(
+                    live,
+                    "turn/start",
+                    {
+                        "threadId": thread_id,
+                        "input": [{"type": "text", "text": assembled}],
+                        "cwd": live.cfg.workspace_container_path,
+                        "approvalPolicy": "never",
+                        "sandboxPolicy": {"type": "dangerFullAccess"},
+                    },
+                )
+                turn_id = None
+                if isinstance(resp, dict):
+                    turn = resp.get("turn")
+                    if isinstance(turn, dict):
+                        tid_val = turn.get("id")
+                        if isinstance(tid_val, str) and tid_val.strip():
+                            turn_id = tid_val.strip()
+                if turn_id:
+                    lane.active_turn_id = turn_id
+                return {"ok": True, "threadId": thread_id, "queued": False, "started": True, "turnId": turn_id}
+            except Exception:
+                lane.busy = False
+                raise
+
+    async def enqueue_system_event(
+        self,
+        *,
+        session_id: str,
+        thread_id: str,
+        kind: str,
+        text: str,
+        meta: Optional[dict[str, Any]] = None,
+    ) -> PersistedSystemEvent:
+        ev = PersistedSystemEvent(
+            event_id=uuid.uuid4().hex,
+            kind=kind,
+            text=text,
+            created_at_ms=_now_ms(),
+            meta=meta or {},
+        )
+
+        def _add(st: PersistedGatewayAutomationState) -> None:
+            sess = st.sessions.get(session_id)
+            if sess is None:
+                sess = PersistedSessionAutomation()
+                st.sessions[session_id] = sess
+            q = sess.system_event_queues.get(thread_id)
+            if q is None:
+                q = []
+                sess.system_event_queues[thread_id] = q
+            q.append(ev)
+            # Keep bounded.
+            if len(q) > 2000:
+                del q[: len(q) - 2000]
+
+        await self._store.update(_add)
+        self.request_heartbeat_now()
+        return ev
+
+    def request_heartbeat_now(self) -> None:
+        self._heartbeat_wakeup.set()
+
+    async def _maybe_request_heartbeat(self, session_id: str, thread_id: str) -> None:
+        # If main thread has pending system events, wake heartbeat after any turn.
+        st = self._store.state
+        sess = st.sessions.get(session_id)
+        if sess is None:
+            return
+        main_tid = sess.main_thread_id
+        if not main_tid:
+            return
+        if thread_id != main_tid:
+            return
+        q = sess.system_event_queues.get(main_tid) or []
+        if q:
+            self.request_heartbeat_now()
+
+    async def _process_lane_after_turn(self, session_id: str, thread_id: str) -> None:
+        lane = self.lane(session_id, thread_id)
+        if lane.busy:
+            return
+        async with lane.lock:
+            if lane.busy:
+                return
+            if not lane.followups:
+                return
+            followups: list[str] = []
+            while lane.followups:
+                followups.append(lane.followups.popleft())
+            merged = self._format_followups(followups)
+
+            live, _ = await _ensure_live_docker_session(session_id, allow_create=True)
+            await self._ensure_initialized(live)
+
+            lane.busy = True
+            try:
+                assembled = await self._assemble_turn_input(session_id, thread_id, user_text=merged, heartbeat=False)
+                resp = await self._rpc(
+                    live,
+                    "turn/start",
+                    {
+                        "threadId": thread_id,
+                        "input": [{"type": "text", "text": assembled}],
+                        "cwd": live.cfg.workspace_container_path,
+                        "approvalPolicy": "never",
+                        "sandboxPolicy": {"type": "dangerFullAccess"},
+                    },
+                )
+                turn_id = None
+                if isinstance(resp, dict):
+                    turn = resp.get("turn")
+                    if isinstance(turn, dict):
+                        tid_val = turn.get("id")
+                        if isinstance(tid_val, str) and tid_val.strip():
+                            turn_id = tid_val.strip()
+                lane.active_turn_id = turn_id
+            except Exception:
+                lane.busy = False
+                log.exception("Failed to start follow-up turn for %s/%s", session_id, thread_id)
+
+    def _format_followups(self, texts: list[str]) -> str:
+        lines = ["Follow-ups (batched):"]
+        for i, t in enumerate(texts, start=1):
+            lines.append(f"{i}) {t.strip()}")
+        return "\n".join(lines).strip()
+
+    async def _assemble_turn_input(self, session_id: str, thread_id: str, *, user_text: str, heartbeat: bool) -> str:
+        drained = await self._drain_system_events(session_id, thread_id, max_events=20)
+        blocks: list[str] = []
+
+        if heartbeat:
+            blocks.append(
+                "HEARTBEAT: You are running a background heartbeat. Read and follow HEARTBEAT.md (embedded below)."
+            )
+            blocks.append(self._read_heartbeat_md_block())
+        elif user_text.strip():
+            blocks.append(user_text.strip())
+
+        if drained:
+            blocks.append("System events (batched):\n" + "\n".join(drained))
+
+        blocks.append(
+            "\n".join(
+                [
+                    "Instructions:",
+                    "- If there is user input, answer it first.",
+                    "- Then process each system event in order.",
+                    "- If an event requires actions, perform them.",
+                    "- End with a short summary of actions/results.",
+                ]
+            )
+        )
+        return "\n\n".join([b for b in blocks if b.strip()]).strip()
+
+    async def _drain_system_events(self, session_id: str, thread_id: str, *, max_events: int) -> list[str]:
+        drained: list[PersistedSystemEvent] = []
+
+        def _pop(st: PersistedGatewayAutomationState) -> None:
+            sess = st.sessions.get(session_id)
+            if sess is None:
+                return
+            q = sess.system_event_queues.get(thread_id)
+            if not q:
+                return
+            take = q[:max_events]
+            del q[: len(take)]
+            drained.extend(take)
+
+        if max_events <= 0:
+            return []
+        await self._store.update(_pop)
+
+        out: list[str] = []
+        for ev in drained:
+            ts = _ms_to_dt_utc(ev.created_at_ms).isoformat()
+            meta = f" meta={json.dumps(ev.meta, ensure_ascii=False)}" if ev.meta else ""
+            out.append(f"[{ev.kind} at={ts}{meta}] {ev.text}".strip())
+        return out
+
+    def _read_heartbeat_md_block(self) -> str:
+        if not self._home_host_path:
+            return "[HEARTBEAT.md]\n(missing ARGUS_HOME_HOST_PATH)\n[/HEARTBEAT.md]"
+        p = Path(self._home_host_path) / "HEARTBEAT.md"
+        try:
+            content = p.read_text(encoding="utf-8")
+        except FileNotFoundError:
+            content = "(missing HEARTBEAT.md)"
+        except Exception as e:  # noqa: BLE001
+            content = f"(failed to read HEARTBEAT.md: {e})"
+        return "[HEARTBEAT.md]\n" + content.strip() + "\n[/HEARTBEAT.md]"
+
+    async def _ensure_initialized(self, live: LiveDockerSession) -> None:
+        if live.initialized_result is not None and live.handshake_done:
+            return
+        # Send initialize and cache result.
+        req = {"method": "initialize", "id": None, "params": {"clientInfo": {"name": "argus_gateway", "title": "Argus Gateway Automation", "version": "0.1.0"}}}
+        rid, fut = await live.reserve_internal_id()
+        req["id"] = rid
+        await live.write_upstream(json.dumps(req))
+        resp = await asyncio.wait_for(fut, timeout=30.0)
+        if isinstance(resp, dict) and isinstance(resp.get("result"), dict):
+            live.initialized_result = resp["result"]
+        # Complete handshake.
+        if not live.handshake_done:
+            await live.write_upstream(json.dumps({"method": "initialized"}))
+            live.handshake_done = True
+
+    async def _rpc(self, live: LiveDockerSession, method: str, params: Any) -> Any:
+        rid, fut = await live.reserve_internal_id()
+        await live.write_upstream(json.dumps({"method": method, "id": rid, "params": params}))
+        resp = await asyncio.wait_for(fut, timeout=120.0)
+        if not isinstance(resp, dict):
+            raise RuntimeError("Invalid JSON-RPC response")
+        if "error" in resp and resp["error"] is not None:
+            err = resp["error"]
+            msg = err.get("message") if isinstance(err, dict) else str(err)
+            raise RuntimeError(msg or "RPC error")
+        return resp.get("result")
+
+    async def _cron_loop(self) -> None:
+        while True:
+            try:
+                sleep_s = await self._cron_tick()
+                try:
+                    await asyncio.wait_for(self._cron_wakeup.wait(), timeout=sleep_s)
+                except asyncio.TimeoutError:
+                    pass
+                self._cron_wakeup.clear()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                log.exception("Cron loop error")
+                await asyncio.sleep(2.0)
+
+    async def _cron_tick(self) -> float:
+        st = self._store.state
+        session_id = st.default_session_id
+        if not session_id:
+            return 5.0
+        sess = st.sessions.get(session_id)
+        if sess is None or not sess.cron_jobs:
+            return 5.0
+
+        now = _now_ms()
+        next_due_ms: Optional[int] = None
+        changed = False
+
+        for job in sess.cron_jobs:
+            if not job.enabled:
+                continue
+            try:
+                # (Re)compute nextRunAtMs if missing.
+                if job.next_run_at_ms is None:
+                    base_dt = _ms_to_dt_utc(job.last_run_at_ms or now)
+                    job.next_run_at_ms = _dt_to_ms(croniter(job.expr, base_dt).get_next(datetime))
+                    changed = True
+                # Run if due.
+                if job.next_run_at_ms is not None and job.next_run_at_ms <= now:
+                    main_tid = sess.main_thread_id
+                    if main_tid:
+                        await self.enqueue_system_event(
+                            session_id=session_id,
+                            thread_id=main_tid,
+                            kind="cron",
+                            text=job.text,
+                            meta={"jobId": job.job_id, "expr": job.expr},
+                        )
+                    job.last_run_at_ms = now
+                    base_dt = _ms_to_dt_utc(now)
+                    job.next_run_at_ms = _dt_to_ms(croniter(job.expr, base_dt).get_next(datetime))
+                    changed = True
+            except Exception:
+                # Keep job but avoid tight loop.
+                log.exception("Failed to evaluate cron job %s", job.job_id)
+                job.next_run_at_ms = now + 60_000
+                changed = True
+
+            if job.enabled and job.next_run_at_ms is not None:
+                next_due_ms = job.next_run_at_ms if next_due_ms is None else min(next_due_ms, job.next_run_at_ms)
+
+        if changed:
+            await self._store.save()
+
+        if next_due_ms is None:
+            return 5.0
+        delay_ms = max(200, min(30_000, next_due_ms - _now_ms()))
+        return delay_ms / 1000.0
+
+    async def _heartbeat_loop(self) -> None:
+        while True:
+            try:
+                try:
+                    await asyncio.wait_for(self._heartbeat_wakeup.wait(), timeout=15.0)
+                except asyncio.TimeoutError:
+                    pass
+                forced = self._heartbeat_wakeup.is_set()
+                self._heartbeat_wakeup.clear()
+                await self._heartbeat_tick(forced=forced)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                log.exception("Heartbeat loop error")
+                await asyncio.sleep(2.0)
+
+    def _heartbeat_tasks_due(self, session_id: str, thread_id: str, now_ms: int) -> bool:
+        last = self._last_heartbeat_run_at_ms.get((session_id, thread_id))
+        if last is None:
+            return True
+        return now_ms - last >= HEARTBEAT_TASKS_INTERVAL_MS
+
+    async def _heartbeat_has_actionable_content(self) -> bool:
+        if not self._home_host_path:
+            return False
+        p = Path(self._home_host_path) / HEARTBEAT_FILENAME
+        try:
+            raw = await asyncio.to_thread(p.read_text, "utf-8")
+        except FileNotFoundError:
+            return False
+        except Exception:
+            log.exception("Failed to read %s for heartbeat gating", str(p))
+            return False
+        return not _is_heartbeat_content_effectively_empty(raw)
+
+    async def _heartbeat_tick(self, *, forced: bool) -> None:
+        if _provision_mode() != "docker":
+            return
+        st = self._store.state
+        session_id = st.default_session_id
+        if not session_id:
+            return
+        sess = st.sessions.get(session_id)
+        if sess is None:
+            return
+        main_tid = sess.main_thread_id
+        if not main_tid:
+            main_tid = await self.ensure_main_thread(session_id)
+        q = sess.system_event_queues.get(main_tid) or []
+        has_system_events = bool(q)
+        if not has_system_events:
+            has_heartbeat_tasks = await self._heartbeat_has_actionable_content()
+            if not has_heartbeat_tasks:
+                return
+            now0 = _now_ms()
+            if not forced and not self._heartbeat_tasks_due(session_id, main_tid, now0):
+                return
+
+        lane = self.lane(session_id, main_tid)
+        if lane.busy:
+            return
+        async with lane.lock:
+            if lane.busy:
+                return
+            # Re-check queue under latest state.
+            sess2 = self._store.state.sessions.get(session_id)
+            if sess2 is None:
+                return
+            q2 = sess2.system_event_queues.get(main_tid) or []
+            has_system_events2 = bool(q2)
+            if not has_system_events2:
+                has_heartbeat_tasks2 = await self._heartbeat_has_actionable_content()
+                if not has_heartbeat_tasks2:
+                    return
+                now1 = _now_ms()
+                if not forced and not self._heartbeat_tasks_due(session_id, main_tid, now1):
+                    return
+
+            live, _ = await _ensure_live_docker_session(session_id, allow_create=True)
+            await self._ensure_initialized(live)
+            await self.ensure_main_thread(session_id)
+
+            lane.busy = True
+            self._last_heartbeat_run_at_ms[(session_id, main_tid)] = _now_ms()
+            try:
+                assembled = await self._assemble_turn_input(session_id, main_tid, user_text="", heartbeat=True)
+                await self._rpc(
+                    live,
+                    "turn/start",
+                    {
+                        "threadId": main_tid,
+                        "input": [{"type": "text", "text": assembled}],
+                        "cwd": live.cfg.workspace_container_path,
+                        "approvalPolicy": "never",
+                        "sandboxPolicy": {"type": "dangerFullAccess"},
+                    },
+                )
+            except Exception:
+                lane.busy = False
+                log.exception("Failed to start heartbeat turn for %s/%s", session_id, main_tid)
 
 
 @dataclass
@@ -493,6 +1469,24 @@ async def _startup():
     app.state.node_registry = NodeRegistry()
     app.state.mcp_lock = asyncio.Lock()
     app.state.mcp_sessions: dict[str, McpSessionState] = {}
+
+    home_host_path = os.getenv("ARGUS_HOME_HOST_PATH") or None
+    if home_host_path:
+        state_path = Path(home_host_path) / "gateway" / "state.json"
+    else:
+        state_path = Path("/tmp/argus-gateway-state.json")
+        log.warning("ARGUS_HOME_HOST_PATH is not set; automation state will be stored at %s", str(state_path))
+
+    app.state.automation_store = AutomationStateStore(state_path)
+    app.state.automation = AutomationManager(state_store=app.state.automation_store, home_host_path=home_host_path)
+    await app.state.automation.start()
+
+
+@app.on_event("shutdown")
+async def _shutdown():
+    automation: Optional[AutomationManager] = getattr(app.state, "automation", None)
+    if automation is not None:
+        await automation.stop()
 
 
 @app.get("/healthz")
@@ -1170,11 +2164,12 @@ def _docker_create_container_sync(cfg: DockerProvisionConfig, session_id: str):
     labels = {
         "io.argus.gateway": "apps/api",
         "io.argus.session_id": session_id,
+        "io.argus.runtime_layout": RUNTIME_LAYOUT,
+        "io.argus.runtime_home_container_path": cfg.home_container_path,
+        "io.argus.runtime_workspace_container_path": cfg.workspace_container_path,
     }
 
-    run_kwargs = {}
-    if cfg.workspace_host_path:
-        run_kwargs["working_dir"] = cfg.workspace_container_path
+    run_kwargs = {"working_dir": cfg.workspace_container_path}
 
     try:
         container = client.containers.run(
@@ -1233,10 +2228,11 @@ def _docker_list_argus_containers_sync():
                 "containerId": c.id,
                 "name": c.name,
                 "status": c.status,
+                "runtimeLayout": labels.get("io.argus.runtime_layout"),
             }
         )
 
-    out.sort(key=lambda x: (x.get("status") != "running", x.get("name") or ""))
+    out.sort(key=lambda x: (x.get("status") != "running", x.get("runtimeLayout") != RUNTIME_LAYOUT, x.get("name") or ""))
     return out
 
 
@@ -1317,6 +2313,144 @@ async def _read_jsonl_line(
         buffer.extend(chunk)
 
 
+async def _ensure_live_docker_session(session_id: str, *, allow_create: bool) -> tuple[LiveDockerSession, bool]:
+    async with app.state.sessions_lock:
+        existing = app.state.sessions.get(session_id)
+    if existing is not None and not existing.closed:
+        return existing, False
+
+    cfg = _docker_cfg()
+    if not cfg.runtime_cmd:
+        raise RuntimeError("ARGUS_RUNTIME_CMD is not set")
+
+    created = False
+    container = await asyncio.to_thread(_docker_get_container_by_session_sync, session_id)
+    if container is None:
+        if not allow_create:
+            raise KeyError("Unknown session")
+        created = True
+        container = await asyncio.to_thread(_docker_create_container_sync, cfg, session_id)
+    else:
+        container = await asyncio.to_thread(_docker_ensure_running_sync, container)
+
+    host = await _docker_wait_for_ip(container, cfg.network, cfg.connect_timeout_s)
+    reader, writer = await _wait_for_tcp(host, 7777, cfg.connect_timeout_s)
+
+    live = LiveDockerSession(
+        session_id=session_id,
+        container_id=container.id,
+        container_name=container.name,
+        upstream_host=host,
+        upstream_port=7777,
+        reader=reader,
+        writer=writer,
+        cfg=cfg,
+        pump_task=None,
+        attach_lock=asyncio.Lock(),
+        attached_wss=set(),
+        request_handler_ws=None,
+        initialized_result=None,
+        handshake_done=False,
+        pending_initialize_ids=set(),
+        initialize_waiters=[],
+        pending_client_requests={},
+        pending_internal_requests={},
+        next_upstream_id=1_000_000_000,
+        pending_server_requests={},
+        outbox=deque(),
+        turn_owners_by_thread={},
+    )
+
+    async def pump() -> None:
+        buf = bytearray()
+        try:
+            while True:
+                raw = await _read_jsonl_line(live.reader, buf, max_line_bytes=cfg.jsonl_line_limit_bytes)
+                if raw is None:
+                    break
+                text = raw.decode("utf-8", errors="replace").rstrip("\r")
+
+                msg: Any = None
+                try:
+                    msg = json.loads(text)
+                except Exception:
+                    msg = None
+
+                if isinstance(msg, dict):
+                    # Server requests (approvals, etc).
+                    if "id" in msg and "method" in msg:
+                        rid = str(msg.get("id"))
+                        if rid not in live.pending_server_requests:
+                            live.pending_server_requests[rid] = text
+                        params = msg.get("params")
+                        thread_id: Optional[str] = None
+                        if isinstance(params, dict):
+                            tid = params.get("threadId")
+                            if isinstance(tid, str) and tid.strip():
+                                thread_id = tid.strip()
+                        await live.deliver_server_request(text, thread_id=thread_id)
+                        continue
+
+                    # Responses.
+                    if "id" in msg and "method" not in msg:
+                        rid = str(msg.get("id"))
+                        should_resolve = False
+                        async with live.attach_lock:
+                            if rid in live.pending_initialize_ids:
+                                live.pending_initialize_ids.discard(rid)
+                                if isinstance(msg.get("result"), dict):
+                                    live.initialized_result = msg["result"]
+                                    should_resolve = True
+                        if should_resolve:
+                            await live.resolve_initialize_waiters()
+                        await live.resolve_internal_response(msg)
+                        await live.deliver_response(msg)
+                        continue
+
+                    # Notifications: feed automation.
+                    if "method" in msg and "id" not in msg:
+                        automation: Optional[AutomationManager] = getattr(app.state, "automation", None)
+                        if automation is not None:
+                            try:
+                                automation.on_upstream_notification(session_id, msg)
+                            except Exception:
+                                log.exception("Automation notification handler failed")
+
+                    if msg.get("method") == "turn/completed":
+                        params = msg.get("params")
+                        if isinstance(params, dict):
+                            tid = params.get("threadId")
+                            if isinstance(tid, str) and tid.strip():
+                                await live.clear_turn_owner(tid.strip())
+
+                await live.broadcast(text)
+        except Exception:
+            log.exception("Upstream pump failed for session %s", session_id)
+        finally:
+            live.closed = True
+            try:
+                live.writer.close()
+            except Exception:
+                pass
+            async with live.attach_lock:
+                for fut in live.pending_internal_requests.values():
+                    if not fut.done():
+                        fut.set_exception(RuntimeError("Session closed"))
+                live.pending_internal_requests.clear()
+            async with app.state.sessions_lock:
+                current = app.state.sessions.get(session_id)
+                if current is live:
+                    app.state.sessions.pop(session_id, None)
+
+    live.pump_task = asyncio.create_task(pump())
+
+    async with app.state.sessions_lock:
+        app.state.sessions[session_id] = live
+
+    log.info("Provisioned session %s -> %s:%s", session_id, host, 7777)
+    return live, created
+
+
 @app.get("/sessions")
 async def list_sessions(request: Request):
     _http_require_token(request)
@@ -1371,6 +2505,146 @@ async def invoke_node(request: Request):
         timeout_ms=timeout_ms,
     )
     return {"ok": res.ok, "nodeId": node_id, "command": command, "payload": res.payload, "payloadJSON": res.payload_json, "error": res.error}
+
+
+def _get_automation_or_500() -> AutomationManager:
+    automation: Optional[AutomationManager] = getattr(app.state, "automation", None)
+    if automation is None:
+        raise HTTPException(status_code=500, detail="Automation is not initialized")
+    return automation
+
+
+@app.get("/automation/state")
+async def automation_state(request: Request):
+    _http_require_token(request)
+    automation = _get_automation_or_500()
+    st = automation._store.state  # intentional: debug surface
+    lanes = []
+    for (sid, tid), lane in automation._lanes.items():  # intentional: debug surface
+        lanes.append({"sessionId": sid, "threadId": tid, "busy": lane.busy, "followupDepth": len(lane.followups)})
+    lanes.sort(key=lambda x: (x["sessionId"], x["threadId"]))
+    return {"ok": True, "persisted": st.to_json(), "runtime": {"lanes": lanes}}
+
+
+@app.get("/automation/cron/jobs")
+async def cron_list_jobs(request: Request):
+    _http_require_token(request)
+    automation = _get_automation_or_500()
+    st = automation._store.state
+    sid = st.default_session_id
+    if not sid:
+        sid = await automation.ensure_default_ready()
+    sess = automation._store.state.sessions.get(sid) or PersistedSessionAutomation()
+    return {"ok": True, "sessionId": sid, "jobs": [j.to_json() for j in sess.cron_jobs]}
+
+
+@app.post("/automation/cron/jobs")
+async def cron_create_job(request: Request):
+    _http_require_token(request)
+    automation = _get_automation_or_500()
+    try:
+        body = await request.json()
+    except Exception as e:
+        raise HTTPException(status_code=400, detail="Invalid JSON body") from e
+    if not isinstance(body, dict):
+        raise HTTPException(status_code=400, detail="Invalid JSON body")
+
+    expr = str(body.get("expr") or "").strip()
+    text = str(body.get("text") or "")
+    enabled = bool(body.get("enabled", True))
+    job_id = str(body.get("jobId") or "").strip() or uuid.uuid4().hex[:10]
+    if not expr:
+        raise HTTPException(status_code=400, detail="Missing 'expr'")
+    if not text.strip():
+        raise HTTPException(status_code=400, detail="Missing 'text'")
+
+    # Validate cron expression.
+    try:
+        croniter(expr, _ms_to_dt_utc(_now_ms())).get_next(datetime)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Invalid cron expr: {e}") from e
+
+    sid = automation._store.state.default_session_id
+    if not sid:
+        sid = await automation.ensure_default_ready()
+
+    def _add(st: PersistedGatewayAutomationState) -> None:
+        sess = st.sessions.get(sid)
+        if sess is None:
+            sess = PersistedSessionAutomation()
+            st.sessions[sid] = sess
+        # Replace if same id exists.
+        sess.cron_jobs = [j for j in sess.cron_jobs if j.job_id != job_id]
+        sess.cron_jobs.append(PersistedCronJob(job_id=job_id, expr=expr, text=text, enabled=enabled))
+
+    await automation._store.update(_add)
+    automation._cron_wakeup.set()
+    return {"ok": True, "sessionId": sid, "job": {"jobId": job_id, "expr": expr, "text": text, "enabled": enabled}}
+
+
+@app.delete("/automation/cron/jobs/{job_id}")
+async def cron_delete_job(job_id: str, request: Request):
+    _http_require_token(request)
+    automation = _get_automation_or_500()
+    sid = automation._store.state.default_session_id
+    if not sid:
+        sid = await automation.ensure_default_ready()
+
+    removed = False
+
+    def _rm(st: PersistedGatewayAutomationState) -> None:
+        nonlocal removed
+        sess = st.sessions.get(sid)
+        if sess is None:
+            return
+        before = len(sess.cron_jobs)
+        sess.cron_jobs = [j for j in sess.cron_jobs if j.job_id != job_id]
+        removed = len(sess.cron_jobs) != before
+
+    await automation._store.update(_rm)
+    automation._cron_wakeup.set()
+    if not removed:
+        raise HTTPException(status_code=404, detail="Job not found")
+    return {"ok": True, "sessionId": sid, "jobId": job_id}
+
+
+@app.post("/automation/systemEvent/enqueue")
+async def automation_enqueue_system_event(request: Request):
+    _http_require_token(request)
+    automation = _get_automation_or_500()
+    try:
+        body = await request.json()
+    except Exception as e:
+        raise HTTPException(status_code=400, detail="Invalid JSON body") from e
+    if not isinstance(body, dict):
+        raise HTTPException(status_code=400, detail="Invalid JSON body")
+
+    session_id = str(body.get("sessionId") or "").strip() or None
+    if not session_id:
+        session_id = automation._store.state.default_session_id
+    if not session_id:
+        session_id = await automation.ensure_default_ready()
+
+    target = str(body.get("target") or "").strip()
+    thread_id = str(body.get("threadId") or "").strip() or None
+    if target == "main" or not thread_id:
+        thread_id = await automation.ensure_main_thread(session_id)
+
+    kind = str(body.get("kind") or "").strip() or "system"
+    text = str(body.get("text") or "")
+    if not text.strip():
+        raise HTTPException(status_code=400, detail="Missing 'text'")
+
+    ev = await automation.enqueue_system_event(session_id=session_id, thread_id=thread_id, kind=kind, text=text)
+    return {"ok": True, "sessionId": session_id, "threadId": thread_id, "event": ev.to_json()}
+
+
+@app.post("/automation/heartbeat/now")
+async def automation_heartbeat_now(request: Request):
+    _http_require_token(request)
+    automation = _get_automation_or_500()
+    automation.request_heartbeat_now()
+    return {"ok": True}
 
 
 @app.delete("/sessions/{session_id}")
@@ -1501,134 +2775,16 @@ async def ws_proxy(ws: WebSocket):
 
         await ws.accept()
 
-        try:
-            cfg = _docker_cfg()
-        except Exception:
-            log.exception("Invalid docker provisioning configuration")
-            await ws.close(code=1011, reason="Server misconfigured")
-            return
-        if not cfg.runtime_cmd:
-            await ws.close(code=1011, reason="Server misconfigured: ARGUS_RUNTIME_CMD is not set")
-            return
         requested_session = (ws.query_params.get("session") or "").strip() or None
         session_id = requested_session or uuid.uuid4().hex[:12]
-        created = False
-
-        async with app.state.sessions_lock:
-            live = app.state.sessions.get(session_id)
-
-        if live is None or live.closed:
-            try:
-                if requested_session:
-                    container = await asyncio.to_thread(_docker_get_container_by_session_sync, session_id)
-                    if container is None:
-                        await ws.close(code=1008, reason="Unknown session")
-                        return
-                    container = await asyncio.to_thread(_docker_ensure_running_sync, container)
-                else:
-                    created = True
-                    container = await asyncio.to_thread(_docker_create_container_sync, cfg, session_id)
-
-                host = await _docker_wait_for_ip(container, cfg.network, cfg.connect_timeout_s)
-                reader, writer = await _wait_for_tcp(host, 7777, cfg.connect_timeout_s)
-            except Exception:
-                await ws.close(code=1011, reason="Failed to provision upstream container")
-                return
-
-            live = LiveDockerSession(
-                session_id=session_id,
-                container_id=container.id,
-                container_name=container.name,
-                upstream_host=host,
-                upstream_port=7777,
-                reader=reader,
-                writer=writer,
-                cfg=cfg,
-                pump_task=None,
-                attach_lock=asyncio.Lock(),
-                attached_wss=set(),
-                request_handler_ws=None,
-                initialized_result=None,
-                handshake_done=False,
-                pending_initialize_ids=set(),
-                initialize_waiters=[],
-                pending_client_requests={},
-                next_upstream_id=1_000_000_000,
-                pending_server_requests={},
-                outbox=deque(),
-                turn_owners_by_thread={},
-            )
-
-            async def pump() -> None:
-                buf = bytearray()
-                try:
-                    while True:
-                        raw = await _read_jsonl_line(live.reader, buf, max_line_bytes=cfg.jsonl_line_limit_bytes)
-                        if raw is None:
-                            break
-                        text = raw.decode("utf-8", errors="replace").rstrip("\r")
-
-                        msg: Any = None
-                        try:
-                            msg = json.loads(text)
-                        except Exception:
-                            msg = None
-
-                        if isinstance(msg, dict):
-                            if "id" in msg and "method" in msg:
-                                rid = str(msg.get("id"))
-                                if rid not in live.pending_server_requests:
-                                    live.pending_server_requests[rid] = text
-                                params = msg.get("params")
-                                thread_id: Optional[str] = None
-                                if isinstance(params, dict):
-                                    tid = params.get("threadId")
-                                    if isinstance(tid, str) and tid.strip():
-                                        thread_id = tid.strip()
-                                await live.deliver_server_request(text, thread_id=thread_id)
-                                continue
-
-                            if "id" in msg and "method" not in msg:
-                                rid = str(msg.get("id"))
-                                should_resolve = False
-                                async with live.attach_lock:
-                                    if rid in live.pending_initialize_ids:
-                                        live.pending_initialize_ids.discard(rid)
-                                        if isinstance(msg.get("result"), dict):
-                                            live.initialized_result = msg["result"]
-                                            should_resolve = True
-                                if should_resolve:
-                                    await live.resolve_initialize_waiters()
-                                await live.deliver_response(msg)
-                                continue
-
-                            if msg.get("method") == "turn/completed":
-                                params = msg.get("params")
-                                if isinstance(params, dict):
-                                    tid = params.get("threadId")
-                                    if isinstance(tid, str) and tid.strip():
-                                        await live.clear_turn_owner(tid.strip())
-
-                        await live.broadcast(text)
-                except Exception:
-                    log.exception("Upstream pump failed for session %s", session_id)
-                finally:
-                    live.closed = True
-                    try:
-                        live.writer.close()
-                    except Exception:
-                        pass
-                    async with app.state.sessions_lock:
-                        current = app.state.sessions.get(session_id)
-                        if current is live:
-                            app.state.sessions.pop(session_id, None)
-
-            live.pump_task = asyncio.create_task(pump())
-
-            async with app.state.sessions_lock:
-                app.state.sessions[session_id] = live
-
-            log.info("Provisioned session %s -> %s:%s", session_id, host, 7777)
+        try:
+            live, created = await _ensure_live_docker_session(session_id, allow_create=not bool(requested_session))
+        except KeyError:
+            await ws.close(code=1008, reason="Unknown session")
+            return
+        except Exception:
+            await ws.close(code=1011, reason="Failed to provision upstream container")
+            return
 
         await live.attach(ws)
 
@@ -1663,6 +2819,94 @@ async def ws_proxy(ws: WebSocket):
                     msg = json.loads(text)
                 except Exception:
                     msg = None
+
+                if isinstance(msg, dict) and isinstance(msg.get("method"), str) and str(msg.get("method")).startswith("argus/"):
+                    has_id = "id" in msg and msg.get("id") is not None
+                    req_id = msg.get("id") if has_id else None
+                    method = str(msg.get("method") or "")
+                    params = msg.get("params")
+                    if not isinstance(params, dict):
+                        params = {}
+                    automation: Optional[AutomationManager] = getattr(app.state, "automation", None)
+                    if automation is None:
+                        if has_id:
+                            try:
+                                await ws.send_text(
+                                    json.dumps({"id": req_id, "error": {"code": -32000, "message": "Automation is not available"}})
+                                )
+                            except Exception:
+                                pass
+                        continue
+                    try:
+                        if method == "argus/thread/main/ensure":
+                            tid = await automation.ensure_main_thread(session_id)
+                            if has_id:
+                                await ws.send_text(json.dumps({"id": req_id, "result": {"threadId": tid}}))
+                            continue
+                        if method == "argus/input/enqueue":
+                            text_param = params.get("text")
+                            if not isinstance(text_param, str) or not text_param.strip():
+                                if has_id:
+                                    await ws.send_text(
+                                        json.dumps({"id": req_id, "error": {"code": -32602, "message": "Missing 'text'"}})
+                                    )
+                                continue
+                            res = await automation.enqueue_user_input(
+                                session_id=session_id,
+                                thread_id=(params.get("threadId") if isinstance(params.get("threadId"), str) else None),
+                                target=(params.get("target") if isinstance(params.get("target"), str) else None),
+                                text=text_param,
+                            )
+                            if has_id:
+                                await ws.send_text(json.dumps({"id": req_id, "result": res}))
+                            continue
+                        if method == "argus/systemEvent/enqueue":
+                            text_param = params.get("text")
+                            if not isinstance(text_param, str) or not text_param.strip():
+                                if has_id:
+                                    await ws.send_text(
+                                        json.dumps({"id": req_id, "error": {"code": -32602, "message": "Missing 'text'"}})
+                                    )
+                                continue
+                            kind = params.get("kind")
+                            if not isinstance(kind, str) or not kind.strip():
+                                kind = "system"
+                            target = params.get("target")
+                            thread_id = params.get("threadId") if isinstance(params.get("threadId"), str) else None
+                            if target == "main" or not (isinstance(thread_id, str) and thread_id.strip()):
+                                thread_id = await automation.ensure_main_thread(session_id)
+                            else:
+                                thread_id = thread_id.strip()
+                            ev = await automation.enqueue_system_event(
+                                session_id=session_id,
+                                thread_id=thread_id,
+                                kind=kind.strip(),
+                                text=text_param,
+                            )
+                            if has_id:
+                                await ws.send_text(
+                                    json.dumps(
+                                        {"id": req_id, "result": {"ok": True, "event": ev.to_json(), "threadId": thread_id}}
+                                    )
+                                )
+                            continue
+                        if method == "argus/heartbeat/request":
+                            automation.request_heartbeat_now()
+                            if has_id:
+                                await ws.send_text(json.dumps({"id": req_id, "result": {"ok": True}}))
+                            continue
+                        if has_id:
+                            await ws.send_text(
+                                json.dumps({"id": req_id, "error": {"code": -32601, "message": f"Method not found: {method}"}})
+                            )
+                        continue
+                    except Exception as e:
+                        if has_id:
+                            try:
+                                await ws.send_text(json.dumps({"id": req_id, "error": {"code": -32000, "message": str(e)}}))
+                            except Exception:
+                                pass
+                    continue
 
                 if isinstance(msg, dict) and msg.get("method") == "initialize":
                     req_id = msg.get("id")

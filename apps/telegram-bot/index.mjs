@@ -67,7 +67,13 @@ async function pathExists(targetPath) {
 class StateStore {
   constructor(statePath) {
     this.path = statePath;
-    this.state = { version: 1, defaultSessionId: null, lastUpdateId: null, threads: {} };
+    this.state = {
+      version: 2,
+      defaultSessionId: null,
+      lastUpdateId: null,
+      threads: {},
+      lastActiveByThread: {}
+    };
     this._writeChain = Promise.resolve();
   }
 
@@ -77,11 +83,25 @@ class StateStore {
       const parsed = parseJson(raw);
       if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return;
       const threads = parsed.threads && typeof parsed.threads === "object" && !Array.isArray(parsed.threads) ? parsed.threads : {};
+      const lastActiveByThreadRaw =
+        parsed.lastActiveByThread && typeof parsed.lastActiveByThread === "object" && !Array.isArray(parsed.lastActiveByThread)
+          ? parsed.lastActiveByThread
+          : {};
+      const lastActiveByThread = {};
+      for (const [threadId, entry] of Object.entries(lastActiveByThreadRaw)) {
+        if (!isNonEmptyString(threadId)) continue;
+        if (!entry || typeof entry !== "object" || Array.isArray(entry)) continue;
+        const chatKey = isNonEmptyString(entry.chatKey) ? entry.chatKey : null;
+        const atMs = Number.isFinite(entry.atMs) ? entry.atMs : null;
+        if (!chatKey) continue;
+        lastActiveByThread[threadId] = { chatKey, ...(Number.isFinite(atMs) ? { atMs } : {}) };
+      }
       this.state = {
-        version: 1,
+        version: 2,
         defaultSessionId: isNonEmptyString(parsed.defaultSessionId) ? parsed.defaultSessionId : null,
         lastUpdateId: Number.isFinite(parsed.lastUpdateId) ? parsed.lastUpdateId : null,
-        threads
+        threads,
+        lastActiveByThread
       };
     } catch (e) {
       if (e && typeof e === "object" && "code" in e && e.code === "ENOENT") return;
@@ -120,6 +140,18 @@ class StateStore {
 
   setLastUpdateId(updateId) {
     this.state.lastUpdateId = updateId;
+    return this.save();
+  }
+
+  getLastActiveChatKey(threadId) {
+    const entry = this.state.lastActiveByThread?.[threadId];
+    return entry && typeof entry === "object" && isNonEmptyString(entry.chatKey) ? entry.chatKey : null;
+  }
+
+  setLastActiveChatKey(threadId, chatKey) {
+    if (!isNonEmptyString(threadId) || !isNonEmptyString(chatKey)) return this.save();
+    if (!this.state.lastActiveByThread || typeof this.state.lastActiveByThread !== "object") this.state.lastActiveByThread = {};
+    this.state.lastActiveByThread[threadId] = { chatKey, atMs: Date.now() };
     return this.save();
   }
 }
@@ -280,7 +312,9 @@ class ArgusClient {
     this._connecting = null;
     this._onSessionId = null;
 
-    this.activeTurn = null;
+    this.turnsByKey = new Map();
+    this.onTurnCompleted = null;
+    this.onDisconnected = null;
   }
 
   _isWsOpen() {
@@ -411,10 +445,15 @@ class ArgusClient {
       const err = new Error("WebSocket closed");
       for (const [, p] of this.pending) p.reject(err);
       this.pending.clear();
-      if (this.activeTurn && this.activeTurn.reject) {
-        this.activeTurn.reject(err);
+      this.turnsByKey.clear();
+      const cb = this.onDisconnected;
+      if (typeof cb === "function") {
+        try {
+          cb();
+        } catch {
+          // ignore
+        }
       }
-      this.activeTurn = null;
     });
   }
 
@@ -466,49 +505,12 @@ class ArgusClient {
     await this.rpc("thread/resume", { threadId });
   }
 
-  async runTurn(threadId, text) {
-    if (this.activeTurn) throw new Error("Turn already in progress");
-
-    let resolve;
-    let reject;
-    const done = new Promise((res, rej) => {
-      resolve = res;
-      reject = rej;
-    });
-
-    const turn = {
-      threadId,
-      turnId: null,
-      delta: "",
-      fullText: null,
-      resolve,
-      reject
-    };
-    this.activeTurn = turn;
-
-    try {
-      await this.rpc(
-        "turn/start",
-        {
-          threadId,
-          input: [{ type: "text", text }],
-          cwd: this.cwd,
-          approvalPolicy: "never",
-          sandboxPolicy: { type: "dangerFullAccess" }
-        },
-        { timeoutMs: 120000 }
-      );
-
-      const out = await Promise.race([
-        done,
-        new Promise((_, rej) =>
-          setTimeout(() => rej(new Error("Timed out waiting for turn/completed")), 15 * 60_000)
-        )
-      ]);
-      return out;
-    } finally {
-      if (this.activeTurn === turn) this.activeTurn = null;
-    }
+  async enqueueInput({ text, threadId, target }) {
+    if (!isNonEmptyString(text)) throw new Error("Missing text");
+    const params = { text };
+    if (isNonEmptyString(threadId)) params.threadId = threadId;
+    if (isNonEmptyString(target)) params.target = target;
+    return await this.rpc("argus/input/enqueue", params, { timeoutMs: 120000 });
   }
 
   _handleServerRequest(msg) {
@@ -538,41 +540,50 @@ class ArgusClient {
       }
       return;
     }
-
-    const turn = this.activeTurn;
-    if (!turn) return;
     const params = msg.params && typeof msg.params === "object" ? msg.params : {};
-
-    if (msg.method === "turn/started") {
-      if (params.threadId !== turn.threadId) return;
-      const incomingTurnId = params.turn && typeof params.turn === "object" ? params.turn.id : null;
-      if (isNonEmptyString(incomingTurnId)) turn.turnId = incomingTurnId;
-      return;
-    }
+    const threadId = isNonEmptyString(params.threadId) ? params.threadId : null;
+    const turnId = isNonEmptyString(params.turnId)
+      ? params.turnId
+      : isNonEmptyString(params.turn?.id)
+        ? params.turn.id
+        : null;
+    const key = threadId && turnId ? `${threadId}:${turnId}` : null;
 
     if (msg.method === "item/agentMessage/delta") {
-      if (params.threadId !== turn.threadId) return;
-      if (turn.turnId && params.turnId && params.turnId !== turn.turnId) return;
-      if (isNonEmptyString(params.delta)) turn.delta += params.delta;
+      if (!key) return;
+      const delta = params.delta;
+      if (!isNonEmptyString(delta)) return;
+      const existing = this.turnsByKey.get(key) || { delta: "", fullText: null };
+      existing.delta += delta;
+      this.turnsByKey.set(key, existing);
       return;
     }
 
     if (msg.method === "item/completed") {
-      if (params.threadId !== turn.threadId) return;
-      if (turn.turnId && params.turnId && params.turnId !== turn.turnId) return;
+      if (!key) return;
       const item = params.item && typeof params.item === "object" ? params.item : null;
       if (!item || item.type !== "agentMessage") return;
-      if (isNonEmptyString(item.text)) turn.fullText = item.text;
+      if (!isNonEmptyString(item.text)) return;
+      const existing = this.turnsByKey.get(key) || { delta: "", fullText: null };
+      existing.fullText = item.text;
+      this.turnsByKey.set(key, existing);
       return;
     }
 
     if (msg.method === "turn/completed") {
-      if (params.threadId !== turn.threadId) return;
-      const incomingTurnId = params.turn && typeof params.turn === "object" ? params.turn.id : null;
-      if (turn.turnId && isNonEmptyString(incomingTurnId) && incomingTurnId !== turn.turnId) return;
-      const finalText = isNonEmptyString(turn.fullText) ? turn.fullText : turn.delta;
-      this.activeTurn = null;
-      turn.resolve(finalText);
+      if (!key) return;
+      const existing = this.turnsByKey.get(key) || { delta: "", fullText: null };
+      this.turnsByKey.delete(key);
+      const finalText = isNonEmptyString(existing.fullText) ? existing.fullText : existing.delta;
+      const cb = this.onTurnCompleted;
+      if (typeof cb === "function") {
+        try {
+          const res = cb({ threadId, turnId, text: finalText });
+          if (res && typeof res.then === "function") res.catch(() => {});
+        } catch {
+          // ignore
+        }
+      }
     }
   }
 
@@ -613,6 +624,17 @@ function sendTargetFromMessage(message) {
   if (!Number.isFinite(chatId)) return null;
   const out = { chat_id: chatId };
   const topicId = message?.message_thread_id;
+  if (Number.isFinite(topicId)) out.message_thread_id = topicId;
+  return out;
+}
+
+function sendTargetFromChatKey(chatKey) {
+  if (!isNonEmptyString(chatKey)) return null;
+  const [chatIdRaw, topicRaw] = chatKey.split(":", 2);
+  const chatId = Number(chatIdRaw);
+  if (!Number.isFinite(chatId)) return null;
+  const out = { chat_id: chatId };
+  const topicId = Number(topicRaw);
   if (Number.isFinite(topicId)) out.message_thread_id = topicId;
   return out;
 }
@@ -678,7 +700,7 @@ async function main() {
   const gatewayHttpUrl = gatewayHttpUrlRaw || deriveHttpBaseFromWsUrl(gatewayWsUrl) || fromHost.httpBase;
 
   const argusToken = isNonEmptyString(process.env.ARGUS_TOKEN) ? process.env.ARGUS_TOKEN : null;
-  const cwd = process.env.ARGUS_CWD || "/workspace";
+  const cwd = process.env.ARGUS_CWD || "/root/.argus/workspace";
   const statePathEnv = stripOuterQuotes(process.env.STATE_PATH);
   let statePath;
   if (isNonEmptyString(statePathEnv)) {
@@ -699,6 +721,25 @@ async function main() {
   log("State path:", statePath);
 
   const argus = new ArgusClient({ gatewayHttpUrl, gatewayWsUrl, token: argusToken, cwd });
+  let deliverEnabled = false;
+
+  argus.onTurnCompleted = async ({ threadId, text }) => {
+    try {
+      if (!deliverEnabled) return;
+      if (!isNonEmptyString(threadId)) return;
+      const chatKey = state.getLastActiveChatKey(threadId);
+      if (!isNonEmptyString(chatKey)) return;
+      const target = sendTargetFromChatKey(chatKey);
+      if (!target) return;
+      const finalText = isNonEmptyString(text) ? text : "(no output)";
+      await tg.sendMessage({ ...target, text: truncateTelegramMessage(finalText) });
+    } catch (e) {
+      log("Failed to deliver turn/completed:", e instanceof Error ? e.message : String(e));
+    }
+  };
+  argus.onDisconnected = () => {
+    deliverEnabled = false;
+  };
 
   const queue = new SerialQueue();
 
@@ -708,6 +749,7 @@ async function main() {
       try {
         await argus.connectToSession(preferred);
         argus.sessionId = preferred;
+        deliverEnabled = true;
         return preferred;
       } catch (e) {
         log("Failed to attach to defaultSessionId, will reselect:", e instanceof Error ? e.message : String(e));
@@ -728,11 +770,13 @@ async function main() {
       await argus.connectToSession(sid);
       argus.sessionId = sid;
       await state.setDefaultSessionId(sid);
+      deliverEnabled = true;
       return sid;
     }
 
     const sid = await argus.connectNewSession();
     await state.setDefaultSessionId(sid);
+    deliverEnabled = true;
     return sid;
   }
 
@@ -819,6 +863,7 @@ async function main() {
           if (cmd === "new") {
             const tid = await argus.startThread();
             await state.setThreadId(chatKey, tid);
+            await state.setLastActiveChatKey(tid, chatKey);
             await tg.sendMessage({ ...target, text: `ok (new thread): ${tid}` });
             return;
           }
@@ -828,21 +873,27 @@ async function main() {
             return;
           }
 
+          const chatType = message?.chat?.type;
           let threadId = state.getThreadId(chatKey);
-          if (!isNonEmptyString(threadId)) {
+          let enqueueTarget = null;
+
+          if (isNonEmptyString(threadId)) {
+            // Use mapped thread.
+          } else if (chatType === "private") {
+            enqueueTarget = "main";
+          } else {
             threadId = await argus.startThread();
             await state.setThreadId(chatKey, threadId);
           }
 
-          try {
-            await argus.resumeThread(threadId);
-          } catch {
-            // ignore resume errors; turn/start may still work
+          const res = await argus.enqueueInput({ text, threadId, target: enqueueTarget });
+          const effectiveThreadId = isNonEmptyString(res?.threadId) ? res.threadId : threadId;
+          if (isNonEmptyString(effectiveThreadId)) {
+            await state.setLastActiveChatKey(effectiveThreadId, chatKey);
+            if (!isNonEmptyString(threadId)) {
+              await state.setThreadId(chatKey, effectiveThreadId);
+            }
           }
-
-          const reply = await argus.runTurn(threadId, text);
-          const finalText = isNonEmptyString(reply) ? reply : "(no output)";
-          await tg.sendMessage({ ...target, text: truncateTelegramMessage(finalText) });
         } catch (e) {
           const msg = e instanceof Error ? e.message : String(e);
           await tg.sendMessage({ ...target, text: `error: ${msg}` });
