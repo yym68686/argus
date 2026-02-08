@@ -2,7 +2,6 @@ import process from "node:process";
 import fs from "node:fs/promises";
 import path from "node:path";
 import WebSocket from "ws";
-import { marked } from "marked";
 
 function log(...args) {
   // eslint-disable-next-line no-console
@@ -694,53 +693,132 @@ function escapeHtmlAttr(text) {
 }
 
 function markdownToTelegramHtml(markdown) {
-  const renderer = new marked.Renderer();
+  const input = String(markdown ?? "");
+  if (!input.trim()) return "";
 
-  renderer.text = (text) => escapeHtml(text);
-  renderer.html = (html) => escapeHtml(html);
+  const normalized = input.replace(/\r\n?/g, "\n");
 
-  renderer.strong = (text) => `<b>${text}</b>`;
-  renderer.em = (text) => `<i>${text}</i>`;
-  renderer.del = (text) => `<s>${text}</s>`;
-
-  renderer.codespan = (code) => `<code>${escapeHtml(code)}</code>`;
-  renderer.code = (code) => {
-    const safe = escapeHtml(code);
+  function renderCodeBlock(raw) {
+    const safe = escapeHtml(String(raw ?? "").replace(/\n+$/, ""));
     const withNl = safe.endsWith("\n") ? safe : `${safe}\n`;
-    return `<pre><code>${withNl}</code></pre>\n\n`;
-  };
+    return `<pre><code>${withNl}</code></pre>`;
+  }
 
-  renderer.br = () => "\n";
-  renderer.paragraph = (text) => `${text}\n\n`;
-  renderer.heading = (text) => `${text}\n\n`;
-  renderer.blockquote = (quote) => `${quote}\n\n`;
-  renderer.hr = () => "——\n\n";
+  function renderInlineSpans(raw) {
+    if (!isNonEmptyString(raw)) return "";
+    let text = String(raw);
 
-  renderer.listitem = (text) => `• ${text}\n`;
-  renderer.list = (body) => `${body}\n`;
+    const placeholders = new Map();
+    let idx = 0;
+    const store = (html) => {
+      const key = `\u0000${idx++}\u0000`;
+      placeholders.set(key, html);
+      return key;
+    };
 
-  renderer.link = (href, _title, text) => {
-    const raw = stripOuterQuotes(href);
-    if (!isNonEmptyString(raw)) return text;
-    const safeHref = escapeHtmlAttr(raw);
-    return `<a href="${safeHref}">${text}</a>`;
-  };
+    // Inline code: `code`
+    text = text.replace(/`([^`\n]+)`/g, (_m, code) => store(`<code>${escapeHtml(code)}</code>`));
 
-  renderer.image = (href, _title, text) => {
-    const raw = stripOuterQuotes(href);
-    const alt = isNonEmptyString(text) ? text : "image";
-    if (!isNonEmptyString(raw)) return escapeHtml(alt);
-    const safeHref = escapeHtmlAttr(raw);
-    return `${escapeHtml(alt)} (${safeHref})`;
-  };
+    // Links: [label](url)
+    text = text.replace(/\[([^\]\n]+)\]\(([^)\n]+)\)/g, (_m, label, href) => {
+      const rawHref = stripOuterQuotes(href);
+      const safeLabel = escapeHtml(label);
+      if (!isNonEmptyString(rawHref)) return safeLabel;
+      const safeHref = escapeHtmlAttr(rawHref);
+      return store(`<a href="${safeHref}">${safeLabel}</a>`);
+    });
 
-  const out = marked.parse(String(markdown ?? ""), {
-    renderer,
-    gfm: true,
-    breaks: false,
-    mangle: false,
-    headerIds: false
-  });
+    // Escape the rest (so user-provided <tag> won't break Telegram HTML).
+    text = escapeHtml(text);
+
+    // Basic emphasis (best-effort).
+    text = text
+      .replace(/\*\*([^*\n]+?)\*\*/g, "<b>$1</b>")
+      .replace(/__([^_\n]+?)__/g, "<b>$1</b>")
+      .replace(/~~([^~\n]+?)~~/g, "<s>$1</s>")
+      .replace(/(^|[^\w*])\*([^*\n]+?)\*(?!\*)/g, "$1<i>$2</i>")
+      .replace(/(^|[^\w_])_([^_\n]+?)_(?!_)/g, "$1<i>$2</i>");
+
+    // Restore placeholders.
+    for (const [key, html] of placeholders.entries()) {
+      text = text.split(key).join(html);
+    }
+    return text;
+  }
+
+  function renderInlineBlock(block) {
+    const lines = String(block ?? "").split("\n");
+    const out = [];
+    for (const lineRaw of lines) {
+      const line = lineRaw ?? "";
+      if (!line.trim()) {
+        out.push("");
+        continue;
+      }
+
+      // Headings (# ...)
+      const headingMatch = /^\s{0,3}#{1,6}\s+(.+?)\s*$/.exec(line);
+      if (headingMatch) {
+        out.push(`<b>${renderInlineSpans(headingMatch[1])}</b>`);
+        continue;
+      }
+
+      // Blockquote (> ...)
+      const quoteMatch = /^\s{0,3}>\s?(.*)$/.exec(line);
+      if (quoteMatch) {
+        out.push(`│ ${renderInlineSpans(quoteMatch[1])}`);
+        continue;
+      }
+
+      // Unordered list (-/*/+ ...)
+      const bulletMatch = /^\s{0,3}[-*+]\s+(.+?)\s*$/.exec(line);
+      if (bulletMatch) {
+        out.push(`• ${renderInlineSpans(bulletMatch[1])}`);
+        continue;
+      }
+
+      out.push(renderInlineSpans(line));
+    }
+    return out.join("\n");
+  }
+
+  // Handle fenced code blocks (```).
+  let out = "";
+  let i = 0;
+  while (i < normalized.length) {
+    const start = normalized.indexOf("```", i);
+    if (start === -1) {
+      out += renderInlineBlock(normalized.slice(i));
+      break;
+    }
+
+    out += renderInlineBlock(normalized.slice(i, start));
+
+    const end = normalized.indexOf("```", start + 3);
+    if (end === -1) {
+      // Unclosed fence: treat the rest as normal text.
+      out += renderInlineBlock(normalized.slice(start));
+      break;
+    }
+
+    let codeStart = start + 3;
+    if (normalized[codeStart] === "\n") {
+      codeStart += 1;
+    } else {
+      const nl = normalized.indexOf("\n", codeStart);
+      if (nl !== -1 && nl < end) codeStart = nl + 1;
+    }
+    const code = normalized.slice(codeStart, end);
+
+    if (out && !out.endsWith("\n")) out += "\n";
+    out += renderCodeBlock(code);
+
+    i = end + 3;
+    if (i < normalized.length && normalized[i] === "\n") {
+      out += "\n";
+      i += 1;
+    }
+  }
 
   return String(out ?? "").trim();
 }

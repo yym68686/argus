@@ -867,6 +867,9 @@ class AutomationManager:
             lane.busy = True
 
             try:
+                # `turn/start` fails with "thread not found" if the app-server process hasn't loaded the thread yet
+                # (e.g. after reconnect/restart). Make `argus/input/enqueue` robust by resuming first.
+                await self._rpc(live, "thread/resume", {"threadId": thread_id})
                 assembled = await self._assemble_turn_input(session_id, thread_id, user_text=text, heartbeat=False)
                 resp = await self._rpc(
                     live,
@@ -965,6 +968,7 @@ class AutomationManager:
 
             lane.busy = True
             try:
+                await self._rpc(live, "thread/resume", {"threadId": thread_id})
                 assembled = await self._assemble_turn_input(session_id, thread_id, user_text=merged, heartbeat=False)
                 resp = await self._rpc(
                     live,
@@ -1335,6 +1339,7 @@ class AutomationManager:
 
             lane.busy = True
             try:
+                await self._rpc(live, "thread/resume", {"threadId": main_tid})
                 assembled = await self._assemble_turn_input(session_id, main_tid, user_text="", heartbeat=True)
                 await self._rpc(
                     live,
