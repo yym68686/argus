@@ -614,13 +614,13 @@ class AutomationManager:
         self._last_heartbeat_run_at_ms: dict[tuple[str, str], int] = {}
 
         self._tasks: list[asyncio.Task[None]] = []
-        self._bootstrapped = False
         self._bootstrap_lock = asyncio.Lock()
+        self._session_backoff_until_ms: dict[str, int] = {}
+        self._session_backoff_failures: dict[str, int] = {}
 
     async def start(self) -> None:
         await self._store.load()
         await self._ensure_workspace_files()
-        self._tasks.append(asyncio.create_task(self._bootstrap_loop()))
         self._tasks.append(asyncio.create_task(self._cron_loop()))
         self._tasks.append(asyncio.create_task(self._heartbeat_loop()))
 
@@ -681,6 +681,28 @@ class AutomationManager:
             self._lanes[key] = lane
         return lane
 
+    def _is_session_backed_off(self, session_id: str, now_ms: Optional[int] = None) -> bool:
+        if not session_id:
+            return False
+        if now_ms is None:
+            now_ms = _now_ms()
+        until = self._session_backoff_until_ms.get(session_id)
+        return until is not None and now_ms < until
+
+    def _clear_session_backoff(self, session_id: str) -> None:
+        self._session_backoff_until_ms.pop(session_id, None)
+        self._session_backoff_failures.pop(session_id, None)
+
+    def _note_session_failure(self, session_id: str, *, what: str, err: Exception) -> None:
+        if not session_id:
+            return
+        failures = self._session_backoff_failures.get(session_id, 0) + 1
+        self._session_backoff_failures[session_id] = failures
+        # 5s, 10s, 20s, ... capped at 10min.
+        delay_s = min(600.0, 5.0 * (2 ** min(failures - 1, 10)))
+        self._session_backoff_until_ms[session_id] = _now_ms() + int(delay_s * 1000)
+        log.warning("%s failed for session %s; backing off %.0fs: %s", what, session_id, delay_s, str(err))
+
     def on_upstream_notification(self, session_id: str, msg: dict[str, Any]) -> None:
         method = msg.get("method")
         params = msg.get("params")
@@ -712,19 +734,6 @@ class AutomationManager:
                 asyncio.create_task(self._maybe_request_heartbeat(session_id, thread_id.strip()))
             return
 
-    async def _bootstrap_loop(self) -> None:
-        # Keep trying to ensure the default session + main thread are ready.
-        while True:
-            try:
-                await self.ensure_default_ready()
-                self._bootstrapped = True
-                await asyncio.sleep(10.0)
-            except asyncio.CancelledError:
-                raise
-            except Exception:
-                log.exception("Automation bootstrap failed; will retry")
-                await asyncio.sleep(2.0)
-
     async def ensure_default_ready(self) -> str:
         if _provision_mode() != "docker":
             raise RuntimeError("Automation is only supported in docker provision mode")
@@ -739,20 +748,14 @@ class AutomationManager:
     async def _choose_default_session_id(self) -> str:
         existing = self._store.state.default_session_id
         if isinstance(existing, str) and existing.strip():
-            try:
-                container = await asyncio.to_thread(_docker_get_container_by_session_sync, existing.strip())
-                if container is not None:
-                    labels = getattr(container, "labels", None) or {}
-                    if labels.get("io.argus.runtime_layout") == RUNTIME_LAYOUT:
-                        return existing.strip()
-            except Exception:
-                log.exception("Failed to validate persisted default_session_id=%s", existing)
+            return existing.strip()
 
         sessions: list[dict[str, Any]] = []
         try:
             sessions = await asyncio.to_thread(_docker_list_argus_containers_sync)
-        except Exception:
-            log.exception("Failed to list docker sessions for automation bootstrap")
+        except Exception as e:
+            # Docker might be slow/unavailable; don't spam stack traces for background bootstrap.
+            log.warning("Failed to list docker sessions while choosing default session: %s", str(e))
 
         sid: Optional[str] = None
         for s in sessions:
@@ -764,8 +767,6 @@ class AutomationManager:
 
         if sid is None:
             sid = uuid.uuid4().hex[:12]
-            cfg = _docker_cfg()
-            await asyncio.to_thread(_docker_create_container_sync, cfg, sid)
 
         await self._store.update(lambda st: setattr(st, "default_session_id", sid))
         return sid
@@ -806,7 +807,17 @@ class AutomationManager:
             if sess is None:
                 sess = PersistedSessionAutomation()
                 st.sessions[session_id] = sess
+            prev_tid = sess.main_thread_id
             sess.main_thread_id = tid
+            if prev_tid and prev_tid != tid:
+                # Migrate pending system events to the new main thread so they don't get stuck.
+                old_q = sess.system_event_queues.pop(prev_tid, None)
+                if old_q:
+                    new_q = sess.system_event_queues.get(tid)
+                    if new_q is None:
+                        sess.system_event_queues[tid] = old_q
+                    else:
+                        new_q.extend(old_q)
 
         await self._store.update(_save_main)
         return tid
@@ -1099,8 +1110,13 @@ class AutomationManager:
         req = {"method": "initialize", "id": None, "params": {"clientInfo": {"name": "argus_gateway", "title": "Argus Gateway Automation", "version": "0.1.0"}}}
         rid, fut = await live.reserve_internal_id()
         req["id"] = rid
-        await live.write_upstream(json.dumps(req))
-        resp = await asyncio.wait_for(fut, timeout=30.0)
+        try:
+            await live.write_upstream(json.dumps(req))
+            resp = await asyncio.wait_for(fut, timeout=30.0)
+        except Exception:
+            async with live.attach_lock:
+                live.pending_internal_requests.pop(str(rid), None)
+            raise
         if isinstance(resp, dict) and isinstance(resp.get("result"), dict):
             live.initialized_result = resp["result"]
         # Complete handshake.
@@ -1110,8 +1126,13 @@ class AutomationManager:
 
     async def _rpc(self, live: LiveDockerSession, method: str, params: Any) -> Any:
         rid, fut = await live.reserve_internal_id()
-        await live.write_upstream(json.dumps({"method": method, "id": rid, "params": params}))
-        resp = await asyncio.wait_for(fut, timeout=120.0)
+        try:
+            await live.write_upstream(json.dumps({"method": method, "id": rid, "params": params}))
+            resp = await asyncio.wait_for(fut, timeout=120.0)
+        except Exception:
+            async with live.attach_lock:
+                live.pending_internal_requests.pop(str(rid), None)
+            raise
         if not isinstance(resp, dict):
             raise RuntimeError("Invalid JSON-RPC response")
         if "error" in resp and resp["error"] is not None:
@@ -1145,6 +1166,9 @@ class AutomationManager:
             return 5.0
 
         now = _now_ms()
+        if self._is_session_backed_off(session_id, now):
+            until = self._session_backoff_until_ms.get(session_id) or (now + 5000)
+            return max(1.0, min(30.0, (until - now) / 1000.0))
         next_due_ms: Optional[int] = None
         changed = False
 
@@ -1160,21 +1184,26 @@ class AutomationManager:
                 # Run if due.
                 if job.next_run_at_ms is not None and job.next_run_at_ms <= now:
                     main_tid = sess.main_thread_id
-                    if main_tid:
-                        await self.enqueue_system_event(
-                            session_id=session_id,
-                            thread_id=main_tid,
-                            kind="cron",
-                            text=job.text,
-                            meta={"jobId": job.job_id, "expr": job.expr},
-                        )
+                    if not main_tid:
+                        main_tid = await self.ensure_main_thread(session_id)
+                        # Refresh session object after persistence updates.
+                        sess = self._store.state.sessions.get(session_id) or sess
+                    await self.enqueue_system_event(
+                        session_id=session_id,
+                        thread_id=main_tid,
+                        kind="cron",
+                        text=job.text,
+                        meta={"jobId": job.job_id, "expr": job.expr},
+                    )
                     job.last_run_at_ms = now
                     base_dt = _ms_to_dt_utc(now)
                     job.next_run_at_ms = _dt_to_ms(croniter(job.expr, base_dt).get_next(datetime))
                     changed = True
-            except Exception:
-                # Keep job but avoid tight loop.
-                log.exception("Failed to evaluate cron job %s", job.job_id)
+                    self._clear_session_backoff(session_id)
+            except Exception as e:
+                # Keep job but avoid tight loop; don't mark as executed.
+                log.exception("Failed to run cron job %s", job.job_id)
+                self._note_session_failure(session_id, what=f"Cron job {job.job_id}", err=e)
                 job.next_run_at_ms = now + 60_000
                 changed = True
 
@@ -1238,52 +1267,73 @@ class AutomationManager:
     async def _heartbeat_tick(self, *, forced: bool) -> None:
         if _provision_mode() != "docker":
             return
+        has_heartbeat_tasks = await self._heartbeat_has_actionable_content()
+
         st = self._store.state
         session_id = st.default_session_id
+
+        # If we don't have a persisted default session yet, only bootstrap when heartbeat has work.
         if not session_id:
-            return
-        sess = st.sessions.get(session_id)
-        if sess is None:
-            return
-        main_tid = sess.main_thread_id
-        if not main_tid:
-            main_tid = await self.ensure_main_thread(session_id)
-        q = sess.system_event_queues.get(main_tid) or []
-        has_system_events = bool(q)
-        if not has_system_events:
-            has_heartbeat_tasks = await self._heartbeat_has_actionable_content()
             if not has_heartbeat_tasks:
                 return
-            now0 = _now_ms()
-            if not forced and not self._heartbeat_tasks_due(session_id, main_tid, now0):
+            try:
+                session_id = await self._choose_default_session_id()
+            except Exception as e:
+                log.warning("Heartbeat bootstrap failed while choosing default session: %s", str(e))
                 return
+            st = self._store.state
+
+        now_ms = _now_ms()
+        if self._is_session_backed_off(session_id, now_ms):
+            return
+
+        sess = st.sessions.get(session_id)
+        main_tid = sess.main_thread_id if sess is not None else None
+        q = (sess.system_event_queues.get(main_tid) or []) if (sess is not None and main_tid) else []
+        has_system_events = bool(q)
+        if not has_system_events:
+            if not has_heartbeat_tasks:
+                return
+            if main_tid and (not forced and not self._heartbeat_tasks_due(session_id, main_tid, now_ms)):
+                return
+
+        try:
+            main_tid = await self.ensure_main_thread(session_id)
+            self._clear_session_backoff(session_id)
+        except Exception as e:
+            self._note_session_failure(session_id, what="Heartbeat bootstrap", err=e)
+            return
 
         lane = self.lane(session_id, main_tid)
         if lane.busy:
             return
+
         async with lane.lock:
             if lane.busy:
                 return
-            # Re-check queue under latest state.
-            sess2 = self._store.state.sessions.get(session_id)
+
+            # Re-check work under latest state.
+            st2 = self._store.state
+            sess2 = st2.sessions.get(session_id)
             if sess2 is None:
                 return
             q2 = sess2.system_event_queues.get(main_tid) or []
             has_system_events2 = bool(q2)
             if not has_system_events2:
-                has_heartbeat_tasks2 = await self._heartbeat_has_actionable_content()
-                if not has_heartbeat_tasks2:
+                if not has_heartbeat_tasks:
                     return
-                now1 = _now_ms()
-                if not forced and not self._heartbeat_tasks_due(session_id, main_tid, now1):
+                now2 = _now_ms()
+                if not forced and not self._heartbeat_tasks_due(session_id, main_tid, now2):
                     return
 
-            live, _ = await _ensure_live_docker_session(session_id, allow_create=True)
-            await self._ensure_initialized(live)
-            await self.ensure_main_thread(session_id)
+            try:
+                live, _ = await _ensure_live_docker_session(session_id, allow_create=True)
+                await self._ensure_initialized(live)
+            except Exception as e:
+                self._note_session_failure(session_id, what="Heartbeat prepare", err=e)
+                return
 
             lane.busy = True
-            self._last_heartbeat_run_at_ms[(session_id, main_tid)] = _now_ms()
             try:
                 assembled = await self._assemble_turn_input(session_id, main_tid, user_text="", heartbeat=True)
                 await self._rpc(
@@ -1297,9 +1347,12 @@ class AutomationManager:
                         "sandboxPolicy": {"type": "dangerFullAccess"},
                     },
                 )
-            except Exception:
+                self._last_heartbeat_run_at_ms[(session_id, main_tid)] = _now_ms()
+                self._clear_session_backoff(session_id)
+            except Exception as e:
                 lane.busy = False
-                log.exception("Failed to start heartbeat turn for %s/%s", session_id, main_tid)
+                self._note_session_failure(session_id, what="Heartbeat turn/start", err=e)
+                return
 
 
 @dataclass
@@ -2225,6 +2278,16 @@ def _docker_cfg() -> DockerProvisionConfig:
     )
 
 
+def _docker_api_timeout_s() -> float:
+    # Keep Docker API calls snappy: the gateway should remain responsive even when Docker is slow/unavailable.
+    # Reuse ARGUS_CONNECT_TIMEOUT_S as a coarse upper bound (no new env var).
+    try:
+        bound = float(os.getenv("ARGUS_CONNECT_TIMEOUT_S", "30"))
+    except Exception:
+        bound = 30.0
+    return max(3.0, min(10.0, bound))
+
+
 def _docker_create_container_sync(cfg: DockerProvisionConfig, session_id: str):
     try:
         import docker  # type: ignore
@@ -2232,7 +2295,7 @@ def _docker_create_container_sync(cfg: DockerProvisionConfig, session_id: str):
     except Exception as e:  # pragma: no cover
         raise RuntimeError("Docker provision mode requires the 'docker' Python package") from e
 
-    client = docker.from_env()
+    client = docker.from_env(timeout=_docker_api_timeout_s())
 
     try:
         client.networks.get(cfg.network)
@@ -2317,7 +2380,7 @@ def _docker_list_argus_containers_sync():
     except Exception as e:  # pragma: no cover
         raise RuntimeError("Docker provision mode requires the 'docker' Python package") from e
 
-    client = docker.from_env()
+    client = docker.from_env(timeout=_docker_api_timeout_s())
     containers = client.containers.list(
         all=True,
         filters={"label": ["io.argus.gateway=apps/api"]},
@@ -2346,7 +2409,7 @@ def _docker_get_container_by_session_sync(session_id: str):
     except Exception as e:  # pragma: no cover
         raise RuntimeError("Docker provision mode requires the 'docker' Python package") from e
 
-    client = docker.from_env()
+    client = docker.from_env(timeout=_docker_api_timeout_s())
     containers = client.containers.list(
         all=True,
         filters={
