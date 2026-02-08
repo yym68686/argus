@@ -2,6 +2,7 @@ import process from "node:process";
 import fs from "node:fs/promises";
 import path from "node:path";
 import WebSocket from "ws";
+import { marked } from "marked";
 
 function log(...args) {
   // eslint-disable-next-line no-console
@@ -681,6 +682,69 @@ function truncateTelegramMessage(text) {
   return text.slice(0, Math.max(0, max - suffix.length)) + suffix;
 }
 
+const TELEGRAM_HTML_PARSE_ERR_RE = /can't parse entities|parse entities|find end of the entity/i;
+const TELEGRAM_MESSAGE_TOO_LONG_RE = /message is too long/i;
+
+function escapeHtml(text) {
+  return String(text).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+}
+
+function escapeHtmlAttr(text) {
+  return escapeHtml(text).replace(/"/g, "&quot;");
+}
+
+function markdownToTelegramHtml(markdown) {
+  const renderer = new marked.Renderer();
+
+  renderer.text = (text) => escapeHtml(text);
+  renderer.html = (html) => escapeHtml(html);
+
+  renderer.strong = (text) => `<b>${text}</b>`;
+  renderer.em = (text) => `<i>${text}</i>`;
+  renderer.del = (text) => `<s>${text}</s>`;
+
+  renderer.codespan = (code) => `<code>${escapeHtml(code)}</code>`;
+  renderer.code = (code) => {
+    const safe = escapeHtml(code);
+    const withNl = safe.endsWith("\n") ? safe : `${safe}\n`;
+    return `<pre><code>${withNl}</code></pre>\n\n`;
+  };
+
+  renderer.br = () => "\n";
+  renderer.paragraph = (text) => `${text}\n\n`;
+  renderer.heading = (text) => `${text}\n\n`;
+  renderer.blockquote = (quote) => `${quote}\n\n`;
+  renderer.hr = () => "——\n\n";
+
+  renderer.listitem = (text) => `• ${text}\n`;
+  renderer.list = (body) => `${body}\n`;
+
+  renderer.link = (href, _title, text) => {
+    const raw = stripOuterQuotes(href);
+    if (!isNonEmptyString(raw)) return text;
+    const safeHref = escapeHtmlAttr(raw);
+    return `<a href="${safeHref}">${text}</a>`;
+  };
+
+  renderer.image = (href, _title, text) => {
+    const raw = stripOuterQuotes(href);
+    const alt = isNonEmptyString(text) ? text : "image";
+    if (!isNonEmptyString(raw)) return escapeHtml(alt);
+    const safeHref = escapeHtmlAttr(raw);
+    return `${escapeHtml(alt)} (${safeHref})`;
+  };
+
+  const out = marked.parse(String(markdown ?? ""), {
+    renderer,
+    gfm: true,
+    breaks: false,
+    mangle: false,
+    headerIds: false
+  });
+
+  return String(out ?? "").trim();
+}
+
 async function main() {
   const telegramToken = process.env.TELEGRAM_BOT_TOKEN;
   if (!isNonEmptyString(telegramToken)) {
@@ -732,7 +796,18 @@ async function main() {
       const target = sendTargetFromChatKey(chatKey);
       if (!target) return;
       const finalText = isNonEmptyString(text) ? text : "(no output)";
-      await tg.sendMessage({ ...target, text: truncateTelegramMessage(finalText) });
+      const truncated = truncateTelegramMessage(finalText);
+      const html = markdownToTelegramHtml(truncated);
+      try {
+        await tg.sendMessage({ ...target, text: html || "(no output)", parse_mode: "HTML" });
+      } catch (e) {
+        const msg = e instanceof Error ? e.message : String(e);
+        if (TELEGRAM_HTML_PARSE_ERR_RE.test(msg) || TELEGRAM_MESSAGE_TOO_LONG_RE.test(msg)) {
+          await tg.sendMessage({ ...target, text: truncated });
+          return;
+        }
+        throw e;
+      }
     } catch (e) {
       log("Failed to deliver turn/completed:", e instanceof Error ? e.message : String(e));
     }
