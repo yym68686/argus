@@ -354,6 +354,18 @@ class ArgusClient {
     return Array.isArray(sessions) ? sessions : [];
   }
 
+  async getAutomationState() {
+    return await this._httpJson("GET", "/automation/state");
+  }
+
+  async ensureMainThread() {
+    await this.initialize();
+    const result = await this.rpc("argus/thread/main/ensure", {});
+    const tid = result?.threadId;
+    if (!isNonEmptyString(tid)) throw new Error("Invalid argus/thread/main/ensure response");
+    return tid;
+  }
+
   async connectToSession(sessionId) {
     if (this._isWsOpen() && this.sessionId === sessionId) {
       await this.initialize();
@@ -991,14 +1003,96 @@ async function main() {
   };
 
   const queue = new SerialQueue();
+  let alignedSessionId = null;
+
+  function chatIdFromChatKey(chatKey) {
+    if (!isNonEmptyString(chatKey)) return null;
+    const chatIdRaw = chatKey.split(":", 2)[0];
+    const chatId = Number(chatIdRaw);
+    return Number.isFinite(chatId) ? chatId : null;
+  }
+
+  async function alignPrivateChatsToMainThread(mainThreadId) {
+    if (!isNonEmptyString(mainThreadId)) return;
+    const threads = state.state.threads;
+    if (!threads || typeof threads !== "object" || Array.isArray(threads)) return;
+
+    let changed = false;
+    for (const [chatKey, entry] of Object.entries(threads)) {
+      const chatId = chatIdFromChatKey(chatKey);
+      if (!Number.isFinite(chatId) || chatId <= 0) continue; // private chats are positive ids
+      if (!entry || typeof entry !== "object" || Array.isArray(entry)) continue;
+      if (entry.threadId !== mainThreadId) {
+        entry.threadId = mainThreadId;
+        changed = true;
+      }
+    }
+
+    const lastActiveByThread = state.state.lastActiveByThread;
+    if (lastActiveByThread && typeof lastActiveByThread === "object" && !Array.isArray(lastActiveByThread)) {
+      let best = null;
+      for (const entry of Object.values(lastActiveByThread)) {
+        if (!entry || typeof entry !== "object" || Array.isArray(entry)) continue;
+        const chatKey = isNonEmptyString(entry.chatKey) ? entry.chatKey : null;
+        if (!chatKey) continue;
+        const chatId = chatIdFromChatKey(chatKey);
+        if (!Number.isFinite(chatId) || chatId <= 0) continue;
+        const atMs = Number.isFinite(entry.atMs) ? entry.atMs : 0;
+        if (!best || atMs > best.atMs) best = { chatKey, atMs };
+      }
+
+      for (const [tid, entry] of Object.entries(lastActiveByThread)) {
+        if (tid === mainThreadId) continue;
+        if (!entry || typeof entry !== "object" || Array.isArray(entry)) continue;
+        const chatKey = isNonEmptyString(entry.chatKey) ? entry.chatKey : null;
+        if (!chatKey) continue;
+        const chatId = chatIdFromChatKey(chatKey);
+        if (!Number.isFinite(chatId) || chatId <= 0) continue;
+        delete lastActiveByThread[tid];
+        changed = true;
+      }
+
+      if (best) {
+        const current = lastActiveByThread[mainThreadId];
+        const curAt = current && typeof current === "object" && Number.isFinite(current.atMs) ? current.atMs : 0;
+        if (!current || best.atMs >= curAt) {
+          lastActiveByThread[mainThreadId] = { chatKey: best.chatKey, ...(best.atMs ? { atMs: best.atMs } : {}) };
+          changed = true;
+        }
+      }
+    }
+
+    if (changed) await state.save();
+  }
 
   async function ensureDefaultSession() {
-    const preferred = state.state.defaultSessionId;
+    let preferred = state.state.defaultSessionId;
+
+    try {
+      const auto = await argus.getAutomationState();
+      const sid = auto?.persisted?.defaultSessionId;
+      if (isNonEmptyString(sid)) preferred = sid;
+    } catch {
+      // ignore; gateway may be booting or auth may be unset
+    }
+
     if (isNonEmptyString(preferred)) {
       try {
         await argus.connectToSession(preferred);
         argus.sessionId = preferred;
+        if (state.state.defaultSessionId !== preferred) {
+          await state.setDefaultSessionId(preferred);
+        }
         deliverEnabled = true;
+        if (alignedSessionId !== preferred) {
+          alignedSessionId = preferred;
+          try {
+            const mainTid = await argus.ensureMainThread();
+            await alignPrivateChatsToMainThread(mainTid);
+          } catch (e) {
+            log("Failed to align TG private chats to gateway main thread:", e instanceof Error ? e.message : String(e));
+          }
+        }
         return preferred;
       } catch (e) {
         log("Failed to attach to defaultSessionId, will reselect:", e instanceof Error ? e.message : String(e));
@@ -1020,12 +1114,30 @@ async function main() {
       argus.sessionId = sid;
       await state.setDefaultSessionId(sid);
       deliverEnabled = true;
+      if (alignedSessionId !== sid) {
+        alignedSessionId = sid;
+        try {
+          const mainTid = await argus.ensureMainThread();
+          await alignPrivateChatsToMainThread(mainTid);
+        } catch (e) {
+          log("Failed to align TG private chats to gateway main thread:", e instanceof Error ? e.message : String(e));
+        }
+      }
       return sid;
     }
 
     const sid = await argus.connectNewSession();
     await state.setDefaultSessionId(sid);
     deliverEnabled = true;
+    if (alignedSessionId !== sid) {
+      alignedSessionId = sid;
+      try {
+        const mainTid = await argus.ensureMainThread();
+        await alignPrivateChatsToMainThread(mainTid);
+      } catch (e) {
+        log("Failed to align TG private chats to gateway main thread:", e instanceof Error ? e.message : String(e));
+      }
+    }
     return sid;
   }
 
@@ -1134,10 +1246,11 @@ async function main() {
           let threadId = state.getThreadId(chatKey);
           let enqueueTarget = null;
 
-          if (isNonEmptyString(threadId)) {
-            // Use mapped thread.
-          } else if (chatType === "private") {
+          if (chatType === "private") {
             enqueueTarget = "main";
+            threadId = null;
+          } else if (isNonEmptyString(threadId)) {
+            // Use mapped thread.
           } else {
             threadId = await argus.startThread();
             await state.setThreadId(chatKey, threadId);

@@ -621,8 +621,56 @@ class AutomationManager:
     async def start(self) -> None:
         await self._store.load()
         await self._ensure_workspace_files()
+        await self._prune_persisted_sessions()
         self._tasks.append(asyncio.create_task(self._cron_loop()))
         self._tasks.append(asyncio.create_task(self._heartbeat_loop()))
+
+    async def _prune_persisted_sessions(self) -> None:
+        # Keep persisted automation state in sync with existing docker runtime containers.
+        # Users often delete old session containers manually; without pruning, stale sessions can
+        # confuse UIs/bots that expect a single "current" session.
+        if _provision_mode() != "docker":
+            return
+        try:
+            sessions = await asyncio.to_thread(_docker_list_argus_containers_sync)
+        except Exception as e:
+            log.warning("Failed to list docker sessions for pruning: %s", str(e))
+            return
+
+        live_session_ids: list[str] = []
+        for s in sessions:
+            if not isinstance(s, dict):
+                continue
+            sid = s.get("sessionId")
+            layout = s.get("runtimeLayout")
+            if isinstance(sid, str) and sid.strip() and layout == RUNTIME_LAYOUT:
+                live_session_ids.append(sid.strip())
+        live_set = set(live_session_ids)
+
+        st = self._store.state
+        removed = [sid for sid in st.sessions.keys() if sid not in live_set]
+        default_missing = bool(st.default_session_id and st.default_session_id not in live_set)
+        if not removed and not default_missing:
+            return
+
+        next_default = None
+        if live_session_ids:
+            # `_docker_list_argus_containers_sync` is already sorted (running first).
+            next_default = live_session_ids[0]
+
+        def _prune(st2: PersistedGatewayAutomationState) -> None:
+            for sid in removed:
+                st2.sessions.pop(sid, None)
+            if st2.default_session_id and st2.default_session_id not in live_set:
+                st2.default_session_id = next_default
+
+        await self._store.update(_prune)
+        log.info(
+            "Pruned automation state sessions: removed=%d default_missing=%s kept=%d",
+            len(removed),
+            "yes" if default_missing else "no",
+            len(live_set),
+        )
 
     def _workspace_root(self) -> Optional[Path]:
         if self._workspace_host_path:
