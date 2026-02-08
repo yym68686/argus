@@ -2275,13 +2275,14 @@ export default function Page() {
                             ) : (
                               <div className="flex flex-col gap-1">
 	                                {threads.map((t) => {
-	                                  const isCurrentThread = t.id === (currentThreadBySession[sid] ?? null);
-	                                  const label = t.preview?.trim() ? t.preview.trim() : "(no preview)";
-	                                  const threadKeyId = `${sid}:${t.id}`;
-	                                  const isThreadMenuOpen = threadMenuOpenFor === threadKeyId;
-	                                  return (
-		                                    <div
-		                                      key={t.id}
+		                                  const isCurrentThread = t.id === (currentThreadBySession[sid] ?? null);
+		                                  const label = t.preview?.trim() ? t.preview.trim() : "(no preview)";
+		                                  const threadKeyId = `${sid}:${t.id}`;
+		                                  const isThreadRunning = Boolean(chatByThreadKey[threadKeyId]?.turnInProgress);
+		                                  const isThreadMenuOpen = threadMenuOpenFor === threadKeyId;
+		                                  return (
+			                                    <div
+			                                      key={t.id}
 		                                      className={cn(
 		                                        "group flex items-center gap-2 rounded-xl border border-transparent",
 		                                        "transition-colors",
@@ -2302,12 +2303,18 @@ export default function Page() {
 	                                          setThreadMenuOpenFor(null);
 	                                          void openThreadInSession(sid, t.id);
 	                                        }}
-	                                      >
-	                                        <span className="flex min-w-0 items-center gap-2">
-	                                          <span className="h-1.5 w-1.5 shrink-0 rounded-full bg-muted-foreground/60" />
-	                                          <span className="min-w-0 flex-1 truncate text-sm">{label}</span>
-	                                        </span>
-	                                      </button>
+		                                      >
+		                                        <span className="flex min-w-0 items-center gap-2">
+		                                          <span
+		                                            className={cn(
+		                                              "h-1.5 w-1.5 shrink-0 rounded-full",
+		                                              isThreadRunning ? "bg-emerald-500" : "bg-muted-foreground/60"
+		                                            )}
+		                                            title={isThreadRunning ? "Running" : "Idle"}
+		                                          />
+		                                          <span className="min-w-0 flex-1 truncate text-sm">{label}</span>
+		                                        </span>
+		                                      </button>
 	
 	                                      <div className="relative shrink-0 pr-1">
 	                                        <Button

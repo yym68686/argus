@@ -1480,7 +1480,7 @@ class AutomationManager:
             lines.append(f"{i}) {t.strip()}")
         return "\n".join(lines).strip()
 
-    async def _read_project_context_block(self, *, include_heartbeat: bool) -> str:
+    async def _read_project_context_block(self, *, session_id: str, include_heartbeat: bool) -> str:
         root = self._workspace_root()
         if root is None:
             return ""
@@ -1491,6 +1491,21 @@ class AutomationManager:
 
         def _read() -> str:
             blocks: list[str] = []
+
+            sid = (session_id or "").strip()
+            if sid:
+                blocks.append(
+                    "\n".join(
+                        [
+                            "[ARGUS]",
+                            f"sessionId: {sid}",
+                            f"selfNodeId: runtime:{sid}",
+                            'node_invoke 建议：优先用 node="self"；多 runtime 在线时用 node="runtime:<sessionId>"（即 selfNodeId）。',
+                            "[/ARGUS]",
+                        ]
+                    )
+                )
+
             for name in filenames:
                 p = root / name
                 try:
@@ -1517,7 +1532,7 @@ class AutomationManager:
         drained = await self._drain_system_events(session_id, thread_id, max_events=20)
         blocks: list[str] = []
 
-        project_context = await self._read_project_context_block(include_heartbeat=heartbeat)
+        project_context = await self._read_project_context_block(session_id=session_id, include_heartbeat=heartbeat)
         if project_context:
             blocks.append(project_context)
 
