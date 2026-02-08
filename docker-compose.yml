@@ -33,6 +33,11 @@ services:
       ARGUS_MCP_TOKEN: ${ARGUS_MCP_TOKEN:-}
       # Optional: enable gateway-owned Telegram delivery (outbound). Inbound is handled by the tg bot/webhook.
       TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:-}
+      # Optional: runtime session container resource limits (applied when the gateway spawns containers).
+      ARGUS_RUNTIME_CPUS: ${ARGUS_RUNTIME_CPUS:-}
+      ARGUS_RUNTIME_MEM_LIMIT: ${ARGUS_RUNTIME_MEM_LIMIT:-}
+      ARGUS_RUNTIME_MEMSWAP_LIMIT: ${ARGUS_RUNTIME_MEMSWAP_LIMIT:-}
+      ARGUS_RUNTIME_PIDS_LIMIT: ${ARGUS_RUNTIME_PIDS_LIMIT:-}
       # Optional: docker provision tuning.
       ARGUS_CONNECT_TIMEOUT_S: ${ARGUS_CONNECT_TIMEOUT_S:-30}
       ARGUS_CONTAINER_PREFIX: ${ARGUS_CONTAINER_PREFIX:-argus-session}

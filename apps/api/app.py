@@ -45,6 +45,11 @@ class DockerProvisionConfig:
     connect_timeout_s: float = 30.0
     jsonl_line_limit_bytes: int = 8 * 1024 * 1024
     container_prefix: str = "argus-session"
+    runtime_cpu_period: Optional[int] = None
+    runtime_cpu_quota: Optional[int] = None
+    runtime_mem_limit_bytes: Optional[int] = None
+    runtime_memswap_limit_bytes: Optional[int] = None
+    runtime_pids_limit: Optional[int] = None
 
 
 @dataclass
@@ -2867,6 +2872,16 @@ def _docker_cfg() -> DockerProvisionConfig:
         jsonl_line_limit_bytes = 8 * 1024 * 1024
     container_prefix = os.getenv("ARGUS_CONTAINER_PREFIX", "argus-session")
 
+    cpu_quota, cpu_period = _parse_runtime_cpu_quota_period()
+    mem_limit_bytes = _parse_optional_bytes_env("ARGUS_RUNTIME_MEM_LIMIT")
+    memswap_limit_bytes = _parse_optional_bytes_env("ARGUS_RUNTIME_MEMSWAP_LIMIT")
+    pids_limit = _parse_optional_int_env("ARGUS_RUNTIME_PIDS_LIMIT")
+
+    if memswap_limit_bytes is not None and mem_limit_bytes is None:
+        raise RuntimeError("ARGUS_RUNTIME_MEMSWAP_LIMIT requires ARGUS_RUNTIME_MEM_LIMIT")
+    if memswap_limit_bytes is not None and mem_limit_bytes is not None and memswap_limit_bytes < mem_limit_bytes:
+        raise RuntimeError("ARGUS_RUNTIME_MEMSWAP_LIMIT must be >= ARGUS_RUNTIME_MEM_LIMIT")
+
     return DockerProvisionConfig(
         image=image,
         network=network,
@@ -2876,6 +2891,11 @@ def _docker_cfg() -> DockerProvisionConfig:
         connect_timeout_s=connect_timeout_s,
         jsonl_line_limit_bytes=jsonl_line_limit_bytes,
         container_prefix=container_prefix,
+        runtime_cpu_quota=cpu_quota,
+        runtime_cpu_period=cpu_period,
+        runtime_mem_limit_bytes=mem_limit_bytes,
+        runtime_memswap_limit_bytes=memswap_limit_bytes,
+        runtime_pids_limit=pids_limit,
     )
 
 
@@ -2887,6 +2907,77 @@ def _docker_api_timeout_s() -> float:
     except Exception:
         bound = 30.0
     return max(3.0, min(10.0, bound))
+
+_MEM_LIMIT_RE = re.compile(r"^\s*(\d+(?:\.\d+)?)\s*([kmgt]i?b?|b)?\s*$", re.IGNORECASE)
+
+
+def _parse_bytes_limit(raw: str) -> int:
+    s = (raw or "").strip()
+    if not s:
+        raise ValueError("empty")
+    m = _MEM_LIMIT_RE.match(s)
+    if not m:
+        raise ValueError(f"invalid bytes spec: {raw!r}")
+    n = float(m.group(1))
+    unit = (m.group(2) or "b").lower()
+    unit = unit.replace("ib", "b")
+    factors = {
+        "b": 1,
+        "k": 1024,
+        "kb": 1024,
+        "m": 1024**2,
+        "mb": 1024**2,
+        "g": 1024**3,
+        "gb": 1024**3,
+        "t": 1024**4,
+        "tb": 1024**4,
+    }
+    factor = factors.get(unit)
+    if factor is None:
+        raise ValueError(f"invalid unit: {unit!r}")
+    out = int(n * factor)
+    if out <= 0:
+        raise ValueError("must be > 0")
+    return out
+
+
+def _parse_optional_bytes_env(name: str) -> Optional[int]:
+    raw = os.getenv(name)
+    if raw is None or not raw.strip():
+        return None
+    try:
+        return _parse_bytes_limit(raw)
+    except Exception as e:  # noqa: BLE001
+        raise RuntimeError(f"{name} must be like '512m'/'1g' (got {raw!r}): {e}") from e
+
+
+def _parse_optional_int_env(name: str) -> Optional[int]:
+    raw = os.getenv(name)
+    if raw is None or not raw.strip():
+        return None
+    try:
+        v = int(raw)
+    except Exception as e:  # noqa: BLE001
+        raise RuntimeError(f"{name} must be an integer (got {raw!r})") from e
+    if v <= 0:
+        raise RuntimeError(f"{name} must be > 0 (got {raw!r})")
+    return v
+
+
+def _parse_runtime_cpu_quota_period() -> tuple[Optional[int], Optional[int]]:
+    raw = os.getenv("ARGUS_RUNTIME_CPUS")
+    if raw is None or not raw.strip():
+        return None, None
+    try:
+        cpus = float(raw)
+    except Exception as e:  # noqa: BLE001
+        raise RuntimeError(f"ARGUS_RUNTIME_CPUS must be a number (got {raw!r})") from e
+    if cpus <= 0:
+        raise RuntimeError(f"ARGUS_RUNTIME_CPUS must be > 0 (got {raw!r})")
+    # Docker's classic CPU limit: quota/period in microseconds.
+    period = 100_000
+    quota = max(1_000, int(cpus * period))
+    return quota, period
 
 
 def _docker_create_container_sync(cfg: DockerProvisionConfig, session_id: str):
@@ -2954,6 +3045,15 @@ def _docker_create_container_sync(cfg: DockerProvisionConfig, session_id: str):
     }
 
     run_kwargs = {"working_dir": cfg.workspace_container_path}
+    if cfg.runtime_mem_limit_bytes is not None:
+        run_kwargs["mem_limit"] = cfg.runtime_mem_limit_bytes
+    if cfg.runtime_memswap_limit_bytes is not None:
+        run_kwargs["memswap_limit"] = cfg.runtime_memswap_limit_bytes
+    if cfg.runtime_cpu_quota is not None and cfg.runtime_cpu_period is not None:
+        run_kwargs["cpu_quota"] = cfg.runtime_cpu_quota
+        run_kwargs["cpu_period"] = cfg.runtime_cpu_period
+    if cfg.runtime_pids_limit is not None:
+        run_kwargs["pids_limit"] = cfg.runtime_pids_limit
 
     try:
         container = client.containers.run(

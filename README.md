@@ -26,6 +26,23 @@ export ARGUS_HOME_HOST_PATH="${HOME}/.argus"
 export ARGUS_WORKSPACE_HOST_PATH="$(pwd)"
 ```
 
+小机器建议（限制 runtime session 容器资源）：
+
+> 说明：`argus-session-...` 容器是网关动态创建的，不能直接用 compose 给它写 `mem_limit/cpus`；
+> 需要通过网关环境变量来设置“创建时的默认配额”。
+
+```bash
+# 例：1C/1G 服务器（留一点给 gateway 本身）
+export ARGUS_RUNTIME_CPUS="0.8"
+export ARGUS_RUNTIME_MEM_LIMIT="768m"
+# 可选：禁用 swap（避免把机器拖死）
+export ARGUS_RUNTIME_MEMSWAP_LIMIT="768m"
+# 可选：限制进程数（防 fork bomb）
+export ARGUS_RUNTIME_PIDS_LIMIT="512"
+```
+
+> 注意：只对**新创建**的 session 生效；已存在的 `argus-session-...` 需要 `docker update` 或删除 session 后重新创建。
+
 启动（只启动后端：会 build runtime 镜像并启动网关）：
 
 ```bash
