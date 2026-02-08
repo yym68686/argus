@@ -202,6 +202,10 @@ class TelegramApi {
   async sendMessage(params) {
     return await this.call("sendMessage", params);
   }
+
+  async sendChatAction(params) {
+    return await this.call("sendChatAction", params);
+  }
 }
 
 function buildUrlWithParams(url, params) {
@@ -624,7 +628,19 @@ function sendTargetFromMessage(message) {
   if (!Number.isFinite(chatId)) return null;
   const out = { chat_id: chatId };
   const topicId = message?.message_thread_id;
-  if (Number.isFinite(topicId)) out.message_thread_id = topicId;
+  // Telegram rejects sendMessage/sendMedia with message_thread_id=1 ("thread not found").
+  // For typing indicators we still include it (see TypingController).
+  const normalizedTopicId = Number.isFinite(topicId) ? Math.trunc(topicId) : null;
+  if (Number.isFinite(normalizedTopicId) && normalizedTopicId !== 1) out.message_thread_id = normalizedTopicId;
+  return out;
+}
+
+function typingTargetFromMessage(message) {
+  const chatId = message?.chat?.id;
+  if (!Number.isFinite(chatId)) return null;
+  const out = { chat_id: chatId };
+  const topicId = message?.message_thread_id;
+  if (Number.isFinite(topicId)) out.message_thread_id = Math.trunc(topicId);
   return out;
 }
 
@@ -635,7 +651,8 @@ function sendTargetFromChatKey(chatKey) {
   if (!Number.isFinite(chatId)) return null;
   const out = { chat_id: chatId };
   const topicId = Number(topicRaw);
-  if (Number.isFinite(topicId)) out.message_thread_id = topicId;
+  const normalizedTopicId = Number.isFinite(topicId) ? Math.trunc(topicId) : null;
+  if (Number.isFinite(normalizedTopicId) && normalizedTopicId !== 1) out.message_thread_id = normalizedTopicId;
   return out;
 }
 
@@ -823,6 +840,81 @@ function markdownToTelegramHtml(markdown) {
   return String(out ?? "").trim();
 }
 
+class TypingController {
+  constructor(tg, { intervalSeconds = 6, ttlMs = 2 * 60_000 } = {}) {
+    this.tg = tg;
+    this.intervalMs = Math.max(1000, Math.floor(Number(intervalSeconds) * 1000));
+    this.ttlMs = Math.max(10_000, Math.floor(Number(ttlMs)));
+    this.activeByChatKey = new Map();
+  }
+
+  _normalizeTarget(target) {
+    if (!target || typeof target !== "object") return null;
+    const chatId = target.chat_id;
+    if (!Number.isFinite(chatId)) return null;
+    const out = { chat_id: chatId };
+    const topicId = target.message_thread_id;
+    // NOTE: Telegram typing indicators accept message_thread_id=1 (General topic).
+    if (Number.isFinite(topicId)) out.message_thread_id = Math.trunc(topicId);
+    return out;
+  }
+
+  async _sendTyping(target) {
+    try {
+      await this.tg.sendChatAction({ ...target, action: "typing" });
+    } catch {
+      // ignore typing failures
+    }
+  }
+
+  start(chatKey, target) {
+    if (!isNonEmptyString(chatKey)) return;
+    const normalized = this._normalizeTarget(target);
+    if (!normalized) return;
+
+    const expiresAtMs = Date.now() + this.ttlMs;
+    const existing = this.activeByChatKey.get(chatKey);
+    if (existing) {
+      existing.expiresAtMs = expiresAtMs;
+      existing.target = normalized;
+      void this._sendTyping(normalized);
+      return;
+    }
+
+    const entry = {
+      expiresAtMs,
+      target: normalized,
+      timer: null
+    };
+    this.activeByChatKey.set(chatKey, entry);
+
+    entry.timer = setInterval(() => {
+      const current = this.activeByChatKey.get(chatKey);
+      if (!current) return;
+      if (Date.now() >= current.expiresAtMs) {
+        this.stop(chatKey);
+        return;
+      }
+      void this._sendTyping(current.target);
+    }, this.intervalMs);
+
+    void this._sendTyping(normalized);
+  }
+
+  stop(chatKey) {
+    const entry = this.activeByChatKey.get(chatKey);
+    if (!entry) return;
+    if (entry.timer) clearInterval(entry.timer);
+    this.activeByChatKey.delete(chatKey);
+  }
+
+  stopAll() {
+    for (const chatKey of this.activeByChatKey.keys()) {
+      this.stop(chatKey);
+    }
+  }
+}
+
 async function main() {
   const telegramToken = process.env.TELEGRAM_BOT_TOKEN;
   if (!isNonEmptyString(telegramToken)) {
@@ -854,6 +946,7 @@ async function main() {
   }
 
   const tg = new TelegramApi(telegramToken);
+  const typing = new TypingController(tg);
   const me = await tg.getMe();
   const botUsername = isNonEmptyString(me?.username) ? me.username : null;
   log("Telegram bot:", botUsername ? `@${botUsername}` : "(unknown)");
@@ -866,11 +959,11 @@ async function main() {
   let deliverEnabled = false;
 
   argus.onTurnCompleted = async ({ threadId, text }) => {
+    if (!deliverEnabled) return;
+    if (!isNonEmptyString(threadId)) return;
+    const chatKey = state.getLastActiveChatKey(threadId);
+    if (!isNonEmptyString(chatKey)) return;
     try {
-      if (!deliverEnabled) return;
-      if (!isNonEmptyString(threadId)) return;
-      const chatKey = state.getLastActiveChatKey(threadId);
-      if (!isNonEmptyString(chatKey)) return;
       const target = sendTargetFromChatKey(chatKey);
       if (!target) return;
       const finalText = isNonEmptyString(text) ? text : "(no output)";
@@ -888,10 +981,13 @@ async function main() {
       }
     } catch (e) {
       log("Failed to deliver turn/completed:", e instanceof Error ? e.message : String(e));
+    } finally {
+      typing.stop(chatKey);
     }
   };
   argus.onDisconnected = () => {
     deliverEnabled = false;
+    typing.stopAll();
   };
 
   const queue = new SerialQueue();
@@ -993,11 +1089,16 @@ async function main() {
       if (message.from?.is_bot) continue;
 
       const target = sendTargetFromMessage(message);
+      const typingTarget = typingTargetFromMessage(message);
       const chatKey = chatKeyFromMessage(message);
       if (!target || !chatKey) continue;
 
       const text = isNonEmptyString(message.text) ? message.text : null;
       const cmd = parseCommand(text || "", botUsername);
+
+      // Show typing cue immediately; Telegram requires periodic refresh for long runs.
+      // Note: sendChatAction accepts message_thread_id=1 (General topic), while sendMessage may not.
+      typing.start(chatKey, typingTarget);
 
       queue.enqueue(async () => {
         try {
@@ -1010,6 +1111,7 @@ async function main() {
               ...target,
               text: `sessionId: ${sid || "(none)"}\nchatKey: ${chatKey}\nthreadId: ${tid || "(none)"}`
             });
+            typing.stop(chatKey);
             return;
           }
 
@@ -1018,11 +1120,13 @@ async function main() {
             await state.setThreadId(chatKey, tid);
             await state.setLastActiveChatKey(tid, chatKey);
             await tg.sendMessage({ ...target, text: `ok (new thread): ${tid}` });
+            typing.stop(chatKey);
             return;
           }
 
           if (!isNonEmptyString(text)) {
             await tg.sendMessage({ ...target, text: "暂不支持该消息类型（目前仅支持文本）。" });
+            typing.stop(chatKey);
             return;
           }
 
@@ -1050,6 +1154,7 @@ async function main() {
         } catch (e) {
           const msg = e instanceof Error ? e.message : String(e);
           await tg.sendMessage({ ...target, text: `error: ${msg}` });
+          typing.stop(chatKey);
         }
       });
     }
