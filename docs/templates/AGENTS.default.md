@@ -13,6 +13,15 @@ read_when:
 - Don’t run destructive commands unless explicitly asked.
 - Don’t send partial/streaming replies to external messaging surfaces (only final replies).
 
+## Long-running commands (required)
+
+- Run all commands via MCP `node_invoke` → `system.run` (yield-after-10s background jobs by default).
+  - Use `node="self"` when invoking; if you must disambiguate, use MCP `nodes_list` and pick a nodeId that starts with `runtime:`.
+  - If `system.run` returns `{running:true, jobId:...}`, tell the user the `jobId` and keep going; don’t block waiting.
+  - Use `process.*` on the same node for followups:
+    - `process.logs` (tail output), `process.get` (status), `process.kill` (stop).
+  - When the command runs in background, completion will be enqueued as a `systemEvent` automatically (heartbeat will surface it).
+
 ## Session start (required)
 
 - Read `SOUL.md`, `USER.md`, `memory.md`, and today+yesterday in `memory/`.

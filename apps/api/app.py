@@ -1906,12 +1906,12 @@ class NodeRegistry:
             self._nodes_by_id[session.node_id] = session
             self._nodes_by_conn[session.conn_id] = session.node_id
 
-    async def unregister(self, conn_id: str) -> Optional[str]:
+    async def unregister(self, conn_id: str) -> Optional[NodeSession]:
         async with self._lock:
             node_id = self._nodes_by_conn.pop(conn_id, None)
             if not node_id:
                 return None
-            self._nodes_by_id.pop(node_id, None)
+            removed = self._nodes_by_id.pop(node_id, None)
             for rid, (pending_node_id, fut) in list(self._pending.items()):
                 if pending_node_id != node_id:
                     continue
@@ -1922,7 +1922,7 @@ class NodeRegistry:
                     NodeInvokeResult(ok=False, error={"code": "NODE_DISCONNECTED", "message": "node disconnected"})
                 )
                 self._pending.pop(rid, None)
-            return node_id
+            return removed
 
     async def list_connected(self) -> list[dict[str, Any]]:
         async with self._lock:
@@ -1943,6 +1943,28 @@ class NodeRegistry:
             )
         out.sort(key=lambda x: x.get("displayName") or x.get("nodeId") or "")
         return out
+
+    async def list_runtime_node_ids(self) -> list[str]:
+        async with self._lock:
+            ids = [s.node_id for s in self._nodes_by_id.values() if (s.node_id or "").startswith("runtime:")]
+        ids.sort()
+        return ids
+
+    async def resolve_self_runtime_node_id(self, *, default_session_id: Optional[str]) -> Optional[str]:
+        runtime_ids = await self.list_runtime_node_ids()
+        if len(runtime_ids) == 1:
+            return runtime_ids[0]
+        if default_session_id:
+            cand = f"runtime:{default_session_id}"
+            if cand in runtime_ids:
+                return cand
+        return None
+
+    async def resolve_implicit_runtime_node_id(self) -> Optional[str]:
+        runtime_ids = await self.list_runtime_node_ids()
+        if len(runtime_ids) == 1:
+            return runtime_ids[0]
+        return None
 
     async def resolve_node_id(self, ident: str) -> Optional[str]:
         key = (ident or "").strip()
@@ -2327,13 +2349,13 @@ async def _mcp_handle_single_message(request: Request, body: dict[str, Any]) -> 
                 "inputSchema": {
                     "type": "object",
                     "properties": {
-                        "node": {"type": "string", "description": "nodeId or displayName"},
+                        "node": {"type": "string", "description": "nodeId/displayName, or 'self'. If omitted, auto-selects the only connected runtime node."},
                         "command": {"type": "string", "description": "Command name to invoke (must be supported by the node)"},
                         "params": {"type": ["object", "array", "string", "number", "boolean", "null"]},
                         "timeoutMs": {"type": "number"},
                         "idempotencyKey": {"type": "string"},
                     },
-                    "required": ["node", "command"],
+                    "required": ["command"],
                     "additionalProperties": False,
                 },
             },
@@ -2364,8 +2386,8 @@ async def _mcp_handle_single_message(request: Request, body: dict[str, Any]) -> 
             )
 
         if tool_name == "node_invoke":
-            node_raw = str(args.get("node") or args.get("nodeId") or "").strip()
             cmd = str(args.get("command") or "").strip()
+            node_raw = str(args.get("node") or args.get("nodeId") or "").strip()
             invoke_params = args.get("params")
             timeout_ms = args.get("timeoutMs")
             if timeout_ms is not None and not isinstance(timeout_ms, (int, float)):
@@ -2381,12 +2403,12 @@ async def _mcp_handle_single_message(request: Request, body: dict[str, Any]) -> 
                     {"MCP-Protocol-Version": sess.protocol_version},
                 )
 
-            if not node_raw or not cmd:
+            if not cmd:
                 return (
                     _jsonrpc_result(
                         request_id=request_id,
                         result=_mcp_call_tool_result(
-                            content=[{"type": "text", "text": "Missing required fields: node, command"}],
+                            content=[{"type": "text", "text": "Missing required field: command"}],
                             structured={"ok": False, "error": {"code": "INVALID_ARGUMENT"}},
                             is_error=True,
                         ),
@@ -2394,7 +2416,49 @@ async def _mcp_handle_single_message(request: Request, body: dict[str, Any]) -> 
                     {"MCP-Protocol-Version": sess.protocol_version},
                 )
 
-            node_id = await app.state.node_registry.resolve_node_id(node_raw)
+            # Node selection:
+            # - node="self": prefer the runtime node for the default session (or the only runtime node if unique)
+            # - node omitted: only allowed when exactly one runtime node is connected
+            node_id: Optional[str] = None
+            if not node_raw:
+                node_id = await app.state.node_registry.resolve_implicit_runtime_node_id()
+                if not node_id:
+                    runtime_ids = await app.state.node_registry.list_runtime_node_ids()
+                    msg_text = (
+                        "No runtime node is connected; start/attach a session (or pass a non-runtime node)."
+                        if not runtime_ids
+                        else "Missing 'node'. Multiple runtime nodes are connected; pass node (or 'self') to disambiguate."
+                    )
+                    return (
+                        _jsonrpc_result(
+                            request_id=request_id,
+                            result=_mcp_call_tool_result(
+                                content=[{"type": "text", "text": msg_text}],
+                                structured={"ok": False, "error": {"code": "INVALID_ARGUMENT", "field": "node", "runtimeNodes": runtime_ids}},
+                                is_error=True,
+                            ),
+                        ),
+                        {"MCP-Protocol-Version": sess.protocol_version},
+                    )
+            elif node_raw.lower() == "self":
+                automation: Optional[AutomationManager] = getattr(app.state, "automation", None)
+                default_sid = automation._store.state.default_session_id if automation is not None else None
+                node_id = await app.state.node_registry.resolve_self_runtime_node_id(default_session_id=default_sid)
+                if not node_id:
+                    runtime_ids = await app.state.node_registry.list_runtime_node_ids()
+                    return (
+                        _jsonrpc_result(
+                            request_id=request_id,
+                            result=_mcp_call_tool_result(
+                                content=[{"type": "text", "text": "node='self' is ambiguous (no unique/default runtime node). Specify a runtime:<sessionId>."}],
+                                structured={"ok": False, "error": {"code": "NODE_NOT_FOUND", "node": "self", "runtimeNodes": runtime_ids}},
+                                is_error=True,
+                            ),
+                        ),
+                        {"MCP-Protocol-Version": sess.protocol_version},
+                    )
+            else:
+                node_id = await app.state.node_registry.resolve_node_id(node_raw)
             if not node_id:
                 return (
                     _jsonrpc_result(
@@ -2548,13 +2612,13 @@ async def _mcp_handle_single_message(request: Request, body: dict[str, Any]) -> 
                 "inputSchema": {
                     "type": "object",
                     "properties": {
-                        "node": {"type": "string", "description": "nodeId or displayName"},
+                        "node": {"type": "string", "description": "nodeId/displayName, or 'self'. If omitted, auto-selects the only connected runtime node."},
                         "command": {"type": "string", "description": "Command name to invoke (must be supported by the node)"},
                         "params": {"type": ["object", "array", "string", "number", "boolean", "null"]},
                         "timeoutMs": {"type": "number"},
                         "idempotencyKey": {"type": "string"},
                     },
-                    "required": ["node", "command"],
+                    "required": ["command"],
                     "additionalProperties": False,
                 },
             },
@@ -2583,8 +2647,8 @@ async def _mcp_handle_single_message(request: Request, body: dict[str, Any]) -> 
             )
 
         if tool_name == "node_invoke":
-            node_raw = str(args.get("node") or "").strip()
             cmd = str(args.get("command") or "").strip()
+            node_raw = str(args.get("node") or args.get("nodeId") or "").strip()
             timeout_ms = args.get("timeoutMs")
             if timeout_ms is not None:
                 try:
@@ -2593,20 +2657,59 @@ async def _mcp_handle_single_message(request: Request, body: dict[str, Any]) -> 
                     timeout_ms = None
             invoke_params = args.get("params")
 
-            if not node_raw or not cmd:
+            if not cmd:
                 return JSONResponse(
                     _jsonrpc_result(
                         request_id=request_id,
                         result=_mcp_call_tool_result(
-                            content=[{"type": "text", "text": "node_invoke requires 'node' and 'command'"}],
-                            structured={"ok": False, "error": {"code": "BAD_INPUT", "message": "missing node/command"}},
+                            content=[{"type": "text", "text": "node_invoke requires 'command'"}],
+                            structured={"ok": False, "error": {"code": "BAD_INPUT", "message": "missing command"}},
                             is_error=True,
                         ),
                     ),
                     status_code=200,
                 )
 
-            node_id = await app.state.node_registry.resolve_node_id(node_raw)
+            node_id: Optional[str] = None
+            if not node_raw:
+                node_id = await app.state.node_registry.resolve_implicit_runtime_node_id()
+                if not node_id:
+                    runtime_ids = await app.state.node_registry.list_runtime_node_ids()
+                    msg_text = (
+                        "No runtime node is connected; start/attach a session (or pass a non-runtime node)."
+                        if not runtime_ids
+                        else "Missing 'node'. Multiple runtime nodes are connected; pass node (or 'self') to disambiguate."
+                    )
+                    return JSONResponse(
+                        _jsonrpc_result(
+                            request_id=request_id,
+                            result=_mcp_call_tool_result(
+                                content=[{"type": "text", "text": msg_text}],
+                                structured={"ok": False, "error": {"code": "BAD_INPUT", "message": "missing node", "runtimeNodes": runtime_ids}},
+                                is_error=True,
+                            ),
+                        ),
+                        status_code=200,
+                    )
+            elif node_raw.lower() == "self":
+                automation: Optional[AutomationManager] = getattr(app.state, "automation", None)
+                default_sid = automation._store.state.default_session_id if automation is not None else None
+                node_id = await app.state.node_registry.resolve_self_runtime_node_id(default_session_id=default_sid)
+                if not node_id:
+                    runtime_ids = await app.state.node_registry.list_runtime_node_ids()
+                    return JSONResponse(
+                        _jsonrpc_result(
+                            request_id=request_id,
+                            result=_mcp_call_tool_result(
+                                content=[{"type": "text", "text": "node='self' is ambiguous (no unique/default runtime node). Specify a runtime:<sessionId>."}],
+                                structured={"ok": False, "error": {"code": "NOT_FOUND", "message": "node not found", "runtimeNodes": runtime_ids}},
+                                is_error=True,
+                            ),
+                        ),
+                        status_code=200,
+                    )
+            else:
+                node_id = await app.state.node_registry.resolve_node_id(node_raw)
             if not node_id:
                 return JSONResponse(
                     _jsonrpc_result(
@@ -2820,6 +2923,22 @@ def _docker_create_container_sync(cfg: DockerProvisionConfig, session_id: str):
         env["ARGUS_TOKEN"] = gateway_token
     if mcp_token:
         env["ARGUS_MCP_TOKEN"] = mcp_token
+
+    # Runtime node-host (inside the same runtime container) connects back to the gateway
+    # for background-job style execution (`system.run` + `process.*`).
+    try:
+        from urllib.parse import quote as _url_quote
+    except Exception:  # pragma: no cover
+        _url_quote = None  # type: ignore
+    node_token = os.getenv("ARGUS_NODE_TOKEN") or gateway_token
+    node_ws_url = "ws://gateway:8080/nodes/ws"
+    if node_token:
+        q = _url_quote(node_token, safe="") if _url_quote is not None else node_token
+        node_ws_url = f"{node_ws_url}?token={q}"
+    env["ARGUS_NODE_WS_URL"] = node_ws_url
+    env["ARGUS_NODE_ID"] = f"runtime:{session_id}"
+    env["ARGUS_NODE_DISPLAY_NAME"] = f"runtime-{session_id}"
+    env["ARGUS_SESSION_ID"] = session_id
     volumes = {}
     if cfg.home_host_path:
         volumes[cfg.home_host_path] = {"bind": cfg.home_container_path, "mode": "rw"}
@@ -3345,6 +3464,195 @@ async def delete_session(session_id: str, request: Request):
     return {"ok": True, "sessionId": session_id}
 
 
+def _format_node_system_event_text(
+    *,
+    event: str,
+    node_id: str,
+    display_name: Optional[str],
+    platform: Optional[str],
+    version: Optional[str],
+    ip: Optional[str],
+) -> str:
+    label = (display_name or "").strip()
+    if label and label != node_id:
+        label = f"{label} ({node_id})"
+    else:
+        label = node_id
+
+    details: list[str] = []
+    if platform and platform.strip():
+        details.append(f"platform={platform.strip()}")
+    if version and version.strip():
+        details.append(f"version={version.strip()}")
+    if ip and ip.strip():
+        details.append(f"ip={ip.strip()}")
+
+    text = f"Node {event}: {label}"
+    if details:
+        text += " · " + " · ".join(details)
+    return text
+
+
+async def _enqueue_node_system_event(
+    *,
+    event: str,
+    node_id: str,
+    display_name: Optional[str],
+    platform: Optional[str],
+    version: Optional[str],
+    ip: Optional[str],
+) -> None:
+    automation: Optional[AutomationManager] = getattr(app.state, "automation", None)
+    if automation is None:
+        return
+
+    st = automation._store.state
+    session_id = st.default_session_id
+    if not session_id:
+        return
+    sess = st.sessions.get(session_id)
+    main_tid = sess.main_thread_id if sess is not None else None
+    if not main_tid:
+        return
+
+    text = _format_node_system_event_text(
+        event=event,
+        node_id=node_id,
+        display_name=display_name,
+        platform=platform,
+        version=version,
+        ip=ip,
+    )
+    try:
+        await automation.enqueue_system_event(
+            session_id=session_id,
+            thread_id=main_tid,
+            kind="node",
+            text=text,
+            meta={"event": event, "nodeId": node_id, "displayName": display_name, "platform": platform, "version": version, "ip": ip},
+        )
+    except Exception:
+        log.exception("Failed to enqueue node systemEvent: %s", text)
+
+def _session_id_from_node_id(node_id: str) -> Optional[str]:
+    node_id = (node_id or "").strip()
+    if not node_id:
+        return None
+    if node_id.startswith("runtime:"):
+        sid = node_id.split(":", 1)[1].strip()
+        return sid or None
+    return None
+
+
+def _format_process_exited_system_event_text(
+    *,
+    job_id: str,
+    argv: Optional[list[str]],
+    cwd: Optional[str],
+    exit_code: Optional[int],
+    signal: Optional[str],
+    timed_out: bool,
+    stdout_tail: Optional[str],
+    stderr_tail: Optional[str],
+) -> str:
+    cmd = ""
+    if argv and all(isinstance(x, str) for x in argv):
+        cmd = " ".join([x for x in argv if x is not None])
+
+    lines: list[str] = []
+    lines.append("Background process finished.")
+    lines.append(f"jobId: {job_id}")
+    if cmd:
+        lines.append(f"command: {cmd}")
+    if cwd:
+        lines.append(f"cwd: {cwd}")
+    parts: list[str] = []
+    if exit_code is not None:
+        parts.append(f"exitCode={exit_code}")
+    if signal:
+        parts.append(f"signal={signal}")
+    if timed_out:
+        parts.append("timedOut=true")
+    if parts:
+        lines.append("result: " + " ".join(parts))
+
+    if stdout_tail and stdout_tail.strip():
+        lines.append("\nstdout (tail):\n" + stdout_tail.strip())
+    if stderr_tail and stderr_tail.strip():
+        lines.append("\nstderr (tail):\n" + stderr_tail.strip())
+
+    lines.append("\nIf you need more output, use `process.logs` with this jobId.")
+    return "\n".join(lines).strip()
+
+
+async def _enqueue_process_exited_system_event(
+    *,
+    node_id: str,
+    payload: dict[str, Any],
+) -> None:
+    automation: Optional[AutomationManager] = getattr(app.state, "automation", None)
+    if automation is None:
+        return
+
+    job_id = str(payload.get("jobId") or "").strip()
+    if not job_id:
+        return
+
+    session_id = payload.get("sessionId")
+    if not isinstance(session_id, str) or not session_id.strip():
+        session_id = _session_id_from_node_id(node_id) or automation._store.state.default_session_id
+    session_id = (session_id or "").strip()
+    if not session_id:
+        return
+
+    argv = payload.get("argv") if isinstance(payload.get("argv"), list) else None
+    cwd = payload.get("cwd") if isinstance(payload.get("cwd"), str) else None
+    exit_code = payload.get("exitCode")
+    exit_code_int: Optional[int] = None
+    if isinstance(exit_code, int):
+        exit_code_int = int(exit_code)
+    signal = payload.get("signal") if isinstance(payload.get("signal"), str) else None
+    timed_out = bool(payload.get("timedOut"))
+    stdout_tail = payload.get("stdoutTail") if isinstance(payload.get("stdoutTail"), str) else None
+    stderr_tail = payload.get("stderrTail") if isinstance(payload.get("stderrTail"), str) else None
+
+    try:
+        main_tid = await automation.ensure_main_thread(session_id)
+    except Exception:
+        log.exception("Failed to ensure main thread for process-exit systemEvent (session %s)", session_id)
+        return
+
+    text = _format_process_exited_system_event_text(
+        job_id=job_id,
+        argv=argv,
+        cwd=cwd,
+        exit_code=exit_code_int,
+        signal=signal,
+        timed_out=timed_out,
+        stdout_tail=stdout_tail,
+        stderr_tail=stderr_tail,
+    )
+
+    try:
+        await automation.enqueue_system_event(
+            session_id=session_id,
+            thread_id=main_tid,
+            kind="process",
+            text=text,
+            meta={
+                "nodeId": node_id,
+                "jobId": job_id,
+                "argv": argv,
+                "cwd": cwd,
+                "exitCode": exit_code_int,
+                "signal": signal,
+                "timedOut": timed_out,
+            },
+        )
+    except Exception:
+        log.exception("Failed to enqueue process-exit systemEvent for job %s", job_id)
+
+
 @app.websocket("/nodes/ws")
 async def ws_nodes(ws: WebSocket):
     provided = _extract_token(ws)
@@ -3396,6 +3704,17 @@ async def ws_nodes(ws: WebSocket):
         last_seen_ms=now_ms,
     )
     await app.state.node_registry.register(session)
+    remote_ip = ws.client.host if ws.client else None
+    asyncio.create_task(
+        _enqueue_node_system_event(
+            event="connected",
+            node_id=node_id,
+            display_name=display_name,
+            platform=platform,
+            version=version,
+            ip=remote_ip,
+        )
+    )
 
     try:
         await ws.send_text(json.dumps({"type": "event", "event": "node.connected", "payload": {"nodeId": node_id}}))
@@ -3418,13 +3737,31 @@ async def ws_nodes(ws: WebSocket):
                 await app.state.node_registry.touch(node_id)
                 await app.state.node_registry.handle_invoke_result(payload)
                 continue
+            if msg.get("type") == "event" and msg.get("event") == "node.process.exited" and isinstance(msg.get("payload"), dict):
+                payload = msg["payload"]
+                if str(payload.get("nodeId") or "") not in ("", node_id):
+                    continue
+                await app.state.node_registry.touch(node_id)
+                asyncio.create_task(_enqueue_process_exited_system_event(node_id=node_id, payload=payload))
+                continue
             if msg.get("type") == "event" and msg.get("event") == "node.heartbeat":
                 await app.state.node_registry.touch(node_id)
                 continue
     except WebSocketDisconnect:
         pass
     finally:
-        await app.state.node_registry.unregister(conn_id)
+        removed = await app.state.node_registry.unregister(conn_id)
+        if removed is not None:
+            asyncio.create_task(
+                _enqueue_node_system_event(
+                    event="disconnected",
+                    node_id=node_id,
+                    display_name=display_name,
+                    platform=platform,
+                    version=version,
+                    ip=remote_ip,
+                )
+            )
 
 
 @app.websocket("/ws")

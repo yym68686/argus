@@ -139,6 +139,7 @@ Argus 还支持一个“Node（设备）”通道与一个内置 MCP endpoint：
 
 - Node Host（例如你的 Mac）通过 `WS /nodes/ws` 连接到网关并注册能力（示例实现：`system.run`）。
 - 网关通过 `HTTP /mcp`（MCP Streamable HTTP）对 runtime 容器里的 Codex 暴露工具：`nodes_list` / `node_invoke`。
+- 每个 runtime session 容器也会自带一个 node-host，并以 `nodeId=runtime:<sessionId>` 注册；调用时可用 `node="self"`（或在仅有一个 runtime node 在线时省略 `node`）。
 
 ### 启动 Node Host（在 Mac 上）
 
