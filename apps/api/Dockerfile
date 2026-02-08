@@ -5,6 +5,8 @@ WORKDIR /app
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1
 
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates && rm -rf /var/lib/apt/lists/*
+
 COPY apps/api/requirements.txt /app/apps/api/requirements.txt
 RUN python -m pip install --no-cache-dir -r /app/apps/api/requirements.txt
 

@@ -521,11 +521,18 @@ class ArgusClient {
     await this.rpc("thread/resume", { threadId });
   }
 
-  async enqueueInput({ text, threadId, target }) {
+  async enqueueInput({ text, threadId, target, source }) {
     if (!isNonEmptyString(text)) throw new Error("Missing text");
     const params = { text };
     if (isNonEmptyString(threadId)) params.threadId = threadId;
     if (isNonEmptyString(target)) params.target = target;
+    if (source && typeof source === "object" && !Array.isArray(source)) {
+      const channel = source.channel;
+      const chatKey = source.chatKey;
+      if (isNonEmptyString(channel) && isNonEmptyString(chatKey)) {
+        params.source = { channel: String(channel), chatKey: String(chatKey) };
+      }
+    }
     return await this.rpc("argus/input/enqueue", params, { timeoutMs: 120000 });
   }
 
@@ -968,37 +975,16 @@ async function main() {
   log("State path:", statePath);
 
   const argus = new ArgusClient({ gatewayHttpUrl, gatewayWsUrl, token: argusToken, cwd });
-  let deliverEnabled = false;
 
   argus.onTurnCompleted = async ({ threadId, text }) => {
-    if (!deliverEnabled) return;
     if (!isNonEmptyString(threadId)) return;
     const chatKey = state.getLastActiveChatKey(threadId);
     if (!isNonEmptyString(chatKey)) return;
-    try {
-      const target = sendTargetFromChatKey(chatKey);
-      if (!target) return;
-      const finalText = isNonEmptyString(text) ? text : "(no output)";
-      const truncated = truncateTelegramMessage(finalText);
-      const html = markdownToTelegramHtml(truncated);
-      try {
-        await tg.sendMessage({ ...target, text: html || "(no output)", parse_mode: "HTML" });
-      } catch (e) {
-        const msg = e instanceof Error ? e.message : String(e);
-        if (TELEGRAM_HTML_PARSE_ERR_RE.test(msg) || TELEGRAM_MESSAGE_TOO_LONG_RE.test(msg)) {
-          await tg.sendMessage({ ...target, text: truncated });
-          return;
-        }
-        throw e;
-      }
-    } catch (e) {
-      log("Failed to deliver turn/completed:", e instanceof Error ? e.message : String(e));
-    } finally {
-      typing.stop(chatKey);
-    }
+    // Delivery is owned by the gateway (so future UIs don't need to reimplement suppression rules).
+    // The bot keeps typing indicators only.
+    typing.stop(chatKey);
   };
   argus.onDisconnected = () => {
-    deliverEnabled = false;
     typing.stopAll();
   };
 
@@ -1083,7 +1069,6 @@ async function main() {
         if (state.state.defaultSessionId !== preferred) {
           await state.setDefaultSessionId(preferred);
         }
-        deliverEnabled = true;
         if (alignedSessionId !== preferred) {
           alignedSessionId = preferred;
           try {
@@ -1113,7 +1098,6 @@ async function main() {
       await argus.connectToSession(sid);
       argus.sessionId = sid;
       await state.setDefaultSessionId(sid);
-      deliverEnabled = true;
       if (alignedSessionId !== sid) {
         alignedSessionId = sid;
         try {
@@ -1128,7 +1112,6 @@ async function main() {
 
     const sid = await argus.connectNewSession();
     await state.setDefaultSessionId(sid);
-    deliverEnabled = true;
     if (alignedSessionId !== sid) {
       alignedSessionId = sid;
       try {
@@ -1256,7 +1239,12 @@ async function main() {
             await state.setThreadId(chatKey, threadId);
           }
 
-          const res = await argus.enqueueInput({ text, threadId, target: enqueueTarget });
+          const res = await argus.enqueueInput({
+            text,
+            threadId,
+            target: enqueueTarget,
+            source: { channel: "telegram", chatKey }
+          });
           const effectiveThreadId = isNonEmptyString(res?.threadId) ? res.threadId : threadId;
           if (isNonEmptyString(effectiveThreadId)) {
             await state.setLastActiveChatKey(effectiveThreadId, chatKey);

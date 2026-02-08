@@ -5,6 +5,8 @@ import os
 import re
 import time
 import uuid
+import urllib.error
+import urllib.request
 from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -281,6 +283,10 @@ def _atomic_write_text(path: Path, content: str) -> None:
 
 HEARTBEAT_FILENAME = "HEARTBEAT.md"
 HEARTBEAT_TASKS_INTERVAL_MS = 30 * 60 * 1000
+HEARTBEAT_TOKEN = "HEARTBEAT_OK"
+HEARTBEAT_ACK_MAX_CHARS = 300
+
+TELEGRAM_MAX_MESSAGE_CHARS = 4000
 
 AGENTS_FILENAME = "AGENTS.md"
 AGENTS_TEMPLATE_FILENAME = "AGENTS.default.md"
@@ -294,6 +300,268 @@ WORKSPACE_BOOTSTRAP_TEMPLATES: list[tuple[str, str]] = [
     (USER_FILENAME, USER_FILENAME),
     (HEARTBEAT_FILENAME, HEARTBEAT_FILENAME),
 ]
+
+def _strip_heartbeat_token_at_edges(raw: str, token: str) -> tuple[str, bool]:
+    text = str(raw or "").strip()
+    if not text or token not in text:
+        return text, False
+    did_strip = False
+    changed = True
+    while changed:
+        changed = False
+        next_text = text.strip()
+        if next_text.startswith(token):
+            text = next_text[len(token) :].lstrip()
+            did_strip = True
+            changed = True
+            continue
+        if next_text.endswith(token):
+            text = next_text[: max(0, len(next_text) - len(token))].rstrip()
+            did_strip = True
+            changed = True
+    collapsed = re.sub(r"\s+", " ", text).strip()
+    return collapsed, did_strip
+
+
+def _strip_heartbeat_token(raw: Optional[str]) -> dict[str, Any]:
+    # OpenClaw-style: treat HEARTBEAT_OK at start/end as an ack token and suppress short replies.
+    if not isinstance(raw, str):
+        return {"shouldSkip": True, "text": "", "didStrip": False}
+    trimmed = raw.strip()
+    if not trimmed:
+        return {"shouldSkip": True, "text": "", "didStrip": False}
+
+    token = HEARTBEAT_TOKEN
+    if token not in trimmed:
+        return {"shouldSkip": False, "text": trimmed, "didStrip": False}
+
+    def _strip_markup_edges(text: str) -> str:
+        # Drop HTML tags, normalize nbsp, remove markdown-ish wrappers at the edges.
+        out = re.sub(r"<[^>]*>", " ", text)
+        out = re.sub(r"&nbsp;", " ", out, flags=re.IGNORECASE)
+        out = re.sub(r"^[*`~_]+", "", out)
+        out = re.sub(r"[*`~_]+$", "", out)
+        return out
+
+    normalized = _strip_markup_edges(trimmed)
+
+    stripped_original, did_original = _strip_heartbeat_token_at_edges(trimmed, token)
+    stripped_norm, did_norm = _strip_heartbeat_token_at_edges(normalized, token)
+    picked_text = stripped_original if (did_original and stripped_original) else stripped_norm
+    did_strip = bool((did_original and stripped_original) or did_norm)
+    if not did_strip:
+        return {"shouldSkip": False, "text": trimmed, "didStrip": False}
+    if not picked_text:
+        return {"shouldSkip": True, "text": "", "didStrip": True}
+    if len(picked_text) <= HEARTBEAT_ACK_MAX_CHARS:
+        return {"shouldSkip": True, "text": "", "didStrip": True}
+    return {"shouldSkip": False, "text": picked_text, "didStrip": True}
+
+
+def _telegram_truncate(text: str) -> str:
+    raw = str(text or "")
+    if len(raw) <= TELEGRAM_MAX_MESSAGE_CHARS:
+        return raw
+    suffix = "\n…(truncated)"
+    return raw[: max(0, TELEGRAM_MAX_MESSAGE_CHARS - len(suffix))] + suffix
+
+
+def _telegram_escape_html(text: str) -> str:
+    return str(text).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
+def _telegram_escape_html_attr(text: str) -> str:
+    return _telegram_escape_html(text).replace('"', "&quot;")
+
+
+def _markdown_to_telegram_html(markdown: str) -> str:
+    # Best-effort, safe conversion: subset of Markdown -> Telegram HTML.
+    inp = str(markdown or "")
+    if not inp.strip():
+        return ""
+    normalized = inp.replace("\r\n", "\n").replace("\r", "\n")
+
+    def render_code_block(raw: str) -> str:
+        safe = _telegram_escape_html(str(raw or "").rstrip("\n"))
+        with_nl = safe if safe.endswith("\n") else safe + "\n"
+        return f"<pre><code>{with_nl}</code></pre>"
+
+    def render_inline_spans(raw: str) -> str:
+        if not isinstance(raw, str) or not raw:
+            return ""
+        text = raw
+        placeholders: dict[str, str] = {}
+        idx = 0
+
+        def store(html: str) -> str:
+            nonlocal idx
+            key = f"\x00{idx}\x00"
+            idx += 1
+            placeholders[key] = html
+            return key
+
+        # Inline code: `code`
+        text = re.sub(r"`([^`\n]+)`", lambda m: store(f"<code>{_telegram_escape_html(m.group(1))}</code>"), text)
+
+        # Links: [label](url)
+        def _link(m) -> str:
+            label = m.group(1)
+            href = m.group(2)
+            safe_label = _telegram_escape_html(label)
+            href_trim = str(href or "").strip().strip('"').strip("'")
+            if not href_trim:
+                return safe_label
+            safe_href = _telegram_escape_html_attr(href_trim)
+            return store(f'<a href="{safe_href}">{safe_label}</a>')
+
+        text = re.sub(r"\[([^\]\n]+)\]\(([^)\n]+)\)", _link, text)
+
+        # Escape everything else to prevent accidental HTML.
+        text = _telegram_escape_html(text)
+
+        # Basic emphasis (best-effort).
+        text = re.sub(r"\*\*([^*\n]+?)\*\*", r"<b>\1</b>", text)
+        text = re.sub(r"__([^_\n]+?)__", r"<b>\1</b>", text)
+        text = re.sub(r"~~([^~\n]+?)~~", r"<s>\1</s>", text)
+        text = re.sub(r"(^|[^\w*])\*([^*\n]+?)\*(?!\*)", r"\1<i>\2</i>", text)
+        text = re.sub(r"(^|[^\w_])_([^_\n]+?)_(?!_)", r"\1<i>\2</i>", text)
+
+        for key, html in placeholders.items():
+            text = text.replace(key, html)
+        return text
+
+    def render_inline_block(block: str) -> str:
+        lines = str(block or "").split("\n")
+        out_lines: list[str] = []
+        for line in lines:
+            if not (line or "").strip():
+                out_lines.append("")
+                continue
+            m = re.match(r"^\s{0,3}#{1,6}\s+(.+?)\s*$", line)
+            if m:
+                out_lines.append(f"<b>{render_inline_spans(m.group(1))}</b>")
+                continue
+            m = re.match(r"^\s{0,3}>\s?(.*)$", line)
+            if m:
+                out_lines.append(f"│ {render_inline_spans(m.group(1))}")
+                continue
+            m = re.match(r"^\s{0,3}[-*+]\s+(.+?)\s*$", line)
+            if m:
+                out_lines.append(f"• {render_inline_spans(m.group(1))}")
+                continue
+            out_lines.append(render_inline_spans(line))
+        return "\n".join(out_lines)
+
+    out = ""
+    i = 0
+    while i < len(normalized):
+        start = normalized.find("```", i)
+        if start == -1:
+            out += render_inline_block(normalized[i:])
+            break
+
+        out += render_inline_block(normalized[i:start])
+        end = normalized.find("```", start + 3)
+        if end == -1:
+            out += render_inline_block(normalized[start:])
+            break
+
+        code_start = start + 3
+        if code_start < len(normalized) and normalized[code_start] == "\n":
+            code_start += 1
+        else:
+            nl = normalized.find("\n", code_start)
+            if nl != -1 and nl < end:
+                code_start = nl + 1
+        code = normalized[code_start:end]
+
+        if out and not out.endswith("\n"):
+            out += "\n"
+        out += render_code_block(code)
+
+        i = end + 3
+        if i < len(normalized) and normalized[i] == "\n":
+            out += "\n"
+            i += 1
+
+    return str(out or "").strip()
+
+
+def _telegram_target_from_chat_key(chat_key: str) -> Optional[dict[str, Any]]:
+    if not isinstance(chat_key, str) or not chat_key.strip():
+        return None
+    raw = chat_key.strip()
+    chat_id_raw, topic_raw = (raw.split(":", 1) + [""])[:2]
+    try:
+        chat_id = int(chat_id_raw)
+    except Exception:
+        return None
+    if chat_id == 0:
+        return None
+    out: dict[str, Any] = {"chat_id": chat_id}
+    if topic_raw.strip():
+        try:
+            topic_id = int(topic_raw.strip())
+        except Exception:
+            topic_id = None
+        # Telegram rejects sendMessage with message_thread_id=1 ("thread not found").
+        if isinstance(topic_id, int) and topic_id != 1:
+            out["message_thread_id"] = topic_id
+    return out
+
+
+TELEGRAM_HTML_PARSE_ERR_RE = re.compile(r"can't parse entities|parse entities|find end of the entity", re.IGNORECASE)
+TELEGRAM_MESSAGE_TOO_LONG_RE = re.compile(r"message is too long", re.IGNORECASE)
+
+
+def _telegram_api_call_sync(token: str, method: str, params: dict[str, Any]) -> Any:
+    if not isinstance(token, str) or not token.strip():
+        raise RuntimeError("Missing TELEGRAM_BOT_TOKEN")
+    if not isinstance(method, str) or not method.strip():
+        raise RuntimeError("Missing Telegram method")
+    if not isinstance(params, dict):
+        raise RuntimeError("Telegram params must be an object")
+
+    url = f"https://api.telegram.org/bot{token.strip()}/{method.strip()}"
+    body = json.dumps(params).encode("utf-8")
+    req = urllib.request.Request(url, data=body, headers={"content-type": "application/json"}, method="POST")
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            raw = resp.read().decode("utf-8", errors="replace")
+    except urllib.error.HTTPError as e:
+        try:
+            raw = e.read().decode("utf-8", errors="replace")
+        except Exception:
+            raw = ""
+        raise RuntimeError(f"Telegram {method} failed: HTTP {e.code} {raw}".strip()) from e
+    except Exception as e:
+        raise RuntimeError(f"Telegram {method} failed: {e}") from e
+
+    try:
+        data = json.loads(raw)
+    except Exception as e:
+        raise RuntimeError(f"Telegram {method} failed: bad JSON response") from e
+    if not isinstance(data, dict):
+        raise RuntimeError(f"Telegram {method} failed: bad response")
+    if not data.get("ok"):
+        desc = data.get("description") or "unknown error"
+        raise RuntimeError(f"Telegram {method} failed: {desc}")
+    return data.get("result")
+
+
+async def _telegram_send_message(
+    *,
+    token: str,
+    target: dict[str, Any],
+    text: str,
+    parse_mode: Optional[str] = None,
+) -> Any:
+    params = dict(target)
+    params["text"] = text
+    if parse_mode:
+        params["parse_mode"] = parse_mode
+        params["disable_web_page_preview"] = True
+    return await asyncio.to_thread(_telegram_api_call_sync, token, "sendMessage", params)
 
 
 def _strip_yaml_front_matter(raw: str) -> str:
@@ -452,12 +720,39 @@ class PersistedCronJob:
             next_run_at_ms=next_run_at_ms,
         )
 
+@dataclass
+class PersistedLastActiveTarget:
+    channel: str
+    chat_key: str
+    at_ms: int
+
+    def to_json(self) -> dict[str, Any]:
+        return {"channel": self.channel, "chatKey": self.chat_key, "atMs": self.at_ms}
+
+    @staticmethod
+    def from_json(obj: Any) -> Optional["PersistedLastActiveTarget"]:
+        if not isinstance(obj, dict):
+            return None
+        channel = str(obj.get("channel") or "").strip()
+        chat_key = str(obj.get("chatKey") or "").strip()
+        at_ms = obj.get("atMs")
+        if not channel or not chat_key or at_ms is None:
+            return None
+        try:
+            at_ms_int = int(at_ms)
+        except Exception:
+            return None
+        if at_ms_int <= 0:
+            return None
+        return PersistedLastActiveTarget(channel=channel, chat_key=chat_key, at_ms=at_ms_int)
+
 
 @dataclass
 class PersistedSessionAutomation:
     main_thread_id: Optional[str] = None
     cron_jobs: list[PersistedCronJob] = field(default_factory=list)
     system_event_queues: dict[str, list[PersistedSystemEvent]] = field(default_factory=dict)
+    last_active_by_thread: dict[str, PersistedLastActiveTarget] = field(default_factory=dict)
 
     def to_json(self) -> dict[str, Any]:
         queues: dict[str, Any] = {}
@@ -465,10 +760,18 @@ class PersistedSessionAutomation:
             if not tid:
                 continue
             queues[tid] = [e.to_json() for e in events]
+        last_active: dict[str, Any] = {}
+        for tid, tgt in self.last_active_by_thread.items():
+            if not tid:
+                continue
+            if not isinstance(tgt, PersistedLastActiveTarget):
+                continue
+            last_active[tid] = tgt.to_json()
         return {
             "mainThreadId": self.main_thread_id,
             "cronJobs": [j.to_json() for j in self.cron_jobs],
             "systemEventQueues": queues,
+            "lastActiveByThread": last_active,
         }
 
     @staticmethod
@@ -500,10 +803,20 @@ class PersistedSessionAutomation:
                         out_events.append(pe)
                 if out_events:
                     queues[tid.strip()] = out_events
+        last_active_raw = obj.get("lastActiveByThread")
+        last_active_by_thread: dict[str, PersistedLastActiveTarget] = {}
+        if isinstance(last_active_raw, dict):
+            for tid, raw_tgt in last_active_raw.items():
+                if not isinstance(tid, str) or not tid.strip():
+                    continue
+                tgt = PersistedLastActiveTarget.from_json(raw_tgt)
+                if tgt is not None:
+                    last_active_by_thread[tid.strip()] = tgt
         return PersistedSessionAutomation(
             main_thread_id=main_thread_id.strip() if isinstance(main_thread_id, str) else None,
             cron_jobs=cron_jobs,
             system_event_queues=queues,
+            last_active_by_thread=last_active_by_thread,
         )
 
 
@@ -617,6 +930,7 @@ class AutomationManager:
         self._bootstrap_lock = asyncio.Lock()
         self._session_backoff_until_ms: dict[str, int] = {}
         self._session_backoff_failures: dict[str, int] = {}
+        self._turn_text_by_key: dict[tuple[str, str, str], dict[str, Any]] = {}
 
     async def start(self) -> None:
         await self._store.load()
@@ -757,30 +1071,129 @@ class AutomationManager:
         if not isinstance(params, dict):
             params = {}
 
+        thread_id_raw = params.get("threadId")
+        thread_id = thread_id_raw.strip() if isinstance(thread_id_raw, str) and thread_id_raw.strip() else None
+
+        turn_id: Optional[str] = None
+        turn_id_raw = params.get("turnId")
+        if isinstance(turn_id_raw, str) and turn_id_raw.strip():
+            turn_id = turn_id_raw.strip()
+        else:
+            turn = params.get("turn")
+            if isinstance(turn, dict):
+                tid = turn.get("id")
+                if isinstance(tid, str) and tid.strip():
+                    turn_id = tid.strip()
+
+        key = (session_id, thread_id, turn_id) if thread_id and turn_id else None
+
+        if method == "item/agentMessage/delta":
+            if not key:
+                return
+            delta = params.get("delta")
+            if not isinstance(delta, str) or not delta:
+                return
+            entry = self._turn_text_by_key.get(key)
+            if entry is None:
+                entry = {"delta": "", "fullText": None}
+                self._turn_text_by_key[key] = entry
+            entry["delta"] = str(entry.get("delta") or "") + delta
+            return
+
+        if method == "item/completed":
+            if not key:
+                return
+            item = params.get("item")
+            if not isinstance(item, dict) or item.get("type") != "agentMessage":
+                return
+            text = item.get("text")
+            if not isinstance(text, str) or not text.strip():
+                return
+            entry = self._turn_text_by_key.get(key)
+            if entry is None:
+                entry = {"delta": "", "fullText": None}
+                self._turn_text_by_key[key] = entry
+            entry["fullText"] = text
+            return
+
         if method == "turn/started":
-            thread_id = params.get("threadId")
-            if isinstance(thread_id, str) and thread_id.strip():
-                turn = params.get("turn")
-                turn_id = None
-                if isinstance(turn, dict):
-                    tid = turn.get("id")
-                    if isinstance(tid, str) and tid.strip():
-                        turn_id = tid.strip()
-                lane = self.lane(session_id, thread_id.strip())
+            if thread_id:
+                lane = self.lane(session_id, thread_id)
                 lane.busy = True
                 if turn_id:
                     lane.active_turn_id = turn_id
             return
 
         if method == "turn/completed":
-            thread_id = params.get("threadId")
-            if isinstance(thread_id, str) and thread_id.strip():
-                lane = self.lane(session_id, thread_id.strip())
+            if thread_id:
+                lane = self.lane(session_id, thread_id)
                 lane.busy = False
                 lane.active_turn_id = None
-                asyncio.create_task(self._process_lane_after_turn(session_id, thread_id.strip()))
-                asyncio.create_task(self._maybe_request_heartbeat(session_id, thread_id.strip()))
+                asyncio.create_task(self._process_lane_after_turn(session_id, thread_id))
+                asyncio.create_task(self._maybe_request_heartbeat(session_id, thread_id))
+
+                final_text = ""
+                if key:
+                    entry = self._turn_text_by_key.pop(key, None)
+                    if isinstance(entry, dict):
+                        full = entry.get("fullText")
+                        delta = entry.get("delta")
+                        if isinstance(full, str) and full.strip():
+                            final_text = full
+                        elif isinstance(delta, str) and delta.strip():
+                            final_text = delta
+                if final_text.strip():
+                    asyncio.create_task(self._deliver_turn_text(session_id, thread_id, final_text))
             return
+
+    async def _deliver_turn_text(self, session_id: str, thread_id: str, text: str) -> None:
+        # Gateway-owned delivery: send a single final message on turn/completed.
+        if not isinstance(text, str) or not text.strip():
+            return
+        st = self._store.state
+        sess = st.sessions.get(session_id)
+        if sess is None:
+            return
+        tgt = sess.last_active_by_thread.get(thread_id)
+        if tgt is None or not isinstance(tgt, PersistedLastActiveTarget):
+            return
+        channel = (tgt.channel or "").strip().lower()
+        if channel not in ("telegram", "tg"):
+            return
+
+        token = os.getenv("TELEGRAM_BOT_TOKEN") or ""
+        if not token.strip():
+            return
+        target = _telegram_target_from_chat_key(tgt.chat_key)
+        if target is None:
+            return
+
+        stripped = _strip_heartbeat_token(text)
+        if stripped.get("shouldSkip"):
+            return
+        final_text = stripped.get("text") if isinstance(stripped.get("text"), str) else text
+        final_text = final_text.strip()
+        if not final_text:
+            return
+
+        truncated = _telegram_truncate(final_text)
+        html = _markdown_to_telegram_html(truncated)
+
+        try:
+            if html:
+                try:
+                    await _telegram_send_message(token=token, target=target, text=html, parse_mode="HTML")
+                    return
+                except Exception as e:
+                    msg = str(e)
+                    if TELEGRAM_HTML_PARSE_ERR_RE.search(msg) or TELEGRAM_MESSAGE_TOO_LONG_RE.search(msg):
+                        # Fall back to plain text.
+                        await _telegram_send_message(token=token, target=target, text=truncated, parse_mode=None)
+                        return
+                    raise
+            await _telegram_send_message(token=token, target=target, text=truncated, parse_mode=None)
+        except Exception as e:
+            log.warning("Failed to deliver to telegram for %s/%s: %s", session_id, thread_id, str(e))
 
     async def ensure_default_ready(self) -> str:
         if _provision_mode() != "docker":
@@ -877,6 +1290,8 @@ class AutomationManager:
         thread_id: Optional[str],
         target: Optional[str],
         text: str,
+        source_channel: Optional[str] = None,
+        source_chat_key: Optional[str] = None,
     ) -> dict[str, Any]:
         if not text.strip():
             raise ValueError("text must not be empty")
@@ -888,6 +1303,19 @@ class AutomationManager:
             thread_id = await self.ensure_main_thread(session_id)
         else:
             thread_id = thread_id.strip()
+
+        if isinstance(source_channel, str) and source_channel.strip() and isinstance(source_chat_key, str) and source_chat_key.strip():
+            ch = source_channel.strip()
+            ck = source_chat_key.strip()
+
+            def _touch_last_active(st: PersistedGatewayAutomationState) -> None:
+                sess = st.sessions.get(session_id)
+                if sess is None:
+                    sess = PersistedSessionAutomation()
+                    st.sessions[session_id] = sess
+                sess.last_active_by_thread[thread_id] = PersistedLastActiveTarget(channel=ch, chat_key=ck, at_ms=_now_ms())
+
+            await self._store.update(_touch_last_active)
 
         lane = self.lane(session_id, thread_id)
 
@@ -1096,17 +1524,34 @@ class AutomationManager:
         if drained:
             blocks.append("System events (batched):\n" + "\n".join(drained))
 
-        blocks.append(
-            "\n".join(
-                [
-                    "Instructions:",
-                    "- If there is user input, answer it first.",
-                    "- Then process each system event in order.",
-                    "- If an event requires actions, perform them.",
-                    "- End with a short summary of actions/results.",
-                ]
+        if heartbeat:
+            blocks.append(
+                "\n".join(
+                    [
+                        "Heartbeat response contract:",
+                        f"- If nothing needs attention right now, reply exactly: {HEARTBEAT_TOKEN}",
+                        f"- If you have a user-visible update/alert, reply with the alert text only (do NOT include {HEARTBEAT_TOKEN}).",
+                        "- Do NOT include meta/status text (timestamps, next schedule, 'heartbeat check', 'wrote memory', etc) unless it's part of the user-visible alert.",
+                        "",
+                        "Instructions:",
+                        "- Process each system event in order (if any).",
+                        "- If an event requires actions, perform them.",
+                        f"- If there is no user-visible output, reply exactly: {HEARTBEAT_TOKEN}",
+                    ]
+                )
             )
-        )
+        else:
+            blocks.append(
+                "\n".join(
+                    [
+                        "Instructions:",
+                        "- If there is user input, answer it first.",
+                        "- Then process each system event in order.",
+                        "- If an event requires actions, perform them.",
+                        "- End with a short summary of actions/results.",
+                    ]
+                )
+            )
         return "\n\n".join([b for b in blocks if b.strip()]).strip()
 
     async def _drain_system_events(self, session_id: str, thread_id: str, *, max_events: int) -> list[str]:
@@ -3071,11 +3516,23 @@ async def ws_proxy(ws: WebSocket):
                                         json.dumps({"id": req_id, "error": {"code": -32602, "message": "Missing 'text'"}})
                                     )
                                 continue
+                            source_channel = None
+                            source_chat_key = None
+                            source = params.get("source")
+                            if isinstance(source, dict):
+                                ch = source.get("channel")
+                                ck = source.get("chatKey")
+                                if isinstance(ch, str) and ch.strip():
+                                    source_channel = ch.strip()
+                                if isinstance(ck, str) and ck.strip():
+                                    source_chat_key = ck.strip()
                             res = await automation.enqueue_user_input(
                                 session_id=session_id,
                                 thread_id=(params.get("threadId") if isinstance(params.get("threadId"), str) else None),
                                 target=(params.get("target") if isinstance(params.get("target"), str) else None),
                                 text=text_param,
+                                source_channel=source_channel,
+                                source_chat_key=source_chat_key,
                             )
                             if has_id:
                                 await ws.send_text(json.dumps({"id": req_id, "result": res}))

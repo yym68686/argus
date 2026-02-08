@@ -31,6 +31,8 @@ services:
       # Optional: separate auth scopes (fallback to ARGUS_TOKEN when unset).
       ARGUS_NODE_TOKEN: ${ARGUS_NODE_TOKEN:-}
       ARGUS_MCP_TOKEN: ${ARGUS_MCP_TOKEN:-}
+      # Optional: enable gateway-owned Telegram delivery (outbound). Inbound is handled by the tg bot/webhook.
+      TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:-}
       # Optional: docker provision tuning.
       ARGUS_CONNECT_TIMEOUT_S: ${ARGUS_CONNECT_TIMEOUT_S:-30}
       ARGUS_CONTAINER_PREFIX: ${ARGUS_CONTAINER_PREFIX:-argus-session}
