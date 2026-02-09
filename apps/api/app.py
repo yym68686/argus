@@ -933,6 +933,7 @@ class AutomationManager:
 
         self._tasks: list[asyncio.Task[None]] = []
         self._bootstrap_lock = asyncio.Lock()
+        self._main_thread_locks: dict[str, asyncio.Lock] = {}
         self._session_backoff_until_ms: dict[str, int] = {}
         self._session_backoff_failures: dict[str, int] = {}
         self._turn_text_by_key: dict[tuple[str, str, str], dict[str, Any]] = {}
@@ -1238,55 +1239,61 @@ class AutomationManager:
         return sid
 
     async def ensure_main_thread(self, session_id: str) -> str:
-        def get_existing(st: PersistedGatewayAutomationState) -> Optional[str]:
-            sess = st.sessions.get(session_id)
-            return sess.main_thread_id if sess else None
+        lock = self._main_thread_locks.get(session_id)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._main_thread_locks[session_id] = lock
 
-        existing = get_existing(self._store.state)
-        live, _ = await _ensure_live_docker_session(session_id, allow_create=True)
-        await self._ensure_initialized(live)
+        async with lock:
+            def get_existing(st: PersistedGatewayAutomationState) -> Optional[str]:
+                sess = st.sessions.get(session_id)
+                return sess.main_thread_id if sess else None
 
-        if isinstance(existing, str) and existing.strip():
-            try:
-                await self._rpc(live, "thread/resume", {"threadId": existing.strip()})
-                return existing.strip()
-            except Exception:
-                log.warning("Failed to resume mainThreadId=%s; will create a new main thread", existing)
+            existing = get_existing(self._store.state)
+            live, _ = await _ensure_live_docker_session(session_id, allow_create=True)
+            await self._ensure_initialized(live)
 
-        result = await self._rpc(
-            live,
-            "thread/start",
-            {"cwd": live.cfg.workspace_container_path, "approvalPolicy": "never", "sandbox": "danger-full-access"},
-        )
-        tid = None
-        if isinstance(result, dict):
-            thread = result.get("thread")
-            if isinstance(thread, dict):
-                tid_val = thread.get("id")
-                if isinstance(tid_val, str) and tid_val.strip():
-                    tid = tid_val.strip()
-        if not tid:
-            raise RuntimeError("Invalid thread/start response (missing thread.id)")
+            if isinstance(existing, str) and existing.strip():
+                try:
+                    await self._rpc(live, "thread/resume", {"threadId": existing.strip()})
+                    return existing.strip()
+                except Exception:
+                    log.warning("Failed to resume mainThreadId=%s; will create a new main thread", existing)
 
-        def _save_main(st: PersistedGatewayAutomationState) -> None:
-            sess = st.sessions.get(session_id)
-            if sess is None:
-                sess = PersistedSessionAutomation()
-                st.sessions[session_id] = sess
-            prev_tid = sess.main_thread_id
-            sess.main_thread_id = tid
-            if prev_tid and prev_tid != tid:
-                # Migrate pending system events to the new main thread so they don't get stuck.
-                old_q = sess.system_event_queues.pop(prev_tid, None)
-                if old_q:
-                    new_q = sess.system_event_queues.get(tid)
-                    if new_q is None:
-                        sess.system_event_queues[tid] = old_q
-                    else:
-                        new_q.extend(old_q)
+            result = await self._rpc(
+                live,
+                "thread/start",
+                {"cwd": live.cfg.workspace_container_path, "approvalPolicy": "never", "sandbox": "danger-full-access"},
+            )
+            tid = None
+            if isinstance(result, dict):
+                thread = result.get("thread")
+                if isinstance(thread, dict):
+                    tid_val = thread.get("id")
+                    if isinstance(tid_val, str) and tid_val.strip():
+                        tid = tid_val.strip()
+            if not tid:
+                raise RuntimeError("Invalid thread/start response (missing thread.id)")
 
-        await self._store.update(_save_main)
-        return tid
+            def _save_main(st: PersistedGatewayAutomationState) -> None:
+                sess = st.sessions.get(session_id)
+                if sess is None:
+                    sess = PersistedSessionAutomation()
+                    st.sessions[session_id] = sess
+                prev_tid = sess.main_thread_id
+                sess.main_thread_id = tid
+                if prev_tid and prev_tid != tid:
+                    # Migrate pending system events to the new main thread so they don't get stuck.
+                    old_q = sess.system_event_queues.pop(prev_tid, None)
+                    if old_q:
+                        new_q = sess.system_event_queues.get(tid)
+                        if new_q is None:
+                            sess.system_event_queues[tid] = old_q
+                        else:
+                            new_q.extend(old_q)
+
+            await self._store.update(_save_main)
+            return tid
 
     async def enqueue_user_input(
         self,
