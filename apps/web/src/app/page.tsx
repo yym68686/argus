@@ -115,6 +115,9 @@ interface ThreadRow {
 
 interface ThreadChatState {
   messages: ChatMessage[];
+  // Upstream turn id (may be reused across reconnects); used only for matching incoming notifications.
+  upstreamTurnId: string | null;
+  // UI turn id (must be unique within a thread); used for grouping and React keys.
   turnId: string | null;
   turnInProgress: boolean;
   hydrated: boolean;
@@ -125,6 +128,7 @@ interface ThreadChatState {
 function emptyThreadChatState(): ThreadChatState {
   return {
     messages: [],
+    upstreamTurnId: null,
     turnId: null,
     turnInProgress: false,
     hydrated: false,
@@ -148,8 +152,34 @@ function getString(v: unknown): string | null {
   return typeof v === "string" ? v : null;
 }
 
+function getTrimmedString(v: unknown): string | null {
+  const s = getString(v);
+  if (!s) return null;
+  const t = s.trim();
+  return t.length ? t : null;
+}
+
+function getIdString(v: unknown): string | null {
+  const s = getTrimmedString(v);
+  if (s) return s;
+  const n = getNumber(v);
+  if (n === null) return null;
+  return String(n);
+}
+
 function getNumber(v: unknown): number | null {
   return typeof v === "number" && Number.isFinite(v) ? v : null;
+}
+
+function turnIdFromParams(params: Record<string, unknown>): string | null {
+  const direct = getIdString(params["turnId"]);
+  if (direct) return direct;
+  const turn = params["turn"];
+  if (isRecord(turn)) {
+    const nested = getIdString(turn["id"]);
+    if (nested) return nested;
+  }
+  return null;
 }
 
 function toolStatusFromString(v: unknown): ToolMessageStatus {
@@ -199,7 +229,7 @@ function appendToolMarkerMarkdown(markdown: string, toolId: string): string {
 
 function parseMarkdownToolSegments(markdown: string): MarkdownToolSegment[] {
   const segments: MarkdownToolSegment[] = [];
-  const re = /<!--tool:([A-Za-z0-9_-]+)-->/g;
+  const re = /<!--tool:([^\s]+?)-->/g;
   let last = 0;
   let m: RegExpExecArray | null;
   while ((m = re.exec(markdown)) !== null) {
@@ -292,9 +322,66 @@ function nowId(prefix: string): string {
   return `${prefix}_${Date.now()}_${Math.random().toString(16).slice(2)}`;
 }
 
-function toolMessageFromThreadItem(rawItem: Record<string, unknown>): ChatMessage | null {
+function uiItemId(opts: { turnId: string | null | undefined; itemType: string | null | undefined; itemId: string }): string {
+  const turn = isNonEmptyString(opts.turnId) ? opts.turnId.trim() : "noTurn";
+  const t = isNonEmptyString(opts.itemType) ? opts.itemType.trim() : "item";
+  const id = opts.itemId.trim();
+  return `${turn}::${t}::${id}`;
+}
+
+function nextUiTurnId(messages: ChatMessage[], upstreamTurnId: string): string {
+  const base = upstreamTurnId.trim();
+  if (!base) return nowId("turn");
+
+  let maxSuffix = 0;
+  for (const m of messages) {
+    if (!isNonEmptyString(m.turnId)) continue;
+    const t = m.turnId.trim();
+    if (t === base) {
+      maxSuffix = Math.max(maxSuffix, 1);
+      continue;
+    }
+    if (!t.startsWith(`${base}#`)) continue;
+    const raw = t.slice(base.length + 1);
+    const n = Number(raw);
+    if (Number.isFinite(n) && n >= 2) maxSuffix = Math.max(maxSuffix, Math.trunc(n));
+  }
+
+  if (maxSuffix === 0) return base;
+  return `${base}#${maxSuffix + 1}`;
+}
+
+function ensureActiveTurnMapping(
+  current: ThreadChatState,
+  incomingUpstreamTurnId: string | null
+): { upstreamTurnId: string | null; uiTurnId: string | null } {
+  const incoming = isNonEmptyString(incomingUpstreamTurnId) ? incomingUpstreamTurnId : null;
+  if (!current.turnInProgress) {
+    return { upstreamTurnId: current.upstreamTurnId, uiTurnId: current.turnId };
+  }
+  if (isNonEmptyString(current.turnId) && isNonEmptyString(current.upstreamTurnId)) {
+    return { upstreamTurnId: current.upstreamTurnId, uiTurnId: current.turnId };
+  }
+  if (!incoming) {
+    return { upstreamTurnId: current.upstreamTurnId, uiTurnId: current.turnId };
+  }
+  return { upstreamTurnId: incoming, uiTurnId: nextUiTurnId(current.messages, incoming) };
+}
+
+function resolveUiTurnIdForEvent(current: ThreadChatState, incomingUpstreamTurnId: string | null): string | undefined {
+  const incoming = isNonEmptyString(incomingUpstreamTurnId) ? incomingUpstreamTurnId : null;
+  if (current.turnInProgress) {
+    const mapped = ensureActiveTurnMapping(current, incoming);
+    if (isNonEmptyString(mapped.uiTurnId) && isNonEmptyString(mapped.upstreamTurnId)) {
+      if (!incoming || incoming === mapped.upstreamTurnId) return mapped.uiTurnId;
+    }
+  }
+  return incoming ?? undefined;
+}
+
+function toolMessageFromThreadItem(rawItem: Record<string, unknown>, idOverride?: string | null): ChatMessage | null {
   const type = getString(rawItem["type"]);
-  const id = getString(rawItem["id"]) ?? nowId("itm");
+  const id = isNonEmptyString(idOverride) ? idOverride : getIdString(rawItem["id"]) ?? nowId("itm");
 
   if (type === "commandExecution") {
     const command = getString(rawItem["command"]) ?? "";
@@ -432,13 +519,52 @@ function userInputsToText(inputs: unknown): string {
   return parts.join("\n").trim();
 }
 
+function userMessageToUiText(rawText: string): string {
+  const trimmed = rawText.trim();
+  if (!trimmed) return "";
+
+  // Heuristic: Gateway-assembled prompts start with "# Project Context" and end with an "Instructions:" block.
+  // For the chat UI we want the user's actual message, not the full injected context/instructions.
+  if (!trimmed.startsWith("# Project Context")) return trimmed;
+
+  let main = trimmed;
+  const instructionsIdx = main.lastIndexOf("\n\nInstructions:");
+  if (instructionsIdx !== -1) {
+    main = main.slice(0, instructionsIdx).trimEnd();
+  }
+
+  const systemEventsIdx = main.lastIndexOf("\n\nSystem events (batched):");
+  if (systemEventsIdx !== -1) {
+    main = main.slice(0, systemEventsIdx).trimEnd();
+  }
+
+  const lines = main.split(/\r?\n/);
+  let lastClose = -1;
+  for (let i = 0; i < lines.length; i++) {
+    if (/^\[\/[A-Za-z0-9_.-]+\]$/.test(lines[i].trim())) lastClose = i;
+  }
+  if (lastClose === -1) return trimmed;
+
+  const extracted = lines.slice(lastClose + 1).join("\n").trim();
+  return extracted || trimmed;
+}
+
 function turnsToChatMessages(turns: unknown): ChatMessage[] {
   if (!Array.isArray(turns)) return [];
   const messages: ChatMessage[] = [];
+  const seenTurns: Record<string, number> = {};
 
   for (const rawTurn of turns) {
     if (!isRecord(rawTurn)) continue;
-    const turnId = getString(rawTurn["id"]) ?? undefined;
+    const upstreamId = getIdString(rawTurn["id"]) ?? null;
+    let turnId: string | undefined;
+    if (isNonEmptyString(upstreamId)) {
+      const next = (seenTurns[upstreamId] ?? 0) + 1;
+      seenTurns[upstreamId] = next;
+      turnId = next === 1 ? upstreamId : `${upstreamId}#${next}`;
+    } else {
+      turnId = nowId("turn");
+    }
     const items = rawTurn["items"];
     if (!Array.isArray(items)) continue;
 
@@ -471,11 +597,12 @@ function turnsToChatMessages(turns: unknown): ChatMessage[] {
 
     for (const rawItem of items) {
       if (!isRecord(rawItem)) continue;
-      const type = getString(rawItem["type"]);
-      const id = getString(rawItem["id"]) ?? nowId("itm");
+      const type = getTrimmedString(rawItem["type"]);
+      const rawId = getIdString(rawItem["id"]) ?? nowId("itm");
+      const id = uiItemId({ turnId, itemType: type, itemId: rawId });
       if (type === "userMessage") {
         flushReasoning();
-        const text = userInputsToText(rawItem["content"]);
+        const text = userMessageToUiText(userInputsToText(rawItem["content"]));
         if (!text) continue;
         messages.push({ id, role: "user", text, turnId });
         continue;
@@ -498,11 +625,11 @@ function turnsToChatMessages(turns: unknown): ChatMessage[] {
         continue;
       }
 
-      const toolMsg = toolMessageFromThreadItem(rawItem);
+      const toolMsg = toolMessageFromThreadItem(rawItem, rawId);
       if (toolMsg && toolMsg.role === "tool") {
-        messages.push({ ...toolMsg, turnId });
+        messages.push({ ...toolMsg, id, turnId });
         if (pendingReasoningParts) {
-          pendingToolIds.push(toolMsg.id);
+          pendingToolIds.push(id);
         }
       }
     }
@@ -618,6 +745,30 @@ export default function Page() {
       return true;
     });
   }, [activeChat?.messages, activeChat?.turnInProgress, activeChat?.turnId, reasoningTurnIds]);
+
+  const turnProgressInsertIndex = React.useMemo(() => {
+    if (!activeChat?.turnInProgress) return null;
+    const msgs = displayMessages;
+
+    const activeTurnId = isNonEmptyString(activeChat.turnId) ? activeChat.turnId : null;
+
+    if (activeTurnId) {
+      for (let i = msgs.length - 1; i >= 0; i--) {
+        const m = msgs[i];
+        if (m.role === "user" && m.turnId === activeTurnId) return i + 1;
+      }
+      const assistantIdx = msgs.findIndex((m) => m.role === "assistant" && m.turnId === activeTurnId);
+      if (assistantIdx !== -1) return assistantIdx;
+    }
+
+    for (let i = msgs.length - 1; i >= 0; i--) {
+      if (msgs[i]?.role === "user") return i + 1;
+    }
+
+    const firstAssistantIdx = msgs.findIndex((m) => m.role === "assistant");
+    if (firstAssistantIdx !== -1) return firstAssistantIdx;
+    return msgs.length;
+  }, [activeChat?.turnInProgress, activeChat?.turnId, displayMessages]);
 
   const canSend = !!prompt.trim();
 
@@ -830,6 +981,7 @@ export default function Page() {
         [key]: {
           ...current,
           turnInProgress: true,
+          upstreamTurnId: null,
           turnId: null,
           reasoningSummary: "",
           reasoningSummaryIndex: null,
@@ -843,13 +995,17 @@ export default function Page() {
       if (isNonEmptyString(turnId)) {
         setChatByThreadKey((prev) => {
           const current = prev[key] ?? { ...emptyThreadChatState(), turnInProgress: true };
-          return { ...prev, [key]: { ...current, turnId } };
+          const uiTurnId = nextUiTurnId(current.messages, turnId);
+          return {
+            ...prev,
+            [key]: { ...current, upstreamTurnId: turnId, turnId: uiTurnId }
+          };
         });
       }
     } catch (e) {
       setChatByThreadKey((prev) => {
         const current = prev[key] ?? emptyThreadChatState();
-        return { ...prev, [key]: { ...current, turnInProgress: false, turnId: null } };
+        return { ...prev, [key]: { ...current, turnInProgress: false, upstreamTurnId: null, turnId: null } };
       });
       toast.error((e as Error)?.message || String(e));
     } finally {
@@ -892,18 +1048,34 @@ export default function Page() {
 	    const key = threadKey(sessionId, incomingThreadId);
 	    setChatByThreadKey((prev) => {
 	      const current = prev[key] ?? emptyThreadChatState();
-	      const isDifferentTurn =
-	        isNonEmptyString(current.turnId) &&
-	        isNonEmptyString(incomingTurnId) &&
-	        current.turnId !== incomingTurnId;
-	      const shouldResetSummary = !current.turnInProgress || isDifferentTurn;
-	      const nextTurnId = current.turnId ?? incomingTurnId;
+	      const incoming = isNonEmptyString(incomingTurnId) ? incomingTurnId : null;
+	      const currentUpstream = isNonEmptyString(current.upstreamTurnId) ? current.upstreamTurnId : null;
+
+	      const isSameTurn = !!(
+	        current.turnInProgress &&
+	        incoming &&
+	        currentUpstream &&
+	        incoming === currentUpstream &&
+	        isNonEmptyString(current.turnId)
+	      );
+
+	      if (isSameTurn) {
+	        return {
+	          ...prev,
+	          [key]: { ...current, turnInProgress: true }
+	        };
+	      }
+
+	      const nextUiId = incoming ? nextUiTurnId(current.messages, incoming) : nowId("turn");
+	      const shouldResetSummary = !current.turnInProgress || !isSameTurn;
+
 	      return {
 	        ...prev,
 	        [key]: {
 	          ...current,
 	          turnInProgress: true,
-	          turnId: nextTurnId ?? null,
+	          upstreamTurnId: incoming,
+	          turnId: nextUiId,
 	          reasoningSummary: shouldResetSummary ? "" : current.reasoningSummary,
 	          reasoningSummaryIndex: shouldResetSummary ? null : current.reasoningSummaryIndex
 	        }
@@ -915,15 +1087,20 @@ export default function Page() {
     const key = threadKey(sessionId, incomingThreadId);
     setChatByThreadKey((prev) => {
       const current = prev[key] ?? emptyThreadChatState();
-      const turnId = current.turnId;
-      if (turnId && incomingTurnId && incomingTurnId !== turnId) return prev;
+      const mapping = ensureActiveTurnMapping(current, incomingTurnId);
+      const activeUpstream = isNonEmptyString(mapping.upstreamTurnId) ? mapping.upstreamTurnId : null;
+      if (current.turnInProgress && activeUpstream && incomingTurnId && incomingTurnId !== activeUpstream) return prev;
 
-      const nextTurnId =
-        current.turnInProgress && !current.turnId && incomingTurnId ? incomingTurnId : current.turnId;
+      const nextTurnId = mapping.uiTurnId ?? current.turnId;
+      const nextUpstreamTurnId = mapping.upstreamTurnId ?? current.upstreamTurnId;
 
       const msgs = current.messages;
       const last = msgs[msgs.length - 1];
-      const expectedTurnId = incomingTurnId ?? nextTurnId ?? undefined;
+      const expectedTurnId =
+        resolveUiTurnIdForEvent(
+          { ...current, turnId: nextTurnId ?? null, upstreamTurnId: nextUpstreamTurnId ?? null },
+          incomingTurnId
+        ) ?? undefined;
       const newAssistant: ChatMessage = { id: nowId("a"), role: "assistant", text: delta, turnId: expectedTurnId };
       const nextMessages =
         last &&
@@ -934,7 +1111,13 @@ export default function Page() {
 
       return {
         ...prev,
-        [key]: { ...current, messages: nextMessages, turnId: nextTurnId ?? null, hydrated: true }
+        [key]: {
+          ...current,
+          messages: nextMessages,
+          turnId: nextTurnId ?? null,
+          upstreamTurnId: nextUpstreamTurnId ?? null,
+          hydrated: true
+        }
       };
     });
   }
@@ -949,9 +1132,12 @@ export default function Page() {
     const key = threadKey(sessionId, incomingThreadId);
     setChatByThreadKey((prev) => {
       const current = prev[key] ?? emptyThreadChatState();
-      const turnId = current.turnId;
-      if (turnId && incomingTurnId && incomingTurnId !== turnId) return prev;
+      const mapping = ensureActiveTurnMapping(current, incomingTurnId);
+      const activeUpstream = isNonEmptyString(mapping.upstreamTurnId) ? mapping.upstreamTurnId : null;
+      if (current.turnInProgress && activeUpstream && incomingTurnId && incomingTurnId !== activeUpstream) return prev;
 
+      const nextTurnId = mapping.uiTurnId ?? current.turnId;
+      const nextUpstreamTurnId = mapping.upstreamTurnId ?? current.upstreamTurnId;
       const nextIndex = summaryIndex ?? current.reasoningSummaryIndex;
       const needsBreak =
         current.reasoningSummary &&
@@ -963,7 +1149,14 @@ export default function Page() {
 
       return {
         ...prev,
-        [key]: { ...current, reasoningSummary: nextText, reasoningSummaryIndex: nextIndex, hydrated: true }
+        [key]: {
+          ...current,
+          turnId: nextTurnId ?? null,
+          upstreamTurnId: nextUpstreamTurnId ?? null,
+          reasoningSummary: nextText,
+          reasoningSummaryIndex: nextIndex,
+          hydrated: true
+        }
       };
     });
   }
@@ -972,14 +1165,19 @@ export default function Page() {
     const key = threadKey(sessionId, incomingThreadId);
     setChatByThreadKey((prev) => {
       const current = prev[key] ?? emptyThreadChatState();
-      const turnId = current.turnId;
-      if (turnId && incomingTurnId && incomingTurnId !== turnId) return prev;
+      const mapping = ensureActiveTurnMapping(current, incomingTurnId);
+      const activeUpstream = isNonEmptyString(mapping.upstreamTurnId) ? mapping.upstreamTurnId : null;
+      if (current.turnInProgress && activeUpstream && incomingTurnId && incomingTurnId !== activeUpstream) return prev;
 
-      const nextTurnId =
-        current.turnInProgress && !current.turnId && incomingTurnId ? incomingTurnId : current.turnId;
+      const nextTurnId = mapping.uiTurnId ?? current.turnId;
+      const nextUpstreamTurnId = mapping.upstreamTurnId ?? current.upstreamTurnId;
 
       const msgs = current.messages;
-      const expectedTurnId = incomingTurnId ?? nextTurnId ?? undefined;
+      const expectedTurnId =
+        resolveUiTurnIdForEvent(
+          { ...current, turnId: nextTurnId ?? null, upstreamTurnId: nextUpstreamTurnId ?? null },
+          incomingTurnId
+        ) ?? undefined;
       const idx = (() => {
         if (expectedTurnId) {
           for (let i = msgs.length - 1; i >= 0; i--) {
@@ -1015,7 +1213,13 @@ export default function Page() {
 
       return {
         ...prev,
-        [key]: { ...current, messages: nextMessages, turnId: nextTurnId ?? null, hydrated: true }
+        [key]: {
+          ...current,
+          messages: nextMessages,
+          turnId: nextTurnId ?? null,
+          upstreamTurnId: nextUpstreamTurnId ?? null,
+          hydrated: true
+        }
       };
     });
   }
@@ -1025,9 +1229,11 @@ export default function Page() {
 	    setChatByThreadKey((prev) => {
 	      const current = prev[key] ?? emptyThreadChatState();
 	      if (!current.turnInProgress) return prev;
-	      if (current.turnId && incomingTurnId && incomingTurnId !== current.turnId) return prev;
+	      const mapping = ensureActiveTurnMapping(current, incomingTurnId);
+	      const nextUpstreamTurnId = mapping.upstreamTurnId ?? current.upstreamTurnId;
+	      if (isNonEmptyString(nextUpstreamTurnId) && incomingTurnId && incomingTurnId !== nextUpstreamTurnId) return prev;
 
-	      const completedTurnId = current.turnId ?? incomingTurnId ?? null;
+	      const completedTurnId = mapping.uiTurnId ?? current.turnId ?? null;
 	      const hasSummary = current.reasoningSummary.trim().length > 0;
 	      const hasTools =
 	        isNonEmptyString(completedTurnId) &&
@@ -1069,6 +1275,7 @@ export default function Page() {
 	          messages: nextMessages,
 	          turnInProgress: false,
 	          turnId: null,
+            upstreamTurnId: null,
 	          reasoningSummary: "",
 	          reasoningSummaryIndex: null
 	        }
@@ -1134,16 +1341,28 @@ export default function Page() {
 	    const key = threadKey(sessionId, incomingThreadId);
 	    setChatByThreadKey((prev) => {
 	      const current = prev[key] ?? emptyThreadChatState();
-	      const turnId = current.turnId;
-	      if (turnId && incomingTurnId && incomingTurnId !== turnId) return prev;
+	      const mapping = ensureActiveTurnMapping(current, incomingTurnId);
+	      const activeUpstream = isNonEmptyString(mapping.upstreamTurnId) ? mapping.upstreamTurnId : null;
+	      if (current.turnInProgress && activeUpstream && incomingTurnId && incomingTurnId !== activeUpstream) return prev;
+
+        const nextTurnId = mapping.uiTurnId ?? current.turnId;
+        const nextUpstreamTurnId = mapping.upstreamTurnId ?? current.upstreamTurnId;
+
+        const effectiveTurnId =
+          msg.turnId ??
+          resolveUiTurnIdForEvent(
+            { ...current, turnId: nextTurnId ?? null, upstreamTurnId: nextUpstreamTurnId ?? null },
+            incomingTurnId
+          ) ??
+          undefined;
+        const itemType = getTrimmedString(item["type"]);
+        const uiId = uiItemId({ turnId: effectiveTurnId, itemType, itemId: msg.id });
 
 	      const msgWithTurn: Extract<ChatMessage, { role: "tool" }> = {
 	        ...msg,
-	        turnId: msg.turnId ?? (incomingTurnId ?? current.turnId ?? undefined)
+          id: uiId,
+	        turnId: effectiveTurnId
 	      };
-
-	      const nextTurnId =
-	        current.turnInProgress && !current.turnId && incomingTurnId ? incomingTurnId : current.turnId;
 
 	      const nextReasoningSummary =
 	        current.turnInProgress
@@ -1160,6 +1379,7 @@ export default function Page() {
             messages: [...msgs, msgWithTurn],
             hydrated: true,
             turnId: nextTurnId ?? null,
+            upstreamTurnId: nextUpstreamTurnId ?? null,
             reasoningSummary: nextReasoningSummary
           }
         };
@@ -1189,6 +1409,7 @@ export default function Page() {
           messages: [...msgs.slice(0, idx), nextMsg, ...msgs.slice(idx + 1)],
           hydrated: true,
           turnId: nextTurnId ?? null,
+          upstreamTurnId: nextUpstreamTurnId ?? null,
           reasoningSummary: nextReasoningSummary
         }
       };
@@ -1199,6 +1420,7 @@ export default function Page() {
 	    sessionId: string,
 	    incomingThreadId: string,
 	    incomingTurnId: string | null,
+      itemType: string,
 	    itemId: string,
 	    delta: string,
 	    stubMeta: ToolMessageMeta
@@ -1206,26 +1428,34 @@ export default function Page() {
 	    const key = threadKey(sessionId, incomingThreadId);
 	    setChatByThreadKey((prev) => {
 	      const current = prev[key] ?? emptyThreadChatState();
-	      const turnId = current.turnId;
-	      if (turnId && incomingTurnId && incomingTurnId !== turnId) return prev;
+	      const mapping = ensureActiveTurnMapping(current, incomingTurnId);
+	      const activeUpstream = isNonEmptyString(mapping.upstreamTurnId) ? mapping.upstreamTurnId : null;
+	      if (current.turnInProgress && activeUpstream && incomingTurnId && incomingTurnId !== activeUpstream) return prev;
 
-	      const nextTurnId =
-	        current.turnInProgress && !current.turnId && incomingTurnId ? incomingTurnId : current.turnId;
+        const nextTurnId = mapping.uiTurnId ?? current.turnId;
+        const nextUpstreamTurnId = mapping.upstreamTurnId ?? current.upstreamTurnId;
+
+        const effectiveTurnId =
+          resolveUiTurnIdForEvent(
+            { ...current, turnId: nextTurnId ?? null, upstreamTurnId: nextUpstreamTurnId ?? null },
+            incomingTurnId
+          ) ?? undefined;
+        const uiId = uiItemId({ turnId: effectiveTurnId, itemType, itemId });
 
 	      const nextReasoningSummary =
 	        current.turnInProgress
-	          ? appendToolMarkerMarkdown(current.reasoningSummary, itemId)
+	          ? appendToolMarkerMarkdown(current.reasoningSummary, uiId)
 	          : current.reasoningSummary;
 
       const msgs = current.messages;
-	      const idx = msgs.findIndex((m) => m.id === itemId && m.role === "tool");
+	      const idx = msgs.findIndex((m) => m.id === uiId && m.role === "tool");
 	      if (idx === -1) {
 	        const nextMsg: ChatMessage = {
-	          id: itemId,
+	          id: uiId,
 	          role: "tool",
 	          text: delta,
 	          meta: stubMeta,
-	          turnId: incomingTurnId ?? current.turnId ?? undefined
+	          turnId: effectiveTurnId
 	        };
 	        return {
 	          ...prev,
@@ -1234,6 +1464,7 @@ export default function Page() {
             messages: [...msgs, nextMsg],
             hydrated: true,
             turnId: nextTurnId ?? null,
+            upstreamTurnId: nextUpstreamTurnId ?? null,
             reasoningSummary: nextReasoningSummary
           }
         };
@@ -1246,7 +1477,7 @@ export default function Page() {
 	        ...existing,
 	        text: existing.text + delta,
 	        meta: mergedMeta,
-	        turnId: existing.turnId ?? (incomingTurnId ?? current.turnId ?? undefined)
+	        turnId: existing.turnId ?? effectiveTurnId
 	      };
 
       return {
@@ -1256,6 +1487,7 @@ export default function Page() {
           messages: [...msgs.slice(0, idx), nextMsg, ...msgs.slice(idx + 1)],
           hydrated: true,
           turnId: nextTurnId ?? null,
+          upstreamTurnId: nextUpstreamTurnId ?? null,
           reasoningSummary: nextReasoningSummary
         }
       };
@@ -1303,8 +1535,7 @@ export default function Page() {
 	    if (method === "turn/started") {
 	      const incomingThreadId = getString(params["threadId"]);
 	      if (!isNonEmptyString(incomingThreadId)) return;
-	      const turn = isRecord(params["turn"]) ? params["turn"] : {};
-	      const incomingTurnId = getString(turn["id"]);
+	      const incomingTurnId = turnIdFromParams(params);
 	      setThreadTurnStarted(sessionId, incomingThreadId, incomingTurnId);
 	      return;
 	    }
@@ -1312,7 +1543,7 @@ export default function Page() {
     if (method === "item/started") {
       const incomingThreadId = getString(params["threadId"]);
       if (!isNonEmptyString(incomingThreadId)) return;
-      const incomingTurnId = getString(params["turnId"]);
+      const incomingTurnId = turnIdFromParams(params);
       const item = isRecord(params["item"]) ? params["item"] : null;
       if (!item) return;
       upsertToolFromItem(sessionId, incomingThreadId, incomingTurnId, item);
@@ -1322,7 +1553,7 @@ export default function Page() {
 	    if (method === "item/agentMessage/delta") {
 	      const incomingThreadId = getString(params["threadId"]);
 	      if (!isNonEmptyString(incomingThreadId)) return;
-	      const incomingTurnId = getString(params["turnId"]);
+	      const incomingTurnId = turnIdFromParams(params);
       const delta = getString(params["delta"]);
       if (!isNonEmptyString(delta)) return;
       appendAssistantDelta(sessionId, incomingThreadId, incomingTurnId, delta);
@@ -1332,7 +1563,7 @@ export default function Page() {
     if (method === "item/reasoning/summaryTextDelta") {
       const incomingThreadId = getString(params["threadId"]);
       if (!isNonEmptyString(incomingThreadId)) return;
-      const incomingTurnId = getString(params["turnId"]);
+      const incomingTurnId = turnIdFromParams(params);
       const delta = getString(params["delta"]);
       if (!isNonEmptyString(delta)) return;
       const summaryIndex = getNumber(params["summaryIndex"]);
@@ -1343,11 +1574,11 @@ export default function Page() {
     if (method === "item/commandExecution/outputDelta") {
       const incomingThreadId = getString(params["threadId"]);
       if (!isNonEmptyString(incomingThreadId)) return;
-      const incomingTurnId = getString(params["turnId"]);
-      const itemId = getString(params["itemId"]);
+      const incomingTurnId = turnIdFromParams(params);
+      const itemId = getIdString(params["itemId"]);
       const delta = getString(params["delta"]);
       if (!isNonEmptyString(itemId) || !isNonEmptyString(delta)) return;
-      appendToolDelta(sessionId, incomingThreadId, incomingTurnId, itemId, delta, {
+      appendToolDelta(sessionId, incomingThreadId, incomingTurnId, "commandExecution", itemId, delta, {
         kind: "commandExecution",
         status: "inProgress",
         command: "",
@@ -1361,11 +1592,11 @@ export default function Page() {
     if (method === "item/fileChange/outputDelta") {
       const incomingThreadId = getString(params["threadId"]);
       if (!isNonEmptyString(incomingThreadId)) return;
-      const incomingTurnId = getString(params["turnId"]);
-      const itemId = getString(params["itemId"]);
+      const incomingTurnId = turnIdFromParams(params);
+      const itemId = getIdString(params["itemId"]);
       const delta = getString(params["delta"]);
       if (!isNonEmptyString(itemId) || !isNonEmptyString(delta)) return;
-      appendToolDelta(sessionId, incomingThreadId, incomingTurnId, itemId, delta, {
+      appendToolDelta(sessionId, incomingThreadId, incomingTurnId, "fileChange", itemId, delta, {
         kind: "fileChange",
         status: "inProgress",
         files: [],
@@ -1377,11 +1608,11 @@ export default function Page() {
     if (method === "item/mcpToolCall/progress") {
       const incomingThreadId = getString(params["threadId"]);
       if (!isNonEmptyString(incomingThreadId)) return;
-      const incomingTurnId = getString(params["turnId"]);
-      const itemId = getString(params["itemId"]);
+      const incomingTurnId = turnIdFromParams(params);
+      const itemId = getIdString(params["itemId"]);
       const message = getString(params["message"]);
       if (!isNonEmptyString(itemId) || !isNonEmptyString(message)) return;
-      appendToolDelta(sessionId, incomingThreadId, incomingTurnId, itemId, message + "\n", {
+      appendToolDelta(sessionId, incomingThreadId, incomingTurnId, "mcpToolCall", itemId, message + "\n", {
         kind: "mcpToolCall",
         status: "inProgress",
         server: "",
@@ -1393,9 +1624,105 @@ export default function Page() {
 	    if (method === "item/completed") {
 	      const incomingThreadId = getString(params["threadId"]);
 	      if (!isNonEmptyString(incomingThreadId)) return;
-	      const incomingTurnId = getString(params["turnId"]);
+	      const incomingTurnId = turnIdFromParams(params);
 
 	      const item = isRecord(params["item"]) ? params["item"] : {};
+	      if (item["type"] === "userMessage") {
+	        const rawId = getIdString(item["id"]);
+	        const text = userMessageToUiText(userInputsToText(item["content"]));
+	        if (!text.trim()) return;
+	        const msgId = rawId ?? nowId("u");
+	        const key = threadKey(sessionId, incomingThreadId);
+	        setChatByThreadKey((prev) => {
+	          const current = prev[key] ?? emptyThreadChatState();
+            const incomingUpstream = isNonEmptyString(incomingTurnId) ? incomingTurnId : null;
+            let nextTurnInProgress = current.turnInProgress;
+            let nextUpstreamTurnId = current.upstreamTurnId;
+            let nextTurnId = current.turnId;
+
+            if (!current.turnInProgress && incomingUpstream) {
+              nextTurnInProgress = true;
+              nextUpstreamTurnId = incomingUpstream;
+              nextTurnId = nextUiTurnId(current.messages, incomingUpstream);
+            } else {
+              const mapping = ensureActiveTurnMapping(current, incomingTurnId);
+              nextTurnId = mapping.uiTurnId ?? current.turnId;
+              nextUpstreamTurnId = mapping.upstreamTurnId ?? current.upstreamTurnId;
+            }
+
+	          if (
+	            nextTurnInProgress &&
+	            isNonEmptyString(nextUpstreamTurnId) &&
+	            incomingTurnId &&
+	            incomingTurnId !== nextUpstreamTurnId
+	          ) {
+	            return prev;
+	          }
+
+	          const effectiveTurnId =
+	            resolveUiTurnIdForEvent(
+	              {
+	                ...current,
+	                turnInProgress: nextTurnInProgress,
+	                turnId: nextTurnId ?? null,
+	                upstreamTurnId: nextUpstreamTurnId ?? null
+	              },
+	              incomingTurnId
+	            ) ?? undefined;
+            const uiId = uiItemId({ turnId: effectiveTurnId, itemType: "userMessage", itemId: msgId });
+
+	          const msgs = current.messages;
+	          let idx = msgs.findIndex((m) => m.role === "user" && m.id === uiId);
+	          if (idx === -1) {
+	            for (let i = msgs.length - 1; i >= 0; i--) {
+	              const m = msgs[i];
+	              if (m.role !== "user") continue;
+	              if (effectiveTurnId && m.turnId === effectiveTurnId && m.text === text) {
+	                idx = i;
+	                break;
+	              }
+	              if (!m.turnId && m.text === text) {
+	                idx = i;
+	                break;
+	              }
+	            }
+	          }
+
+	          const nextMsg: ChatMessage = { id: uiId, role: "user", text, turnId: effectiveTurnId };
+	          let nextMessages: ChatMessage[];
+	          if (idx >= 0) {
+	            const existing = msgs[idx];
+	            if (existing.role !== "user") return prev;
+	            nextMessages = [
+	              ...msgs.slice(0, idx),
+	              { ...existing, ...nextMsg, turnId: effectiveTurnId ?? existing.turnId },
+	              ...msgs.slice(idx + 1)
+	            ];
+	          } else {
+	            let insertAt = -1;
+	            if (isNonEmptyString(effectiveTurnId)) {
+	              insertAt = msgs.findIndex((m) => m.turnId === effectiveTurnId);
+	            }
+	            nextMessages =
+	              insertAt === -1
+	                ? [...msgs, nextMsg]
+	                : [...msgs.slice(0, insertAt), nextMsg, ...msgs.slice(insertAt)];
+	          }
+
+	          return {
+	            ...prev,
+	            [key]: {
+	              ...current,
+	              messages: nextMessages,
+                turnInProgress: nextTurnInProgress,
+	              turnId: nextTurnId ?? null,
+	              upstreamTurnId: nextUpstreamTurnId ?? null,
+	              hydrated: true
+	            }
+	          };
+	        });
+	        return;
+	      }
 	      if (item["type"] === "agentMessage") {
 	        const fullText = getString(item["text"]);
 	        if (isNonEmptyString(fullText)) {
@@ -1408,14 +1735,13 @@ export default function Page() {
           upsertToolFromItem(sessionId, incomingThreadId, incomingTurnId, item);
           return;
         }
-	      return;
-	    }
+      return;
+    }
 
     if (method === "turn/completed") {
       const incomingThreadId = getString(params["threadId"]);
       if (!isNonEmptyString(incomingThreadId)) return;
-      const turn = isRecord(params["turn"]) ? params["turn"] : {};
-      const incomingTurnId = getString(turn["id"]);
+      const incomingTurnId = turnIdFromParams(params);
       setThreadTurnCompleted(sessionId, incomingThreadId, incomingTurnId);
       void refreshThreadsForSession(sessionId, { silent: true });
       void maybeStartQueuedFollowupTurn(sessionId, incomingThreadId);
@@ -1724,6 +2050,7 @@ export default function Page() {
 	            ...current,
 	            messages: [...current.messages, userMsg],
 	            turnInProgress: true,
+	            upstreamTurnId: null,
 	            turnId: null,
 	            reasoningSummary: "",
 	            reasoningSummaryIndex: null,
@@ -1738,14 +2065,15 @@ export default function Page() {
 			        if (isNonEmptyString(turnId)) {
 			          setChatByThreadKey((prev) => {
 			            const current = prev[key] ?? { ...emptyThreadChatState(), turnInProgress: true };
-		            return { ...prev, [key]: { ...current, turnId } };
+                  const uiTurnId = nextUiTurnId(current.messages, turnId);
+		            return { ...prev, [key]: { ...current, upstreamTurnId: turnId, turnId: uiTurnId } };
 		          });
 		        }
 		      } catch (e) {
 		        if (!wasBusy) {
 		          setChatByThreadKey((prev) => {
 		            const current = prev[key] ?? { ...emptyThreadChatState(), turnInProgress: true };
-		            return { ...prev, [key]: { ...current, turnInProgress: false, turnId: null } };
+		            return { ...prev, [key]: { ...current, turnInProgress: false, upstreamTurnId: null, turnId: null } };
 		          });
 		        }
 		        throw e;
@@ -2526,14 +2854,18 @@ export default function Page() {
 		                    className="h-full overflow-auto p-4 pt-12 pb-44 scrollbar-hide md:p-5 md:pt-14 md:pb-48"
 		                  >
 		                    <div className="mx-auto grid w-full max-w-3xl grid-cols-1 gap-3">
-		                      {displayMessages.map((m) => (
-		                        <Bubble
-		                          key={m.id}
-		                          message={m}
-		                          turnTools={m.role === "reasoning" && isNonEmptyString(m.turnId) ? toolsByTurnId[m.turnId] : undefined}
-		                        />
+		                      {displayMessages.map((m, idx) => (
+		                        <React.Fragment key={m.id}>
+		                          {activeChat?.turnInProgress && turnProgressInsertIndex === idx ? (
+		                            <TurnProgress summary={activeChat.reasoningSummary} tools={activeTurnTools} />
+		                          ) : null}
+		                          <Bubble
+		                            message={m}
+		                            turnTools={m.role === "reasoning" && isNonEmptyString(m.turnId) ? toolsByTurnId[m.turnId] : undefined}
+		                          />
+		                        </React.Fragment>
 		                      ))}
-		                      {activeChat?.turnInProgress ? (
+		                      {activeChat?.turnInProgress && turnProgressInsertIndex === displayMessages.length ? (
 		                        <TurnProgress summary={activeChat.reasoningSummary} tools={activeTurnTools} />
 		                      ) : null}
 		                    </div>

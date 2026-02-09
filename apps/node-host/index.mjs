@@ -11,6 +11,7 @@ const DEFAULT_LOG_TAIL_BYTES = 2 * 1024 * 1024;
 const DEFAULT_LOGS_TAIL_BYTES = 64 * 1024;
 const MAX_COMPLETED_JOBS = 200;
 const JOB_DIRNAME = "jobs";
+const MAX_STDIN_TEXT_BYTES = 1 * 1024 * 1024;
 
 function parseArgs(argv) {
   const out = {};
@@ -306,19 +307,22 @@ class JobStore {
     return { ok: true, payload: { jobId, signal: "SIGTERM" } };
   }
 
-	  async run({ argv, cwd, env, timeoutMs, yieldMs, notifyOnExit }) {
+	  async run({ argv, cwd, env, timeoutMs, yieldMs, notifyOnExit, stdinText }) {
 	    const jobId = crypto.randomUUID();
 	    const p = this._jobPaths(jobId);
 	    fs.mkdirSync(p.dir, { recursive: true });
 
 	    const createdAtMs = Date.now();
 	    const notifyMode = notifyOnExit === true ? "always" : notifyOnExit === false ? "never" : "auto";
+	    const stdinTextBytes =
+	      typeof stdinText === "string" ? Buffer.byteLength(stdinText, "utf8") : null;
 	    const meta = {
 	      version: 1,
 	      jobId,
 	      nodeId: this.nodeId,
       argv,
       cwd: cwd ?? null,
+      stdinTextBytes,
       createdAtMs,
       startedAtMs: null,
       endedAtMs: null,
@@ -343,11 +347,27 @@ class JobStore {
     const stdoutTail = new TailBuffer(DEFAULT_LOG_TAIL_BYTES);
     const stderrTail = new TailBuffer(DEFAULT_LOG_TAIL_BYTES);
 
+    // Default stdin is /dev/null (ignore) to avoid commands hanging waiting for input/EOF.
+    const stdio = ["ignore", "pipe", "pipe"];
+    if (typeof stdinText === "string") stdio[0] = "pipe";
     const child = spawn(argv[0], argv.slice(1), {
       cwd: cwd ?? undefined,
       env: env ? { ...process.env, ...env } : process.env,
       shell: false,
+      stdio,
     });
+
+    if (typeof stdinText === "string") {
+      try {
+        child.stdin?.end(stdinText, "utf8");
+      } catch {
+        try {
+          child.stdin?.end();
+        } catch {
+          // ignore
+        }
+      }
+    }
 
     meta.pid = child.pid ?? null;
     meta.startedAtMs = Date.now();
@@ -545,6 +565,16 @@ async function runCommand(params) {
   const cwd = typeof params?.cwd === "string" && params.cwd.trim() ? params.cwd : undefined;
   const timeoutMs = Number.isFinite(params?.timeoutMs) ? Number(params.timeoutMs) : undefined;
   const yieldMs = Number.isFinite(params?.yieldMs) ? Number(params.yieldMs) : undefined;
+  const stdinText = typeof params?.stdinText === "string" ? params.stdinText : undefined;
+  if (typeof stdinText === "string" && Buffer.byteLength(stdinText, "utf8") > MAX_STDIN_TEXT_BYTES) {
+    return {
+      ok: false,
+      error: {
+        code: "BAD_INPUT",
+        message: `system.run stdinText too large (max ${MAX_STDIN_TEXT_BYTES} bytes)`,
+      },
+    };
+  }
   const notifyFieldPresent =
     params && typeof params === "object" && !Array.isArray(params) && Object.prototype.hasOwnProperty.call(params, "notifyOnExit");
   const notifyOnExit = notifyFieldPresent ? Boolean(params.notifyOnExit) : null; // null => auto (default)
@@ -569,6 +599,7 @@ async function runCommand(params) {
       timeoutMs,
       yieldMs,
       notifyOnExit,
+      stdinText,
     });
   } catch (err) {
     return { ok: false, error: { code: "SPAWN_FAILED", message: String(err?.message || err) } };
