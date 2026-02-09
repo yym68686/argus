@@ -2340,7 +2340,7 @@ async def _mcp_handle_single_message(request: Request, body: dict[str, Any]) -> 
                 "title": "Argus Gateway MCP",
                 "version": "0.1.0",
             },
-            "instructions": "This MCP server exposes tools for listing and invoking connected nodes.",
+            "instructions": "This MCP server exposes tools for managing gateway cron jobs and invoking connected nodes.",
         }
         return (
             _jsonrpc_result(request_id=request_id, result=result),
@@ -2361,6 +2361,29 @@ async def _mcp_handle_single_message(request: Request, body: dict[str, Any]) -> 
                 "title": "Nodes List",
                 "description": "List connected nodes (devices) and their advertised commands.",
                 "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False},
+            },
+            {
+                "name": "cron",
+                "title": "Cron",
+                "description": "Manage gateway cron jobs (status/list/add/update/remove/run). Jobs enqueue systemEvents into the session main thread and are processed by heartbeat.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "action": {
+                            "type": "string",
+                            "enum": ["status", "list", "add", "update", "remove", "run"],
+                            "description": "Action to perform.",
+                        },
+                        "sessionId": {"type": "string", "description": "Optional target sessionId (defaults to the gateway default session)."},
+                        "includeDisabled": {"type": "boolean", "description": "For list: include disabled jobs."},
+                        "jobId": {"type": "string", "description": "For update/remove/run: cron job id."},
+                        "expr": {"type": "string", "description": "For add/update: cron expression (UTC-based)."},
+                        "text": {"type": "string", "description": "For add/update: payload text to enqueue as a systemEvent when due."},
+                        "enabled": {"type": "boolean", "description": "For add/update: enable/disable the job."},
+                    },
+                    "required": ["action"],
+                    "additionalProperties": False,
+                },
             },
             {
                 "name": "node_invoke",
@@ -2404,6 +2427,542 @@ async def _mcp_handle_single_message(request: Request, body: dict[str, Any]) -> 
                 ),
                 {"MCP-Protocol-Version": sess.protocol_version},
             )
+
+        if tool_name == "cron":
+            action = str(args.get("action") or "").strip().lower()
+            allowed_actions = {"status", "list", "add", "update", "remove", "run"}
+            if action not in allowed_actions:
+                return (
+                    _jsonrpc_result(
+                        request_id=request_id,
+                        result=_mcp_call_tool_result(
+                            content=[{"type": "text", "text": "Invalid cron action"}],
+                            structured={"ok": False, "error": {"code": "INVALID_ARGUMENT", "field": "action", "allowed": sorted(list(allowed_actions))}},
+                            is_error=True,
+                        ),
+                    ),
+                    {"MCP-Protocol-Version": sess.protocol_version},
+                )
+
+            automation: Optional[AutomationManager] = getattr(app.state, "automation", None)
+            if automation is None:
+                return (
+                    _jsonrpc_result(
+                        request_id=request_id,
+                        result=_mcp_call_tool_result(
+                            content=[{"type": "text", "text": "Automation is not initialized"}],
+                            structured={"ok": False, "error": {"code": "NOT_READY", "message": "automation is not initialized"}},
+                            is_error=True,
+                        ),
+                    ),
+                    {"MCP-Protocol-Version": sess.protocol_version},
+                )
+
+            requested_sid = str(args.get("sessionId") or "").strip() or None
+            session_id = automation._store.state.default_session_id
+            if not session_id:
+                try:
+                    session_id = await automation._choose_default_session_id()
+                except Exception as e:
+                    return (
+                        _jsonrpc_result(
+                            request_id=request_id,
+                            result=_mcp_call_tool_result(
+                                content=[{"type": "text", "text": f"Failed to choose default session: {e}"}],
+                                structured={"ok": False, "error": {"code": "INTERNAL_ERROR", "message": str(e)}},
+                                is_error=True,
+                            ),
+                        ),
+                        {"MCP-Protocol-Version": sess.protocol_version},
+                    )
+
+            if requested_sid and requested_sid != session_id:
+                return (
+                    _jsonrpc_result(
+                        request_id=request_id,
+                        result=_mcp_call_tool_result(
+                            content=[{"type": "text", "text": "This cron tool currently only operates on the gateway default session"}],
+                            structured={"ok": False, "error": {"code": "UNSUPPORTED", "message": "non-default sessionId is not supported", "defaultSessionId": session_id}},
+                            is_error=True,
+                        ),
+                    ),
+                    {"MCP-Protocol-Version": sess.protocol_version},
+                )
+
+            include_disabled = bool(args.get("includeDisabled"))
+            job_id = str(args.get("jobId") or "").strip()
+            now_ms = _now_ms()
+
+            def _cron_validate_expr(expr: str) -> Optional[str]:
+                try:
+                    croniter(expr, _ms_to_dt_utc(now_ms)).get_next(datetime)
+                    return None
+                except Exception as e:  # noqa: BLE001
+                    return str(e)
+
+            def _cron_compute_next_ms(expr: str, *, base_ms: int) -> int:
+                base_dt = _ms_to_dt_utc(base_ms)
+                return _dt_to_ms(croniter(expr, base_dt).get_next(datetime))
+
+            if action == "status":
+                st = automation._store.state
+                sess_state = st.sessions.get(session_id)
+                jobs = sess_state.cron_jobs if sess_state is not None else []
+                enabled_jobs = [j for j in jobs if j.enabled]
+                next_due_ms: Optional[int] = None
+                for j in enabled_jobs:
+                    cand = j.next_run_at_ms
+                    if cand is None:
+                        try:
+                            cand = _cron_compute_next_ms(j.expr, base_ms=j.last_run_at_ms or now_ms)
+                        except Exception:
+                            cand = None
+                    if cand is None:
+                        continue
+                    next_due_ms = cand if next_due_ms is None else min(next_due_ms, cand)
+                payload = {
+                    "ok": True,
+                    "sessionId": session_id,
+                    "defaultSessionId": st.default_session_id,
+                    "jobs": len(jobs),
+                    "enabledJobs": len(enabled_jobs),
+                    "nextDueAtMs": next_due_ms,
+                }
+                return (
+                    _jsonrpc_result(
+                        request_id=request_id,
+                        result=_mcp_call_tool_result(content=[{"type": "text", "text": json.dumps(payload, ensure_ascii=False)}], structured=payload),
+                    ),
+                    {"MCP-Protocol-Version": sess.protocol_version},
+                )
+
+            if action == "list":
+                st = automation._store.state
+                sess_state = st.sessions.get(session_id)
+                jobs = sess_state.cron_jobs if sess_state is not None else []
+                out_jobs: list[dict[str, Any]] = []
+                for j in jobs:
+                    if not include_disabled and not j.enabled:
+                        continue
+                    d = j.to_json()
+                    # Best-effort: compute nextRunAtMs for display if missing.
+                    if j.enabled and "nextRunAtMs" not in d:
+                        try:
+                            d["nextRunAtMs"] = _cron_compute_next_ms(j.expr, base_ms=j.last_run_at_ms or now_ms)
+                        except Exception:
+                            pass
+                    out_jobs.append(d)
+                payload = {"ok": True, "sessionId": session_id, "jobs": out_jobs}
+                return (
+                    _jsonrpc_result(
+                        request_id=request_id,
+                        result=_mcp_call_tool_result(content=[{"type": "text", "text": json.dumps(payload, ensure_ascii=False)}], structured=payload),
+                    ),
+                    {"MCP-Protocol-Version": sess.protocol_version},
+                )
+
+            if action == "add":
+                expr = str(args.get("expr") or "").strip()
+                text = str(args.get("text") or "")
+                enabled_val = args.get("enabled", True)
+                if enabled_val is not None and not isinstance(enabled_val, bool):
+                    return (
+                        _jsonrpc_result(
+                            request_id=request_id,
+                            result=_mcp_call_tool_result(
+                                content=[{"type": "text", "text": "enabled must be a boolean"}],
+                                structured={"ok": False, "error": {"code": "INVALID_ARGUMENT", "field": "enabled"}},
+                                is_error=True,
+                            ),
+                        ),
+                        {"MCP-Protocol-Version": sess.protocol_version},
+                    )
+                enabled = bool(enabled_val) if isinstance(enabled_val, bool) else True
+
+                if not expr:
+                    return (
+                        _jsonrpc_result(
+                            request_id=request_id,
+                            result=_mcp_call_tool_result(
+                                content=[{"type": "text", "text": "Missing required field: expr"}],
+                                structured={"ok": False, "error": {"code": "INVALID_ARGUMENT", "field": "expr"}},
+                                is_error=True,
+                            ),
+                        ),
+                        {"MCP-Protocol-Version": sess.protocol_version},
+                    )
+                if not text.strip():
+                    return (
+                        _jsonrpc_result(
+                            request_id=request_id,
+                            result=_mcp_call_tool_result(
+                                content=[{"type": "text", "text": "Missing required field: text"}],
+                                structured={"ok": False, "error": {"code": "INVALID_ARGUMENT", "field": "text"}},
+                                is_error=True,
+                            ),
+                        ),
+                        {"MCP-Protocol-Version": sess.protocol_version},
+                    )
+                err = _cron_validate_expr(expr)
+                if err is not None:
+                    return (
+                        _jsonrpc_result(
+                            request_id=request_id,
+                            result=_mcp_call_tool_result(
+                                content=[{"type": "text", "text": f"Invalid cron expr: {err}"}],
+                                structured={"ok": False, "error": {"code": "INVALID_ARGUMENT", "field": "expr", "message": err}},
+                                is_error=True,
+                            ),
+                        ),
+                        {"MCP-Protocol-Version": sess.protocol_version},
+                    )
+
+                if not job_id:
+                    job_id = uuid.uuid4().hex[:10]
+
+                saved: Optional[PersistedCronJob] = None
+
+                def _upsert(st: PersistedGatewayAutomationState) -> None:
+                    nonlocal saved
+                    sess_state = st.sessions.get(session_id)
+                    if sess_state is None:
+                        sess_state = PersistedSessionAutomation()
+                        st.sessions[session_id] = sess_state
+                    existing = next((j for j in sess_state.cron_jobs if j.job_id == job_id), None)
+                    prev_expr = existing.expr if existing is not None else None
+                    prev_enabled = existing.enabled if existing is not None else None
+                    last_run_at_ms = existing.last_run_at_ms if existing is not None else None
+                    prev_next = existing.next_run_at_ms if existing is not None else None
+
+                    # Compute next run time:
+                    # - if schedule changed or job was re-enabled: base from now
+                    # - otherwise: follow the scheduler behavior (base from lastRunAtMs if present)
+                    base_ms = last_run_at_ms or now_ms
+                    if prev_expr is not None and prev_expr != expr:
+                        base_ms = now_ms
+                    if prev_enabled is False and enabled is True:
+                        base_ms = now_ms
+
+                    next_run_at_ms: Optional[int] = None
+                    if enabled:
+                        if (
+                            prev_expr == expr
+                            and prev_enabled == enabled
+                            and last_run_at_ms is None
+                            and isinstance(prev_next, int)
+                            and prev_next > now_ms
+                        ):
+                            next_run_at_ms = prev_next
+                        else:
+                            next_run_at_ms = _cron_compute_next_ms(expr, base_ms=base_ms)
+
+                    sess_state.cron_jobs = [j for j in sess_state.cron_jobs if j.job_id != job_id]
+                    saved = PersistedCronJob(
+                        job_id=job_id,
+                        expr=expr,
+                        text=text,
+                        enabled=enabled,
+                        last_run_at_ms=last_run_at_ms,
+                        next_run_at_ms=next_run_at_ms,
+                    )
+                    sess_state.cron_jobs.append(saved)
+
+                await automation._store.update(_upsert)
+                automation._cron_wakeup.set()
+                payload = {"ok": True, "sessionId": session_id, "job": saved.to_json() if saved is not None else None}
+                return (
+                    _jsonrpc_result(
+                        request_id=request_id,
+                        result=_mcp_call_tool_result(content=[{"type": "text", "text": json.dumps(payload, ensure_ascii=False)}], structured=payload),
+                    ),
+                    {"MCP-Protocol-Version": sess.protocol_version},
+                )
+
+            if action == "update":
+                if not job_id:
+                    return (
+                        _jsonrpc_result(
+                            request_id=request_id,
+                            result=_mcp_call_tool_result(
+                                content=[{"type": "text", "text": "Missing required field: jobId"}],
+                                structured={"ok": False, "error": {"code": "INVALID_ARGUMENT", "field": "jobId"}},
+                                is_error=True,
+                            ),
+                        ),
+                        {"MCP-Protocol-Version": sess.protocol_version},
+                    )
+
+                has_expr = "expr" in args
+                has_text = "text" in args
+                has_enabled = "enabled" in args
+                if not (has_expr or has_text or has_enabled):
+                    return (
+                        _jsonrpc_result(
+                            request_id=request_id,
+                            result=_mcp_call_tool_result(
+                                content=[{"type": "text", "text": "Nothing to update (provide expr/text/enabled)"}],
+                                structured={"ok": False, "error": {"code": "INVALID_ARGUMENT"}},
+                                is_error=True,
+                            ),
+                        ),
+                        {"MCP-Protocol-Version": sess.protocol_version},
+                    )
+
+                expr_patch = str(args.get("expr") or "").strip() if has_expr else None
+                text_patch = str(args.get("text") or "") if has_text else None
+                enabled_patch_raw = args.get("enabled") if has_enabled else None
+                if has_enabled and enabled_patch_raw is not None and not isinstance(enabled_patch_raw, bool):
+                    return (
+                        _jsonrpc_result(
+                            request_id=request_id,
+                            result=_mcp_call_tool_result(
+                                content=[{"type": "text", "text": "enabled must be a boolean"}],
+                                structured={"ok": False, "error": {"code": "INVALID_ARGUMENT", "field": "enabled"}},
+                                is_error=True,
+                            ),
+                        ),
+                        {"MCP-Protocol-Version": sess.protocol_version},
+                    )
+                enabled_patch = bool(enabled_patch_raw) if isinstance(enabled_patch_raw, bool) else None
+
+                if has_expr:
+                    if not expr_patch:
+                        return (
+                            _jsonrpc_result(
+                                request_id=request_id,
+                                result=_mcp_call_tool_result(
+                                    content=[{"type": "text", "text": "expr must not be empty"}],
+                                    structured={"ok": False, "error": {"code": "INVALID_ARGUMENT", "field": "expr"}},
+                                    is_error=True,
+                                ),
+                            ),
+                            {"MCP-Protocol-Version": sess.protocol_version},
+                        )
+                    err = _cron_validate_expr(expr_patch)
+                    if err is not None:
+                        return (
+                            _jsonrpc_result(
+                                request_id=request_id,
+                                result=_mcp_call_tool_result(
+                                    content=[{"type": "text", "text": f"Invalid cron expr: {err}"}],
+                                    structured={"ok": False, "error": {"code": "INVALID_ARGUMENT", "field": "expr", "message": err}},
+                                    is_error=True,
+                                ),
+                            ),
+                            {"MCP-Protocol-Version": sess.protocol_version},
+                        )
+
+                if has_text and text_patch is not None and not text_patch.strip():
+                    return (
+                        _jsonrpc_result(
+                            request_id=request_id,
+                            result=_mcp_call_tool_result(
+                                content=[{"type": "text", "text": "text must not be empty"}],
+                                structured={"ok": False, "error": {"code": "INVALID_ARGUMENT", "field": "text"}},
+                                is_error=True,
+                            ),
+                        ),
+                        {"MCP-Protocol-Version": sess.protocol_version},
+                    )
+
+                updated: Optional[PersistedCronJob] = None
+                not_found = False
+
+                def _patch(st: PersistedGatewayAutomationState) -> None:
+                    nonlocal updated, not_found
+                    sess_state = st.sessions.get(session_id)
+                    if sess_state is None:
+                        not_found = True
+                        return
+                    existing = next((j for j in sess_state.cron_jobs if j.job_id == job_id), None)
+                    if existing is None:
+                        not_found = True
+                        return
+                    new_expr = expr_patch if expr_patch is not None else existing.expr
+                    new_text = text_patch if text_patch is not None else existing.text
+                    new_enabled = enabled_patch if enabled_patch is not None else existing.enabled
+
+                    base_ms = existing.last_run_at_ms or now_ms
+                    if new_expr != existing.expr:
+                        base_ms = now_ms
+                    if existing.enabled is False and new_enabled is True:
+                        base_ms = now_ms
+
+                    next_run_at_ms: Optional[int] = existing.next_run_at_ms
+                    if not new_enabled:
+                        next_run_at_ms = None
+                    else:
+                        if (
+                            new_expr == existing.expr
+                            and new_enabled == existing.enabled
+                            and existing.last_run_at_ms is None
+                            and isinstance(existing.next_run_at_ms, int)
+                            and existing.next_run_at_ms > now_ms
+                        ):
+                            next_run_at_ms = existing.next_run_at_ms
+                        else:
+                            next_run_at_ms = _cron_compute_next_ms(new_expr, base_ms=base_ms)
+
+                    updated = PersistedCronJob(
+                        job_id=existing.job_id,
+                        expr=new_expr,
+                        text=new_text,
+                        enabled=new_enabled,
+                        last_run_at_ms=existing.last_run_at_ms,
+                        next_run_at_ms=next_run_at_ms,
+                    )
+                    sess_state.cron_jobs = [j for j in sess_state.cron_jobs if j.job_id != job_id]
+                    sess_state.cron_jobs.append(updated)
+
+                await automation._store.update(_patch)
+                if not_found:
+                    return (
+                        _jsonrpc_result(
+                            request_id=request_id,
+                            result=_mcp_call_tool_result(
+                                content=[{"type": "text", "text": "Job not found"}],
+                                structured={"ok": False, "error": {"code": "NOT_FOUND", "jobId": job_id}},
+                                is_error=True,
+                            ),
+                        ),
+                        {"MCP-Protocol-Version": sess.protocol_version},
+                    )
+                automation._cron_wakeup.set()
+                payload = {"ok": True, "sessionId": session_id, "job": updated.to_json() if updated is not None else None}
+                return (
+                    _jsonrpc_result(
+                        request_id=request_id,
+                        result=_mcp_call_tool_result(content=[{"type": "text", "text": json.dumps(payload, ensure_ascii=False)}], structured=payload),
+                    ),
+                    {"MCP-Protocol-Version": sess.protocol_version},
+                )
+
+            if action == "remove":
+                if not job_id:
+                    return (
+                        _jsonrpc_result(
+                            request_id=request_id,
+                            result=_mcp_call_tool_result(
+                                content=[{"type": "text", "text": "Missing required field: jobId"}],
+                                structured={"ok": False, "error": {"code": "INVALID_ARGUMENT", "field": "jobId"}},
+                                is_error=True,
+                            ),
+                        ),
+                        {"MCP-Protocol-Version": sess.protocol_version},
+                    )
+                removed = False
+
+                def _rm(st: PersistedGatewayAutomationState) -> None:
+                    nonlocal removed
+                    sess_state = st.sessions.get(session_id)
+                    if sess_state is None:
+                        return
+                    before = len(sess_state.cron_jobs)
+                    sess_state.cron_jobs = [j for j in sess_state.cron_jobs if j.job_id != job_id]
+                    removed = len(sess_state.cron_jobs) != before
+
+                await automation._store.update(_rm)
+                automation._cron_wakeup.set()
+                if not removed:
+                    return (
+                        _jsonrpc_result(
+                            request_id=request_id,
+                            result=_mcp_call_tool_result(
+                                content=[{"type": "text", "text": "Job not found"}],
+                                structured={"ok": False, "error": {"code": "NOT_FOUND", "jobId": job_id}},
+                                is_error=True,
+                            ),
+                        ),
+                        {"MCP-Protocol-Version": sess.protocol_version},
+                    )
+                payload = {"ok": True, "sessionId": session_id, "jobId": job_id}
+                return (
+                    _jsonrpc_result(
+                        request_id=request_id,
+                        result=_mcp_call_tool_result(content=[{"type": "text", "text": json.dumps(payload, ensure_ascii=False)}], structured=payload),
+                    ),
+                    {"MCP-Protocol-Version": sess.protocol_version},
+                )
+
+            if action == "run":
+                if not job_id:
+                    return (
+                        _jsonrpc_result(
+                            request_id=request_id,
+                            result=_mcp_call_tool_result(
+                                content=[{"type": "text", "text": "Missing required field: jobId"}],
+                                structured={"ok": False, "error": {"code": "INVALID_ARGUMENT", "field": "jobId"}},
+                                is_error=True,
+                            ),
+                        ),
+                        {"MCP-Protocol-Version": sess.protocol_version},
+                    )
+
+                st = automation._store.state
+                sess_state = st.sessions.get(session_id)
+                job = None
+                if sess_state is not None:
+                    job = next((j for j in sess_state.cron_jobs if j.job_id == job_id), None)
+                if job is None:
+                    return (
+                        _jsonrpc_result(
+                            request_id=request_id,
+                            result=_mcp_call_tool_result(
+                                content=[{"type": "text", "text": "Job not found"}],
+                                structured={"ok": False, "error": {"code": "NOT_FOUND", "jobId": job_id}},
+                                is_error=True,
+                            ),
+                        ),
+                        {"MCP-Protocol-Version": sess.protocol_version},
+                    )
+
+                # Ensure a main thread exists for manual run routing.
+                try:
+                    main_tid = await automation.ensure_main_thread(session_id)
+                except Exception as e:
+                    return (
+                        _jsonrpc_result(
+                            request_id=request_id,
+                            result=_mcp_call_tool_result(
+                                content=[{"type": "text", "text": f"Failed to ensure main thread: {e}"}],
+                                structured={"ok": False, "error": {"code": "INTERNAL_ERROR", "message": str(e)}},
+                                is_error=True,
+                            ),
+                        ),
+                        {"MCP-Protocol-Version": sess.protocol_version},
+                    )
+
+                await automation.enqueue_system_event(
+                    session_id=session_id,
+                    thread_id=main_tid,
+                    kind="cron",
+                    text=job.text,
+                    meta={"jobId": job.job_id, "expr": job.expr, "manual": True},
+                )
+
+                def _mark_run(st2: PersistedGatewayAutomationState) -> None:
+                    sess2 = st2.sessions.get(session_id)
+                    if sess2 is None:
+                        return
+                    j2 = next((j for j in sess2.cron_jobs if j.job_id == job_id), None)
+                    if j2 is None:
+                        return
+                    j2.last_run_at_ms = now_ms
+                    try:
+                        j2.next_run_at_ms = _cron_compute_next_ms(j2.expr, base_ms=now_ms)
+                    except Exception:
+                        j2.next_run_at_ms = None
+
+                await automation._store.update(_mark_run)
+                automation._cron_wakeup.set()
+                payload = {"ok": True, "sessionId": session_id, "jobId": job_id, "enqueued": True}
+                return (
+                    _jsonrpc_result(
+                        request_id=request_id,
+                        result=_mcp_call_tool_result(content=[{"type": "text", "text": json.dumps(payload, ensure_ascii=False)}], structured=payload),
+                    ),
+                    {"MCP-Protocol-Version": sess.protocol_version},
+                )
 
         if tool_name == "node_invoke":
             cmd = str(args.get("command") or "").strip()
