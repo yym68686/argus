@@ -807,6 +807,30 @@ export default function Page() {
 
     void (async () => {
       try {
+        // Prefer the gateway default session (persisted) so we don't accidentally create a new session
+        // when the runtime container was deleted but state.json still exists.
+        try {
+          const token = extractTokenFromWsUrl(wsUrl);
+          const base = httpBaseFromWsUrl(wsUrl) ?? "";
+          if (base.trim()) {
+            const headers: Record<string, string> = {};
+            if (token) headers["Authorization"] = `Bearer ${token}`;
+            const resp = await fetch(`${base}/automation/state`, { headers });
+            if (resp.ok) {
+              const body = (await resp.json()) as { persisted?: { defaultSessionId?: string } };
+              const sid = (body?.persisted?.defaultSessionId ?? "").trim();
+              if (isNonEmptyString(sid)) {
+                setActiveSessionId(sid);
+                await ensureSessionReady(sid);
+                void refreshSessions({ silent: true });
+                return;
+              }
+            }
+          }
+        } catch {
+          // ignore
+        }
+
         const list = await refreshSessions({ silent: true, throwOnError: true });
         const existing = list.find((s) => isNonEmptyString(s.sessionId))?.sessionId ?? null;
         if (existing) {

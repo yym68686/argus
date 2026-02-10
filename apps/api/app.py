@@ -941,9 +941,21 @@ class AutomationManager:
     async def start(self) -> None:
         await self._store.load()
         await self._ensure_workspace_files()
+        await self._restore_default_session_if_singleton()
         await self._prune_persisted_sessions()
         self._tasks.append(asyncio.create_task(self._cron_loop()))
         self._tasks.append(asyncio.create_task(self._heartbeat_loop()))
+
+    async def _restore_default_session_if_singleton(self) -> None:
+        st = self._store.state
+        if isinstance(st.default_session_id, str) and st.default_session_id.strip():
+            return
+        keys = [sid.strip() for sid in st.sessions.keys() if isinstance(sid, str) and sid.strip()]
+        if len(keys) != 1:
+            return
+        sid = keys[0]
+        await self._store.update(lambda st2: setattr(st2, "default_session_id", sid))
+        log.info("Restored missing defaultSessionId to singleton persisted session %s", sid)
 
     async def _prune_persisted_sessions(self) -> None:
         # Keep persisted automation state in sync with existing docker runtime containers.
@@ -1222,6 +1234,13 @@ class AutomationManager:
         existing = self._store.state.default_session_id
         if isinstance(existing, str) and existing.strip():
             return existing.strip()
+
+        # If defaultSessionId is missing but we have exactly one persisted session, adopt it.
+        persisted_ids = [sid.strip() for sid in self._store.state.sessions.keys() if isinstance(sid, str) and sid.strip()]
+        if len(persisted_ids) == 1:
+            sid = persisted_ids[0]
+            await self._store.update(lambda st: setattr(st, "default_session_id", sid))
+            return sid
 
         sessions: list[dict[str, Any]] = []
         try:
@@ -4487,7 +4506,16 @@ async def ws_proxy(ws: WebSocket):
         requested_session = (ws.query_params.get("session") or "").strip() or None
         session_id = requested_session or uuid.uuid4().hex[:12]
         try:
-            live, created = await _ensure_live_docker_session(session_id, allow_create=not bool(requested_session))
+            allow_create = not bool(requested_session)
+            if requested_session:
+                # If the client asked for an explicit session and it's already known in persisted automation state,
+                # allow re-creating the runtime container (e.g. after a clean rebuild where the host state persists).
+                automation: Optional[AutomationManager] = getattr(app.state, "automation", None)
+                if automation is not None:
+                    st = automation._store.state
+                    if requested_session == st.default_session_id or requested_session in st.sessions:
+                        allow_create = True
+            live, created = await _ensure_live_docker_session(session_id, allow_create=allow_create)
         except KeyError:
             await ws.close(code=1008, reason="Unknown session")
             return
