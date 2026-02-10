@@ -1333,6 +1333,11 @@ class AutomationManager:
         if not text.strip():
             raise ValueError("text must not be empty")
 
+        # Adopt the first actively-used session as the gateway default session if missing.
+        # This prevents "TG works but defaultSessionId stays null" after a clean rebuild.
+        if not self._store.state.default_session_id:
+            await self._store.update(lambda st: setattr(st, "default_session_id", session_id))
+
         live, _ = await _ensure_live_docker_session(session_id, allow_create=True)
         await self._ensure_initialized(live)
 
