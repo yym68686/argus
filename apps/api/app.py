@@ -1552,21 +1552,24 @@ class AutomationManager:
             blocks.append("System events (batched):\n" + "\n".join(drained))
 
         if heartbeat:
-            blocks.append(
-                "\n".join(
-                    [
-                        "Heartbeat response contract:",
-                        f"- If nothing needs attention right now, reply exactly: {HEARTBEAT_TOKEN}",
-                        f"- If you have a user-visible update/alert, reply with the alert text only (do NOT include {HEARTBEAT_TOKEN}).",
-                        "- Do NOT include meta/status text (timestamps, next schedule, 'heartbeat check', 'wrote memory', etc) unless it's part of the user-visible alert.",
-                        "",
-                        "Instructions:",
-                        "- Process each system event in order (if any).",
-                        "- If an event requires actions, perform them.",
-                        f"- If there is no user-visible output, reply exactly: {HEARTBEAT_TOKEN}",
-                    ]
+                blocks.append(
+                    "\n".join(
+                        [
+                            "Heartbeat response contract:",
+                            "- This heartbeat turn is a poll/automation tick, NOT a user question.",
+                            "- Do NOT answer or re-answer any previous user message, and do NOT restate previous assistant outputs.",
+                            "- Only produce a user-visible alert if there is NEW information that must be shown to the user (triggered by HEARTBEAT.md or a system event).",
+                            f"- If there is no user-visible alert, reply exactly: {HEARTBEAT_TOKEN}",
+                            f"- If any system event includes directives like 'Do NOT message the user' / 'no user-facing report' / 'silent', you MUST reply exactly: {HEARTBEAT_TOKEN} (even if you performed actions).",
+                            "- Do NOT include meta/status text (timestamps, next schedule, 'heartbeat check', 'wrote memory', etc).",
+                            "",
+                            "Instructions:",
+                            "- Process each system event in order (if any).",
+                            "- If an event requires actions, perform them.",
+                            f"- If there is no user-visible alert, reply exactly: {HEARTBEAT_TOKEN}",
+                        ]
+                    )
                 )
-            )
         else:
             blocks.append(
                 "\n".join(

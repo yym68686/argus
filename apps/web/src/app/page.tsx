@@ -527,15 +527,28 @@ function userMessageToUiText(rawText: string): string {
   // For the chat UI we want the user's actual message, not the full injected context/instructions.
   if (!trimmed.startsWith("# Project Context")) return trimmed;
 
+  const isHeartbeat = trimmed.includes(
+    "HEARTBEAT: You are running a background heartbeat. Read and follow HEARTBEAT.md in # Project Context."
+  );
+
   let main = trimmed;
   const instructionsIdx = main.lastIndexOf("\n\nInstructions:");
   if (instructionsIdx !== -1) {
     main = main.slice(0, instructionsIdx).trimEnd();
   }
 
-  const systemEventsIdx = main.lastIndexOf("\n\nSystem events (batched):");
-  if (systemEventsIdx !== -1) {
-    main = main.slice(0, systemEventsIdx).trimEnd();
+  if (isHeartbeat) {
+    // For heartbeat turns, keep any batched systemEvent text visible in the UI so it's obvious what triggered it.
+    // But strip the heartbeat-only contract block to avoid clutter.
+    const contractIdx = main.lastIndexOf("\n\nHeartbeat response contract:");
+    if (contractIdx !== -1) {
+      main = main.slice(0, contractIdx).trimEnd();
+    }
+  } else {
+    const systemEventsIdx = main.lastIndexOf("\n\nSystem events (batched):");
+    if (systemEventsIdx !== -1) {
+      main = main.slice(0, systemEventsIdx).trimEnd();
+    }
   }
 
   const lines = main.split(/\r?\n/);
@@ -546,6 +559,12 @@ function userMessageToUiText(rawText: string): string {
   if (lastClose === -1) return trimmed;
 
   const extracted = lines.slice(lastClose + 1).join("\n").trim();
+  if (!isHeartbeat) return extracted || trimmed;
+
+  // Heartbeat turns may have no system events; show that explicitly to help debugging.
+  if (!extracted.includes("\n\nSystem events (batched):")) {
+    return (extracted ? extracted + "\n\n" : "") + "System events (batched):\n(none)";
+  }
   return extracted || trimmed;
 }
 
