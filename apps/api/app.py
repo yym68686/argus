@@ -965,6 +965,12 @@ class AutomationManager:
             layout = s.get("runtimeLayout")
             if isinstance(sid, str) and sid.strip() and layout == RUNTIME_LAYOUT:
                 live_session_ids.append(sid.strip())
+        if not live_session_ids:
+            # Safety: if Docker returns no live session containers (common right after a clean rebuild, or during
+            # transient Docker API issues), pruning would wipe persisted automation state including cron jobs.
+            # Keep state; a session can be recreated later with the persisted defaultSessionId.
+            log.info("No live docker sessions found; skipping automation-state pruning")
+            return
         live_set = set(live_session_ids)
 
         st = self._store.state
