@@ -3606,7 +3606,24 @@ def _docker_create_container_sync(cfg: DockerProvisionConfig, session_id: str):
     except Exception:  # pragma: no cover
         _url_quote = None  # type: ignore
     node_token = os.getenv("ARGUS_NODE_TOKEN") or gateway_token
-    node_ws_url = "ws://gateway:8080/nodes/ws"
+    gateway_internal_host = (os.getenv("ARGUS_GATEWAY_INTERNAL_HOST") or "").strip() or None
+    if not gateway_internal_host:
+        # Prefer the current gateway container name (resolvable on the shared docker network)
+        # over a hard-coded service name like "gateway". This makes runtime node-host connect
+        # reliably even when the gateway wasn't started via docker-compose.
+        try:
+            self_id = (os.getenv("HOSTNAME") or "").strip()
+            if self_id:
+                me = client.containers.get(self_id)
+                cand = getattr(me, "name", None)
+                if isinstance(cand, str) and cand.strip():
+                    gateway_internal_host = cand.strip()
+        except Exception:
+            gateway_internal_host = None
+    if not gateway_internal_host:
+        gateway_internal_host = "gateway"
+
+    node_ws_url = f"ws://{gateway_internal_host}:8080/nodes/ws"
     if node_token:
         q = _url_quote(node_token, safe="") if _url_quote is not None else node_token
         node_ws_url = f"{node_ws_url}?token={q}"

@@ -710,7 +710,34 @@ async function run() {
   while (true) {
     const ws = new WebSocket(url);
 
-    await new Promise((resolve) => ws.once("open", resolve));
+    const opened = await new Promise((resolve) => {
+      let settled = false;
+      const done = (ok, err) => {
+        if (settled) return;
+        settled = true;
+        ws.removeListener("open", onOpen);
+        ws.removeListener("error", onError);
+        ws.removeListener("close", onClose);
+        resolve({ ok, err });
+      };
+      const onOpen = () => done(true, null);
+      const onError = (err) => done(false, err || new Error("websocket error"));
+      const onClose = () => done(false, new Error("websocket closed before open"));
+      ws.once("open", onOpen);
+      ws.once("error", onError);
+      ws.once("close", onClose);
+    });
+    if (!opened.ok) {
+      // eslint-disable-next-line no-console
+      console.error(`Failed to connect to nodes/ws: ${opened.err ? String(opened.err) : "unknown error"}`);
+      try {
+        ws.terminate();
+      } catch {
+        // ignore
+      }
+      await sleep(reconnectDelayMs);
+      continue;
+    }
     activeWs = ws;
     ws.send(
       JSON.stringify({
