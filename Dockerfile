@@ -2,6 +2,9 @@ FROM node:22-bookworm-slim
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
   ca-certificates \
+  curl \
+  python-is-python3 \
+  python3 \
   socat \
   && rm -rf /var/lib/apt/lists/*
 
