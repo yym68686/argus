@@ -912,6 +912,9 @@ class ThreadLane:
     busy: bool = False
     active_turn_id: Optional[str] = None
     followups: deque[str] = field(default_factory=deque)
+    busy_since_ms: Optional[int] = None
+    last_progress_at_ms: Optional[int] = None
+    last_unstick_attempt_at_ms: Optional[int] = None
 
 
 class AutomationManager:
@@ -937,6 +940,7 @@ class AutomationManager:
         self._session_backoff_until_ms: dict[str, int] = {}
         self._session_backoff_failures: dict[str, int] = {}
         self._turn_text_by_key: dict[tuple[str, str, str], dict[str, Any]] = {}
+        self._session_restart_locks: dict[str, asyncio.Lock] = {}
 
     async def start(self) -> None:
         await self._store.load()
@@ -945,6 +949,7 @@ class AutomationManager:
         await self._prune_persisted_sessions()
         self._tasks.append(asyncio.create_task(self._cron_loop()))
         self._tasks.append(asyncio.create_task(self._heartbeat_loop()))
+        self._tasks.append(asyncio.create_task(self._lane_watchdog_loop()))
 
     async def _restore_default_session_if_singleton(self) -> None:
         st = self._store.state
@@ -1067,6 +1072,167 @@ class AutomationManager:
             self._lanes[key] = lane
         return lane
 
+    def _mark_lane_busy(self, lane: ThreadLane, *, turn_id: Optional[str] = None) -> None:
+        now = _now_ms()
+        lane.busy = True
+        if lane.busy_since_ms is None:
+            lane.busy_since_ms = now
+        lane.last_progress_at_ms = now
+        if isinstance(turn_id, str) and turn_id.strip():
+            lane.active_turn_id = turn_id.strip()
+
+    def _mark_lane_idle(self, lane: ThreadLane) -> None:
+        lane.busy = False
+        lane.active_turn_id = None
+        lane.busy_since_ms = None
+        lane.last_progress_at_ms = None
+
+    def _note_lane_progress(self, lane: ThreadLane) -> None:
+        lane.last_progress_at_ms = _now_ms()
+
+    def _stuck_turn_timeout_ms(self) -> int:
+        # Safety net: if a turn never emits `turn/completed`, lanes can get stuck "busy" forever
+        # and block cron/heartbeat/user follow-ups. Default: 15 minutes; set 0 to disable.
+        raw = os.getenv("ARGUS_STUCK_TURN_TIMEOUT_S")
+        if raw is None or not raw.strip():
+            return 15 * 60 * 1000
+        try:
+            s = float(raw)
+        except Exception:
+            return 15 * 60 * 1000
+        if s <= 0:
+            return 0
+        return int(s * 1000)
+
+    def _reset_lane_state_for_session(self, session_id: str) -> list[str]:
+        affected_tids: list[str] = []
+        for (sid, tid), lane in list(self._lanes.items()):
+            if sid != session_id:
+                continue
+            # Keep followups; only clear the active turn state.
+            self._mark_lane_idle(lane)
+            affected_tids.append(tid)
+
+        # Clear any partial turn text buffers for this session (memory safety).
+        for key in list(self._turn_text_by_key.keys()):
+            if key[0] == session_id:
+                self._turn_text_by_key.pop(key, None)
+        return affected_tids
+
+    async def _force_close_live_session(self, session_id: str) -> None:
+        live: Optional[LiveDockerSession] = None
+        try:
+            async with app.state.sessions_lock:
+                live = app.state.sessions.pop(session_id, None)
+        except Exception:
+            live = None
+        if live is None:
+            return
+        try:
+            live.closed = True
+        except Exception:
+            pass
+        try:
+            live.writer.close()
+        except Exception:
+            pass
+        try:
+            if live.pump_task is not None:
+                live.pump_task.cancel()
+        except Exception:
+            pass
+
+    async def _restart_runtime_container(self, session_id: str) -> None:
+        if _provision_mode() != "docker":
+            return
+        try:
+            container = await asyncio.to_thread(_docker_get_container_by_session_sync, session_id)
+        except Exception as e:
+            log.warning("Failed to locate runtime container for session %s: %s", session_id, str(e))
+            return
+        if container is None:
+            return
+        try:
+            await asyncio.to_thread(container.restart, timeout=10)
+        except Exception as e:
+            log.warning("Failed to restart runtime container for session %s: %s", session_id, str(e))
+
+    async def _unstick_session(self, session_id: str, *, reason: str) -> None:
+        lock = self._session_restart_locks.get(session_id)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._session_restart_locks[session_id] = lock
+
+        async with lock:
+            log.warning("Unsticking session %s (%s): resetting lanes and restarting runtime", session_id, reason)
+            await self._force_close_live_session(session_id)
+            await self._restart_runtime_container(session_id)
+            self._clear_session_backoff(session_id)
+
+            affected_tids = self._reset_lane_state_for_session(session_id)
+            for tid in affected_tids:
+                lane = self.lane(session_id, tid)
+                if lane.followups:
+                    asyncio.create_task(self._process_lane_after_turn(session_id, tid))
+            self.request_heartbeat_now()
+
+    def on_runtime_session_closed(self, session_id: str) -> None:
+        # Called when the TCP session to the runtime closes unexpectedly (crash/OOM/restart).
+        affected_tids = self._reset_lane_state_for_session(session_id)
+        try:
+            for tid in affected_tids:
+                lane = self.lane(session_id, tid)
+                if lane.followups:
+                    asyncio.create_task(self._process_lane_after_turn(session_id, tid))
+            self.request_heartbeat_now()
+        except RuntimeError:
+            # No running loop; ignore.
+            pass
+
+    async def _lane_watchdog_loop(self) -> None:
+        while True:
+            try:
+                await asyncio.sleep(15.0)
+                await self._lane_watchdog_tick()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                log.exception("Lane watchdog error")
+                await asyncio.sleep(2.0)
+
+    async def _lane_watchdog_tick(self) -> None:
+        timeout_ms = self._stuck_turn_timeout_ms()
+        if timeout_ms <= 0:
+            return
+
+        now = _now_ms()
+        stuck_sessions: set[str] = set()
+        for (sid, tid), lane in list(self._lanes.items()):
+            if not lane.busy:
+                continue
+            since = lane.last_progress_at_ms or lane.busy_since_ms or now
+            if now - since < timeout_ms:
+                continue
+
+            last_attempt = lane.last_unstick_attempt_at_ms
+            if last_attempt is not None and now - last_attempt < max(60_000, timeout_ms // 2):
+                continue
+            lane.last_unstick_attempt_at_ms = now
+
+            log.warning(
+                "Lane stuck: session=%s thread=%s activeTurnId=%s busySinceMs=%s lastProgressAtMs=%s followupDepth=%d",
+                sid,
+                tid,
+                lane.active_turn_id,
+                lane.busy_since_ms,
+                lane.last_progress_at_ms,
+                len(lane.followups),
+            )
+            stuck_sessions.add(sid)
+
+        for sid in stuck_sessions:
+            await self._unstick_session(sid, reason="stuck_turn")
+
     def _is_session_backed_off(self, session_id: str, now_ms: Optional[int] = None) -> bool:
         if not session_id:
             return False
@@ -1122,6 +1288,8 @@ class AutomationManager:
                 entry = {"delta": "", "fullText": None}
                 self._turn_text_by_key[key] = entry
             entry["delta"] = str(entry.get("delta") or "") + delta
+            if thread_id:
+                self._note_lane_progress(self.lane(session_id, thread_id))
             return
 
         if method == "item/completed":
@@ -1138,21 +1306,20 @@ class AutomationManager:
                 entry = {"delta": "", "fullText": None}
                 self._turn_text_by_key[key] = entry
             entry["fullText"] = text
+            if thread_id:
+                self._note_lane_progress(self.lane(session_id, thread_id))
             return
 
         if method == "turn/started":
             if thread_id:
                 lane = self.lane(session_id, thread_id)
-                lane.busy = True
-                if turn_id:
-                    lane.active_turn_id = turn_id
+                self._mark_lane_busy(lane, turn_id=turn_id)
             return
 
         if method == "turn/completed":
             if thread_id:
                 lane = self.lane(session_id, thread_id)
-                lane.busy = False
-                lane.active_turn_id = None
+                self._mark_lane_idle(lane)
                 asyncio.create_task(self._process_lane_after_turn(session_id, thread_id))
                 asyncio.create_task(self._maybe_request_heartbeat(session_id, thread_id))
 
@@ -1382,7 +1549,7 @@ class AutomationManager:
                     "started": False,
                     "followupDepth": len(lane.followups),
                 }
-            lane.busy = True
+            self._mark_lane_busy(lane)
 
             try:
                 # `turn/start` fails with "thread not found" if the app-server process hasn't loaded the thread yet
@@ -1409,9 +1576,10 @@ class AutomationManager:
                             turn_id = tid_val.strip()
                 if turn_id:
                     lane.active_turn_id = turn_id
+                    self._note_lane_progress(lane)
                 return {"ok": True, "threadId": thread_id, "queued": False, "started": True, "turnId": turn_id}
             except Exception:
-                lane.busy = False
+                self._mark_lane_idle(lane)
                 raise
 
     async def enqueue_system_event(
@@ -1484,7 +1652,7 @@ class AutomationManager:
             live, _ = await _ensure_live_docker_session(session_id, allow_create=True)
             await self._ensure_initialized(live)
 
-            lane.busy = True
+            self._mark_lane_busy(lane)
             try:
                 await self._rpc(live, "thread/resume", {"threadId": thread_id})
                 assembled = await self._assemble_turn_input(session_id, thread_id, user_text=merged, heartbeat=False)
@@ -1507,8 +1675,9 @@ class AutomationManager:
                         if isinstance(tid_val, str) and tid_val.strip():
                             turn_id = tid_val.strip()
                 lane.active_turn_id = turn_id
+                self._note_lane_progress(lane)
             except Exception:
-                lane.busy = False
+                self._mark_lane_idle(lane)
                 log.exception("Failed to start follow-up turn for %s/%s", session_id, thread_id)
 
     def _format_followups(self, texts: list[str]) -> str:
@@ -1890,11 +2059,11 @@ class AutomationManager:
                 self._note_session_failure(session_id, what="Heartbeat prepare", err=e)
                 return
 
-            lane.busy = True
+            self._mark_lane_busy(lane)
             try:
                 await self._rpc(live, "thread/resume", {"threadId": main_tid})
                 assembled = await self._assemble_turn_input(session_id, main_tid, user_text="", heartbeat=True)
-                await self._rpc(
+                resp = await self._rpc(
                     live,
                     "turn/start",
                     {
@@ -1905,10 +2074,20 @@ class AutomationManager:
                         "sandboxPolicy": {"type": "dangerFullAccess"},
                     },
                 )
+                turn_id = None
+                if isinstance(resp, dict):
+                    turn = resp.get("turn")
+                    if isinstance(turn, dict):
+                        tid_val = turn.get("id")
+                        if isinstance(tid_val, str) and tid_val.strip():
+                            turn_id = tid_val.strip()
+                if turn_id:
+                    lane.active_turn_id = turn_id
+                    self._note_lane_progress(lane)
                 self._last_heartbeat_run_at_ms[(session_id, main_tid)] = _now_ms()
                 self._clear_session_backoff(session_id)
             except Exception as e:
-                lane.busy = False
+                self._mark_lane_idle(lane)
                 self._note_session_failure(session_id, what="Heartbeat turn/start", err=e)
                 return
 
@@ -3956,6 +4135,12 @@ async def _ensure_live_docker_session(session_id: str, *, allow_create: bool) ->
                 current = app.state.sessions.get(session_id)
                 if current is live:
                     app.state.sessions.pop(session_id, None)
+            automation: Optional[AutomationManager] = getattr(app.state, "automation", None)
+            if automation is not None:
+                try:
+                    automation.on_runtime_session_closed(session_id)
+                except Exception:
+                    log.exception("Automation cleanup failed for closed session %s", session_id)
 
     live.pump_task = asyncio.create_task(pump())
 
@@ -4036,7 +4221,17 @@ async def automation_state(request: Request):
     st = automation._store.state  # intentional: debug surface
     lanes = []
     for (sid, tid), lane in automation._lanes.items():  # intentional: debug surface
-        lanes.append({"sessionId": sid, "threadId": tid, "busy": lane.busy, "followupDepth": len(lane.followups)})
+        lanes.append(
+            {
+                "sessionId": sid,
+                "threadId": tid,
+                "busy": lane.busy,
+                "activeTurnId": lane.active_turn_id,
+                "busySinceMs": lane.busy_since_ms,
+                "lastProgressAtMs": lane.last_progress_at_ms,
+                "followupDepth": len(lane.followups),
+            }
+        )
     lanes.sort(key=lambda x: (x["sessionId"], x["threadId"]))
     return {"ok": True, "persisted": st.to_json(), "runtime": {"lanes": lanes}}
 
