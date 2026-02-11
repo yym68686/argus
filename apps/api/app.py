@@ -304,6 +304,7 @@ TELEGRAM_MAX_UPLOAD_BYTES = 50 * 1024 * 1024
 TELEGRAM_THREAD_NOT_FOUND_RE = re.compile(r"message thread not found", re.IGNORECASE)
 MEDIA_LINE_RE = re.compile(r"^\s*MEDIA:\s*(.*?)\s*$", re.IGNORECASE)
 MARKDOWN_FENCE_RE = re.compile(r"^\s*```")
+TELEGRAM_IMAGE_EXTS: set[str] = {".png", ".jpg", ".jpeg", ".webp", ".bmp"}
 
 AGENTS_FILENAME = "AGENTS.md"
 AGENTS_TEMPLATE_FILENAME = "AGENTS.default.md"
@@ -401,6 +402,17 @@ def _is_valid_media_ref(ref: str) -> bool:
         return True
     # Local attachments must be workspace-relative to avoid leaking host files.
     return s.startswith("./")
+
+def _is_image_media_ref(ref: str) -> bool:
+    if not isinstance(ref, str):
+        return False
+    s = ref.strip()
+    if not s:
+        return False
+    # Drop query/fragment for URLs.
+    base = s.split("?", 1)[0].split("#", 1)[0]
+    ext = Path(base).suffix.lower()
+    return ext in TELEGRAM_IMAGE_EXTS
 
 
 def _split_media_from_output(raw: str) -> tuple[str, list[str]]:
@@ -745,6 +757,18 @@ async def _telegram_send_document_url(*, token: str, target: dict[str, Any], url
         raise
 
 
+async def _telegram_send_photo_url(*, token: str, target: dict[str, Any], url: str) -> Any:
+    params = dict(target)
+    params["photo"] = url
+    try:
+        return await asyncio.to_thread(_telegram_api_call_sync, token, "sendPhoto", params)
+    except Exception as e:  # noqa: BLE001
+        if "message_thread_id" in params and TELEGRAM_THREAD_NOT_FOUND_RE.search(str(e) or ""):
+            params.pop("message_thread_id", None)
+            return await asyncio.to_thread(_telegram_api_call_sync, token, "sendPhoto", params)
+        raise
+
+
 async def _telegram_send_document_file(
     *,
     token: str,
@@ -772,6 +796,39 @@ async def _telegram_send_document_file(
                 "sendDocument",
                 params,
                 file_field="document",
+                file_path=file_path,
+                filename=filename,
+            )
+        raise
+
+
+async def _telegram_send_photo_file(
+    *,
+    token: str,
+    target: dict[str, Any],
+    file_path: Path,
+    filename: Optional[str] = None,
+) -> Any:
+    params = dict(target)
+    try:
+        return await asyncio.to_thread(
+            _telegram_api_call_multipart_sync,
+            token,
+            "sendPhoto",
+            params,
+            file_field="photo",
+            file_path=file_path,
+            filename=filename,
+        )
+    except Exception as e:  # noqa: BLE001
+        if "message_thread_id" in params and TELEGRAM_THREAD_NOT_FOUND_RE.search(str(e) or ""):
+            params.pop("message_thread_id", None)
+            return await asyncio.to_thread(
+                _telegram_api_call_multipart_sync,
+                token,
+                "sendPhoto",
+                params,
+                file_field="photo",
                 file_path=file_path,
                 filename=filename,
             )
@@ -1657,7 +1714,13 @@ class AutomationManager:
             for ref in media_refs[:5]:
                 try:
                     if ref.startswith("http://") or ref.startswith("https://"):
-                        await _telegram_send_document_url(token=token, target=target, url=ref)
+                        if _is_image_media_ref(ref):
+                            try:
+                                await _telegram_send_photo_url(token=token, target=target, url=ref)
+                            except Exception:
+                                await _telegram_send_document_url(token=token, target=target, url=ref)
+                        else:
+                            await _telegram_send_document_url(token=token, target=target, url=ref)
                         delivered_any = True
                         continue
 
@@ -1676,7 +1739,13 @@ class AutomationManager:
                     if size > TELEGRAM_MAX_UPLOAD_BYTES:
                         raise RuntimeError(f"media file too large ({size} bytes)")
 
-                    await _telegram_send_document_file(token=token, target=target, file_path=cand)
+                    if _is_image_media_ref(ref):
+                        try:
+                            await _telegram_send_photo_file(token=token, target=target, file_path=cand)
+                        except Exception:
+                            await _telegram_send_document_file(token=token, target=target, file_path=cand)
+                    else:
+                        await _telegram_send_document_file(token=token, target=target, file_path=cand)
                     delivered_any = True
                 except Exception as e:
                     log.warning(
