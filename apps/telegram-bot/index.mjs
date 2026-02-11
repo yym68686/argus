@@ -206,6 +206,14 @@ class TelegramApi {
   async sendChatAction(params) {
     return await this.call("sendChatAction", params);
   }
+
+  async setMyCommands(commands, params) {
+    return await this.call("setMyCommands", { commands, ...(params || {}) });
+  }
+
+  async deleteMyCommands(params) {
+    return await this.call("deleteMyCommands", params || {});
+  }
 }
 
 function buildUrlWithParams(url, params) {
@@ -706,7 +714,7 @@ function parseCommand(text, botUsername) {
   const cmd = (cmdRaw || "").toLowerCase();
   if (!cmd) return null;
   if (at && botUsername && at.toLowerCase() !== botUsername.toLowerCase()) return null;
-  if (cmd === "new" || cmd === "where") return cmd;
+  if (cmd === "new" || cmd === "where" || cmd === "help" || cmd === "start") return cmd;
   return null;
 }
 
@@ -970,6 +978,23 @@ async function main() {
   const botUsername = isNonEmptyString(me?.username) ? me.username : null;
   log("Telegram bot:", botUsername ? `@${botUsername}` : "(unknown)");
 
+  const commandMenu = [
+    { command: "help", description: "Show help" },
+    { command: "where", description: "Show current session/thread mapping" },
+    { command: "new", description: "Start a new thread" }
+  ];
+  try {
+    try {
+      await tg.deleteMyCommands();
+    } catch {
+      // ignore; older bots may not support deleteMyCommands
+    }
+    await tg.setMyCommands(commandMenu);
+    log("Telegram command menu installed:", commandMenu.map((c) => `/${c.command}`).join(", "));
+  } catch (e) {
+    log("setMyCommands failed (continuing):", e instanceof Error ? e.message : String(e));
+  }
+
   const state = new StateStore(statePath);
   await state.load();
   log("State path:", statePath);
@@ -1215,6 +1240,25 @@ async function main() {
             await state.setThreadId(chatKey, tid);
             await state.setLastActiveChatKey(tid, chatKey);
             await tg.sendMessage({ ...target, text: `ok (new thread): ${tid}` });
+            typing.stop(chatKey);
+            return;
+          }
+
+          if (cmd === "help" || cmd === "start") {
+            const tid = state.getThreadId(chatKey);
+            const sid = state.state.defaultSessionId;
+            const helpText = [
+              "Commands:",
+              "/help — show this help",
+              "/where — show session/thread ids (debug)",
+              "/new — start a new thread",
+              "",
+              "Notes:",
+              "- In private chat, messages go to the session main thread.",
+              "- In groups/topics, the bot maps chat/topic -> thread automatically."
+            ].join("\n");
+            const extra = `\n\nCurrent:\nsessionId: ${sid || "(none)"}\nthreadId: ${tid || "(none)"}`;
+            await tg.sendMessage({ ...target, text: helpText + extra });
             typing.stop(chatKey);
             return;
           }
