@@ -1918,11 +1918,27 @@ class AutomationManager:
                 del q[: len(q) - 2000]
 
         await self._store.update(_add)
-        self.request_heartbeat_now()
+        if self._system_event_wakes_heartbeat(ev):
+            self.request_heartbeat_now()
         return ev
 
     def request_heartbeat_now(self) -> None:
         self._heartbeat_wakeup.set()
+
+    def _system_event_wakes_heartbeat(self, ev: PersistedSystemEvent) -> bool:
+        # Node up/down are status-only: record them, but don't wake heartbeat.
+        # Allow explicit override via meta.wakeHeartbeat.
+        wake = None
+        if isinstance(ev.meta, dict):
+            wake = ev.meta.get("wakeHeartbeat")
+        if wake is True:
+            return True
+        if wake is False:
+            return False
+        return ev.kind != "node"
+
+    def _queue_has_actionable_system_events(self, q: list[PersistedSystemEvent]) -> bool:
+        return any(self._system_event_wakes_heartbeat(ev) for ev in q)
 
     async def _maybe_request_heartbeat(self, session_id: str, thread_id: str) -> None:
         # If main thread has pending system events, wake heartbeat after any turn.
@@ -1936,7 +1952,7 @@ class AutomationManager:
         if thread_id != main_tid:
             return
         q = sess.system_event_queues.get(main_tid) or []
-        if q:
+        if self._queue_has_actionable_system_events(q):
             self.request_heartbeat_now()
 
     async def _process_lane_after_turn(self, session_id: str, thread_id: str) -> None:
@@ -2100,9 +2116,12 @@ class AutomationManager:
         if project_context:
             blocks.append(project_context)
 
-        skills_block = await self._read_skills_prompt_block()
-        if skills_block:
-            blocks.append(skills_block)
+        # Heartbeat turns must stay narrowly focused on HEARTBEAT.md + system events.
+        # Including the full skills prompt here can accidentally prime irrelevant user-facing output.
+        if not heartbeat:
+            skills_block = await self._read_skills_prompt_block()
+            if skills_block:
+                blocks.append(skills_block)
 
         if heartbeat:
             blocks.append("HEARTBEAT: You are running a background heartbeat. Read and follow HEARTBEAT.md in # Project Context.")
@@ -2110,7 +2129,7 @@ class AutomationManager:
             blocks.append(user_text.strip())
 
         if drained:
-            blocks.append("System events (batched):\n" + "\n".join(drained))
+            blocks.append("System events (batched, highest priority):\n" + "\n".join(drained))
 
         if heartbeat:
                 blocks.append(
@@ -2118,8 +2137,10 @@ class AutomationManager:
                         [
                             "Heartbeat response contract:",
                             "- This heartbeat turn is a poll/automation tick, NOT a user question.",
-                            "- Do NOT answer or re-answer any previous user message, and do NOT restate previous assistant outputs.",
-                            "- Only produce a user-visible alert if there is NEW information that must be shown to the user (triggered by HEARTBEAT.md or a system event).",
+                            "- Your decision MUST be based ONLY on: (a) HEARTBEAT.md in # Project Context, and (b) the system events shown in this message.",
+                            "- Ignore the rest of the conversation history. Do NOT answer or re-answer any previous user message, and do NOT restate previous assistant outputs.",
+                            "- Treat `kind=node` (connected/disconnected) system events as status-only; never message the user for them.",
+                            "- Only produce a user-visible alert if there is NEW information that must be shown to the user (triggered by HEARTBEAT.md or a non-node system event).",
                             f"- If there is no user-visible alert, reply exactly: {HEARTBEAT_TOKEN}",
                             f"- If any system event includes directives like 'Do NOT message the user' / 'no user-facing report' / 'silent', you MUST reply exactly: {HEARTBEAT_TOKEN} (even if you performed actions).",
                             "- Do NOT include meta/status text (timestamps, next schedule, 'heartbeat check', 'wrote memory', etc).",
@@ -2378,8 +2399,8 @@ class AutomationManager:
         sess = st.sessions.get(session_id)
         main_tid = sess.main_thread_id if sess is not None else None
         q = (sess.system_event_queues.get(main_tid) or []) if (sess is not None and main_tid) else []
-        has_system_events = bool(q)
-        if not has_system_events:
+        has_actionable_system_events = self._queue_has_actionable_system_events(q)
+        if not has_actionable_system_events:
             if not has_heartbeat_tasks:
                 return
             if main_tid and (not forced and not self._heartbeat_tasks_due(session_id, main_tid, now_ms)):
@@ -2406,8 +2427,8 @@ class AutomationManager:
             if sess2 is None:
                 return
             q2 = sess2.system_event_queues.get(main_tid) or []
-            has_system_events2 = bool(q2)
-            if not has_system_events2:
+            has_actionable_system_events2 = self._queue_has_actionable_system_events(q2)
+            if not has_actionable_system_events2:
                 if not has_heartbeat_tasks:
                     return
                 now2 = _now_ms()
@@ -4817,7 +4838,15 @@ async def _enqueue_node_system_event(
             thread_id=main_tid,
             kind="node",
             text=text,
-            meta={"event": event, "nodeId": node_id, "displayName": display_name, "platform": platform, "version": version, "ip": ip},
+            meta={
+                "event": event,
+                "nodeId": node_id,
+                "displayName": display_name,
+                "platform": platform,
+                "version": version,
+                "ip": ip,
+                "wakeHeartbeat": False,
+            },
         )
     except Exception:
         log.exception("Failed to enqueue node systemEvent: %s", text)
