@@ -1,5 +1,7 @@
 # Argus — Self-hosted Assistant Gateway (Telegram-first)
 
+[![Telegram user group](https://img.shields.io/badge/Telegram-Join%20the%20community-2CA5E0?logo=telegram&logoColor=white)](https://t.me/argus_hub)
+
 [English](./README.md) | [Chinese](./README_CN.md)
 
 Argus is a small gateway you run on your own server.

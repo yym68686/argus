@@ -1,5 +1,7 @@
 # Argus — 自托管的助手网关（Telegram 优先）
 
+[![Telegram 用户群](https://img.shields.io/badge/Telegram-加入用户群-2CA5E0?logo=telegram&logoColor=white)](https://t.me/argus_hub)
+
 [英文](./README.md) | [中文](./README_CN.md)
 
 Argus 是一个你可以部署在自己服务器上的“小网关”。
