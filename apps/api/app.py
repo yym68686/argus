@@ -13,6 +13,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
 
+import requests
 from fastapi import FastAPI, HTTPException, Request, Response, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, PlainTextResponse
@@ -292,6 +293,10 @@ HEARTBEAT_TOKEN = "HEARTBEAT_OK"
 HEARTBEAT_ACK_MAX_CHARS = 300
 
 TELEGRAM_MAX_MESSAGE_CHARS = 4000
+TELEGRAM_MAX_UPLOAD_BYTES = 50 * 1024 * 1024
+TELEGRAM_THREAD_NOT_FOUND_RE = re.compile(r"message thread not found", re.IGNORECASE)
+MEDIA_LINE_RE = re.compile(r"^\s*MEDIA:\s*(.*?)\s*$", re.IGNORECASE)
+MARKDOWN_FENCE_RE = re.compile(r"^\s*```")
 
 AGENTS_FILENAME = "AGENTS.md"
 AGENTS_TEMPLATE_FILENAME = "AGENTS.default.md"
@@ -361,6 +366,97 @@ def _strip_heartbeat_token(raw: Optional[str]) -> dict[str, Any]:
     if len(picked_text) <= HEARTBEAT_ACK_MAX_CHARS:
         return {"shouldSkip": True, "text": "", "didStrip": True}
     return {"shouldSkip": False, "text": picked_text, "didStrip": True}
+
+def _unwrap_media_quotes(raw: str) -> Optional[str]:
+    if not isinstance(raw, str):
+        return None
+    trimmed = raw.strip()
+    if len(trimmed) < 2:
+        return None
+    first = trimmed[0]
+    last = trimmed[-1]
+    if first != last or first not in ('"', "'", "`"):
+        return None
+    return trimmed[1:-1].strip()
+
+
+def _is_valid_media_ref(ref: str) -> bool:
+    if not isinstance(ref, str):
+        return False
+    s = ref.strip()
+    if not s:
+        return False
+    if len(s) > 4096:
+        return False
+    if s.startswith("http://") or s.startswith("https://"):
+        return True
+    # Local attachments must be workspace-relative to avoid leaking host files.
+    return s.startswith("./")
+
+
+def _split_media_from_output(raw: str) -> tuple[str, list[str]]:
+    """
+    Extract MEDIA directives from assistant output.
+
+    Semantics (OpenClaw-inspired):
+    - Only treat lines that start with "MEDIA:" (on their own line) as directives.
+    - Ignore MEDIA inside fenced code blocks (```).
+    - Accept:
+      - "MEDIA: ./relative/path"
+      - "MEDIA: \"./path with spaces.pdf\"" (quoted)
+      - "MEDIA: https://example.com/file.pdf"
+    - When at least one valid media ref is found on a MEDIA: line, drop that line from the text.
+      Otherwise keep the line unchanged.
+    """
+    if not isinstance(raw, str) or not raw.strip():
+        return "", []
+
+    in_fence = False
+    media: list[str] = []
+    kept_lines: list[str] = []
+
+    for line in raw.splitlines():
+        if MARKDOWN_FENCE_RE.match(line):
+            in_fence = not in_fence
+            kept_lines.append(line)
+            continue
+        if in_fence:
+            kept_lines.append(line)
+            continue
+
+        m = MEDIA_LINE_RE.match(line)
+        if not m:
+            kept_lines.append(line)
+            continue
+
+        payload = (m.group(1) or "").strip()
+        if not payload:
+            # Keep "MEDIA:" lines with no payload as regular text.
+            kept_lines.append(line)
+            continue
+
+        unwrapped = _unwrap_media_quotes(payload)
+        parts = [unwrapped] if unwrapped is not None else [p for p in payload.split() if p]
+
+        found_any = False
+        for part in parts:
+            cand = (part or "").strip()
+            if _is_valid_media_ref(cand):
+                media.append(cand)
+                found_any = True
+
+        if not found_any:
+            kept_lines.append(line)
+
+    deduped: list[str] = []
+    seen: set[str] = set()
+    for ref in media:
+        if ref in seen:
+            continue
+        seen.add(ref)
+        deduped.append(ref)
+
+    return "\n".join(kept_lines).strip(), deduped
 
 
 def _telegram_truncate(text: str) -> str:
@@ -553,6 +649,58 @@ def _telegram_api_call_sync(token: str, method: str, params: dict[str, Any]) -> 
         raise RuntimeError(f"Telegram {method} failed: {desc}")
     return data.get("result")
 
+def _telegram_api_call_multipart_sync(
+    token: str,
+    method: str,
+    params: dict[str, Any],
+    *,
+    file_field: str,
+    file_path: Path,
+    filename: Optional[str] = None,
+) -> Any:
+    if not isinstance(token, str) or not token.strip():
+        raise RuntimeError("Missing TELEGRAM_BOT_TOKEN")
+    if not isinstance(method, str) or not method.strip():
+        raise RuntimeError("Missing Telegram method")
+    if not isinstance(params, dict):
+        raise RuntimeError("Telegram params must be an object")
+    if not isinstance(file_field, str) or not file_field.strip():
+        raise RuntimeError("Missing Telegram file field")
+    if not isinstance(file_path, Path):
+        raise RuntimeError("Invalid Telegram file path")
+
+    url = f"https://api.telegram.org/bot{token.strip()}/{method.strip()}"
+
+    data: dict[str, Any] = {}
+    for k, v in params.items():
+        if v is None:
+            continue
+        data[k] = v
+
+    raw = ""
+    try:
+        with file_path.open("rb") as f:
+            name = filename or file_path.name or "file"
+            files = {file_field: (name, f)}
+            resp = requests.post(url, data=data, files=files, timeout=30)
+            raw = resp.text
+            resp.raise_for_status()
+    except requests.HTTPError as e:
+        raise RuntimeError(f"Telegram {method} failed: HTTP {getattr(e.response, 'status_code', '?')} {raw}".strip()) from e
+    except Exception as e:  # noqa: BLE001
+        raise RuntimeError(f"Telegram {method} failed: {e}") from e
+
+    try:
+        parsed = json.loads(raw)
+    except Exception as e:  # noqa: BLE001
+        raise RuntimeError(f"Telegram {method} failed: bad JSON response") from e
+    if not isinstance(parsed, dict):
+        raise RuntimeError(f"Telegram {method} failed: bad response")
+    if not parsed.get("ok"):
+        desc = parsed.get("description") or "unknown error"
+        raise RuntimeError(f"Telegram {method} failed: {desc}")
+    return parsed.get("result")
+
 
 async def _telegram_send_message(
     *,
@@ -566,7 +714,59 @@ async def _telegram_send_message(
     if parse_mode:
         params["parse_mode"] = parse_mode
         params["disable_web_page_preview"] = True
-    return await asyncio.to_thread(_telegram_api_call_sync, token, "sendMessage", params)
+    try:
+        return await asyncio.to_thread(_telegram_api_call_sync, token, "sendMessage", params)
+    except Exception as e:  # noqa: BLE001
+        # Thread may be missing/deleted; retry without message_thread_id like OpenClaw.
+        if "message_thread_id" in params and TELEGRAM_THREAD_NOT_FOUND_RE.search(str(e) or ""):
+            params.pop("message_thread_id", None)
+            return await asyncio.to_thread(_telegram_api_call_sync, token, "sendMessage", params)
+        raise
+
+
+async def _telegram_send_document_url(*, token: str, target: dict[str, Any], url: str) -> Any:
+    params = dict(target)
+    params["document"] = url
+    try:
+        return await asyncio.to_thread(_telegram_api_call_sync, token, "sendDocument", params)
+    except Exception as e:  # noqa: BLE001
+        if "message_thread_id" in params and TELEGRAM_THREAD_NOT_FOUND_RE.search(str(e) or ""):
+            params.pop("message_thread_id", None)
+            return await asyncio.to_thread(_telegram_api_call_sync, token, "sendDocument", params)
+        raise
+
+
+async def _telegram_send_document_file(
+    *,
+    token: str,
+    target: dict[str, Any],
+    file_path: Path,
+    filename: Optional[str] = None,
+) -> Any:
+    params = dict(target)
+    try:
+        return await asyncio.to_thread(
+            _telegram_api_call_multipart_sync,
+            token,
+            "sendDocument",
+            params,
+            file_field="document",
+            file_path=file_path,
+            filename=filename,
+        )
+    except Exception as e:  # noqa: BLE001
+        if "message_thread_id" in params and TELEGRAM_THREAD_NOT_FOUND_RE.search(str(e) or ""):
+            params.pop("message_thread_id", None)
+            return await asyncio.to_thread(
+                _telegram_api_call_multipart_sync,
+                token,
+                "sendDocument",
+                params,
+                file_field="document",
+                file_path=file_path,
+                filename=filename,
+            )
+        raise
 
 
 def _strip_yaml_front_matter(raw: str) -> str:
@@ -1362,29 +1562,81 @@ class AutomationManager:
         stripped = _strip_heartbeat_token(text)
         if stripped.get("shouldSkip"):
             return
-        final_text = stripped.get("text") if isinstance(stripped.get("text"), str) else text
-        final_text = final_text.strip()
-        if not final_text:
+        final_raw = stripped.get("text") if isinstance(stripped.get("text"), str) else text
+        final_raw = final_raw.strip()
+        if not final_raw:
             return
 
-        truncated = _telegram_truncate(final_text)
-        html = _markdown_to_telegram_html(truncated)
+        clean_text, media_refs = _split_media_from_output(final_raw)
+        delivered_any = False
 
-        try:
-            if html:
+        clean_text = clean_text.strip()
+        if clean_text:
+            truncated = _telegram_truncate(clean_text)
+            html = _markdown_to_telegram_html(truncated)
+            try:
+                if html:
+                    try:
+                        await _telegram_send_message(token=token, target=target, text=html, parse_mode="HTML")
+                        delivered_any = True
+                    except Exception as e:
+                        msg = str(e)
+                        if TELEGRAM_HTML_PARSE_ERR_RE.search(msg) or TELEGRAM_MESSAGE_TOO_LONG_RE.search(msg):
+                            # Fall back to plain text.
+                            await _telegram_send_message(token=token, target=target, text=truncated, parse_mode=None)
+                            delivered_any = True
+                        else:
+                            raise
+                else:
+                    await _telegram_send_message(token=token, target=target, text=truncated, parse_mode=None)
+                    delivered_any = True
+            except Exception as e:
+                log.warning("Failed to deliver to telegram for %s/%s: %s", session_id, thread_id, str(e))
+
+        if media_refs:
+            workspace_root = self._workspace_root()
+            root_resolved = None
+            if workspace_root is not None:
                 try:
-                    await _telegram_send_message(token=token, target=target, text=html, parse_mode="HTML")
-                    return
+                    root_resolved = workspace_root.resolve()
+                except Exception:
+                    root_resolved = workspace_root
+
+            for ref in media_refs[:5]:
+                try:
+                    if ref.startswith("http://") or ref.startswith("https://"):
+                        await _telegram_send_document_url(token=token, target=target, url=ref)
+                        delivered_any = True
+                        continue
+
+                    if not ref.startswith("./"):
+                        continue
+                    if root_resolved is None:
+                        raise RuntimeError("workspace root is not configured (ARGUS_HOME_HOST_PATH/ARGUS_WORKSPACE_HOST_PATH)")
+
+                    rel = ref[2:]
+                    cand = (root_resolved / rel).resolve()
+                    if not cand.is_relative_to(root_resolved):
+                        raise RuntimeError("media path escapes workspace root")
+                    if not cand.is_file():
+                        raise RuntimeError("media file not found")
+                    size = cand.stat().st_size
+                    if size > TELEGRAM_MAX_UPLOAD_BYTES:
+                        raise RuntimeError(f"media file too large ({size} bytes)")
+
+                    await _telegram_send_document_file(token=token, target=target, file_path=cand)
+                    delivered_any = True
                 except Exception as e:
-                    msg = str(e)
-                    if TELEGRAM_HTML_PARSE_ERR_RE.search(msg) or TELEGRAM_MESSAGE_TOO_LONG_RE.search(msg):
-                        # Fall back to plain text.
-                        await _telegram_send_message(token=token, target=target, text=truncated, parse_mode=None)
-                        return
-                    raise
-            await _telegram_send_message(token=token, target=target, text=truncated, parse_mode=None)
-        except Exception as e:
-            log.warning("Failed to deliver to telegram for %s/%s: %s", session_id, thread_id, str(e))
+                    log.warning(
+                        "Failed to deliver telegram attachment for %s/%s (ref=%s): %s",
+                        session_id,
+                        thread_id,
+                        ref,
+                        str(e),
+                    )
+
+        if not delivered_any:
+            return
 
     async def ensure_default_ready(self) -> str:
         if _provision_mode() != "docker":

@@ -22,6 +22,12 @@ read_when:
     - `process.logs` (tail output), `process.get` (status), `process.kill` (stop).
   - When the command runs in background, completion will be enqueued as a `systemEvent` automatically (heartbeat will surface it).
 
+## Sending files (Telegram)
+
+- To send an attachment, write it into the workspace and include a standalone line in your final answer:
+  - `MEDIA: ./relative/path/to/file.ext`
+- You can include multiple `MEDIA:` lines (one per file). Keep them outside fenced code blocks.
+
 ## Session start (required)
 
 - Read `SOUL.md`, `USER.md`, `memory.md`, and today+yesterday in `memory/`.
