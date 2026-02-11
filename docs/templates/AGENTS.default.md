@@ -66,11 +66,14 @@ git commit -m "Add Clawd workspace"
 
 ## What Argus Does
 
-- Runs WhatsApp gateway coding agent so the assistant can read/write chats, fetch context, and run skills via the host Mac.
+- Runs an agent inside a runtime container and exposes it via Telegram/Web through the Gateway.
+- The Gateway can enqueue `systemEvent`s (cron/heartbeat/job completions) that heartbeats will surface.
+
+## Skills (recommended)
+
+- Skills live under `skills/` in this workspace.
+- To add a skill, create `skills/<name>/SKILL.md` with YAML frontmatter (`name`, `description`) and optional `scripts/`, `references/`, `assets/`.
 
 ## Usage Notes
 
-- Prefer the `Argus` CLI for scripting; mac app handles permissions.
-- Run installs from the Skills tab; it hides the button if a binary is already present.
-- Keep heartbeats enabled so the assistant can schedule reminders, monitor inboxes, and trigger camera captures.
-- Canvas UI runs full-screen with native overlays. Avoid placing critical controls in the top-left/top-right/bottom edges; add explicit gutters in the layout and don’t rely on safe-area insets.
+- Keep heartbeats enabled so the assistant can process scheduled automation and queued `systemEvent`s.

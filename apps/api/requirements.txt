@@ -2,3 +2,4 @@ fastapi>=0.110
 uvicorn[standard]>=0.23
 docker>=7.0
 croniter>=2.0
+requests>=2.31

@@ -287,6 +287,13 @@ def _atomic_write_text(path: Path, content: str) -> None:
     tmp.replace(path)
 
 
+def _atomic_write_bytes(path: Path, content: bytes) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_bytes(content)
+    tmp.replace(path)
+
+
 HEARTBEAT_FILENAME = "HEARTBEAT.md"
 HEARTBEAT_TASKS_INTERVAL_MS = 30 * 60 * 1000
 HEARTBEAT_TOKEN = "HEARTBEAT_OK"
@@ -302,6 +309,8 @@ AGENTS_FILENAME = "AGENTS.md"
 AGENTS_TEMPLATE_FILENAME = "AGENTS.default.md"
 SOUL_FILENAME = "SOUL.md"
 USER_FILENAME = "USER.md"
+SKILLS_DIRNAME = "skills"
+SKILL_MD_FILENAME = "SKILL.md"
 
 PROJECT_CONTEXT_FILENAMES: list[str] = [AGENTS_FILENAME, SOUL_FILENAME, USER_FILENAME]
 WORKSPACE_BOOTSTRAP_TEMPLATES: list[tuple[str, str]] = [
@@ -780,6 +789,47 @@ def _strip_yaml_front_matter(raw: str) -> str:
     return raw
 
 
+def _parse_yaml_front_matter(raw: str) -> dict[str, str]:
+    # Minimal YAML frontmatter parser (single-line key: value pairs only).
+    text = str(raw or "").lstrip("\ufeff")
+    lines = text.splitlines()
+    if not lines or lines[0].strip() != "---":
+        return {}
+    out: dict[str, str] = {}
+    for i in range(1, len(lines)):
+        line = lines[i]
+        if line.strip() == "---":
+            break
+        if ":" not in line:
+            continue
+        key, value = line.split(":", 1)
+        k = key.strip()
+        if not k:
+            continue
+        v = value.strip()
+        if len(v) >= 2 and ((v[0] == '"' and v[-1] == '"') or (v[0] == "'" and v[-1] == "'")):
+            v = v[1:-1]
+        out[k] = v
+    return out
+
+
+def _bootstrap_workspace_skill_templates(workspace_root: Path) -> None:
+    template_root = _resolve_repo_root() / "docs" / "templates" / SKILLS_DIRNAME
+    if not template_root.is_dir():
+        return
+    dest_root = workspace_root / SKILLS_DIRNAME
+    for skill_dir in sorted([p for p in template_root.iterdir() if p.is_dir()]):
+        for src in sorted([p for p in skill_dir.rglob("*") if p.is_file()]):
+            rel = src.relative_to(skill_dir)
+            dest = dest_root / skill_dir.name / rel
+            if dest.exists():
+                continue
+            try:
+                _atomic_write_bytes(dest, src.read_bytes())
+            except Exception:
+                continue
+
+
 def _is_heartbeat_content_effectively_empty(content: Optional[str]) -> bool:
     # Mirror OpenClaw's semantics: treat whitespace/headers/comments/empty checklist as empty.
     if content is None or not isinstance(content, str):
@@ -1249,6 +1299,8 @@ class AutomationManager:
                 if template_clean:
                     template_clean += "\n"
                 _atomic_write_text(target_path, template_clean or f"# {target_name}\n")
+
+            _bootstrap_workspace_skill_templates(root)
 
         try:
             await asyncio.to_thread(_ensure)
@@ -1986,6 +2038,60 @@ class AutomationManager:
             log.exception("Failed to read project context from workspace")
             return ""
 
+    async def _read_skills_prompt_block(self) -> str:
+        root = self._workspace_root()
+        if root is None:
+            return ""
+
+        def _read() -> str:
+            skills_root = root / SKILLS_DIRNAME
+            if not skills_root.is_dir():
+                return ""
+            skills: list[dict[str, str]] = []
+            for skill_dir in sorted([p for p in skills_root.iterdir() if p.is_dir()]):
+                skill_md = skill_dir / SKILL_MD_FILENAME
+                if not skill_md.is_file():
+                    continue
+                try:
+                    raw = skill_md.read_text(encoding="utf-8")
+                except Exception:
+                    continue
+                meta = _parse_yaml_front_matter(raw)
+                name = (meta.get("name") or skill_dir.name).strip()
+                if not name:
+                    continue
+                description = (meta.get("description") or "").strip()
+                location = f"/root/.argus/workspace/{SKILLS_DIRNAME}/{skill_dir.name}/{SKILL_MD_FILENAME}"
+                skills.append({"name": name, "description": description, "location": location})
+
+            if not skills:
+                return ""
+
+            lines: list[str] = [
+                "## Skills (mandatory)",
+                "",
+                "A skill is a set of local instructions stored in a `SKILL.md` file.",
+                "",
+                "Trigger rules:",
+                "- If the user names a skill (e.g. `$skill-creator`) OR the task clearly matches a skill’s description, you MUST use that skill for this turn.",
+                "- After selecting a skill, read its `SKILL.md` at the `location` (read only enough to follow the workflow).",
+                "",
+                "<available_skills>",
+            ]
+            for s in skills:
+                lines.append(f"- name: {s['name']}")
+                if s["description"]:
+                    lines.append(f"  description: {s['description']}")
+                lines.append(f"  location: {s['location']}")
+            lines.append("</available_skills>")
+            return "\n".join(lines).strip()
+
+        try:
+            return await asyncio.to_thread(_read)
+        except Exception:
+            log.exception("Failed to read skills from workspace")
+            return ""
+
     async def _assemble_turn_input(self, session_id: str, thread_id: str, *, user_text: str, heartbeat: bool) -> str:
         drained = await self._drain_system_events(session_id, thread_id, max_events=20)
         blocks: list[str] = []
@@ -1993,6 +2099,10 @@ class AutomationManager:
         project_context = await self._read_project_context_block(session_id=session_id, include_heartbeat=heartbeat)
         if project_context:
             blocks.append(project_context)
+
+        skills_block = await self._read_skills_prompt_block()
+        if skills_block:
+            blocks.append(skills_block)
 
         if heartbeat:
             blocks.append("HEARTBEAT: You are running a background heartbeat. Read and follow HEARTBEAT.md in # Project Context.")
