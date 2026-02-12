@@ -718,6 +718,14 @@ function parseCommand(text, botUsername) {
   return null;
 }
 
+function extractReplyText(message) {
+  const reply = message?.reply_to_message;
+  if (!reply || typeof reply !== "object") return null;
+  if (isNonEmptyString(reply.text)) return reply.text;
+  if (isNonEmptyString(reply.caption)) return reply.caption;
+  return null;
+}
+
 function truncateTelegramMessage(text) {
   const max = 4000;
   if (text.length <= max) return text;
@@ -1215,6 +1223,7 @@ async function main() {
 
       const text = isNonEmptyString(message.text) ? message.text : null;
       const cmd = parseCommand(text || "", botUsername);
+      const replyText = extractReplyText(message);
 
       // Show typing cue immediately; Telegram requires periodic refresh for long runs.
       // Note: sendChatAction accepts message_thread_id=1 (General topic), while sendMessage may not.
@@ -1269,6 +1278,10 @@ async function main() {
             return;
           }
 
+          const userText = replyText && !cmd
+            ? ["REPLY_TO:", replyText, "", "USER:", text].join("\n")
+            : text;
+
           const chatType = message?.chat?.type;
           let threadId = state.getThreadId(chatKey);
           let enqueueTarget = null;
@@ -1284,7 +1297,7 @@ async function main() {
           }
 
           const res = await argus.enqueueInput({
-            text,
+            text: userText,
             threadId,
             target: enqueueTarget,
             source: { channel: "telegram", chatKey }
