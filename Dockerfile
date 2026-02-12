@@ -5,6 +5,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
   curl \
   python-is-python3 \
   python3 \
+  ripgrep \
   socat \
   && rm -rf /var/lib/apt/lists/*
 
