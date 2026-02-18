@@ -305,6 +305,7 @@ TELEGRAM_THREAD_NOT_FOUND_RE = re.compile(r"message thread not found", re.IGNORE
 MEDIA_LINE_RE = re.compile(r"^\s*MEDIA:\s*(.*?)\s*$", re.IGNORECASE)
 MARKDOWN_FENCE_RE = re.compile(r"^\s*```")
 TELEGRAM_IMAGE_EXTS: set[str] = {".png", ".jpg", ".jpeg", ".webp", ".bmp"}
+DEFAULT_JSONL_LINE_LIMIT_BYTES = 128 * 1024 * 1024
 
 AGENTS_FILENAME = "AGENTS.md"
 AGENTS_TEMPLATE_FILENAME = "AGENTS.default.md"
@@ -4112,9 +4113,9 @@ def _docker_cfg() -> DockerProvisionConfig:
 
     connect_timeout_s = float(os.getenv("ARGUS_CONNECT_TIMEOUT_S", "30"))
     try:
-        jsonl_line_limit_bytes = int(os.getenv("ARGUS_JSONL_LINE_LIMIT_BYTES", str(8 * 1024 * 1024)))
+        jsonl_line_limit_bytes = int(os.getenv("ARGUS_JSONL_LINE_LIMIT_BYTES", str(DEFAULT_JSONL_LINE_LIMIT_BYTES)))
     except Exception:
-        jsonl_line_limit_bytes = 8 * 1024 * 1024
+        jsonl_line_limit_bytes = DEFAULT_JSONL_LINE_LIMIT_BYTES
     container_prefix = os.getenv("ARGUS_CONTAINER_PREFIX", "argus-session")
 
     cpu_quota, cpu_period = _parse_runtime_cpu_quota_period()
@@ -5432,9 +5433,9 @@ async def ws_proxy(ws: WebSocket):
 
     async def tcp_to_ws():
         try:
-            line_limit = int(os.getenv("ARGUS_JSONL_LINE_LIMIT_BYTES", str(8 * 1024 * 1024)))
+            line_limit = int(os.getenv("ARGUS_JSONL_LINE_LIMIT_BYTES", str(DEFAULT_JSONL_LINE_LIMIT_BYTES)))
         except Exception:
-            line_limit = 8 * 1024 * 1024
+            line_limit = DEFAULT_JSONL_LINE_LIMIT_BYTES
         buf = bytearray()
         try:
             while True:
