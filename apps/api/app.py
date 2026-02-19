@@ -2228,6 +2228,8 @@ class AutomationManager:
                     [
                         "Instructions:",
                         "- If there is user input, answer it first.",
+                        f"- IMPORTANT: `{HEARTBEAT_TOKEN}` is reserved exclusively for heartbeat turns. Never output `{HEARTBEAT_TOKEN}` in a normal user turn.",
+                        f"- If the user message is only a preference/rule update, reply with a short natural-language acknowledgement (and what will change) instead of `{HEARTBEAT_TOKEN}`.",
                         "- Then process each system event in order.",
                         "- If an event requires actions, perform them.",
                         "- End with a short summary of actions/results.",
