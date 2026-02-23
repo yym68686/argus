@@ -11,7 +11,7 @@ read_when:
 
 - Don’t dump directories or secrets into chat.
 - Don’t run destructive commands unless explicitly asked.
-- Don’t send partial/streaming replies to external messaging surfaces (only final replies).
+- Don’t send partial/streaming replies to external messaging surfaces, unless you are explicitly using the gateway MCP `message_send` tool for a short progress update.
 
 ## Long-running commands (required)
 
@@ -21,6 +21,20 @@ read_when:
   - Use `process.*` on the same node for followups:
     - `process.logs` (tail output), `process.get` (status), `process.kill` (stop).
   - When the command runs in background, completion will be enqueued as a `systemEvent` automatically (heartbeat will surface it).
+
+## Proactive messaging (MCP) (recommended)
+
+- You can proactively message the user during long tasks using the gateway MCP tool `message_send` (it may appear as `mcp__<server>__message_send` in the tool list).
+- The gateway injects the current inbound chat identity into the turn input as:
+  - `[SOURCE]` → `chatKey: <chat_id>[:<message_thread_id>]`
+- For Telegram, use that `chatKey` as `target` so you don’t guess who to message.
+- Use this for **brief** progress updates (start / still running / finished / error). Avoid spamming.
+
+Example (Telegram progress update):
+
+```json
+{"name":"message_send","arguments":{"channel":"telegram","target":"<SOURCE.chatKey>","text":"Still working on it… (ETA ~2 min)","format":"markdown","silent":true}}
+```
 
 ## Sending files (Telegram)
 

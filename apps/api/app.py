@@ -786,12 +786,15 @@ async def _telegram_send_message(
     target: dict[str, Any],
     text: str,
     parse_mode: Optional[str] = None,
+    disable_notification: Optional[bool] = None,
 ) -> Any:
     params = dict(target)
     params["text"] = text
     if parse_mode:
         params["parse_mode"] = parse_mode
         params["disable_web_page_preview"] = True
+    if disable_notification is not None:
+        params["disable_notification"] = bool(disable_notification)
     try:
         return await asyncio.to_thread(_telegram_api_call_sync, token, "sendMessage", params)
     except Exception as e:  # noqa: BLE001
@@ -2034,7 +2037,14 @@ class AutomationManager:
                 # `turn/start` fails with "thread not found" if the app-server process hasn't loaded the thread yet
                 # (e.g. after reconnect/restart). Make `argus/input/enqueue` robust by resuming first.
                 await self._ensure_thread_loaded_or_resumed(live, thread_id)
-                assembled = await self._assemble_turn_input(session_id, thread_id, user_text=text, heartbeat=False)
+                assembled = await self._assemble_turn_input(
+                    session_id,
+                    thread_id,
+                    user_text=text,
+                    heartbeat=False,
+                    source_channel=source_channel,
+                    source_chat_key=source_chat_key,
+                )
 
                 local_images: list[str] = []
                 if (
@@ -2296,7 +2306,14 @@ class AutomationManager:
             self._mark_lane_busy(lane)
             try:
                 await self._ensure_thread_loaded_or_resumed(live, thread_id)
-                assembled = await self._assemble_turn_input(session_id, thread_id, user_text=merged, heartbeat=False)
+                assembled = await self._assemble_turn_input(
+                    session_id,
+                    thread_id,
+                    user_text=merged,
+                    heartbeat=False,
+                    source_channel=telegram_channel,
+                    source_chat_key=telegram_chat_key,
+                )
 
                 local_images: list[str] = []
                 if (
@@ -2446,7 +2463,16 @@ class AutomationManager:
             log.exception("Failed to read skills from workspace")
             return ""
 
-    async def _assemble_turn_input(self, session_id: str, thread_id: str, *, user_text: str, heartbeat: bool) -> str:
+    async def _assemble_turn_input(
+        self,
+        session_id: str,
+        thread_id: str,
+        *,
+        user_text: str,
+        heartbeat: bool,
+        source_channel: Optional[str] = None,
+        source_chat_key: Optional[str] = None,
+    ) -> str:
         drained = await self._drain_system_events(session_id, thread_id, max_events=20)
         blocks: list[str] = []
 
@@ -2460,6 +2486,18 @@ class AutomationManager:
             skills_block = await self._read_skills_prompt_block()
             if skills_block:
                 blocks.append(skills_block)
+
+        if not heartbeat:
+            ch = source_channel.strip() if isinstance(source_channel, str) else ""
+            ck = source_chat_key.strip() if isinstance(source_chat_key, str) else ""
+            if ch or ck:
+                lines = ["[SOURCE]"]
+                if ch:
+                    lines.append(f"channel: {ch}")
+                if ck:
+                    lines.append(f"chatKey: {ck}")
+                lines.append("[/SOURCE]")
+                blocks.append("\n".join(lines).strip())
 
         if heartbeat:
             blocks.append("HEARTBEAT: You are running a background heartbeat. Read and follow HEARTBEAT.md in # Project Context.")
@@ -3315,7 +3353,7 @@ async def _mcp_handle_single_message(request: Request, body: dict[str, Any]) -> 
                 "title": "Argus Gateway MCP",
                 "version": "0.1.0",
             },
-            "instructions": "This MCP server exposes tools for managing gateway cron jobs and invoking connected nodes.",
+            "instructions": "This MCP server exposes tools for managing gateway cron jobs, sending messages, and invoking connected nodes.",
         }
         return (
             _jsonrpc_result(request_id=request_id, result=result),
@@ -3336,6 +3374,23 @@ async def _mcp_handle_single_message(request: Request, body: dict[str, Any]) -> 
                 "title": "Nodes List",
                 "description": "List connected nodes (devices) and their advertised commands.",
                 "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False},
+            },
+            {
+                "name": "message_send",
+                "title": "Message Send",
+                "description": "Send an outbound message. Currently supports Telegram only. Target uses chatKey format: <chat_id>[:<message_thread_id>].",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "channel": {"type": "string", "description": "Delivery channel (default: telegram)."},
+                        "target": {"type": "string", "description": "Destination chatKey, e.g. '123456789' or '-1001:42'."},
+                        "text": {"type": "string", "description": "Message text to send."},
+                        "format": {"type": "string", "enum": ["plain", "markdown", "html"], "description": "Text format hint (default: markdown)."},
+                        "silent": {"type": "boolean", "description": "Telegram: disable_notification."},
+                    },
+                    "required": ["target", "text"],
+                    "additionalProperties": False,
+                },
             },
             {
                 "name": "cron",
@@ -3398,6 +3453,225 @@ async def _mcp_handle_single_message(request: Request, body: dict[str, Any]) -> 
                     result=_mcp_call_tool_result(
                         content=[{"type": "text", "text": json.dumps({"nodes": nodes}, ensure_ascii=False)}],
                         structured={"nodes": nodes},
+                    ),
+                ),
+                {"MCP-Protocol-Version": sess.protocol_version},
+            )
+
+        if tool_name == "message_send":
+            raw_channel = args.get("channel")
+            channel = str(raw_channel or "telegram").strip().lower()
+            if channel in ("tg", "telegram"):
+                channel = "telegram"
+
+            if channel != "telegram":
+                return (
+                    _jsonrpc_result(
+                        request_id=request_id,
+                        result=_mcp_call_tool_result(
+                            content=[{"type": "text", "text": f"Unsupported channel: {channel}"}],
+                            structured={"ok": False, "error": {"code": "UNSUPPORTED", "field": "channel", "supported": ["telegram"]}},
+                            is_error=True,
+                        ),
+                    ),
+                    {"MCP-Protocol-Version": sess.protocol_version},
+                )
+
+            chat_key = str(args.get("target") or args.get("chatKey") or "").strip()
+            if not chat_key:
+                return (
+                    _jsonrpc_result(
+                        request_id=request_id,
+                        result=_mcp_call_tool_result(
+                            content=[{"type": "text", "text": "Missing required field: target"}],
+                            structured={"ok": False, "error": {"code": "INVALID_ARGUMENT", "field": "target"}},
+                            is_error=True,
+                        ),
+                    ),
+                    {"MCP-Protocol-Version": sess.protocol_version},
+                )
+
+            text_param = args.get("text")
+            if not isinstance(text_param, str) or not text_param.strip():
+                return (
+                    _jsonrpc_result(
+                        request_id=request_id,
+                        result=_mcp_call_tool_result(
+                            content=[{"type": "text", "text": "Missing required field: text"}],
+                            structured={"ok": False, "error": {"code": "INVALID_ARGUMENT", "field": "text"}},
+                            is_error=True,
+                        ),
+                    ),
+                    {"MCP-Protocol-Version": sess.protocol_version},
+                )
+
+            token = os.getenv("TELEGRAM_BOT_TOKEN") or ""
+            if not token.strip():
+                return (
+                    _jsonrpc_result(
+                        request_id=request_id,
+                        result=_mcp_call_tool_result(
+                            content=[{"type": "text", "text": "Missing TELEGRAM_BOT_TOKEN"}],
+                            structured={"ok": False, "error": {"code": "NOT_CONFIGURED", "message": "Missing TELEGRAM_BOT_TOKEN"}},
+                            is_error=True,
+                        ),
+                    ),
+                    {"MCP-Protocol-Version": sess.protocol_version},
+                )
+
+            target = _telegram_target_from_chat_key(chat_key)
+            if target is None:
+                return (
+                    _jsonrpc_result(
+                        request_id=request_id,
+                        result=_mcp_call_tool_result(
+                            content=[{"type": "text", "text": "Invalid target chatKey"}],
+                            structured={"ok": False, "error": {"code": "INVALID_ARGUMENT", "field": "target"}},
+                            is_error=True,
+                        ),
+                    ),
+                    {"MCP-Protocol-Version": sess.protocol_version},
+                )
+
+            allow_unknown = str(os.getenv("ARGUS_MCP_MESSAGE_ALLOW_UNKNOWN_TARGETS") or "").strip().lower() in (
+                "1",
+                "true",
+                "yes",
+                "on",
+            )
+            if not allow_unknown:
+                automation: Optional[AutomationManager] = getattr(app.state, "automation", None)
+                if automation is None:
+                    return (
+                        _jsonrpc_result(
+                            request_id=request_id,
+                            result=_mcp_call_tool_result(
+                                content=[{"type": "text", "text": "Automation is not initialized; cannot validate target"}],
+                                structured={"ok": False, "error": {"code": "NOT_READY", "message": "automation is not initialized"}},
+                                is_error=True,
+                            ),
+                        ),
+                        {"MCP-Protocol-Version": sess.protocol_version},
+                    )
+
+                chat_id = target.get("chat_id")
+                known = False
+                st = automation._store.state
+                for sess_state in (st.sessions or {}).values():
+                    last_active = getattr(sess_state, "last_active_by_thread", None)
+                    if not isinstance(last_active, dict):
+                        continue
+                    for tgt in last_active.values():
+                        ck = getattr(tgt, "chat_key", None)
+                        if not isinstance(ck, str) or not ck.strip():
+                            continue
+                        cand = _telegram_target_from_chat_key(ck)
+                        if cand is None:
+                            continue
+                        if cand.get("chat_id") == chat_id:
+                            known = True
+                            break
+                    if known:
+                        break
+
+                if not known:
+                    return (
+                        _jsonrpc_result(
+                            request_id=request_id,
+                            result=_mcp_call_tool_result(
+                                content=[{"type": "text", "text": "Target not allowed (unknown chatKey). Set ARGUS_MCP_MESSAGE_ALLOW_UNKNOWN_TARGETS=1 to override."}],
+                                structured={"ok": False, "error": {"code": "FORBIDDEN", "field": "target"}},
+                                is_error=True,
+                            ),
+                        ),
+                        {"MCP-Protocol-Version": sess.protocol_version},
+                    )
+
+            raw_format = args.get("format")
+            fmt = str(raw_format or "markdown").strip().lower()
+            silent = bool(args.get("silent")) if args.get("silent") is not None else None
+
+            truncated = _telegram_truncate(text_param.strip())
+            try:
+                if fmt == "html":
+                    try:
+                        res = await _telegram_send_message(
+                            token=token,
+                            target=target,
+                            text=truncated,
+                            parse_mode="HTML",
+                            disable_notification=silent,
+                        )
+                    except Exception as e:  # noqa: BLE001
+                        msg = str(e)
+                        if TELEGRAM_HTML_PARSE_ERR_RE.search(msg) or TELEGRAM_MESSAGE_TOO_LONG_RE.search(msg):
+                            res = await _telegram_send_message(
+                                token=token,
+                                target=target,
+                                text=truncated,
+                                parse_mode=None,
+                                disable_notification=silent,
+                            )
+                        else:
+                            raise
+                elif fmt == "plain":
+                    res = await _telegram_send_message(
+                        token=token,
+                        target=target,
+                        text=truncated,
+                        parse_mode=None,
+                        disable_notification=silent,
+                    )
+                else:
+                    html = _markdown_to_telegram_html(truncated)
+                    if html:
+                        try:
+                            res = await _telegram_send_message(
+                                token=token,
+                                target=target,
+                                text=html,
+                                parse_mode="HTML",
+                                disable_notification=silent,
+                            )
+                        except Exception as e:  # noqa: BLE001
+                            msg = str(e)
+                            if TELEGRAM_HTML_PARSE_ERR_RE.search(msg) or TELEGRAM_MESSAGE_TOO_LONG_RE.search(msg):
+                                res = await _telegram_send_message(
+                                    token=token,
+                                    target=target,
+                                    text=truncated,
+                                    parse_mode=None,
+                                    disable_notification=silent,
+                                )
+                            else:
+                                raise
+                    else:
+                        res = await _telegram_send_message(
+                            token=token,
+                            target=target,
+                            text=truncated,
+                            parse_mode=None,
+                            disable_notification=silent,
+                        )
+            except Exception as e:  # noqa: BLE001
+                return (
+                    _jsonrpc_result(
+                        request_id=request_id,
+                        result=_mcp_call_tool_result(
+                            content=[{"type": "text", "text": f"message_send failed: {e}"}],
+                            structured={"ok": False, "error": {"code": "DELIVERY_FAILED", "message": str(e)}},
+                            is_error=True,
+                        ),
+                    ),
+                    {"MCP-Protocol-Version": sess.protocol_version},
+                )
+
+            return (
+                _jsonrpc_result(
+                    request_id=request_id,
+                    result=_mcp_call_tool_result(
+                        content=[{"type": "text", "text": "Sent"}],
+                        structured={"ok": True, "channel": channel, "target": chat_key, "result": res},
                     ),
                 ),
                 {"MCP-Protocol-Version": sess.protocol_version},
