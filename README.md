@@ -4,6 +4,8 @@
 
 [English](./README.md) | [Chinese](./README_CN.md)
 
+**Why “Argus”?** Argus is named after the hundred‑eyed giant (Argus Panoptes) from Greek mythology. The legend says that even when he slept, he only closed two eyes and the rest stayed awake. The goal of this project is similar: a proactive personal assistant that can keep working when you’re not around (e.g. asleep), via heartbeats, cron jobs, and connected devices.
+
 Argus is a small gateway you run on your own server.
 It lets you talk to an AI assistant in **Telegram**, run background check-ins (heartbeat), schedule tasks (cron), and connect devices (nodes) that can execute actions.
 

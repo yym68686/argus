@@ -1877,7 +1877,7 @@ class AutomationManager:
 
             if isinstance(existing, str) and existing.strip():
                 try:
-                    await self._rpc(live, "thread/resume", {"threadId": existing.strip()})
+                    await self._ensure_thread_loaded_or_resumed(live, existing.strip())
                     return existing.strip()
                 except Exception:
                     log.warning("Failed to resume mainThreadId=%s; will create a new main thread", existing)
@@ -1932,7 +1932,7 @@ class AutomationManager:
             await self._ensure_initialized(live)
 
             # Ensure the thread exists/is loadable in the upstream app-server.
-            await self._rpc(live, "thread/resume", {"threadId": thread_id})
+            await self._ensure_thread_loaded_or_resumed(live, thread_id)
 
             def _save_main(st: PersistedGatewayAutomationState) -> None:
                 if not st.default_session_id:
@@ -2033,7 +2033,7 @@ class AutomationManager:
             try:
                 # `turn/start` fails with "thread not found" if the app-server process hasn't loaded the thread yet
                 # (e.g. after reconnect/restart). Make `argus/input/enqueue` robust by resuming first.
-                await self._rpc(live, "thread/resume", {"threadId": thread_id})
+                await self._ensure_thread_loaded_or_resumed(live, thread_id)
                 assembled = await self._assemble_turn_input(session_id, thread_id, user_text=text, heartbeat=False)
 
                 local_images: list[str] = []
@@ -2295,7 +2295,7 @@ class AutomationManager:
 
             self._mark_lane_busy(lane)
             try:
-                await self._rpc(live, "thread/resume", {"threadId": thread_id})
+                await self._ensure_thread_loaded_or_resumed(live, thread_id)
                 assembled = await self._assemble_turn_input(session_id, thread_id, user_text=merged, heartbeat=False)
 
                 local_images: list[str] = []
@@ -2590,6 +2590,39 @@ class AutomationManager:
             raise RuntimeError(msg or "RPC error")
         return resp.get("result")
 
+    async def _is_thread_loaded(self, live: LiveDockerSession, thread_id: str) -> bool:
+        tid = str(thread_id or "").strip()
+        if not tid:
+            return False
+        cursor: Optional[str] = None
+        for _ in range(20):
+            try:
+                params: dict[str, Any] = {"limit": 200}
+                if cursor:
+                    params["cursor"] = cursor
+                resp = await self._rpc(live, "thread/loaded/list", params)
+            except Exception:
+                return False
+            if not isinstance(resp, dict):
+                return False
+            data = resp.get("data")
+            if isinstance(data, list) and tid in [x for x in data if isinstance(x, str)]:
+                return True
+            nxt = resp.get("nextCursor")
+            if isinstance(nxt, str) and nxt.strip():
+                cursor = nxt.strip()
+                continue
+            break
+        return False
+
+    async def _ensure_thread_loaded_or_resumed(self, live: LiveDockerSession, thread_id: str) -> None:
+        tid = str(thread_id or "").strip()
+        if not tid:
+            raise ValueError("thread_id must not be empty")
+        if await self._is_thread_loaded(live, tid):
+            return
+        await self._rpc(live, "thread/resume", {"threadId": tid})
+
     async def _cron_loop(self) -> None:
         while True:
             try:
@@ -2784,7 +2817,7 @@ class AutomationManager:
 
             self._mark_lane_busy(lane)
             try:
-                await self._rpc(live, "thread/resume", {"threadId": main_tid})
+                await self._ensure_thread_loaded_or_resumed(live, main_tid)
                 assembled = await self._assemble_turn_input(session_id, main_tid, user_text="", heartbeat=True)
                 resp = await self._rpc(
                     live,
