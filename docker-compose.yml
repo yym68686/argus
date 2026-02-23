@@ -73,6 +73,9 @@ services:
     environment:
       TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:-}
       ARGUS_TOKEN: ${ARGUS_TOKEN:-}
+      # Optional: restrict /newmain usage to a comma-separated allowlist of private chat ids.
+      # Example: TELEGRAM_ADMIN_CHAT_IDS=123456789,987654321
+      TELEGRAM_ADMIN_CHAT_IDS: ${TELEGRAM_ADMIN_CHAT_IDS:-}
       HOST: ${HOST:-gateway}
     volumes:
       - telegram-bot-data:/data

@@ -41,6 +41,19 @@ function clampNumber(value, fallback) {
   return Number.isFinite(n) ? n : fallback;
 }
 
+function parseChatIdList(value) {
+  if (!isNonEmptyString(value)) return [];
+  const out = [];
+  for (const part of value.split(",")) {
+    const trimmed = part.trim();
+    if (!trimmed) continue;
+    const n = Number(trimmed);
+    if (!Number.isFinite(n)) continue;
+    out.push(Math.trunc(n));
+  }
+  return out;
+}
+
 async function ensureDirForFile(filePath) {
   const dir = path.dirname(filePath);
   await fs.mkdir(dir, { recursive: true });
@@ -371,6 +384,15 @@ class ArgusClient {
     const result = await this.rpc("argus/thread/main/ensure", {});
     const tid = result?.threadId;
     if (!isNonEmptyString(tid)) throw new Error("Invalid argus/thread/main/ensure response");
+    return tid;
+  }
+
+  async setMainThread(threadId) {
+    if (!isNonEmptyString(threadId)) throw new Error("Missing threadId");
+    await this.initialize();
+    const result = await this.rpc("argus/thread/main/set", { threadId });
+    const tid = result?.threadId;
+    if (!isNonEmptyString(tid)) throw new Error("Invalid argus/thread/main/set response");
     return tid;
   }
 
@@ -717,7 +739,7 @@ function parseCommand(text, botUsername) {
   const cmd = (cmdRaw || "").toLowerCase();
   if (!cmd) return null;
   if (at && botUsername && at.toLowerCase() !== botUsername.toLowerCase()) return null;
-  if (cmd === "new" || cmd === "where" || cmd === "help" || cmd === "start") return cmd;
+  if (cmd === "new" || cmd === "newmain" || cmd === "where" || cmd === "help" || cmd === "start") return cmd;
   return null;
 }
 
@@ -1010,6 +1032,9 @@ async function main() {
 
   const argusToken = isNonEmptyString(process.env.ARGUS_TOKEN) ? process.env.ARGUS_TOKEN : null;
   const cwd = process.env.ARGUS_CWD || "/root/.argus/workspace";
+  const adminChatIds = new Set(
+    parseChatIdList(process.env.TELEGRAM_ADMIN_CHAT_IDS || "")
+  );
   const statePathEnv = stripOuterQuotes(process.env.STATE_PATH);
   let statePath;
   if (isNonEmptyString(statePathEnv)) {
@@ -1029,7 +1054,8 @@ async function main() {
   const commandMenu = [
     { command: "help", description: "Show help" },
     { command: "where", description: "Show current session/thread mapping" },
-    { command: "new", description: "Start a new thread" }
+    { command: "new", description: "Start a new thread" },
+    { command: "newmain", description: "Start a new main thread (private chat)" }
   ];
   try {
     try {
@@ -1260,6 +1286,7 @@ async function main() {
       const typingTarget = typingTargetFromMessage(message);
       const chatKey = chatKeyFromMessage(message);
       if (!target || !chatKey) continue;
+      const chatType = message?.chat?.type;
 
       const text = isNonEmptyString(message.text)
         ? message.text
@@ -1301,6 +1328,29 @@ async function main() {
             return;
           }
 
+          if (cmd === "newmain") {
+            const chatId = chatIdFromChatKey(chatKey);
+            if (chatType !== "private" || !Number.isFinite(chatId) || chatId <= 0) {
+              await tg.sendMessage({ ...target, text: "只能在私聊中使用 /newmain（群聊/话题请用 /new）。" });
+              typing.stop(chatKey);
+              return;
+            }
+            if (adminChatIds.size > 0 && !adminChatIds.has(Math.trunc(chatId))) {
+              await tg.sendMessage({ ...target, text: "该命令未授权（需要在 TELEGRAM_ADMIN_CHAT_IDS 白名单中）。" });
+              typing.stop(chatKey);
+              return;
+            }
+
+            const tid = await argus.startThread();
+            const mainTid = await argus.setMainThread(tid);
+            await state.setThreadId(chatKey, mainTid);
+            await state.setLastActiveChatKey(mainTid, chatKey);
+            await alignPrivateChatsToMainThread(mainTid);
+            await tg.sendMessage({ ...target, text: `ok (new main thread): ${mainTid}` });
+            typing.stop(chatKey);
+            return;
+          }
+
           if (cmd === "help" || cmd === "start") {
             const tid = state.getThreadId(chatKey);
             const sid = state.state.defaultSessionId;
@@ -1309,6 +1359,7 @@ async function main() {
               "/help — show this help",
               "/where — show session/thread ids (debug)",
               "/new — start a new thread",
+              "/newmain — start a new main thread (private chat)",
               "",
               "Notes:",
               "- In private chat, messages go to the session main thread.",
@@ -1341,7 +1392,6 @@ async function main() {
 
           const userText = userLines.join("\n");
 
-          const chatType = message?.chat?.type;
           let threadId = state.getThreadId(chatKey);
           let enqueueTarget = null;
 

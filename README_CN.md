@@ -37,12 +37,14 @@ docker compose --profile tg up --build
 - 打开 Telegram → 私聊你的 bot
 - 发送 `/where`（查看当前 `sessionId` / `threadId`）
 - 发送 `/new`（为当前 chat 新开一个 thread）
+- 发送 `/newmain`（为该 session 新开并切换 main thread；会影响 heartbeat 与私聊）
 - 直接发一句话测试
 
 备注：
 
 - 如果你希望 bot 在群里对“所有消息”都触发回复，需要在 BotFather 里关闭 **Group Privacy**。
 - 出站回复由 **gateway** 统一投递（每轮 turn 只发 1 条最终文本）；bot 负责入站消息与 “typing…” 指示。
+- 如果设置了 `TELEGRAM_ADMIN_CHAT_IDS`，则只有白名单里的私聊 chat id 才能使用 `/newmain`。
 
 停止：
 

@@ -37,12 +37,14 @@ docker compose --profile tg up --build
 - Open Telegram → DM your bot
 - Run `/where` (shows the current `sessionId` / `threadId`)
 - Run `/new` (starts a new thread for this chat)
+- Run `/newmain` (starts a new main thread for this session; affects heartbeat + private chats)
 - Send a message
 
 Notes:
 
 - If you want the bot to respond to all group messages, disable **Group Privacy** in BotFather.
 - Outbound replies are delivered by the **gateway** (one final message per turn). The bot handles inbound messages + typing indicators.
+- If you set `TELEGRAM_ADMIN_CHAT_IDS`, only those private chat ids can run `/newmain`.
 
 Stop:
 

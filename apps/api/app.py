@@ -1917,6 +1917,45 @@ class AutomationManager:
             await self._store.update(_save_main)
             return tid
 
+    async def set_main_thread(self, session_id: str, thread_id: str) -> str:
+        thread_id = thread_id.strip() if isinstance(thread_id, str) else ""
+        if not thread_id:
+            raise ValueError("thread_id must not be empty")
+
+        lock = self._main_thread_locks.get(session_id)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._main_thread_locks[session_id] = lock
+
+        async with lock:
+            live, _ = await _ensure_live_docker_session(session_id, allow_create=True)
+            await self._ensure_initialized(live)
+
+            # Ensure the thread exists/is loadable in the upstream app-server.
+            await self._rpc(live, "thread/resume", {"threadId": thread_id})
+
+            def _save_main(st: PersistedGatewayAutomationState) -> None:
+                if not st.default_session_id:
+                    st.default_session_id = session_id
+                sess = st.sessions.get(session_id)
+                if sess is None:
+                    sess = PersistedSessionAutomation()
+                    st.sessions[session_id] = sess
+                prev_tid = sess.main_thread_id
+                sess.main_thread_id = thread_id
+                if prev_tid and prev_tid != thread_id:
+                    # Migrate pending system events to the new main thread so they don't get stuck.
+                    old_q = sess.system_event_queues.pop(prev_tid, None)
+                    if old_q:
+                        new_q = sess.system_event_queues.get(thread_id)
+                        if new_q is None:
+                            sess.system_event_queues[thread_id] = old_q
+                        else:
+                            new_q.extend(old_q)
+
+            await self._store.update(_save_main)
+            return thread_id
+
     async def enqueue_user_input(
         self,
         *,
@@ -5471,6 +5510,18 @@ async def ws_proxy(ws: WebSocket):
                             tid = await automation.ensure_main_thread(session_id)
                             if has_id:
                                 await ws.send_text(json.dumps({"id": req_id, "result": {"threadId": tid}}))
+                            continue
+                        if method == "argus/thread/main/set":
+                            raw_tid = params.get("threadId")
+                            if not isinstance(raw_tid, str) or not raw_tid.strip():
+                                if has_id:
+                                    await ws.send_text(
+                                        json.dumps({"id": req_id, "error": {"code": -32602, "message": "Missing 'threadId'"}})
+                                    )
+                                continue
+                            tid = await automation.set_main_thread(session_id, raw_tid.strip())
+                            if has_id:
+                                await ws.send_text(json.dumps({"id": req_id, "result": {"ok": True, "threadId": tid}}))
                             continue
                         if method == "argus/input/enqueue":
                             telegram_images = params.get("telegramImages")
