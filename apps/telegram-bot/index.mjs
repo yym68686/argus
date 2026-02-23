@@ -529,9 +529,12 @@ class ArgusClient {
     await this.rpc("thread/resume", { threadId });
   }
 
-  async enqueueInput({ text, threadId, target, source }) {
-    if (!isNonEmptyString(text)) throw new Error("Missing text");
-    const params = { text };
+  async enqueueInput({ text, threadId, target, source, telegramImages }) {
+    const images = Array.isArray(telegramImages) ? telegramImages : [];
+    const hasText = isNonEmptyString(text);
+    if (!hasText && images.length === 0) throw new Error("Missing text");
+    const params = { text: hasText ? text : "" };
+    if (images.length > 0) params.telegramImages = images;
     if (isNonEmptyString(threadId)) params.threadId = threadId;
     if (isNonEmptyString(target)) params.target = target;
     if (source && typeof source === "object" && !Array.isArray(source)) {
@@ -724,6 +727,43 @@ function extractReplyText(message) {
   if (isNonEmptyString(reply.text)) return reply.text;
   if (isNonEmptyString(reply.caption)) return reply.caption;
   return null;
+}
+
+function extractTelegramImagesFromMessage(message) {
+  const out = [];
+  if (!message || typeof message !== "object") return out;
+
+  const photos = Array.isArray(message.photo) ? message.photo : null;
+  if (photos && photos.length > 0) {
+    const best = photos[photos.length - 1];
+    if (best && typeof best === "object" && isNonEmptyString(best.file_id)) {
+      out.push({
+        kind: "photo",
+        fileId: best.file_id,
+        fileUniqueId: isNonEmptyString(best.file_unique_id) ? best.file_unique_id : null,
+        fileName: null,
+        mimeType: null,
+        fileSize: typeof best.file_size === "number" ? best.file_size : null,
+      });
+    }
+  }
+
+  const doc = message.document;
+  if (doc && typeof doc === "object" && isNonEmptyString(doc.file_id)) {
+    const mimeType = isNonEmptyString(doc.mime_type) ? doc.mime_type : null;
+    if (mimeType && mimeType.startsWith("image/")) {
+      out.push({
+        kind: "document",
+        fileId: doc.file_id,
+        fileUniqueId: isNonEmptyString(doc.file_unique_id) ? doc.file_unique_id : null,
+        fileName: isNonEmptyString(doc.file_name) ? doc.file_name : null,
+        mimeType,
+        fileSize: typeof doc.file_size === "number" ? doc.file_size : null,
+      });
+    }
+  }
+
+  return out;
 }
 
 function truncateTelegramMessage(text) {
@@ -1221,9 +1261,17 @@ async function main() {
       const chatKey = chatKeyFromMessage(message);
       if (!target || !chatKey) continue;
 
-      const text = isNonEmptyString(message.text) ? message.text : null;
+      const text = isNonEmptyString(message.text)
+        ? message.text
+        : isNonEmptyString(message.caption)
+          ? message.caption
+          : null;
       const cmd = parseCommand(text || "", botUsername);
-      const replyText = extractReplyText(message);
+
+      const messageImages = extractTelegramImagesFromMessage(message).map((img) => ({ ...img, source: "message" }));
+      const replyTextRaw = extractReplyText(message);
+      const replyImages = extractTelegramImagesFromMessage(message?.reply_to_message).map((img) => ({ ...img, source: "reply" }));
+      const replyText = replyTextRaw || (replyImages.length > 0 ? "<media:image>" : null);
 
       // Show typing cue immediately; Telegram requires periodic refresh for long runs.
       // Note: sendChatAction accepts message_thread_id=1 (General topic), while sendMessage may not.
@@ -1272,15 +1320,26 @@ async function main() {
             return;
           }
 
-          if (!isNonEmptyString(text)) {
-            await tg.sendMessage({ ...target, text: "暂不支持该消息类型（目前仅支持文本）。" });
+          if (!isNonEmptyString(text) && messageImages.length == 0 && replyImages.length == 0) {
+            await tg.sendMessage({ ...target, text: "暂不支持该消息类型（目前仅支持文本/图片）。" });
             typing.stop(chatKey);
             return;
           }
 
-          const userText = replyText && !cmd
-            ? ["REPLY_TO:", replyText, "", "USER:", text].join("\n")
-            : text;
+          const userBody = isNonEmptyString(text) ? text : "<media:image>";
+
+          const userLines = [];
+          if (replyText && !cmd) {
+            userLines.push("REPLY_TO:", replyText);
+            if (replyImages.length > 0) userLines.push(`[reply attachments: ${replyImages.length} image(s)]`);
+            userLines.push("");
+            userLines.push("USER:", userBody);
+          } else {
+            userLines.push(userBody);
+          }
+          if (messageImages.length > 0) userLines.push(`[attachments: ${messageImages.length} image(s)]`);
+
+          const userText = userLines.join("\n");
 
           const chatType = message?.chat?.type;
           let threadId = state.getThreadId(chatKey);
@@ -1300,7 +1359,8 @@ async function main() {
             text: userText,
             threadId,
             target: enqueueTarget,
-            source: { channel: "telegram", chatKey }
+            source: { channel: "telegram", chatKey },
+            telegramImages: [...replyImages, ...messageImages],
           });
           const effectiveThreadId = isNonEmptyString(res?.threadId) ? res.threadId : threadId;
           if (isNonEmptyString(effectiveThreadId)) {

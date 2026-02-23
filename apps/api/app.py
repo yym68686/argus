@@ -293,6 +293,17 @@ def _atomic_write_bytes(path: Path, content: bytes) -> None:
     tmp.write_bytes(content)
     tmp.replace(path)
 
+def _sanitize_path_part(raw: str, *, fallback: str = 'x', max_len: int = 64) -> str:
+    s = str(raw or '').strip()
+    if not s:
+        return fallback
+    s = re.sub(r'[^a-zA-Z0-9._-]+', '_', s)
+    s = s.strip('._-')
+    if not s:
+        return fallback
+    return s[:max_len]
+
+
 
 HEARTBEAT_FILENAME = "HEARTBEAT.md"
 HEARTBEAT_TASKS_INTERVAL_MS = 30 * 60 * 1000
@@ -301,6 +312,7 @@ HEARTBEAT_ACK_MAX_CHARS = 300
 
 TELEGRAM_MAX_MESSAGE_CHARS = 4000
 TELEGRAM_MAX_UPLOAD_BYTES = 50 * 1024 * 1024
+TELEGRAM_MAX_DOWNLOAD_BYTES = 20 * 1024 * 1024
 TELEGRAM_THREAD_NOT_FOUND_RE = re.compile(r"message thread not found", re.IGNORECASE)
 MEDIA_LINE_RE = re.compile(r"^\s*MEDIA:\s*(.*?)\s*$", re.IGNORECASE)
 MARKDOWN_FENCE_RE = re.compile(r"^\s*```")
@@ -670,6 +682,50 @@ def _telegram_api_call_sync(token: str, method: str, params: dict[str, Any]) -> 
         desc = data.get("description") or "unknown error"
         raise RuntimeError(f"Telegram {method} failed: {desc}")
     return data.get("result")
+
+def _telegram_get_file_sync(token: str, file_id: str) -> dict[str, Any]:
+    res = _telegram_api_call_sync(token, "getFile", {"file_id": file_id})
+    if not isinstance(res, dict):
+        raise RuntimeError("Telegram getFile failed: bad response")
+    return res
+
+
+def _telegram_download_file_to_path_sync(token: str, file_path: str, dest: Path, *, max_bytes: int) -> int:
+    if not isinstance(token, str) or not token.strip():
+        raise RuntimeError("Missing TELEGRAM_BOT_TOKEN")
+    if not isinstance(file_path, str) or not file_path.strip():
+        raise RuntimeError("Missing Telegram file_path")
+    if not isinstance(dest, Path):
+        raise RuntimeError("Invalid destination path")
+
+    url = f"https://api.telegram.org/file/bot{token.strip()}/{file_path.lstrip('/')}"
+    req = urllib.request.Request(url, method="GET")
+    total = 0
+
+    try:
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            tmp = dest.with_suffix(dest.suffix + ".tmp")
+            with tmp.open("wb") as f:
+                while True:
+                    chunk = resp.read(1024 * 64)
+                    if not chunk:
+                        break
+                    total += len(chunk)
+                    if total > max_bytes:
+                        raise RuntimeError(f"Telegram file too large (> {max_bytes} bytes)")
+                    f.write(chunk)
+            tmp.replace(dest)
+            return total
+    except urllib.error.HTTPError as e:
+        try:
+            raw = e.read().decode("utf-8", errors="replace")
+        except Exception:
+            raw = ""
+        raise RuntimeError(f"Telegram file download failed: HTTP {e.code} {raw}".strip()) from e
+    except Exception as e:
+        raise RuntimeError(f"Telegram file download failed: {e}") from e
+
 
 def _telegram_api_call_multipart_sync(
     token: str,
@@ -1219,7 +1275,7 @@ class ThreadLane:
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     busy: bool = False
     active_turn_id: Optional[str] = None
-    followups: deque[str] = field(default_factory=deque)
+    followups: deque[Any] = field(default_factory=deque)
     busy_since_ms: Optional[int] = None
     last_progress_at_ms: Optional[int] = None
     last_unstick_attempt_at_ms: Optional[int] = None
@@ -1870,7 +1926,17 @@ class AutomationManager:
         text: str,
         source_channel: Optional[str] = None,
         source_chat_key: Optional[str] = None,
+        telegram_images: Optional[list[dict[str, Any]]] = None,
     ) -> dict[str, Any]:
+        if telegram_images is not None and not isinstance(telegram_images, list):
+            telegram_images = None
+        if telegram_images:
+            telegram_images = [x for x in telegram_images if isinstance(x, dict)]
+            if not telegram_images:
+                telegram_images = None
+
+        if not text.strip() and telegram_images:
+            text = "<media:image>"
         if not text.strip():
             raise ValueError("text must not be empty")
 
@@ -1904,7 +1970,7 @@ class AutomationManager:
 
         # If busy, enqueue follow-up (next turn).
         if lane.busy:
-            lane.followups.append(text)
+            lane.followups.append({"text": text, "source_channel": source_channel, "source_chat_key": source_chat_key, "telegram_images": telegram_images})
             return {
                 "ok": True,
                 "threadId": thread_id,
@@ -1915,7 +1981,7 @@ class AutomationManager:
 
         async with lane.lock:
             if lane.busy:
-                lane.followups.append(text)
+                lane.followups.append({"text": text, "source_channel": source_channel, "source_chat_key": source_chat_key, "telegram_images": telegram_images})
                 return {
                     "ok": True,
                     "threadId": thread_id,
@@ -1930,12 +1996,29 @@ class AutomationManager:
                 # (e.g. after reconnect/restart). Make `argus/input/enqueue` robust by resuming first.
                 await self._rpc(live, "thread/resume", {"threadId": thread_id})
                 assembled = await self._assemble_turn_input(session_id, thread_id, user_text=text, heartbeat=False)
+
+                local_images: list[str] = []
+                if (
+                    telegram_images
+                    and isinstance(source_channel, str)
+                    and source_channel.strip().lower() in ("telegram", "tg")
+                ):
+                    local_images = await self._prepare_telegram_local_images(
+                        session_id=session_id,
+                        source_chat_key=source_chat_key,
+                        telegram_images=telegram_images,
+                    )
+
+                input_items: list[dict[str, Any]] = [{"type": "text", "text": assembled}]
+                for pth in local_images:
+                    input_items.append({"type": "localImage", "path": pth})
+
                 resp = await self._rpc(
                     live,
                     "turn/start",
                     {
                         "threadId": thread_id,
-                        "input": [{"type": "text", "text": assembled}],
+                        "input": input_items,
                         "cwd": live.cfg.workspace_container_path,
                         "approvalPolicy": "never",
                         "sandboxPolicy": {"type": "dangerFullAccess"},
@@ -1955,6 +2038,114 @@ class AutomationManager:
             except Exception:
                 self._mark_lane_idle(lane)
                 raise
+
+    async def _prepare_telegram_local_images(
+        self,
+        *,
+        session_id: str,
+        source_chat_key: Optional[str],
+        telegram_images: list[dict[str, Any]],
+    ) -> list[str]:
+        if not telegram_images:
+            return []
+
+        token = os.getenv("TELEGRAM_BOT_TOKEN") or ""
+        if not token.strip():
+            return []
+
+        root = self._workspace_root()
+        if root is None:
+            return []
+
+        chat_part = _sanitize_path_part(source_chat_key or session_id or "unknown", fallback="unknown")
+        base_dir = root / "inbox" / "telegram" / chat_part
+        try:
+            base_dir.mkdir(parents=True, exist_ok=True)
+        except Exception:
+            pass
+
+        mime_to_ext = {
+            "image/png": ".png",
+            "image/jpeg": ".jpg",
+            "image/jpg": ".jpg",
+            "image/webp": ".webp",
+            "image/bmp": ".bmp",
+        }
+
+        out: list[str] = []
+        seen: set[str] = set()
+
+        for idx, ref in enumerate(telegram_images[:8], start=1):
+            if not isinstance(ref, dict):
+                continue
+            file_id = ref.get("fileId") or ref.get("file_id")
+            if not isinstance(file_id, str) or not file_id.strip():
+                continue
+            file_id = file_id.strip()
+            if file_id in seen:
+                continue
+            seen.add(file_id)
+
+            unique_id = ref.get("fileUniqueId") or ref.get("file_unique_id") or file_id
+            if not isinstance(unique_id, str) or not unique_id.strip():
+                unique_id = file_id
+            unique_part = _sanitize_path_part(unique_id, fallback=file_id)
+
+            source = ref.get("source") or "message"
+            if not isinstance(source, str) or not source.strip():
+                source = "message"
+            source_part = _sanitize_path_part(source, fallback="message", max_len=16)
+
+            file_name = ref.get("fileName") or ref.get("file_name")
+            mime_type = ref.get("mimeType") or ref.get("mime_type")
+
+            try:
+                info = await asyncio.to_thread(_telegram_get_file_sync, token, file_id)
+            except Exception as e:
+                log.warning("Telegram getFile failed for fileId=%s: %s", file_id, str(e))
+                continue
+
+            file_path = info.get("file_path") if isinstance(info, dict) else None
+            if not isinstance(file_path, str) or not file_path.strip():
+                log.warning("Telegram getFile missing file_path for fileId=%s", file_id)
+                continue
+
+            file_size = info.get("file_size") if isinstance(info, dict) else None
+            if isinstance(file_size, int) and file_size > TELEGRAM_MAX_DOWNLOAD_BYTES:
+                log.warning("Telegram file too large for fileId=%s size=%s", file_id, file_size)
+                continue
+
+            ext = Path(file_path).suffix.lower()
+            if not ext and isinstance(file_name, str) and file_name.strip():
+                ext = Path(file_name.strip()).suffix.lower()
+            if not ext and isinstance(mime_type, str) and mime_type.strip():
+                ext = mime_to_ext.get(mime_type.strip().lower(), "")
+            if not ext:
+                ext = ".jpg"
+            if not ext.startswith(".") or len(ext) > 10:
+                ext = ".jpg"
+
+            ts = _now_ms()
+            dest = base_dir / f"{ts}_{idx:02d}_{source_part}_{unique_part}{ext}"
+            try:
+                await asyncio.to_thread(
+                    _telegram_download_file_to_path_sync,
+                    token,
+                    file_path,
+                    dest,
+                    max_bytes=TELEGRAM_MAX_DOWNLOAD_BYTES,
+                )
+            except Exception as e:
+                log.warning("Telegram download failed for fileId=%s: %s", file_id, str(e))
+                continue
+
+            try:
+                rel = dest.relative_to(root).as_posix()
+            except Exception:
+                rel = str(dest)
+            out.append(rel)
+
+        return out
 
     async def enqueue_system_event(
         self,
@@ -2034,10 +2225,31 @@ class AutomationManager:
                 return
             if not lane.followups:
                 return
-            followups: list[str] = []
+            followup_texts: list[str] = []
+            telegram_images: list[dict[str, Any]] = []
+            telegram_channel: Optional[str] = None
+            telegram_chat_key: Optional[str] = None
+
             while lane.followups:
-                followups.append(lane.followups.popleft())
-            merged = self._format_followups(followups)
+                item = lane.followups.popleft()
+                if isinstance(item, str):
+                    followup_texts.append(item)
+                    continue
+                if not isinstance(item, dict):
+                    continue
+                t = item.get("text")
+                if isinstance(t, str) and t.strip():
+                    followup_texts.append(t)
+                ch = item.get("source_channel")
+                ck = item.get("source_chat_key")
+                if isinstance(ch, str) and ch.strip():
+                    telegram_channel = ch.strip()
+                if isinstance(ck, str) and ck.strip():
+                    telegram_chat_key = ck.strip()
+                imgs = item.get("telegram_images")
+                if isinstance(imgs, list):
+                    telegram_images.extend([x for x in imgs if isinstance(x, dict)])
+            merged = self._format_followups(followup_texts)
 
             live, _ = await _ensure_live_docker_session(session_id, allow_create=True)
             await self._ensure_initialized(live)
@@ -2046,12 +2258,29 @@ class AutomationManager:
             try:
                 await self._rpc(live, "thread/resume", {"threadId": thread_id})
                 assembled = await self._assemble_turn_input(session_id, thread_id, user_text=merged, heartbeat=False)
+
+                local_images: list[str] = []
+                if (
+                    telegram_images
+                    and isinstance(telegram_channel, str)
+                    and telegram_channel.strip().lower() in ("telegram", "tg")
+                ):
+                    local_images = await self._prepare_telegram_local_images(
+                        session_id=session_id,
+                        source_chat_key=telegram_chat_key,
+                        telegram_images=telegram_images,
+                    )
+
+                input_items: list[dict[str, Any]] = [{"type": "text", "text": assembled}]
+                for pth in local_images:
+                    input_items.append({"type": "localImage", "path": pth})
+
                 resp = await self._rpc(
                     live,
                     "turn/start",
                     {
                         "threadId": thread_id,
-                        "input": [{"type": "text", "text": assembled}],
+                        "input": input_items,
                         "cwd": live.cfg.workspace_container_path,
                         "approvalPolicy": "never",
                         "sandboxPolicy": {"type": "dangerFullAccess"},
@@ -5244,13 +5473,26 @@ async def ws_proxy(ws: WebSocket):
                                 await ws.send_text(json.dumps({"id": req_id, "result": {"threadId": tid}}))
                             continue
                         if method == "argus/input/enqueue":
+                            telegram_images = params.get("telegramImages")
+                            if not isinstance(telegram_images, list):
+                                telegram_images = None
+                            else:
+                                telegram_images = [x for x in telegram_images if isinstance(x, dict)]
+                                if not telegram_images:
+                                    telegram_images = None
+
                             text_param = params.get("text")
-                            if not isinstance(text_param, str) or not text_param.strip():
-                                if has_id:
-                                    await ws.send_text(
-                                        json.dumps({"id": req_id, "error": {"code": -32602, "message": "Missing 'text'"}})
-                                    )
-                                continue
+                            if not isinstance(text_param, str):
+                                text_param = ""
+                            if not text_param.strip():
+                                if telegram_images:
+                                    text_param = "<media:image>"
+                                else:
+                                    if has_id:
+                                        await ws.send_text(
+                                            json.dumps({"id": req_id, "error": {"code": -32602, "message": "Missing 'text'"}})
+                                        )
+                                    continue
                             source_channel = None
                             source_chat_key = None
                             source = params.get("source")
@@ -5268,6 +5510,7 @@ async def ws_proxy(ws: WebSocket):
                                 text=text_param,
                                 source_channel=source_channel,
                                 source_chat_key=source_chat_key,
+                                telegram_images=telegram_images,
                             )
                             if has_id:
                                 await ws.send_text(json.dumps({"id": req_id, "result": res}))
