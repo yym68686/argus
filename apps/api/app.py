@@ -8,7 +8,7 @@ import uuid
 import urllib.error
 import urllib.request
 from collections import deque
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
@@ -1119,6 +1119,57 @@ class PersistedLastActiveTarget:
         return PersistedLastActiveTarget(channel=channel, chat_key=chat_key, at_ms=at_ms_int)
 
 
+AGENT_ID_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9_-]{0,63}$")
+
+
+def _normalize_agent_id(raw: Any) -> str:
+    if not isinstance(raw, str):
+        return ""
+    agent_id = raw.strip().lower()
+    if not agent_id:
+        return ""
+    if not AGENT_ID_RE.match(agent_id):
+        return ""
+    return agent_id
+
+
+@dataclass
+class PersistedAgentRuntime:
+    agent_id: str
+    session_id: str
+    workspace_host_path: str
+    created_at_ms: int
+
+    def to_json(self) -> dict[str, Any]:
+        return {
+            "agentId": self.agent_id,
+            "sessionId": self.session_id,
+            "workspaceHostPath": self.workspace_host_path,
+            "createdAtMs": int(self.created_at_ms),
+        }
+
+    @staticmethod
+    def from_json(obj: Any) -> Optional["PersistedAgentRuntime"]:
+        if not isinstance(obj, dict):
+            return None
+        agent_id = _normalize_agent_id(obj.get("agentId"))
+        session_id = str(obj.get("sessionId") or "").strip()
+        workspace_host_path = str(obj.get("workspaceHostPath") or "").strip()
+        created_at_ms = obj.get("createdAtMs")
+        try:
+            created_at_int = int(created_at_ms) if created_at_ms is not None else _now_ms()
+        except Exception:
+            created_at_int = _now_ms()
+        if not agent_id or not session_id or not workspace_host_path:
+            return None
+        return PersistedAgentRuntime(
+            agent_id=agent_id,
+            session_id=session_id,
+            workspace_host_path=workspace_host_path,
+            created_at_ms=created_at_int,
+        )
+
+
 @dataclass
 class PersistedSessionAutomation:
     main_thread_id: Optional[str] = None
@@ -1194,15 +1245,19 @@ class PersistedSessionAutomation:
 
 @dataclass
 class PersistedGatewayAutomationState:
-    version: int = 1
+    version: int = 2
     default_session_id: Optional[str] = None
     sessions: dict[str, PersistedSessionAutomation] = field(default_factory=dict)
+    agents: dict[str, PersistedAgentRuntime] = field(default_factory=dict)
+    chat_bindings: dict[str, str] = field(default_factory=dict)
 
     def to_json(self) -> dict[str, Any]:
         return {
             "version": int(self.version),
             "defaultSessionId": self.default_session_id,
             "sessions": {sid: sess.to_json() for sid, sess in self.sessions.items()},
+            "agents": {aid: a.to_json() for aid, a in self.agents.items()},
+            "chatBindings": dict(self.chat_bindings),
         }
 
     @staticmethod
@@ -1224,10 +1279,37 @@ class PersistedGatewayAutomationState:
                 if not isinstance(sid, str) or not sid.strip():
                     continue
                 sessions[sid.strip()] = PersistedSessionAutomation.from_json(v)
+
+        agents_raw = obj.get("agents")
+        agents: dict[str, PersistedAgentRuntime] = {}
+        if isinstance(agents_raw, dict):
+            for aid, raw_agent in agents_raw.items():
+                aid_norm = _normalize_agent_id(aid)
+                agent = PersistedAgentRuntime.from_json(raw_agent)
+                if agent is None:
+                    continue
+                key = aid_norm or agent.agent_id
+                if not key:
+                    continue
+                agents[key] = agent
+
+        chat_bindings_raw = obj.get("chatBindings")
+        chat_bindings: dict[str, str] = {}
+        if isinstance(chat_bindings_raw, dict):
+            for ck, aid in chat_bindings_raw.items():
+                if not isinstance(ck, str) or not ck.strip():
+                    continue
+                agent_id = _normalize_agent_id(aid)
+                if not agent_id:
+                    continue
+                chat_bindings[ck.strip()] = agent_id
+
         return PersistedGatewayAutomationState(
             version=version_int,
             default_session_id=default_session_id.strip() if isinstance(default_session_id, str) else None,
             sessions=sessions,
+            agents=agents,
+            chat_bindings=chat_bindings,
         )
 
 
@@ -1294,6 +1376,8 @@ class AutomationManager:
     ) -> None:
         self._store = state_store
         self._home_host_path = home_host_path
+        # Back-compat: previously this was the single workspace root for all sessions.
+        # After multi-agent support, this is treated as a best-effort fallback only.
         self._workspace_host_path = workspace_host_path
 
         self._lanes: dict[tuple[str, str], ThreadLane] = {}
@@ -1311,12 +1395,161 @@ class AutomationManager:
 
     async def start(self) -> None:
         await self._store.load()
+        await self._ensure_main_agent()
         await self._ensure_workspace_files()
         await self._restore_default_session_if_singleton()
         await self._prune_persisted_sessions()
         self._tasks.append(asyncio.create_task(self._cron_loop()))
         self._tasks.append(asyncio.create_task(self._heartbeat_loop()))
         self._tasks.append(asyncio.create_task(self._lane_watchdog_loop()))
+
+    def get_workspace_host_path_for_session(self, session_id: str) -> Optional[str]:
+        sid = session_id.strip() if isinstance(session_id, str) else ""
+        if not sid:
+            return None
+        st = self._store.state
+        for agent in (st.agents or {}).values():
+            if not isinstance(agent, PersistedAgentRuntime):
+                continue
+            if agent.session_id == sid and agent.workspace_host_path:
+                return agent.workspace_host_path
+        return None
+
+    def resolve_agent_for_chat_key(self, chat_key: str) -> str:
+        ck = chat_key.strip() if isinstance(chat_key, str) else ""
+        if not ck:
+            return "main"
+        st = self._store.state
+        agent_id = st.chat_bindings.get(ck) if isinstance(st.chat_bindings, dict) else None
+        agent_id = _normalize_agent_id(agent_id) if isinstance(agent_id, str) else ""
+        return agent_id or "main"
+
+    def resolve_agent_session_id(self, agent_id: str) -> Optional[str]:
+        aid = _normalize_agent_id(agent_id)
+        if not aid:
+            return None
+        st = self._store.state
+        agent = st.agents.get(aid) if isinstance(st.agents, dict) else None
+        if isinstance(agent, PersistedAgentRuntime) and isinstance(agent.session_id, str) and agent.session_id.strip():
+            return agent.session_id.strip()
+        return None
+
+    def resolve_session_id_for_chat_key(self, chat_key: str) -> Optional[str]:
+        aid = self.resolve_agent_for_chat_key(chat_key)
+        return self.resolve_agent_session_id(aid) or self._store.state.default_session_id
+
+    async def create_agent(self, *, agent_id: str) -> PersistedAgentRuntime:
+        if _provision_mode() != "docker":
+            raise RuntimeError("Agent containers are only supported in docker provision mode")
+        aid = _normalize_agent_id(agent_id)
+        if not aid:
+            raise ValueError("Invalid agentId (must match [a-zA-Z0-9][a-zA-Z0-9_-]{0,63})")
+        if aid == "main":
+            raise ValueError("agentId 'main' is reserved")
+        if not self._home_host_path:
+            raise RuntimeError("ARGUS_HOME_HOST_PATH is required to create agents")
+
+        workspace_host_path = str((Path(self._home_host_path) / f"workspace-{aid}").resolve())
+        session_id = uuid.uuid4().hex[:12]
+        created_at_ms = _now_ms()
+
+        def _write(st: PersistedGatewayAutomationState) -> None:
+            st.version = max(int(getattr(st, "version", 1) or 1), 2)
+            if aid in st.agents:
+                raise ValueError(f"Agent already exists: {aid}")
+            st.agents[aid] = PersistedAgentRuntime(
+                agent_id=aid,
+                session_id=session_id,
+                workspace_host_path=workspace_host_path,
+                created_at_ms=created_at_ms,
+            )
+            if session_id not in st.sessions:
+                st.sessions[session_id] = PersistedSessionAutomation()
+
+        await self._store.update(_write)
+        await self._ensure_workspace_files_at(Path(workspace_host_path), legacy_home=None)
+        # Eagerly create the container so /newagent immediately works even before first user message.
+        await _ensure_live_docker_session(session_id, allow_create=True)
+        agent = self._store.state.agents.get(aid)
+        if not isinstance(agent, PersistedAgentRuntime):
+            raise RuntimeError("Failed to persist agent")
+        return agent
+
+    async def bind_chat_to_agent(self, *, chat_key: str, agent_id: str) -> PersistedAgentRuntime:
+        ck = chat_key.strip() if isinstance(chat_key, str) else ""
+        if not ck:
+            raise ValueError("Missing chatKey")
+        aid = _normalize_agent_id(agent_id)
+        if not aid:
+            raise ValueError("Invalid agentId")
+
+        def _write(st: PersistedGatewayAutomationState) -> None:
+            st.version = max(int(getattr(st, "version", 1) or 1), 2)
+            if aid not in st.agents:
+                raise ValueError(f"Unknown agent: {aid}")
+            st.chat_bindings[ck] = aid
+
+        await self._store.update(_write)
+        agent = self._store.state.agents.get(aid)
+        if not isinstance(agent, PersistedAgentRuntime):
+            raise RuntimeError("Agent not found after update")
+        return agent
+
+    def list_agents(self) -> list[dict[str, Any]]:
+        st = self._store.state
+        out: list[dict[str, Any]] = []
+        for aid, agent in (st.agents or {}).items():
+            if not isinstance(agent, PersistedAgentRuntime):
+                continue
+            out.append(
+                {
+                    "agentId": aid,
+                    "sessionId": agent.session_id,
+                    "workspaceHostPath": agent.workspace_host_path,
+                    "createdAtMs": agent.created_at_ms,
+                    "isDefault": bool(aid == "main"),
+                }
+            )
+        out.sort(key=lambda x: (not x.get("isDefault"), x.get("agentId") or ""))
+        return out
+
+    async def _ensure_main_agent(self) -> None:
+        if not self._home_host_path and not self._workspace_host_path:
+            return
+
+        now = _now_ms()
+        home = Path(self._home_host_path) if self._home_host_path else None
+        main_workspace_host_path = None
+        if home is not None:
+            main_workspace_host_path = str((home / "workspace").resolve())
+        elif self._workspace_host_path:
+            main_workspace_host_path = str(Path(self._workspace_host_path).resolve())
+
+        if not main_workspace_host_path:
+            return
+
+        def _write(st: PersistedGatewayAutomationState) -> None:
+            st.version = max(int(getattr(st, "version", 1) or 1), 2)
+            existing = st.agents.get("main")
+            main_session_id = None
+            if isinstance(existing, PersistedAgentRuntime) and isinstance(existing.session_id, str) and existing.session_id.strip():
+                main_session_id = existing.session_id.strip()
+            if not main_session_id:
+                main_session_id = st.default_session_id.strip() if isinstance(st.default_session_id, str) and st.default_session_id.strip() else None
+            if not main_session_id:
+                main_session_id = uuid.uuid4().hex[:12]
+
+            st.default_session_id = main_session_id
+            st.agents["main"] = PersistedAgentRuntime(
+                agent_id="main",
+                session_id=main_session_id,
+                workspace_host_path=main_workspace_host_path,
+                created_at_ms=getattr(existing, "created_at_ms", None) or now,
+            )
+            if main_session_id not in st.sessions:
+                st.sessions[main_session_id] = PersistedSessionAutomation()
+
+        await self._store.update(_write)
 
     async def _restore_default_session_if_singleton(self) -> None:
         st = self._store.state
@@ -1358,8 +1591,17 @@ class AutomationManager:
         live_set = set(live_session_ids)
 
         st = self._store.state
-        removed = [sid for sid in st.sessions.keys() if sid not in live_set]
-        default_missing = bool(st.default_session_id and st.default_session_id not in live_set)
+        protected: set[str] = set()
+        if isinstance(st.default_session_id, str) and st.default_session_id.strip():
+            protected.add(st.default_session_id.strip())
+        for agent in (st.agents or {}).values():
+            if isinstance(agent, PersistedAgentRuntime) and isinstance(agent.session_id, str) and agent.session_id.strip():
+                protected.add(agent.session_id.strip())
+
+        removed = [sid for sid in st.sessions.keys() if sid not in live_set and sid not in protected]
+        default_missing = bool(
+            st.default_session_id and st.default_session_id not in live_set and st.default_session_id not in protected
+        )
         if not removed and not default_missing:
             return
 
@@ -1383,25 +1625,39 @@ class AutomationManager:
         )
 
     def _workspace_root(self) -> Optional[Path]:
-        if self._workspace_host_path:
-            return Path(self._workspace_host_path)
         if self._home_host_path:
             return Path(self._home_host_path) / "workspace"
+        if self._workspace_host_path:
+            return Path(self._workspace_host_path)
         return None
+
+    def _workspace_root_for_session(self, session_id: str) -> Optional[Path]:
+        sid = session_id.strip() if isinstance(session_id, str) else ""
+        if sid:
+            p = self.get_workspace_host_path_for_session(sid)
+            if isinstance(p, str) and p.strip():
+                return Path(p)
+        return self._workspace_root()
 
     async def _ensure_workspace_files(self) -> None:
         root = self._workspace_root()
         if root is None:
             return
 
+        legacy_home = Path(self._home_host_path) if self._home_host_path else None
+        try:
+            await self._ensure_workspace_files_at(root, legacy_home=legacy_home)
+        except Exception:
+            log.exception("Failed to initialize workspace templates under %s", str(root))
+
+    async def _ensure_workspace_files_at(self, root: Path, *, legacy_home: Optional[Path]) -> None:
         def _ensure() -> None:
             root.mkdir(parents=True, exist_ok=True)
-            legacy_home = Path(self._home_host_path) if self._home_host_path else None
             for template_name, target_name in WORKSPACE_BOOTSTRAP_TEMPLATES:
                 target_path = root / target_name
                 if target_path.exists():
                     continue
-                # Migration: if legacy HEARTBEAT.md exists in home, keep it.
+                # Migration: if legacy HEARTBEAT.md exists in home, keep it (main workspace only).
                 if legacy_home is not None and target_name == HEARTBEAT_FILENAME:
                     legacy_heartbeat = legacy_home / HEARTBEAT_FILENAME
                     if legacy_heartbeat.exists():
@@ -1419,10 +1675,7 @@ class AutomationManager:
 
             _bootstrap_workspace_skill_templates(root)
 
-        try:
-            await asyncio.to_thread(_ensure)
-        except Exception:
-            log.exception("Failed to initialize workspace templates under %s", str(root))
+        await asyncio.to_thread(_ensure)
 
     async def stop(self) -> None:
         for t in self._tasks:
@@ -1763,7 +2016,7 @@ class AutomationManager:
                 log.warning("Failed to deliver to telegram for %s/%s: %s", session_id, thread_id, str(e))
 
         if media_refs:
-            workspace_root = self._workspace_root()
+            workspace_root = self._workspace_root_for_session(session_id)
             root_resolved = None
             if workspace_root is not None:
                 try:
@@ -2102,7 +2355,7 @@ class AutomationManager:
         if not token.strip():
             return []
 
-        root = self._workspace_root()
+        root = self._workspace_root_for_session(session_id)
         if root is None:
             return []
 
@@ -2362,7 +2615,7 @@ class AutomationManager:
         return "\n".join(lines).strip()
 
     async def _read_project_context_block(self, *, session_id: str, include_heartbeat: bool) -> str:
-        root = self._workspace_root()
+        root = self._workspace_root_for_session(session_id)
         if root is None:
             return ""
 
@@ -2409,8 +2662,8 @@ class AutomationManager:
             log.exception("Failed to read project context from workspace")
             return ""
 
-    async def _read_skills_prompt_block(self) -> str:
-        root = self._workspace_root()
+    async def _read_skills_prompt_block(self, *, session_id: str) -> str:
+        root = self._workspace_root_for_session(session_id)
         if root is None:
             return ""
 
@@ -2483,7 +2736,7 @@ class AutomationManager:
         # Heartbeat turns must stay narrowly focused on HEARTBEAT.md + system events.
         # Including the full skills prompt here can accidentally prime irrelevant user-facing output.
         if not heartbeat:
-            skills_block = await self._read_skills_prompt_block()
+            skills_block = await self._read_skills_prompt_block(session_id=session_id)
             if skills_block:
                 blocks.append(skills_block)
 
@@ -4722,6 +4975,19 @@ def _docker_cfg() -> DockerProvisionConfig:
     )
 
 
+def _resolve_workspace_host_path_for_session(session_id: str) -> Optional[str]:
+    sid = session_id.strip() if isinstance(session_id, str) else ""
+    if not sid:
+        return None
+    automation: Optional[AutomationManager] = getattr(app.state, "automation", None)
+    if automation is None:
+        return None
+    try:
+        return automation.get_workspace_host_path_for_session(sid)
+    except Exception:
+        return None
+
+
 def _docker_api_timeout_s() -> float:
     # Keep Docker API calls snappy: the gateway should remain responsive even when Docker is slow/unavailable.
     # Reuse ARGUS_CONNECT_TIMEOUT_S as a coarse upper bound (no new env var).
@@ -4883,6 +5149,8 @@ def _docker_create_container_sync(cfg: DockerProvisionConfig, session_id: str):
         "io.argus.runtime_home_container_path": cfg.home_container_path,
         "io.argus.runtime_workspace_container_path": cfg.workspace_container_path,
     }
+    if cfg.workspace_host_path:
+        labels["io.argus.runtime_workspace_host_path"] = cfg.workspace_host_path
 
     run_kwargs = {"working_dir": cfg.workspace_container_path}
     if cfg.runtime_mem_limit_bytes is not None:
@@ -5044,6 +5312,12 @@ async def _ensure_live_docker_session(session_id: str, *, allow_create: bool) ->
         return existing, False
 
     cfg = _docker_cfg()
+    # Multi-agent: mount a per-session workspace when configured in automation state.
+    workspace_override = _resolve_workspace_host_path_for_session(session_id)
+    if workspace_override:
+        if not os.path.isabs(workspace_override):
+            raise RuntimeError(f"Invalid workspace override for session {session_id}: not an absolute path")
+        cfg = replace(cfg, workspace_host_path=workspace_override)
     if not cfg.runtime_cmd:
         raise RuntimeError("ARGUS_RUNTIME_CMD is not set")
 
@@ -5817,6 +6091,78 @@ async def ws_proxy(ws: WebSocket):
                             tid = await automation.ensure_main_thread(session_id)
                             if has_id:
                                 await ws.send_text(json.dumps({"id": req_id, "result": {"threadId": tid}}))
+                            continue
+                        if method == "argus/agent/list":
+                            chat_key = None
+                            raw_chat_key = params.get("chatKey")
+                            if isinstance(raw_chat_key, str) and raw_chat_key.strip():
+                                chat_key = raw_chat_key.strip()
+                            source = params.get("source")
+                            if chat_key is None and isinstance(source, dict):
+                                ck = source.get("chatKey")
+                                if isinstance(ck, str) and ck.strip():
+                                    chat_key = ck.strip()
+                            current_agent = automation.resolve_agent_for_chat_key(chat_key or "")
+                            result = {
+                                "ok": True,
+                                "agents": automation.list_agents(),
+                                "currentAgentId": current_agent,
+                                "currentSessionId": automation.resolve_agent_session_id(current_agent),
+                            }
+                            if has_id:
+                                await ws.send_text(json.dumps({"id": req_id, "result": result}))
+                            continue
+                        if method == "argus/agent/resolve":
+                            raw_chat_key = params.get("chatKey")
+                            if not isinstance(raw_chat_key, str) or not raw_chat_key.strip():
+                                if has_id:
+                                    await ws.send_text(
+                                        json.dumps({"id": req_id, "error": {"code": -32602, "message": "Missing 'chatKey'"}})
+                                    )
+                                continue
+                            chat_key = raw_chat_key.strip()
+                            agent_id = automation.resolve_agent_for_chat_key(chat_key)
+                            sess_id = (
+                                automation.resolve_agent_session_id(agent_id) or automation._store.state.default_session_id
+                            )
+                            result = {"ok": True, "chatKey": chat_key, "agentId": agent_id, "sessionId": sess_id}
+                            if has_id:
+                                await ws.send_text(json.dumps({"id": req_id, "result": result}))
+                            continue
+                        if method == "argus/agent/create":
+                            raw_aid = params.get("agentId") or params.get("name")
+                            aid = _normalize_agent_id(raw_aid)
+                            if not aid:
+                                if has_id:
+                                    await ws.send_text(
+                                        json.dumps({"id": req_id, "error": {"code": -32602, "message": "Invalid 'agentId'"}})
+                                    )
+                                continue
+                            agent = await automation.create_agent(agent_id=aid)
+                            result = {"ok": True, "agent": agent.to_json()}
+                            if has_id:
+                                await ws.send_text(json.dumps({"id": req_id, "result": result}))
+                            continue
+                        if method == "argus/agent/use":
+                            raw_chat_key = params.get("chatKey")
+                            raw_aid = params.get("agentId") or params.get("name")
+                            if not isinstance(raw_chat_key, str) or not raw_chat_key.strip():
+                                if has_id:
+                                    await ws.send_text(
+                                        json.dumps({"id": req_id, "error": {"code": -32602, "message": "Missing 'chatKey'"}})
+                                    )
+                                continue
+                            aid = _normalize_agent_id(raw_aid)
+                            if not aid:
+                                if has_id:
+                                    await ws.send_text(
+                                        json.dumps({"id": req_id, "error": {"code": -32602, "message": "Invalid 'agentId'"}})
+                                    )
+                                continue
+                            agent = await automation.bind_chat_to_agent(chat_key=raw_chat_key.strip(), agent_id=aid)
+                            result = {"ok": True, "chatKey": raw_chat_key.strip(), "agent": agent.to_json()}
+                            if has_id:
+                                await ws.send_text(json.dumps({"id": req_id, "result": result}))
                             continue
                         if method == "argus/thread/main/set":
                             raw_tid = params.get("threadId")

@@ -41,19 +41,6 @@ function clampNumber(value, fallback) {
   return Number.isFinite(n) ? n : fallback;
 }
 
-function parseChatIdList(value) {
-  if (!isNonEmptyString(value)) return [];
-  const out = [];
-  for (const part of value.split(",")) {
-    const trimmed = part.trim();
-    if (!trimmed) continue;
-    const n = Number(trimmed);
-    if (!Number.isFinite(n)) continue;
-    out.push(Math.trunc(n));
-  }
-  return out;
-}
-
 async function ensureDirForFile(filePath) {
   const dir = path.dirname(filePath);
   await fs.mkdir(dir, { recursive: true });
@@ -81,11 +68,10 @@ class StateStore {
   constructor(statePath) {
     this.path = statePath;
     this.state = {
-      version: 2,
+      version: 3,
       defaultSessionId: null,
       lastUpdateId: null,
-      threads: {},
-      lastActiveByThread: {}
+      threadsBySession: {}
     };
     this._writeChain = Promise.resolve();
   }
@@ -95,26 +81,29 @@ class StateStore {
       const raw = await fs.readFile(this.path, "utf-8");
       const parsed = parseJson(raw);
       if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return;
-      const threads = parsed.threads && typeof parsed.threads === "object" && !Array.isArray(parsed.threads) ? parsed.threads : {};
-      const lastActiveByThreadRaw =
-        parsed.lastActiveByThread && typeof parsed.lastActiveByThread === "object" && !Array.isArray(parsed.lastActiveByThread)
-          ? parsed.lastActiveByThread
+
+      const defaultSessionId = isNonEmptyString(parsed.defaultSessionId) ? parsed.defaultSessionId : null;
+
+      const threadsBySession =
+        parsed.threadsBySession && typeof parsed.threadsBySession === "object" && !Array.isArray(parsed.threadsBySession)
+          ? parsed.threadsBySession
           : {};
-      const lastActiveByThread = {};
-      for (const [threadId, entry] of Object.entries(lastActiveByThreadRaw)) {
-        if (!isNonEmptyString(threadId)) continue;
-        if (!entry || typeof entry !== "object" || Array.isArray(entry)) continue;
-        const chatKey = isNonEmptyString(entry.chatKey) ? entry.chatKey : null;
-        const atMs = Number.isFinite(entry.atMs) ? entry.atMs : null;
-        if (!chatKey) continue;
-        lastActiveByThread[threadId] = { chatKey, ...(Number.isFinite(atMs) ? { atMs } : {}) };
+
+      // Back-compat: v2 stored a flat threads map (assumed to belong to defaultSessionId).
+      const legacyThreads =
+        parsed.threads && typeof parsed.threads === "object" && !Array.isArray(parsed.threads) ? parsed.threads : null;
+      if (legacyThreads && Object.keys(legacyThreads).length > 0) {
+        const sid = defaultSessionId || "default";
+        if (!threadsBySession[sid] || typeof threadsBySession[sid] !== "object" || Array.isArray(threadsBySession[sid])) {
+          threadsBySession[sid] = legacyThreads;
+        }
       }
+
       this.state = {
-        version: 2,
-        defaultSessionId: isNonEmptyString(parsed.defaultSessionId) ? parsed.defaultSessionId : null,
+        version: 3,
+        defaultSessionId,
         lastUpdateId: Number.isFinite(parsed.lastUpdateId) ? parsed.lastUpdateId : null,
-        threads,
-        lastActiveByThread
+        threadsBySession
       };
     } catch (e) {
       if (e && typeof e === "object" && "code" in e && e.code === "ENOENT") return;
@@ -135,14 +124,28 @@ class StateStore {
     return this._writeChain;
   }
 
-  getThreadId(chatKey) {
-    const entry = this.state.threads?.[chatKey];
+  _threadsForSession(sessionId) {
+    const sid = isNonEmptyString(sessionId) ? sessionId : "default";
+    if (!this.state.threadsBySession || typeof this.state.threadsBySession !== "object" || Array.isArray(this.state.threadsBySession)) {
+      this.state.threadsBySession = {};
+    }
+    const bucket = this.state.threadsBySession[sid];
+    if (!bucket || typeof bucket !== "object" || Array.isArray(bucket)) {
+      this.state.threadsBySession[sid] = {};
+      return this.state.threadsBySession[sid];
+    }
+    return bucket;
+  }
+
+  getThreadId(sessionId, chatKey) {
+    const bucket = this._threadsForSession(sessionId);
+    const entry = bucket?.[chatKey];
     return entry && typeof entry === "object" && isNonEmptyString(entry.threadId) ? entry.threadId : null;
   }
 
-  setThreadId(chatKey, threadId) {
-    if (!this.state.threads || typeof this.state.threads !== "object") this.state.threads = {};
-    this.state.threads[chatKey] = { threadId };
+  setThreadId(sessionId, chatKey, threadId) {
+    const bucket = this._threadsForSession(sessionId);
+    bucket[chatKey] = { threadId };
     return this.save();
   }
 
@@ -153,18 +156,6 @@ class StateStore {
 
   setLastUpdateId(updateId) {
     this.state.lastUpdateId = updateId;
-    return this.save();
-  }
-
-  getLastActiveChatKey(threadId) {
-    const entry = this.state.lastActiveByThread?.[threadId];
-    return entry && typeof entry === "object" && isNonEmptyString(entry.chatKey) ? entry.chatKey : null;
-  }
-
-  setLastActiveChatKey(threadId, chatKey) {
-    if (!isNonEmptyString(threadId) || !isNonEmptyString(chatKey)) return this.save();
-    if (!this.state.lastActiveByThread || typeof this.state.lastActiveByThread !== "object") this.state.lastActiveByThread = {};
-    this.state.lastActiveByThread[threadId] = { chatKey, atMs: Date.now() };
     return this.save();
   }
 }
@@ -634,7 +625,7 @@ class ArgusClient {
       const cb = this.onTurnCompleted;
       if (typeof cb === "function") {
         try {
-          const res = cb({ threadId, turnId, text: finalText });
+          const res = cb({ sessionId: this.sessionId, threadId, turnId, text: finalText });
           if (res && typeof res.then === "function") res.catch(() => {});
         } catch {
           // ignore
@@ -739,8 +730,10 @@ function parseCommand(text, botUsername) {
   const cmd = (cmdRaw || "").toLowerCase();
   if (!cmd) return null;
   if (at && botUsername && at.toLowerCase() !== botUsername.toLowerCase()) return null;
-  if (cmd === "new" || cmd === "newmain" || cmd === "where" || cmd === "help" || cmd === "start") return cmd;
-  return null;
+  const allowed = new Set(["new", "newmain", "where", "help", "start", "agents", "newagent", "useagent"]);
+  if (!allowed.has(cmd)) return null;
+  const args = trimmed.slice(first.length).trim();
+  return { cmd, args };
 }
 
 function extractReplyText(message) {
@@ -1032,9 +1025,6 @@ async function main() {
 
   const argusToken = isNonEmptyString(process.env.ARGUS_TOKEN) ? process.env.ARGUS_TOKEN : null;
   const cwd = process.env.ARGUS_CWD || "/root/.argus/workspace";
-  const adminChatIds = new Set(
-    parseChatIdList(process.env.TELEGRAM_ADMIN_CHAT_IDS || "")
-  );
   const statePathEnv = stripOuterQuotes(process.env.STATE_PATH);
   let statePath;
   if (isNonEmptyString(statePathEnv)) {
@@ -1054,6 +1044,9 @@ async function main() {
   const commandMenu = [
     { command: "help", description: "Show help" },
     { command: "where", description: "Show current session/thread mapping" },
+    { command: "agents", description: "List agents (workspaces)" },
+    { command: "newagent", description: "Create a new agent (workspace)" },
+    { command: "useagent", description: "Switch current agent" },
     { command: "new", description: "Start a new thread" },
     { command: "newmain", description: "Start a new main thread (private chat)" }
   ];
@@ -1073,22 +1066,49 @@ async function main() {
   await state.load();
   log("State path:", statePath);
 
-  const argus = new ArgusClient({ gatewayHttpUrl, gatewayWsUrl, token: argusToken, cwd });
+  // HTTP-only helper (does not need a WS connection).
+  const argusHttp = new ArgusClient({ gatewayHttpUrl, gatewayWsUrl, token: argusToken, cwd });
 
-  argus.onTurnCompleted = async ({ threadId, text }) => {
-    if (!isNonEmptyString(threadId)) return;
-    const chatKey = state.getLastActiveChatKey(threadId);
-    if (!isNonEmptyString(chatKey)) return;
-    // Delivery is owned by the gateway (so future UIs don't need to reimplement suppression rules).
-    // The bot keeps typing indicators only.
-    typing.stop(chatKey);
+  // Keep one WS per gateway sessionId to avoid reconnect churn when routing between agents.
+  const clients = new Map(); // sessionId -> ArgusClient
+  const lastActiveBySessionThread = new Map(); // `${sessionId}:${threadId}` -> chatKey
+  const sessionThreadKey = (sessionId, threadId) => `${sessionId}:${threadId}`;
+
+  const attachClientHooks = (client) => {
+    client.onTurnCompleted = async ({ sessionId, threadId }) => {
+      if (!isNonEmptyString(sessionId) || !isNonEmptyString(threadId)) return;
+      const chatKey = lastActiveBySessionThread.get(sessionThreadKey(sessionId, threadId));
+      if (!isNonEmptyString(chatKey)) return;
+      typing.stop(chatKey);
+    };
+    client.onDisconnected = () => {
+      const sid = client.sessionId;
+      if (!isNonEmptyString(sid)) {
+        typing.stopAll();
+        return;
+      }
+      for (const [key, chatKey] of lastActiveBySessionThread.entries()) {
+        if (key.startsWith(`${sid}:`) && isNonEmptyString(chatKey)) {
+          typing.stop(chatKey);
+        }
+      }
+    };
   };
-  argus.onDisconnected = () => {
-    typing.stopAll();
-  };
+
+  async function getClient(sessionId) {
+    if (!isNonEmptyString(sessionId)) throw new Error("Missing sessionId");
+    const sid = sessionId.trim();
+    let client = clients.get(sid);
+    if (!client) {
+      client = new ArgusClient({ gatewayHttpUrl, gatewayWsUrl, token: argusToken, cwd });
+      attachClientHooks(client);
+      clients.set(sid, client);
+    }
+    await client.connectToSession(sid);
+    return client;
+  }
 
   const queue = new SerialQueue();
-  let alignedSessionId = null;
 
   function chatIdFromChatKey(chatKey) {
     if (!isNonEmptyString(chatKey)) return null;
@@ -1097,64 +1117,11 @@ async function main() {
     return Number.isFinite(chatId) ? chatId : null;
   }
 
-  async function alignPrivateChatsToMainThread(mainThreadId) {
-    if (!isNonEmptyString(mainThreadId)) return;
-    const threads = state.state.threads;
-    if (!threads || typeof threads !== "object" || Array.isArray(threads)) return;
-
-    let changed = false;
-    for (const [chatKey, entry] of Object.entries(threads)) {
-      const chatId = chatIdFromChatKey(chatKey);
-      if (!Number.isFinite(chatId) || chatId <= 0) continue; // private chats are positive ids
-      if (!entry || typeof entry !== "object" || Array.isArray(entry)) continue;
-      if (entry.threadId !== mainThreadId) {
-        entry.threadId = mainThreadId;
-        changed = true;
-      }
-    }
-
-    const lastActiveByThread = state.state.lastActiveByThread;
-    if (lastActiveByThread && typeof lastActiveByThread === "object" && !Array.isArray(lastActiveByThread)) {
-      let best = null;
-      for (const entry of Object.values(lastActiveByThread)) {
-        if (!entry || typeof entry !== "object" || Array.isArray(entry)) continue;
-        const chatKey = isNonEmptyString(entry.chatKey) ? entry.chatKey : null;
-        if (!chatKey) continue;
-        const chatId = chatIdFromChatKey(chatKey);
-        if (!Number.isFinite(chatId) || chatId <= 0) continue;
-        const atMs = Number.isFinite(entry.atMs) ? entry.atMs : 0;
-        if (!best || atMs > best.atMs) best = { chatKey, atMs };
-      }
-
-      for (const [tid, entry] of Object.entries(lastActiveByThread)) {
-        if (tid === mainThreadId) continue;
-        if (!entry || typeof entry !== "object" || Array.isArray(entry)) continue;
-        const chatKey = isNonEmptyString(entry.chatKey) ? entry.chatKey : null;
-        if (!chatKey) continue;
-        const chatId = chatIdFromChatKey(chatKey);
-        if (!Number.isFinite(chatId) || chatId <= 0) continue;
-        delete lastActiveByThread[tid];
-        changed = true;
-      }
-
-      if (best) {
-        const current = lastActiveByThread[mainThreadId];
-        const curAt = current && typeof current === "object" && Number.isFinite(current.atMs) ? current.atMs : 0;
-        if (!current || best.atMs >= curAt) {
-          lastActiveByThread[mainThreadId] = { chatKey: best.chatKey, ...(best.atMs ? { atMs: best.atMs } : {}) };
-          changed = true;
-        }
-      }
-    }
-
-    if (changed) await state.save();
-  }
-
   async function ensureDefaultSession() {
     let preferred = state.state.defaultSessionId;
 
     try {
-      const auto = await argus.getAutomationState();
+      const auto = await argusHttp.getAutomationState();
       const sid = auto?.persisted?.defaultSessionId;
       if (isNonEmptyString(sid)) preferred = sid;
     } catch {
@@ -1163,19 +1130,9 @@ async function main() {
 
     if (isNonEmptyString(preferred)) {
       try {
-        await argus.connectToSession(preferred);
-        argus.sessionId = preferred;
+        await getClient(preferred);
         if (state.state.defaultSessionId !== preferred) {
           await state.setDefaultSessionId(preferred);
-        }
-        if (alignedSessionId !== preferred) {
-          alignedSessionId = preferred;
-          try {
-            const mainTid = await argus.ensureMainThread();
-            await alignPrivateChatsToMainThread(mainTid);
-          } catch (e) {
-            log("Failed to align TG private chats to gateway main thread:", e instanceof Error ? e.message : String(e));
-          }
         }
         return preferred;
       } catch (e) {
@@ -1185,7 +1142,7 @@ async function main() {
 
     let sessions = [];
     try {
-      sessions = await argus.listSessions();
+      sessions = await argusHttp.listSessions();
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
       const cause = e instanceof Error && e.cause instanceof Error ? e.cause.message : null;
@@ -1194,33 +1151,34 @@ async function main() {
 
     if (sessions.length > 0 && isNonEmptyString(sessions[0]?.sessionId)) {
       const sid = sessions[0].sessionId;
-      await argus.connectToSession(sid);
-      argus.sessionId = sid;
+      await getClient(sid);
       await state.setDefaultSessionId(sid);
-      if (alignedSessionId !== sid) {
-        alignedSessionId = sid;
-        try {
-          const mainTid = await argus.ensureMainThread();
-          await alignPrivateChatsToMainThread(mainTid);
-        } catch (e) {
-          log("Failed to align TG private chats to gateway main thread:", e instanceof Error ? e.message : String(e));
-        }
-      }
       return sid;
     }
 
-    const sid = await argus.connectNewSession();
+    const tmp = new ArgusClient({ gatewayHttpUrl, gatewayWsUrl, token: argusToken, cwd });
+    attachClientHooks(tmp);
+    const sid = await tmp.connectNewSession();
+    clients.set(sid, tmp);
     await state.setDefaultSessionId(sid);
-    if (alignedSessionId !== sid) {
-      alignedSessionId = sid;
-      try {
-        const mainTid = await argus.ensureMainThread();
-        await alignPrivateChatsToMainThread(mainTid);
-      } catch (e) {
-        log("Failed to align TG private chats to gateway main thread:", e instanceof Error ? e.message : String(e));
-      }
-    }
     return sid;
+  }
+
+  async function getControlClient() {
+    const sid = await ensureDefaultSession();
+    return await getClient(sid);
+  }
+
+  async function resolveRouteForChatKey(chatKey) {
+    const control = await getControlClient();
+    try {
+      const res = await control.rpc("argus/agent/resolve", { chatKey });
+      const sessionId = isNonEmptyString(res?.sessionId) ? res.sessionId : null;
+      const agentId = isNonEmptyString(res?.agentId) ? res.agentId : "main";
+      return { agentId, sessionId: sessionId || control.sessionId };
+    } catch (e) {
+      return { agentId: "main", sessionId: control.sessionId };
+    }
   }
 
   await queue.enqueue(async () => {
@@ -1293,7 +1251,7 @@ async function main() {
         : isNonEmptyString(message.caption)
           ? message.caption
           : null;
-      const cmd = parseCommand(text || "", botUsername);
+      const parsedCmd = parseCommand(text || "", botUsername);
 
       const messageImages = extractTelegramImagesFromMessage(message).map((img) => ({ ...img, source: "message" }));
       const replyTextRaw = extractReplyText(message);
@@ -1306,23 +1264,104 @@ async function main() {
 
       queue.enqueue(async () => {
         try {
-          await ensureDefaultSession();
+          const control = await getControlClient();
+          const cmd = parsedCmd?.cmd || null;
+          const cmdArgs = parsedCmd?.args || "";
+
+          if (cmd === "agents") {
+            const data = await control.rpc("argus/agent/list", { chatKey });
+            const current = data?.currentAgentId;
+            const agents = Array.isArray(data?.agents) ? data.agents : [];
+            const lines = [];
+            lines.push(`currentAgentId: ${current || "(none)"}`);
+            lines.push(`currentSessionId: ${data?.currentSessionId || "(none)"}`);
+            lines.push("");
+            lines.push("agents:");
+            for (const a of agents) {
+              if (!a || typeof a !== "object") continue;
+              const aid = isNonEmptyString(a.agentId) ? a.agentId : "(unknown)";
+              const sid = isNonEmptyString(a.sessionId) ? a.sessionId : "(none)";
+              const ws = isNonEmptyString(a.workspaceHostPath) ? path.basename(a.workspaceHostPath) : "";
+              lines.push(`- ${aid} (sessionId=${sid}${ws ? `, workspace=${ws}` : ""})`);
+            }
+            await tg.sendMessage({ ...target, text: truncateTelegramMessage(lines.join("\n")) });
+            typing.stop(chatKey);
+            return;
+          }
+
+          if (cmd === "newagent") {
+            const chatId = chatIdFromChatKey(chatKey);
+            if (chatType !== "private" || !Number.isFinite(chatId) || chatId <= 0) {
+              await tg.sendMessage({ ...target, text: "只能在私聊中使用 /newagent。" });
+              typing.stop(chatKey);
+              return;
+            }
+            const name = cmdArgs.split(/\s+/, 1)[0]?.trim().toLowerCase();
+            if (!isNonEmptyString(name)) {
+              await tg.sendMessage({ ...target, text: "用法：/newagent <name>" });
+              typing.stop(chatKey);
+              return;
+            }
+            const created = await control.rpc("argus/agent/create", { agentId: name });
+            await control.rpc("argus/agent/use", { chatKey, agentId: name });
+            const sid = created?.agent?.sessionId;
+            if (isNonEmptyString(sid)) {
+              await getClient(sid);
+            }
+            await tg.sendMessage({ ...target, text: `ok (new agent): ${name}` });
+            typing.stop(chatKey);
+            return;
+          }
+
+          if (cmd === "useagent") {
+            const name = cmdArgs.split(/\s+/, 1)[0]?.trim().toLowerCase();
+            if (!isNonEmptyString(name)) {
+              await tg.sendMessage({ ...target, text: "用法：/useagent <name>" });
+              typing.stop(chatKey);
+              return;
+            }
+            const used = await control.rpc("argus/agent/use", { chatKey, agentId: name });
+            const sid = used?.agent?.sessionId;
+            if (isNonEmptyString(sid)) {
+              await getClient(sid);
+            }
+            await tg.sendMessage({ ...target, text: `ok (use agent): ${name}` });
+            typing.stop(chatKey);
+            return;
+          }
+
+          const route = await resolveRouteForChatKey(chatKey);
+          const sessionId = route.sessionId;
+          const agentId = route.agentId;
+          const client = await getClient(sessionId);
 
           if (cmd === "where") {
-            const sid = state.state.defaultSessionId;
-            const tid = state.getThreadId(chatKey);
+            let tid = null;
+            if (chatType === "private") {
+              try {
+                tid = await client.ensureMainThread();
+              } catch {
+                tid = null;
+              }
+            } else {
+              tid = state.getThreadId(sessionId, chatKey);
+            }
             await tg.sendMessage({
               ...target,
-              text: `sessionId: ${sid || "(none)"}\nchatKey: ${chatKey}\nthreadId: ${tid || "(none)"}`
+              text: `agentId: ${agentId}\nsessionId: ${sessionId || "(none)"}\nchatKey: ${chatKey}\nthreadId: ${tid || "(none)"}`
             });
             typing.stop(chatKey);
             return;
           }
 
           if (cmd === "new") {
-            const tid = await argus.startThread();
-            await state.setThreadId(chatKey, tid);
-            await state.setLastActiveChatKey(tid, chatKey);
+            if (chatType === "private") {
+              await tg.sendMessage({ ...target, text: "私聊请用 /newmain（/new 仅用于群聊/话题）。" });
+              typing.stop(chatKey);
+              return;
+            }
+            const tid = await client.startThread();
+            await state.setThreadId(sessionId, chatKey, tid);
             await tg.sendMessage({ ...target, text: `ok (new thread): ${tid}` });
             typing.stop(chatKey);
             return;
@@ -1335,38 +1374,29 @@ async function main() {
               typing.stop(chatKey);
               return;
             }
-            if (adminChatIds.size > 0 && !adminChatIds.has(Math.trunc(chatId))) {
-              await tg.sendMessage({ ...target, text: "该命令未授权（需要在 TELEGRAM_ADMIN_CHAT_IDS 白名单中）。" });
-              typing.stop(chatKey);
-              return;
-            }
-
-            const tid = await argus.startThread();
-            const mainTid = await argus.setMainThread(tid);
-            await state.setThreadId(chatKey, mainTid);
-            await state.setLastActiveChatKey(mainTid, chatKey);
-            await alignPrivateChatsToMainThread(mainTid);
+            const tid = await client.startThread();
+            const mainTid = await client.setMainThread(tid);
             await tg.sendMessage({ ...target, text: `ok (new main thread): ${mainTid}` });
             typing.stop(chatKey);
             return;
           }
 
           if (cmd === "help" || cmd === "start") {
-            const tid = state.getThreadId(chatKey);
-            const sid = state.state.defaultSessionId;
             const helpText = [
               "Commands:",
               "/help — show this help",
-              "/where — show session/thread ids (debug)",
-              "/new — start a new thread",
+              "/where — show current agent/session/thread ids (debug)",
+              "/agents — list agents (workspaces)",
+              "/newagent <name> — create a new agent (private chat)",
+              "/useagent <name> — switch current agent",
+              "/new — start a new thread (group/topic)",
               "/newmain — start a new main thread (private chat)",
               "",
               "Notes:",
-              "- In private chat, messages go to the session main thread.",
-              "- In groups/topics, the bot maps chat/topic -> thread automatically."
+              "- In private chat, messages go to the current agent session main thread.",
+              "- In groups/topics, the bot maps chat/topic -> thread per session."
             ].join("\n");
-            const extra = `\n\nCurrent:\nsessionId: ${sid || "(none)"}\nthreadId: ${tid || "(none)"}`;
-            await tg.sendMessage({ ...target, text: helpText + extra });
+            await tg.sendMessage({ ...target, text: helpText });
             typing.stop(chatKey);
             return;
           }
@@ -1392,7 +1422,7 @@ async function main() {
 
           const userText = userLines.join("\n");
 
-          let threadId = state.getThreadId(chatKey);
+          let threadId = state.getThreadId(sessionId, chatKey);
           let enqueueTarget = null;
 
           if (chatType === "private") {
@@ -1401,11 +1431,11 @@ async function main() {
           } else if (isNonEmptyString(threadId)) {
             // Use mapped thread.
           } else {
-            threadId = await argus.startThread();
-            await state.setThreadId(chatKey, threadId);
+            threadId = await client.startThread();
+            await state.setThreadId(sessionId, chatKey, threadId);
           }
 
-          const res = await argus.enqueueInput({
+          const res = await client.enqueueInput({
             text: userText,
             threadId,
             target: enqueueTarget,
@@ -1414,10 +1444,7 @@ async function main() {
           });
           const effectiveThreadId = isNonEmptyString(res?.threadId) ? res.threadId : threadId;
           if (isNonEmptyString(effectiveThreadId)) {
-            await state.setLastActiveChatKey(effectiveThreadId, chatKey);
-            if (!isNonEmptyString(threadId)) {
-              await state.setThreadId(chatKey, effectiveThreadId);
-            }
+            lastActiveBySessionThread.set(sessionThreadKey(sessionId, effectiveThreadId), chatKey);
           }
         } catch (e) {
           const msg = e instanceof Error ? e.message : String(e);
