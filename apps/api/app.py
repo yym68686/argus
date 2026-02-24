@@ -1,4 +1,7 @@
 import asyncio
+import base64
+import hashlib
+import hmac
 import json
 import logging
 import os
@@ -2931,64 +2934,67 @@ class AutomationManager:
 
     async def _cron_tick(self) -> float:
         st = self._store.state
-        session_id = st.default_session_id
-        if not session_id:
-            return 5.0
-        sess = st.sessions.get(session_id)
-        if sess is None or not sess.cron_jobs:
+        if not st.sessions:
             return 5.0
 
-        now = _now_ms()
-        if self._is_session_backed_off(session_id, now):
-            until = self._session_backoff_until_ms.get(session_id) or (now + 5000)
-            return max(1.0, min(30.0, (until - now) / 1000.0))
-        next_due_ms: Optional[int] = None
+        next_wakeup_ms: Optional[int] = None
         changed = False
 
-        for job in sess.cron_jobs:
-            if not job.enabled:
+        # Iterate all sessions: each agent has its own cron set.
+        for session_id, sess in list(st.sessions.items()):
+            if sess is None or not sess.cron_jobs:
                 continue
-            try:
-                # (Re)compute nextRunAtMs if missing.
-                if job.next_run_at_ms is None:
-                    base_dt = _ms_to_dt_utc(job.last_run_at_ms or now)
-                    job.next_run_at_ms = _dt_to_ms(croniter(job.expr, base_dt).get_next(datetime))
-                    changed = True
-                # Run if due.
-                if job.next_run_at_ms is not None and job.next_run_at_ms <= now:
-                    main_tid = sess.main_thread_id
-                    if not main_tid:
-                        main_tid = await self.ensure_main_thread(session_id)
-                        # Refresh session object after persistence updates.
-                        sess = self._store.state.sessions.get(session_id) or sess
-                    await self.enqueue_system_event(
-                        session_id=session_id,
-                        thread_id=main_tid,
-                        kind="cron",
-                        text=job.text,
-                        meta={"jobId": job.job_id, "expr": job.expr},
-                    )
-                    job.last_run_at_ms = now
-                    base_dt = _ms_to_dt_utc(now)
-                    job.next_run_at_ms = _dt_to_ms(croniter(job.expr, base_dt).get_next(datetime))
-                    changed = True
-                    self._clear_session_backoff(session_id)
-            except Exception as e:
-                # Keep job but avoid tight loop; don't mark as executed.
-                log.exception("Failed to run cron job %s", job.job_id)
-                self._note_session_failure(session_id, what=f"Cron job {job.job_id}", err=e)
-                job.next_run_at_ms = now + 60_000
-                changed = True
 
-            if job.enabled and job.next_run_at_ms is not None:
-                next_due_ms = job.next_run_at_ms if next_due_ms is None else min(next_due_ms, job.next_run_at_ms)
+            now = _now_ms()
+            if self._is_session_backed_off(session_id, now):
+                until = self._session_backoff_until_ms.get(session_id) or (now + 5000)
+                next_wakeup_ms = until if next_wakeup_ms is None else min(next_wakeup_ms, until)
+                continue
+
+            for job in sess.cron_jobs:
+                if not job.enabled:
+                    continue
+                try:
+                    # (Re)compute nextRunAtMs if missing.
+                    if job.next_run_at_ms is None:
+                        base_dt = _ms_to_dt_utc(job.last_run_at_ms or now)
+                        job.next_run_at_ms = _dt_to_ms(croniter(job.expr, base_dt).get_next(datetime))
+                        changed = True
+                    # Run if due.
+                    if job.next_run_at_ms is not None and job.next_run_at_ms <= now:
+                        main_tid = sess.main_thread_id
+                        if not main_tid:
+                            main_tid = await self.ensure_main_thread(session_id)
+                            # Refresh session object after persistence updates.
+                            sess = self._store.state.sessions.get(session_id) or sess
+                        await self.enqueue_system_event(
+                            session_id=session_id,
+                            thread_id=main_tid,
+                            kind="cron",
+                            text=job.text,
+                            meta={"jobId": job.job_id, "expr": job.expr},
+                        )
+                        job.last_run_at_ms = now
+                        base_dt = _ms_to_dt_utc(now)
+                        job.next_run_at_ms = _dt_to_ms(croniter(job.expr, base_dt).get_next(datetime))
+                        changed = True
+                        self._clear_session_backoff(session_id)
+                except Exception as e:
+                    # Keep job but avoid tight loop; don't mark as executed.
+                    log.exception("Failed to run cron job %s for session %s", job.job_id, session_id)
+                    self._note_session_failure(session_id, what=f"Cron job {job.job_id}", err=e)
+                    job.next_run_at_ms = now + 60_000
+                    changed = True
+
+                if job.enabled and job.next_run_at_ms is not None:
+                    next_wakeup_ms = job.next_run_at_ms if next_wakeup_ms is None else min(next_wakeup_ms, job.next_run_at_ms)
 
         if changed:
             await self._store.save()
 
-        if next_due_ms is None:
+        if next_wakeup_ms is None:
             return 5.0
-        delay_ms = max(200, min(30_000, next_due_ms - _now_ms()))
+        delay_ms = max(200, min(30_000, next_wakeup_ms - _now_ms()))
         return delay_ms / 1000.0
 
     async def _heartbeat_loop(self) -> None:
@@ -3013,8 +3019,8 @@ class AutomationManager:
             return True
         return now_ms - last >= HEARTBEAT_TASKS_INTERVAL_MS
 
-    async def _heartbeat_has_actionable_content(self) -> bool:
-        root = self._workspace_root()
+    async def _heartbeat_has_actionable_content(self, session_id: str) -> bool:
+        root = self._workspace_root_for_session(session_id)
         if root is None:
             return False
         p = root / HEARTBEAT_FILENAME
@@ -3024,7 +3030,12 @@ class AutomationManager:
             # Back-compat: older setups stored HEARTBEAT.md under `$ARGUS_HOME_HOST_PATH/HEARTBEAT.md`.
             if not self._home_host_path:
                 return False
-            legacy = Path(self._home_host_path) / HEARTBEAT_FILENAME
+            home = Path(self._home_host_path)
+            # Only apply legacy fallback for the main workspace to avoid accidentally
+            # running the same heartbeat tasks across all agents.
+            if root != (home / "workspace"):
+                return False
+            legacy = home / HEARTBEAT_FILENAME
             try:
                 raw = await asyncio.to_thread(legacy.read_text, "utf-8")
             except FileNotFoundError:
@@ -3040,103 +3051,105 @@ class AutomationManager:
     async def _heartbeat_tick(self, *, forced: bool) -> None:
         if _provision_mode() != "docker":
             return
-        has_heartbeat_tasks = await self._heartbeat_has_actionable_content()
-
         st = self._store.state
-        session_id = st.default_session_id
-
-        # If we don't have a persisted default session yet, only bootstrap when heartbeat has work.
-        if not session_id:
-            if not has_heartbeat_tasks:
-                return
-            try:
-                session_id = await self._choose_default_session_id()
-            except Exception as e:
-                log.warning("Heartbeat bootstrap failed while choosing default session: %s", str(e))
-                return
-            st = self._store.state
-
-        now_ms = _now_ms()
-        if self._is_session_backed_off(session_id, now_ms):
+        session_ids = [sid for sid in st.sessions.keys() if isinstance(sid, str) and sid.strip()]
+        if not session_ids:
             return
 
-        sess = st.sessions.get(session_id)
-        main_tid = sess.main_thread_id if sess is not None else None
-        q = (sess.system_event_queues.get(main_tid) or []) if (sess is not None and main_tid) else []
-        has_actionable_system_events = self._queue_has_actionable_system_events(q)
-        if not has_actionable_system_events:
-            if not has_heartbeat_tasks:
-                return
-            if main_tid and (not forced and not self._heartbeat_tasks_due(session_id, main_tid, now_ms)):
+        # Start a small number of heartbeat turns per tick to avoid overload when many
+        # agents are active.
+        started = 0
+        for session_id in sorted(session_ids):
+            if started >= 3:
                 return
 
-        try:
-            main_tid = await self.ensure_main_thread(session_id)
-            self._clear_session_backoff(session_id)
-        except Exception as e:
-            self._note_session_failure(session_id, what="Heartbeat bootstrap", err=e)
-            return
+            now_ms = _now_ms()
+            if self._is_session_backed_off(session_id, now_ms):
+                continue
 
-        lane = self.lane(session_id, main_tid)
-        if lane.busy:
-            return
+            sess = self._store.state.sessions.get(session_id)
+            if sess is None:
+                continue
+            main_tid = sess.main_thread_id
+            q = (sess.system_event_queues.get(main_tid) or []) if main_tid else []
+            has_actionable_system_events = self._queue_has_actionable_system_events(q)
+            has_heartbeat_tasks = await self._heartbeat_has_actionable_content(session_id)
 
-        async with lane.lock:
-            if lane.busy:
-                return
-
-            # Re-check work under latest state.
-            st2 = self._store.state
-            sess2 = st2.sessions.get(session_id)
-            if sess2 is None:
-                return
-            q2 = sess2.system_event_queues.get(main_tid) or []
-            has_actionable_system_events2 = self._queue_has_actionable_system_events(q2)
-            if not has_actionable_system_events2:
+            if not has_actionable_system_events:
                 if not has_heartbeat_tasks:
-                    return
-                now2 = _now_ms()
-                if not forced and not self._heartbeat_tasks_due(session_id, main_tid, now2):
-                    return
+                    continue
+                if main_tid and (not forced and not self._heartbeat_tasks_due(session_id, main_tid, now_ms)):
+                    continue
 
             try:
-                live, _ = await _ensure_live_docker_session(session_id, allow_create=True)
-                await self._ensure_initialized(live)
-            except Exception as e:
-                self._note_session_failure(session_id, what="Heartbeat prepare", err=e)
-                return
-
-            self._mark_lane_busy(lane)
-            try:
-                await self._ensure_thread_loaded_or_resumed(live, main_tid)
-                assembled = await self._assemble_turn_input(session_id, main_tid, user_text="", heartbeat=True)
-                resp = await self._rpc(
-                    live,
-                    "turn/start",
-                    {
-                        "threadId": main_tid,
-                        "input": [{"type": "text", "text": assembled}],
-                        "cwd": live.cfg.workspace_container_path,
-                        "approvalPolicy": "never",
-                        "sandboxPolicy": {"type": "dangerFullAccess"},
-                    },
-                )
-                turn_id = None
-                if isinstance(resp, dict):
-                    turn = resp.get("turn")
-                    if isinstance(turn, dict):
-                        tid_val = turn.get("id")
-                        if isinstance(tid_val, str) and tid_val.strip():
-                            turn_id = tid_val.strip()
-                if turn_id:
-                    lane.active_turn_id = turn_id
-                    self._note_lane_progress(lane)
-                self._last_heartbeat_run_at_ms[(session_id, main_tid)] = _now_ms()
+                main_tid = await self.ensure_main_thread(session_id)
                 self._clear_session_backoff(session_id)
             except Exception as e:
-                self._mark_lane_idle(lane)
-                self._note_session_failure(session_id, what="Heartbeat turn/start", err=e)
-                return
+                self._note_session_failure(session_id, what="Heartbeat bootstrap", err=e)
+                continue
+
+            lane = self.lane(session_id, main_tid)
+            if lane.busy:
+                continue
+
+            async with lane.lock:
+                if lane.busy:
+                    continue
+
+                # Re-check work under latest state.
+                st2 = self._store.state
+                sess2 = st2.sessions.get(session_id)
+                if sess2 is None:
+                    continue
+                q2 = sess2.system_event_queues.get(main_tid) or []
+                has_actionable_system_events2 = self._queue_has_actionable_system_events(q2)
+                has_heartbeat_tasks2 = await self._heartbeat_has_actionable_content(session_id)
+                if not has_actionable_system_events2:
+                    if not has_heartbeat_tasks2:
+                        continue
+                    now2 = _now_ms()
+                    if not forced and not self._heartbeat_tasks_due(session_id, main_tid, now2):
+                        continue
+
+                try:
+                    live, _ = await _ensure_live_docker_session(session_id, allow_create=True)
+                    await self._ensure_initialized(live)
+                except Exception as e:
+                    self._note_session_failure(session_id, what="Heartbeat prepare", err=e)
+                    continue
+
+                self._mark_lane_busy(lane)
+                try:
+                    await self._ensure_thread_loaded_or_resumed(live, main_tid)
+                    assembled = await self._assemble_turn_input(session_id, main_tid, user_text="", heartbeat=True)
+                    resp = await self._rpc(
+                        live,
+                        "turn/start",
+                        {
+                            "threadId": main_tid,
+                            "input": [{"type": "text", "text": assembled}],
+                            "cwd": live.cfg.workspace_container_path,
+                            "approvalPolicy": "never",
+                            "sandboxPolicy": {"type": "dangerFullAccess"},
+                        },
+                    )
+                    turn_id = None
+                    if isinstance(resp, dict):
+                        turn = resp.get("turn")
+                        if isinstance(turn, dict):
+                            tid_val = turn.get("id")
+                            if isinstance(tid_val, str) and tid_val.strip():
+                                turn_id = tid_val.strip()
+                    if turn_id:
+                        lane.active_turn_id = turn_id
+                        self._note_lane_progress(lane)
+                    self._last_heartbeat_run_at_ms[(session_id, main_tid)] = _now_ms()
+                    self._clear_session_backoff(session_id)
+                    started += 1
+                except Exception as e:
+                    self._mark_lane_idle(lane)
+                    self._note_session_failure(session_id, what="Heartbeat turn/start", err=e)
+                    continue
 
 
 @dataclass
@@ -3345,6 +3358,7 @@ class McpSessionState:
     protocol_version: str
     initialized: bool
     client_info: Optional[dict[str, Any]]
+    scoped_session_id: Optional[str] = None
     created_at_ms: int
     last_seen_ms: int
 
@@ -3584,12 +3598,15 @@ async def _mcp_handle_single_message(request: Request, body: dict[str, Any]) -> 
 
         session_id = uuid.uuid4().hex
         now_ms = int(time.time() * 1000)
+        scoped_sid = getattr(request.state, "mcp_scoped_session_id", None)
+        scoped_sid = scoped_sid.strip() if isinstance(scoped_sid, str) and scoped_sid.strip() else None
         sess = McpSessionState(
             session_id=session_id,
             protocol_version=negotiated,
             # We don't emit server-side notifications, so we can treat initialize as sufficient.
             initialized=True,
             client_info=client_info,
+            scoped_session_id=scoped_sid,
             created_at_ms=now_ms,
             last_seen_ms=now_ms,
         )
@@ -3606,7 +3623,7 @@ async def _mcp_handle_single_message(request: Request, body: dict[str, Any]) -> 
                 "title": "Argus Gateway MCP",
                 "version": "0.1.0",
             },
-            "instructions": "This MCP server exposes tools for managing gateway cron jobs, sending messages, and invoking connected nodes.",
+            "instructions": "This MCP server exposes tools for managing gateway cron jobs, sending messages, and invoking connected nodes. Cron/heartbeat operations are scoped to the calling runtime session by default.",
         }
         return (
             _jsonrpc_result(request_id=request_id, result=result),
@@ -3648,7 +3665,7 @@ async def _mcp_handle_single_message(request: Request, body: dict[str, Any]) -> 
             {
                 "name": "cron",
                 "title": "Cron",
-                "description": "Manage gateway cron jobs (status/list/add/update/remove/run). Jobs enqueue systemEvents into the session main thread and are processed by heartbeat.",
+                "description": "Manage gateway cron jobs (status/list/add/update/remove/run) for the calling runtime session only. Jobs enqueue systemEvents into the session main thread and are processed by heartbeat.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -3657,7 +3674,6 @@ async def _mcp_handle_single_message(request: Request, body: dict[str, Any]) -> 
                             "enum": ["status", "list", "add", "update", "remove", "run"],
                             "description": "Action to perform.",
                         },
-                        "sessionId": {"type": "string", "description": "Optional target sessionId (defaults to the gateway default session)."},
                         "includeDisabled": {"type": "boolean", "description": "For list: include disabled jobs."},
                         "jobId": {"type": "string", "description": "For update/remove/run: cron job id."},
                         "expr": {"type": "string", "description": "For add/update: cron expression (UTC-based)."},
@@ -3960,36 +3976,35 @@ async def _mcp_handle_single_message(request: Request, body: dict[str, Any]) -> 
                     {"MCP-Protocol-Version": sess.protocol_version},
                 )
 
-            requested_sid = str(args.get("sessionId") or "").strip() or None
-            session_id = automation._store.state.default_session_id
-            if not session_id:
-                try:
-                    session_id = await automation._choose_default_session_id()
-                except Exception as e:
-                    return (
-                        _jsonrpc_result(
-                            request_id=request_id,
-                            result=_mcp_call_tool_result(
-                                content=[{"type": "text", "text": f"Failed to choose default session: {e}"}],
-                                structured={"ok": False, "error": {"code": "INTERNAL_ERROR", "message": str(e)}},
-                                is_error=True,
-                            ),
-                        ),
-                        {"MCP-Protocol-Version": sess.protocol_version},
-                    )
-
-            if requested_sid and requested_sid != session_id:
+            scoped_sid = getattr(request.state, "mcp_scoped_session_id", None) or sess.scoped_session_id
+            scoped_sid = scoped_sid.strip() if isinstance(scoped_sid, str) and scoped_sid.strip() else None
+            if not scoped_sid:
                 return (
                     _jsonrpc_result(
                         request_id=request_id,
                         result=_mcp_call_tool_result(
-                            content=[{"type": "text", "text": "This cron tool currently only operates on the gateway default session"}],
-                            structured={"ok": False, "error": {"code": "UNSUPPORTED", "message": "non-default sessionId is not supported", "defaultSessionId": session_id}},
+                            content=[{"type": "text", "text": "Cron tool requires a runtime session scope"}],
+                            structured={"ok": False, "error": {"code": "FORBIDDEN", "message": "missing runtime session scope"}},
                             is_error=True,
                         ),
                     ),
                     {"MCP-Protocol-Version": sess.protocol_version},
                 )
+
+            if "sessionId" in args or "agentId" in args:
+                return (
+                    _jsonrpc_result(
+                        request_id=request_id,
+                        result=_mcp_call_tool_result(
+                            content=[{"type": "text", "text": "Cron tool is session-scoped; do not pass sessionId/agentId"}],
+                            structured={"ok": False, "error": {"code": "INVALID_ARGUMENT", "message": "cron tool is session-scoped; remove sessionId/agentId"}},
+                            is_error=True,
+                        ),
+                    ),
+                    {"MCP-Protocol-Version": sess.protocol_version},
+                )
+
+            session_id = scoped_sid
 
             include_disabled = bool(args.get("includeDisabled"))
             job_id = str(args.get("jobId") or "").strip()
@@ -4642,11 +4657,14 @@ async def _mcp_handle_single_message(request: Request, body: dict[str, Any]) -> 
 
         session_id = uuid.uuid4().hex
         now_ms = int(time.time() * 1000)
+        scoped_sid = getattr(request.state, "mcp_scoped_session_id", None)
+        scoped_sid = scoped_sid.strip() if isinstance(scoped_sid, str) and scoped_sid.strip() else None
         sess = McpSessionState(
             session_id=session_id,
             protocol_version=negotiated,
             initialized=False,
             client_info=client_info,
+            scoped_session_id=scoped_sid,
             created_at_ms=now_ms,
             last_seen_ms=now_ms,
         )
@@ -4663,7 +4681,7 @@ async def _mcp_handle_single_message(request: Request, body: dict[str, Any]) -> 
                 "title": "Argus Gateway MCP",
                 "version": "0.1.0",
             },
-            "instructions": "This MCP server exposes tools for listing and invoking connected nodes.",
+            "instructions": "This MCP server exposes tools for listing and invoking connected nodes. Requests may be scoped to a runtime session.",
         }
         resp = JSONResponse(_jsonrpc_result(request_id=request_id, result=result), status_code=200)
         resp.headers["MCP-Session-Id"] = session_id
@@ -4875,12 +4893,57 @@ MCP_PROTOCOL_VERSION_LATEST = SUPPORTED_MCP_PROTOCOL_VERSIONS[0]
 
 
 def _mcp_require_token(request: Request):
-    expected = os.getenv("ARGUS_MCP_TOKEN") or os.getenv("ARGUS_TOKEN") or None
-    if expected is None:
+    # MCP auth is scoped per runtime session to avoid cross-agent data access.
+    #
+    # - The gateway reads a master secret from ARGUS_MCP_TOKEN (fallback: ARGUS_TOKEN).
+    # - Each runtime container receives a derived per-session token as its ARGUS_MCP_TOKEN.
+    # - Requests authenticated with the derived token are scoped to that sessionId.
+    # - The raw master token is NOT accepted directly.
+    master = os.getenv("ARGUS_MCP_TOKEN") or os.getenv("ARGUS_TOKEN") or None
+    request.state.mcp_scoped_session_id = None
+    if master is None:
         return
-    provided = _extract_token_http(request)
-    if provided != expected:
-        raise HTTPException(status_code=401, detail="Unauthorized")
+    provided = _extract_token_http(request) or ""
+    scoped = _mcp_verify_derived_session_token(master, provided)
+    if scoped:
+        request.state.mcp_scoped_session_id = scoped
+        return
+    raise HTTPException(status_code=401, detail="Unauthorized")
+
+
+_MCP_DERIVED_TOKEN_PREFIX = "argus-mcp-v1"
+
+
+def _b64url_no_pad(raw: bytes) -> str:
+    return base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
+
+
+def _mcp_derive_session_token(master: str, session_id: str) -> str:
+    sid = str(session_id or "").strip()
+    if not sid:
+        raise ValueError("session_id must not be empty")
+    mac = hmac.new(master.encode("utf-8"), sid.encode("utf-8"), hashlib.sha256).digest()
+    sig = _b64url_no_pad(mac)[:32]
+    return f"{_MCP_DERIVED_TOKEN_PREFIX}.{sid}.{sig}"
+
+
+def _mcp_verify_derived_session_token(master: str, token: str) -> Optional[str]:
+    t = str(token or "").strip()
+    if not t:
+        return None
+    parts = t.split(".", 2)
+    if len(parts) != 3:
+        return None
+    prefix, sid, sig = parts
+    if prefix != _MCP_DERIVED_TOKEN_PREFIX:
+        return None
+    if not sid or not sig:
+        return None
+    expected = _mcp_derive_session_token(master, sid)
+    # Constant-time compare.
+    if hmac.compare_digest(expected, t):
+        return sid
+    return None
 
 
 def _jsonrpc_error(*, request_id: Any, code: int, message: str, data: Any = None) -> dict[str, Any]:
@@ -5098,11 +5161,9 @@ def _docker_create_container_sync(cfg: DockerProvisionConfig, session_id: str):
     # NOTE: Codex rejects inline bearer tokens in config.toml for streamable_http;
     # use `bearer_token_env_var` and read from these env vars instead.
     gateway_token = os.getenv("ARGUS_TOKEN") or None
-    mcp_token = os.getenv("ARGUS_MCP_TOKEN") or gateway_token
-    if gateway_token:
-        env["ARGUS_TOKEN"] = gateway_token
-    if mcp_token:
-        env["ARGUS_MCP_TOKEN"] = mcp_token
+    mcp_master = os.getenv("ARGUS_MCP_TOKEN") or gateway_token
+    if mcp_master:
+        env["ARGUS_MCP_TOKEN"] = _mcp_derive_session_token(mcp_master, session_id)
 
     # Runtime node-host (inside the same runtime container) connects back to the gateway
     # for background-job style execution (`system.run` + `process.*`).
