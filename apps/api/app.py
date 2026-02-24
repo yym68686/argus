@@ -3358,9 +3358,9 @@ class McpSessionState:
     protocol_version: str
     initialized: bool
     client_info: Optional[dict[str, Any]]
-    scoped_session_id: Optional[str] = None
     created_at_ms: int
     last_seen_ms: int
+    scoped_session_id: Optional[str] = None
 
 def _provision_mode() -> str:
     return os.getenv("ARGUS_PROVISION_MODE", "static").strip().lower()
