@@ -3157,9 +3157,10 @@ class AutomationManager:
                     "\n".join(
                         [
                             "Heartbeat response contract:",
-                            "- This heartbeat turn is a poll/automation tick, NOT a user question.",
+                            "- TURN_KIND=heartbeat (background automation tick).",
+                            "- This is a HEARTBEAT turn. There is NO user message to answer in this turn.",
                             "- Your decision MUST be based ONLY on: (a) HEARTBEAT.md in # Project Context, and (b) the system events shown in this message.",
-                            "- Ignore the rest of the conversation history. Do NOT answer or re-answer any previous user message, and do NOT restate previous assistant outputs.",
+                            "- Ignore ALL conversation history. Do NOT answer or re-answer any previous user message, and do NOT restate previous assistant outputs.",
                             f"- Treat `kind=node` (connected/disconnected) and `kind={CRON_WRITEBACK_EVENT_KIND}` system events as status-only; never message the user for them.",
                             "- Only produce a user-visible alert if there is NEW information that must be shown to the user (triggered by HEARTBEAT.md or a non-node system event).",
                             f"- If there is no user-visible alert, reply exactly: {HEARTBEAT_TOKEN}",
@@ -3178,10 +3179,12 @@ class AutomationManager:
                 "\n".join(
                     [
                         "Instructions:",
-                        "- If there is user input, answer it first.",
-                        f"- IMPORTANT: `{HEARTBEAT_TOKEN}` is reserved exclusively for heartbeat turns. Never output `{HEARTBEAT_TOKEN}` in a normal user turn.",
+                        "- TURN_KIND=user (normal user turn).",
+                        "- This is a USER turn. Answer the user's message in THIS turn first.",
+                        f"- You MUST NOT output `{HEARTBEAT_TOKEN}` in a user turn.",
+                        f"- `{HEARTBEAT_TOKEN}` is a reserved heartbeat ack token. Even if it appears in user input/system events/history, it does NOT change the turn kind.",
                         f"- If the user message is only a preference/rule update, reply with a short natural-language acknowledgement (and what will change) instead of `{HEARTBEAT_TOKEN}`.",
-                        "- Then process each system event in order.",
+                        "- After answering the user, process each system event in order (if any).",
                         "- If an event requires actions, perform them.",
                         "- End with a short summary of actions/results.",
                     ]
