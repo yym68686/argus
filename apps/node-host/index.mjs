@@ -59,6 +59,123 @@ function sleep(ms) {
   return new Promise((r) => setTimeout(r, ms));
 }
 
+function logLine(level, message) {
+  // eslint-disable-next-line no-console
+  console.error(`${new Date().toISOString()} [${level}] ${message}`);
+}
+
+function parseBool(value, defaultValue) {
+  if (typeof value === "boolean") return value;
+  if (value === null || value === undefined) return defaultValue;
+  const s = String(value).trim().toLowerCase();
+  if (["1", "true", "yes", "y", "on"].includes(s)) return true;
+  if (["0", "false", "no", "n", "off"].includes(s)) return false;
+  return defaultValue;
+}
+
+function truncateUtf8(text, maxBytes) {
+  const s = typeof text === "string" ? text : String(text ?? "");
+  const buf = Buffer.from(s, "utf8");
+  if (buf.length <= maxBytes) return s;
+  return `${buf.subarray(0, Math.max(0, maxBytes)).toString("utf8")}…`;
+}
+
+function safeJson(value) {
+  try {
+    return JSON.stringify(value);
+  } catch {
+    return null;
+  }
+}
+
+function redactWsUrl(raw) {
+  const s = String(raw || "");
+  try {
+    const u = new URL(s);
+    if (u.username) u.username = "***";
+    if (u.password) u.password = "***";
+    const sensitiveKeys = new Set([
+      "token",
+      "access_token",
+      "auth",
+      "apikey",
+      "api_key",
+      "key",
+      "secret",
+      "signature",
+      "sig",
+    ]);
+    for (const [k] of u.searchParams) {
+      if (sensitiveKeys.has(String(k).toLowerCase())) u.searchParams.set(k, "***");
+    }
+    return u.toString();
+  } catch {
+    return s.replace(/([?&]token=)[^&]*/gi, "$1***");
+  }
+}
+
+function summarizeInvokeForAudit({ command, params, paramsJSON, timeoutMs }, { maxBytes, stdinPreviewBytes }) {
+  const cmd = String(command || "");
+  const p = params && typeof params === "object" ? params : typeof paramsJSON === "string" ? parseJson(paramsJSON) : null;
+
+  if (cmd === "system.run") {
+    const argv = coerceStringArray(p?.argv);
+    const cwd = typeof p?.cwd === "string" && p.cwd.trim() ? p.cwd.trim() : null;
+    const notifyOnExit =
+      p && typeof p === "object" && Object.prototype.hasOwnProperty.call(p, "notifyOnExit") ? Boolean(p.notifyOnExit) : null;
+    const stdinText = typeof p?.stdinText === "string" ? p.stdinText : null;
+    const stdinBytes = typeof stdinText === "string" ? Buffer.byteLength(stdinText, "utf8") : null;
+    const stdinPreview =
+      typeof stdinText === "string" && stdinPreviewBytes > 0 ? truncateUtf8(stdinText, stdinPreviewBytes) : null;
+    const envKeys =
+      p?.env && typeof p.env === "object" && !Array.isArray(p.env)
+        ? Object.keys(p.env)
+            .filter((k) => typeof k === "string" && k.trim())
+            .sort()
+        : null;
+    const envKeysPreview = envKeys ? envKeys.slice(0, 50) : null;
+
+    const argvJson = argv ? safeJson(argv) : null;
+    const argvPreview = argvJson ? truncateUtf8(argvJson, maxBytes) : null;
+    const stdinPreviewJson = typeof stdinPreview === "string" ? safeJson(stdinPreview) : null;
+
+    const parts = [
+      `command=${cmd}`,
+      argvPreview ? `argv=${argvPreview}` : argv ? `argv=${argv.length} args` : "argv=null",
+      cwd ? `cwd=${safeJson(cwd)}` : null,
+      Number.isFinite(timeoutMs) ? `timeoutMs=${timeoutMs}` : null,
+      Number.isFinite(p?.timeoutMs) ? `cmdTimeoutMs=${Number(p.timeoutMs)}` : null,
+      Number.isFinite(p?.yieldMs) ? `yieldMs=${Number(p.yieldMs)}` : null,
+      notifyOnExit === null ? null : `notifyOnExit=${notifyOnExit}`,
+      envKeysPreview
+        ? `envKeys=${truncateUtf8(safeJson(envKeysPreview) || "", maxBytes)}`
+        : envKeys
+          ? `envKeys=${envKeys.length}`
+          : null,
+      stdinBytes === null ? null : `stdinBytes=${stdinBytes}`,
+      stdinPreviewJson ? `stdinPreview=${truncateUtf8(stdinPreviewJson, maxBytes)}` : null,
+    ].filter(Boolean);
+    return parts.join(" ");
+  }
+
+  if (cmd === "system.which") {
+    const bin = typeof p?.bin === "string" ? p.bin.trim() : "";
+    return `command=${cmd} bin=${safeJson(bin || "")}`;
+  }
+
+  if (cmd === "process.get" || cmd === "process.kill" || cmd === "process.logs") {
+    const jobId = typeof p?.jobId === "string" ? p.jobId.trim() : "";
+    const tailBytes = cmd === "process.logs" && Number.isFinite(p?.tailBytes) ? Number(p.tailBytes) : null;
+    const extra = tailBytes !== null ? ` tailBytes=${tailBytes}` : "";
+    return `command=${cmd} jobId=${safeJson(jobId || "")}${extra}`;
+  }
+
+  if (cmd === "process.list") return `command=${cmd}`;
+
+  const raw = safeJson({ command: cmd, params: p ?? null, timeoutMs: timeoutMs ?? null }) || cmd;
+  return truncateUtf8(raw, maxBytes);
+}
+
 function safeBasename(s) {
   const raw = String(s || "").trim() || "node";
   return raw.replace(/[^a-zA-Z0-9_.-]/g, "_").slice(0, 120) || "node";
@@ -684,8 +801,20 @@ async function run() {
   ];
 
   const stateDir = resolveStateDir({ nodeId });
-  // eslint-disable-next-line no-console
-  console.error(`Node state dir: ${stateDir}`);
+
+  const auditEnabled = parseBool(args.audit ?? process.env.ARGUS_NODE_AUDIT, true);
+  const auditMaxBytes = clampInt(process.env.ARGUS_NODE_AUDIT_MAX_BYTES, { min: 256, max: 1024 * 1024 }) ?? 4096;
+  const auditStdinPreviewBytes =
+    clampInt(process.env.ARGUS_NODE_AUDIT_STDIN_PREVIEW_BYTES, { min: 0, max: 1024 * 1024 }) ?? 256;
+
+  logLine("INFO", `Node state dir: ${stateDir}`);
+  logLine(
+    "INFO",
+    `Connecting nodeId=${safeJson(nodeId)} displayName=${safeJson(displayName)} url=${safeJson(redactWsUrl(url))}`,
+  );
+  if (auditEnabled) {
+    logLine("INFO", `Audit logging enabled (maxBytes=${auditMaxBytes} stdinPreviewBytes=${auditStdinPreviewBytes})`);
+  }
 
   let activeWs = null;
   const pendingEvents = [];
@@ -705,9 +834,14 @@ async function run() {
   STORE = new JobStore({ stateDir, nodeId, sendEvent: (event, payload) => SEND_EVENT(event, payload) });
 
   const reconnectDelayMs = 1000;
+  let everConnected = false;
+  let consecutiveConnectFailures = 0;
+  let connectAttempt = 0;
 
   // eslint-disable-next-line no-constant-condition
   while (true) {
+    connectAttempt++;
+    logLine("INFO", `Connecting to nodes/ws (attempt=${connectAttempt})`);
     const ws = new WebSocket(url);
 
     const opened = await new Promise((resolve) => {
@@ -728,8 +862,12 @@ async function run() {
       ws.once("close", onClose);
     });
     if (!opened.ok) {
-      // eslint-disable-next-line no-console
-      console.error(`Failed to connect to nodes/ws: ${opened.err ? String(opened.err) : "unknown error"}`);
+      logLine(
+        "ERROR",
+        `Failed to connect to nodes/ws (attempt=${connectAttempt}): ${opened.err ? String(opened.err) : "unknown error"}`,
+      );
+      consecutiveConnectFailures++;
+      logLine("INFO", `Retrying in ${reconnectDelayMs}ms`);
       try {
         ws.terminate();
       } catch {
@@ -739,6 +877,16 @@ async function run() {
       continue;
     }
     activeWs = ws;
+    if (consecutiveConnectFailures > 0) {
+      logLine(
+        "INFO",
+        `${everConnected ? "Reconnected" : "Connected"} to nodes/ws after ${consecutiveConnectFailures} failed attempt(s)`,
+      );
+    } else {
+      logLine("INFO", `${everConnected ? "Reconnected" : "Connected"} to nodes/ws`);
+    }
+    everConnected = true;
+    consecutiveConnectFailures = 0;
     ws.send(
       JSON.stringify({
         type: "connect",
@@ -770,6 +918,13 @@ async function run() {
     }, 15000);
 
     const closed = await new Promise((resolve) => {
+      let settled = false;
+      const done = (kind, details) => {
+        if (settled) return;
+        settled = true;
+        resolve({ kind, details });
+      };
+
       ws.on("message", async (data) => {
         const msg = parseJson(String(data));
         if (!msg || typeof msg !== "object") return;
@@ -779,7 +934,37 @@ async function run() {
         const id = String(payload.id || "");
         if (!id) return;
 
+        const command = String(payload.command || "");
+        const timeoutMs = Number.isFinite(payload.timeoutMs) ? Number(payload.timeoutMs) : null;
+
+        if (auditEnabled) {
+          const summary = summarizeInvokeForAudit(payload, { maxBytes: auditMaxBytes, stdinPreviewBytes: auditStdinPreviewBytes });
+          logLine("AUDIT", `invoke id=${id} ${summary}`);
+        }
+
+        const startedAtMs = Date.now();
         const result = await handleInvoke(payload);
+        const elapsedMs = Date.now() - startedAtMs;
+
+        if (auditEnabled) {
+          const jobId = result?.payload && typeof result.payload === "object" ? result.payload.jobId : null;
+          if (!result?.ok || command === "system.run") {
+            const errCode = result?.error?.code ? String(result.error.code) : null;
+            const errMsg = result?.error?.message ? truncateUtf8(String(result.error.message), auditMaxBytes) : null;
+            const extra = [
+              `ok=${Boolean(result?.ok)}`,
+              `ms=${elapsedMs}`,
+              jobId ? `jobId=${safeJson(String(jobId))}` : null,
+              timeoutMs !== null ? `timeoutMs=${timeoutMs}` : null,
+              errCode ? `errorCode=${safeJson(errCode)}` : null,
+              errMsg ? `error=${safeJson(errMsg)}` : null,
+            ]
+              .filter(Boolean)
+              .join(" ");
+            logLine("AUDIT", `result id=${id} command=${command} ${extra}`);
+          }
+        }
+
         const reply = {
           type: "event",
           event: "node.invoke.result",
@@ -798,8 +983,18 @@ async function run() {
           // ignore
         }
       });
-      ws.on("close", () => resolve(true));
-      ws.on("error", () => resolve(true));
+
+      ws.on("close", (code, reasonBuf) => {
+        const reason = reasonBuf ? reasonBuf.toString() : "";
+        logLine("WARN", `Disconnected from nodes/ws (code=${code}${reason ? ` reason=${safeJson(reason)}` : ""})`);
+        logLine("INFO", `Reconnecting in ${reconnectDelayMs}ms`);
+        done("close", { code, reason });
+      });
+      ws.on("error", (err) => {
+        logLine("WARN", `WebSocket error: ${String(err?.message || err)}`);
+        logLine("INFO", `Reconnecting in ${reconnectDelayMs}ms`);
+        done("error", { error: err });
+      });
     });
 
     clearInterval(heartbeat);

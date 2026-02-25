@@ -29,7 +29,10 @@ export ARGUS_TOKEN="<ARGUS_TOKEN>"
 - 兼容（浏览器/简单客户端）：URL 参数 `?token=<ARGUS_TOKEN>`
   - 完整示例：`ws://$HOST:8080/ws?token=<ARGUS_TOKEN>`
 
-> 备注：如果服务端配置了分离 token（`ARGUS_NODE_TOKEN` / `ARGUS_MCP_TOKEN`），则 Node Host 与 MCP 端点需要用对应 token；未配置时默认复用 `ARGUS_TOKEN`。
+> 备注：
+>
+> - 如果服务端配置了分离 token（`ARGUS_NODE_TOKEN` / `ARGUS_MCP_TOKEN`），则 Node Host / MCP 会使用对应的 master secret；未配置时默认复用 `ARGUS_TOKEN`。
+> - Node Host（`/nodes/ws`）是按 **session 隔离** 的：推荐用派生 token `argus-node-v1.<sessionId>.<sig>` 把 node 绑定到指定 session（`sig = base64url(hmac_sha256(master, sessionId))[:32]`）；直接用 master token 只会绑定到默认 session。
 
 ## 2. 系统架构（你在写客户端时需要知道的）
 

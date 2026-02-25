@@ -102,6 +102,12 @@ Notes:
 
 - Each runtime session container also runs a built-in node-host and registers as `runtime:<sessionId>`.
 - Inside the runtime, prefer `node="self"`; if multiple runtimes are online, use `node="runtime:<sessionId>"`.
+- Node hosts are **session-scoped**:
+  - Using the raw gateway token (e.g. `$ARGUS_TOKEN`) attaches the node to the **default session** only.
+  - To attach a node to a specific session, use a derived token: `argus-node-v1.<sessionId>.<sig>` (master secret: `ARGUS_NODE_TOKEN`, fallback: `ARGUS_TOKEN`; `sig = base64url(hmac_sha256(master, sessionId))[:32]`).
+- node-host prints connection/reconnect status and an audit log of received remote commands to stderr.
+  - Disable audit logs: `ARGUS_NODE_AUDIT=0` (or `node index.mjs --audit false ...`)
+  - Tune output: `ARGUS_NODE_AUDIT_MAX_BYTES`, `ARGUS_NODE_AUDIT_STDIN_PREVIEW_BYTES`
 
 ## Optional web UI
 

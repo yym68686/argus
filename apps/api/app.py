@@ -3768,6 +3768,7 @@ class NodeSession:
     node_id: str
     conn_id: str
     ws: WebSocket
+    scoped_session_id: Optional[str] = None
     display_name: Optional[str] = None
     platform: Optional[str] = None
     version: Optional[str] = None
@@ -3788,18 +3789,22 @@ class NodeInvokeResult:
 class NodeRegistry:
     def __init__(self) -> None:
         self._lock = asyncio.Lock()
-        self._nodes_by_id: dict[str, NodeSession] = {}
-        self._nodes_by_conn: dict[str, str] = {}
-        self._pending: dict[str, tuple[str, asyncio.Future[NodeInvokeResult]]] = {}
+        self._nodes_by_key: dict[tuple[str, str], NodeSession] = {}
+        self._nodes_by_conn: dict[str, tuple[str, str]] = {}
+        self._pending: dict[str, tuple[tuple[str, str], asyncio.Future[NodeInvokeResult]]] = {}
+
+    def _norm_scope(self, scope_session_id: Optional[str]) -> str:
+        return scope_session_id.strip() if isinstance(scope_session_id, str) and scope_session_id.strip() else ""
 
     async def register(self, session: NodeSession) -> None:
+        key = (self._norm_scope(session.scoped_session_id), session.node_id)
         async with self._lock:
-            existing = self._nodes_by_id.get(session.node_id)
+            existing = self._nodes_by_key.get(key)
             if existing is not None:
                 self._nodes_by_conn.pop(existing.conn_id, None)
-                self._nodes_by_id.pop(existing.node_id, None)
-                for rid, (pending_node_id, fut) in list(self._pending.items()):
-                    if pending_node_id != session.node_id:
+                self._nodes_by_key.pop(key, None)
+                for rid, (pending_key, fut) in list(self._pending.items()):
+                    if pending_key != key:
                         continue
                     if not fut.done():
                         fut.set_result(
@@ -3813,17 +3818,17 @@ class NodeRegistry:
                     await existing.ws.close(code=1012, reason="replaced")
                 except Exception:
                     pass
-            self._nodes_by_id[session.node_id] = session
-            self._nodes_by_conn[session.conn_id] = session.node_id
+            self._nodes_by_key[key] = session
+            self._nodes_by_conn[session.conn_id] = key
 
     async def unregister(self, conn_id: str) -> Optional[NodeSession]:
         async with self._lock:
-            node_id = self._nodes_by_conn.pop(conn_id, None)
-            if not node_id:
+            key = self._nodes_by_conn.pop(conn_id, None)
+            if not key:
                 return None
-            removed = self._nodes_by_id.pop(node_id, None)
-            for rid, (pending_node_id, fut) in list(self._pending.items()):
-                if pending_node_id != node_id:
+            removed = self._nodes_by_key.pop(key, None)
+            for rid, (pending_key, fut) in list(self._pending.items()):
+                if pending_key != key:
                     continue
                 if fut.done():
                     self._pending.pop(rid, None)
@@ -3834,14 +3839,18 @@ class NodeRegistry:
                 self._pending.pop(rid, None)
             return removed
 
-    async def list_connected(self) -> list[dict[str, Any]]:
+    async def list_connected(self, *, scope_session_id: Optional[str] = None) -> list[dict[str, Any]]:
+        scope = self._norm_scope(scope_session_id) if scope_session_id is not None else None
         async with self._lock:
-            sessions = list(self._nodes_by_id.values())
+            sessions = list(self._nodes_by_key.items())
         out: list[dict[str, Any]] = []
-        for s in sessions:
+        for (sid, _), s in sessions:
+            if scope is not None and sid != scope:
+                continue
             out.append(
                 {
                     "nodeId": s.node_id,
+                    "sessionId": sid or None,
                     "displayName": s.display_name,
                     "platform": s.platform,
                     "version": s.version,
@@ -3854,14 +3863,28 @@ class NodeRegistry:
         out.sort(key=lambda x: x.get("displayName") or x.get("nodeId") or "")
         return out
 
-    async def list_runtime_node_ids(self) -> list[str]:
+    async def list_runtime_node_ids(self, *, scope_session_id: Optional[str] = None) -> list[str]:
+        scope = self._norm_scope(scope_session_id) if scope_session_id is not None else None
         async with self._lock:
-            ids = [s.node_id for s in self._nodes_by_id.values() if (s.node_id or "").startswith("runtime:")]
+            ids = [
+                s.node_id
+                for (sid, _), s in self._nodes_by_key.items()
+                if (s.node_id or "").startswith("runtime:") and (scope is None or sid == scope)
+            ]
         ids.sort()
         return ids
 
-    async def resolve_self_runtime_node_id(self, *, default_session_id: Optional[str]) -> Optional[str]:
-        runtime_ids = await self.list_runtime_node_ids()
+    async def resolve_self_runtime_node_id(
+        self, *, scope_session_id: Optional[str] = None, default_session_id: Optional[str] = None
+    ) -> Optional[str]:
+        scope = self._norm_scope(scope_session_id) if scope_session_id is not None else None
+        if scope:
+            cand = f"runtime:{scope}"
+            async with self._lock:
+                if (scope, cand) in self._nodes_by_key:
+                    return cand
+
+        runtime_ids = await self.list_runtime_node_ids(scope_session_id=scope)
         if len(runtime_ids) == 1:
             return runtime_ids[0]
         if default_session_id:
@@ -3870,38 +3893,70 @@ class NodeRegistry:
                 return cand
         return None
 
-    async def resolve_implicit_runtime_node_id(self) -> Optional[str]:
-        runtime_ids = await self.list_runtime_node_ids()
+    async def resolve_implicit_runtime_node_id(self, *, scope_session_id: Optional[str] = None) -> Optional[str]:
+        runtime_ids = await self.list_runtime_node_ids(scope_session_id=scope_session_id)
         if len(runtime_ids) == 1:
             return runtime_ids[0]
         return None
 
-    async def resolve_node_id(self, ident: str) -> Optional[str]:
+    async def resolve_node_id(self, ident: str, *, scope_session_id: Optional[str] = None) -> Optional[str]:
         key = (ident or "").strip()
         if not key:
             return None
+        scope = self._norm_scope(scope_session_id) if scope_session_id is not None else None
         async with self._lock:
-            if key in self._nodes_by_id:
-                return key
+            exact = [
+                s.node_id
+                for (sid, node_id), s in self._nodes_by_key.items()
+                if node_id == key and (scope is None or sid == scope)
+            ]
+            if len(exact) == 1:
+                return exact[0]
+            if len(exact) > 1:
+                return None
+
             matches = [
                 s.node_id
-                for s in self._nodes_by_id.values()
-                if (s.display_name or "").strip().lower() == key.lower()
+                for (sid, _), s in self._nodes_by_key.items()
+                if (s.display_name or "").strip().lower() == key.lower() and (scope is None or sid == scope)
             ]
         if len(matches) == 1:
             return matches[0]
         return None
 
-    async def touch(self, node_id: str) -> None:
+    async def touch(self, node_id: str, *, scope_session_id: Optional[str] = None) -> None:
+        scope = self._norm_scope(scope_session_id) if scope_session_id is not None else None
         now_ms = int(time.time() * 1000)
         async with self._lock:
-            s = self._nodes_by_id.get(node_id)
-            if s is not None:
-                s.last_seen_ms = now_ms
+            if scope is not None:
+                s = self._nodes_by_key.get((scope, node_id))
+                if s is not None:
+                    s.last_seen_ms = now_ms
+                return
+            # Global touch: only if unique across scopes
+            matches = [s for (sid, nid), s in self._nodes_by_key.items() if nid == node_id]
+            if len(matches) == 1:
+                matches[0].last_seen_ms = now_ms
 
-    async def invoke(self, *, node_id: str, command: str, params: Any = None, timeout_ms: Optional[int] = None) -> NodeInvokeResult:
+    async def invoke(
+        self,
+        *,
+        node_id: str,
+        scope_session_id: Optional[str] = None,
+        command: str,
+        params: Any = None,
+        timeout_ms: Optional[int] = None,
+    ) -> NodeInvokeResult:
+        scope = self._norm_scope(scope_session_id) if scope_session_id is not None else None
         async with self._lock:
-            session = self._nodes_by_id.get(node_id)
+            if scope is not None:
+                session = self._nodes_by_key.get((scope, node_id))
+                key = (scope, node_id)
+            else:
+                matches = [(k, s) for k, s in self._nodes_by_key.items() if k[1] == node_id]
+                if len(matches) != 1:
+                    return NodeInvokeResult(ok=False, error={"code": "NOT_CONNECTED", "message": "node not connected"})
+                key, session = matches[0]
         if session is None or session.ws.client_state != WebSocketState.CONNECTED:
             return NodeInvokeResult(ok=False, error={"code": "NOT_CONNECTED", "message": "node not connected"})
         if session.commands and command not in session.commands:
@@ -3925,7 +3980,7 @@ class NodeRegistry:
 
         fut: asyncio.Future[NodeInvokeResult] = asyncio.get_running_loop().create_future()
         async with self._lock:
-            self._pending[request_id] = (node_id, fut)
+            self._pending[request_id] = (key, fut)
         try:
             await session.ws.send_text(json.dumps({"type": "event", "event": "node.invoke.request", "payload": payload}))
         except Exception:
@@ -4344,7 +4399,8 @@ async def _mcp_handle_single_message(request: Request, body: dict[str, Any]) -> 
         args = arguments if isinstance(arguments, dict) else {}
 
         if tool_name == "nodes_list":
-            nodes = await app.state.node_registry.list_connected()
+            scoped_sid = getattr(request.state, "mcp_scoped_session_id", None) or sess.scoped_session_id
+            nodes = await app.state.node_registry.list_connected(scope_session_id=scoped_sid)
             return (
                 _jsonrpc_result(
                     request_id=request_id,
@@ -5466,11 +5522,12 @@ async def _mcp_handle_single_message(request: Request, body: dict[str, Any]) -> 
             # Node selection:
             # - node="self": prefer the runtime node for the default session (or the only runtime node if unique)
             # - node omitted: only allowed when exactly one runtime node is connected
+            scoped_sid = getattr(request.state, "mcp_scoped_session_id", None) or sess.scoped_session_id
             node_id: Optional[str] = None
             if not node_raw:
-                node_id = await app.state.node_registry.resolve_implicit_runtime_node_id()
+                node_id = await app.state.node_registry.resolve_implicit_runtime_node_id(scope_session_id=scoped_sid)
                 if not node_id:
-                    runtime_ids = await app.state.node_registry.list_runtime_node_ids()
+                    runtime_ids = await app.state.node_registry.list_runtime_node_ids(scope_session_id=scoped_sid)
                     msg_text = (
                         "No runtime node is connected; start/attach a session (or pass a non-runtime node)."
                         if not runtime_ids
@@ -5488,11 +5545,9 @@ async def _mcp_handle_single_message(request: Request, body: dict[str, Any]) -> 
                         {"MCP-Protocol-Version": sess.protocol_version},
                     )
             elif node_raw.lower() == "self":
-                automation: Optional[AutomationManager] = getattr(app.state, "automation", None)
-                default_sid = automation._store.state.default_session_id if automation is not None else None
-                node_id = await app.state.node_registry.resolve_self_runtime_node_id(default_session_id=default_sid)
+                node_id = await app.state.node_registry.resolve_self_runtime_node_id(scope_session_id=scoped_sid)
                 if not node_id:
-                    runtime_ids = await app.state.node_registry.list_runtime_node_ids()
+                    runtime_ids = await app.state.node_registry.list_runtime_node_ids(scope_session_id=scoped_sid)
                     return (
                         _jsonrpc_result(
                             request_id=request_id,
@@ -5505,7 +5560,7 @@ async def _mcp_handle_single_message(request: Request, body: dict[str, Any]) -> 
                         {"MCP-Protocol-Version": sess.protocol_version},
                     )
             else:
-                node_id = await app.state.node_registry.resolve_node_id(node_raw)
+                node_id = await app.state.node_registry.resolve_node_id(node_raw, scope_session_id=scoped_sid)
             if not node_id:
                 return (
                     _jsonrpc_result(
@@ -5521,6 +5576,7 @@ async def _mcp_handle_single_message(request: Request, body: dict[str, Any]) -> 
 
             res: NodeInvokeResult = await app.state.node_registry.invoke(
                 node_id=node_id,
+                scope_session_id=scoped_sid,
                 command=cmd,
                 params=invoke_params,
                 timeout_ms=int(timeout_ms) if isinstance(timeout_ms, (int, float)) else None,
@@ -5684,7 +5740,8 @@ async def _mcp_handle_single_message(request: Request, body: dict[str, Any]) -> 
             args = {}
 
         if tool_name == "nodes_list":
-            nodes = await app.state.node_registry.list_connected()
+            scoped_sid = getattr(request.state, "mcp_scoped_session_id", None) or sess.scoped_session_id
+            nodes = await app.state.node_registry.list_connected(scope_session_id=scoped_sid)
             return JSONResponse(
                 _jsonrpc_result(
                     request_id=request_id,
@@ -5721,10 +5778,11 @@ async def _mcp_handle_single_message(request: Request, body: dict[str, Any]) -> 
                 )
 
             node_id: Optional[str] = None
+            scoped_sid = getattr(request.state, "mcp_scoped_session_id", None) or sess.scoped_session_id
             if not node_raw:
-                node_id = await app.state.node_registry.resolve_implicit_runtime_node_id()
+                node_id = await app.state.node_registry.resolve_implicit_runtime_node_id(scope_session_id=scoped_sid)
                 if not node_id:
-                    runtime_ids = await app.state.node_registry.list_runtime_node_ids()
+                    runtime_ids = await app.state.node_registry.list_runtime_node_ids(scope_session_id=scoped_sid)
                     msg_text = (
                         "No runtime node is connected; start/attach a session (or pass a non-runtime node)."
                         if not runtime_ids
@@ -5742,11 +5800,9 @@ async def _mcp_handle_single_message(request: Request, body: dict[str, Any]) -> 
                         status_code=200,
                     )
             elif node_raw.lower() == "self":
-                automation: Optional[AutomationManager] = getattr(app.state, "automation", None)
-                default_sid = automation._store.state.default_session_id if automation is not None else None
-                node_id = await app.state.node_registry.resolve_self_runtime_node_id(default_session_id=default_sid)
+                node_id = await app.state.node_registry.resolve_self_runtime_node_id(scope_session_id=scoped_sid)
                 if not node_id:
-                    runtime_ids = await app.state.node_registry.list_runtime_node_ids()
+                    runtime_ids = await app.state.node_registry.list_runtime_node_ids(scope_session_id=scoped_sid)
                     return JSONResponse(
                         _jsonrpc_result(
                             request_id=request_id,
@@ -5759,7 +5815,7 @@ async def _mcp_handle_single_message(request: Request, body: dict[str, Any]) -> 
                         status_code=200,
                     )
             else:
-                node_id = await app.state.node_registry.resolve_node_id(node_raw)
+                node_id = await app.state.node_registry.resolve_node_id(node_raw, scope_session_id=scoped_sid)
             if not node_id:
                 return JSONResponse(
                     _jsonrpc_result(
@@ -5775,6 +5831,7 @@ async def _mcp_handle_single_message(request: Request, body: dict[str, Any]) -> 
 
             res: NodeInvokeResult = await app.state.node_registry.invoke(
                 node_id=node_id,
+                scope_session_id=scoped_sid,
                 command=cmd,
                 params=invoke_params,
                 timeout_ms=timeout_ms,
@@ -5895,6 +5952,39 @@ def _mcp_verify_derived_session_token(master: str, token: str) -> Optional[str]:
     if hmac.compare_digest(expected, t):
         return sid
     return None
+
+
+_NODE_DERIVED_TOKEN_PREFIX = "argus-node-v1"
+
+
+def _node_derive_session_token(master: str, session_id: str) -> str:
+    sid = str(session_id or "").strip()
+    if not sid:
+        raise ValueError("session_id must not be empty")
+    mac = hmac.new(master.encode("utf-8"), sid.encode("utf-8"), hashlib.sha256).digest()
+    sig = _b64url_no_pad(mac)[:32]
+    return f"{_NODE_DERIVED_TOKEN_PREFIX}.{sid}.{sig}"
+
+
+def _node_verify_derived_session_token(master: str, token: str) -> Optional[str]:
+    t = str(token or "").strip()
+    if not t:
+        return None
+    parts = t.split(".", 2)
+    if len(parts) != 3:
+        return None
+    prefix, sid, sig = parts
+    if prefix != _NODE_DERIVED_TOKEN_PREFIX:
+        return None
+    if not sid or not sig:
+        return None
+    try:
+        expected = _node_derive_session_token(master, sid)
+    except Exception:
+        return None
+    if expected != t:
+        return None
+    return sid
 
 
 def _jsonrpc_error(*, request_id: Any, code: int, message: str, data: Any = None) -> dict[str, Any]:
@@ -6122,7 +6212,7 @@ def _docker_create_container_sync(cfg: DockerProvisionConfig, session_id: str):
         from urllib.parse import quote as _url_quote
     except Exception:  # pragma: no cover
         _url_quote = None  # type: ignore
-    node_token = os.getenv("ARGUS_NODE_TOKEN") or gateway_token
+    node_master = os.getenv("ARGUS_NODE_TOKEN") or gateway_token
     gateway_internal_host = (os.getenv("ARGUS_GATEWAY_INTERNAL_HOST") or "").strip() or None
     if not gateway_internal_host:
         # Prefer the current gateway container name (resolvable on the shared docker network)
@@ -6141,8 +6231,9 @@ def _docker_create_container_sync(cfg: DockerProvisionConfig, session_id: str):
         gateway_internal_host = "gateway"
 
     node_ws_url = f"ws://{gateway_internal_host}:8080/nodes/ws"
-    if node_token:
-        q = _url_quote(node_token, safe="") if _url_quote is not None else node_token
+    if node_master:
+        derived = _node_derive_session_token(node_master, session_id)
+        q = _url_quote(derived, safe="") if _url_quote is not None else derived
         node_ws_url = f"{node_ws_url}?token={q}"
     env["ARGUS_NODE_WS_URL"] = node_ws_url
     env["ARGUS_NODE_ID"] = f"runtime:{session_id}"
@@ -6800,6 +6891,7 @@ def _format_node_system_event_text(
 async def _enqueue_node_system_event(
     *,
     event: str,
+    session_id: Optional[str] = None,
     node_id: str,
     display_name: Optional[str],
     platform: Optional[str],
@@ -6811,10 +6903,11 @@ async def _enqueue_node_system_event(
         return
 
     st = automation._store.state
-    session_id = st.default_session_id
-    if not session_id:
+    sid = session_id.strip() if isinstance(session_id, str) and session_id.strip() else st.default_session_id
+    sid = sid.strip() if isinstance(sid, str) and sid.strip() else None
+    if not sid:
         return
-    sess = st.sessions.get(session_id)
+    sess = st.sessions.get(sid)
     main_tid = sess.main_thread_id if sess is not None else None
     if not main_tid:
         return
@@ -6829,12 +6922,13 @@ async def _enqueue_node_system_event(
     )
     try:
         await automation.enqueue_system_event(
-            session_id=session_id,
+            session_id=sid,
             thread_id=main_tid,
             kind="node",
             text=text,
             meta={
                 "event": event,
+                "sessionId": sid,
                 "nodeId": node_id,
                 "displayName": display_name,
                 "platform": platform,
@@ -6901,6 +6995,7 @@ async def _enqueue_process_exited_system_event(
     *,
     node_id: str,
     payload: dict[str, Any],
+    scoped_session_id: Optional[str] = None,
 ) -> None:
     automation: Optional[AutomationManager] = getattr(app.state, "automation", None)
     if automation is None:
@@ -6912,7 +7007,7 @@ async def _enqueue_process_exited_system_event(
 
     session_id = payload.get("sessionId")
     if not isinstance(session_id, str) or not session_id.strip():
-        session_id = _session_id_from_node_id(node_id) or automation._store.state.default_session_id
+        session_id = scoped_session_id or _session_id_from_node_id(node_id) or automation._store.state.default_session_id
     session_id = (session_id or "").strip()
     if not session_id:
         return
@@ -6967,14 +7062,26 @@ async def _enqueue_process_exited_system_event(
 
 @app.websocket("/nodes/ws")
 async def ws_nodes(ws: WebSocket):
-    provided = _extract_token(ws)
-    expected = os.getenv("ARGUS_NODE_TOKEN") or os.getenv("ARGUS_TOKEN") or None
-    if expected and provided != expected:
-        await ws.accept()
-        await ws.close(code=1008, reason="Unauthorized")
-        return
+    provided = _extract_token(ws) or ""
+    master = os.getenv("ARGUS_NODE_TOKEN") or os.getenv("ARGUS_TOKEN") or None
+    scoped_session_id: Optional[str] = None
+
+    if master is not None:
+        # Back-compat: allow the raw master token, but scope it to the gateway default session only.
+        if provided == master:
+            automation: Optional[AutomationManager] = getattr(app.state, "automation", None)
+            scoped_session_id = automation._store.state.default_session_id if automation is not None else None
+        else:
+            scoped_session_id = _node_verify_derived_session_token(master, provided)
+    else:
+        # No auth configured: best-effort scope to default session (dev mode).
+        automation = getattr(app.state, "automation", None)
+        scoped_session_id = automation._store.state.default_session_id if automation is not None else None
 
     await ws.accept()
+    if master is not None and not (isinstance(scoped_session_id, str) and scoped_session_id.strip()):
+        await ws.close(code=1008, reason="Unauthorized")
+        return
     conn_id = uuid.uuid4().hex[:12]
 
     try:
@@ -7007,6 +7114,7 @@ async def ws_nodes(ws: WebSocket):
         node_id=node_id,
         conn_id=conn_id,
         ws=ws,
+        scoped_session_id=scoped_session_id.strip() if isinstance(scoped_session_id, str) and scoped_session_id.strip() else None,
         display_name=display_name,
         platform=platform,
         version=version,
@@ -7020,6 +7128,7 @@ async def ws_nodes(ws: WebSocket):
     asyncio.create_task(
         _enqueue_node_system_event(
             event="connected",
+            session_id=scoped_session_id,
             node_id=node_id,
             display_name=display_name,
             platform=platform,
@@ -7046,18 +7155,20 @@ async def ws_nodes(ws: WebSocket):
                 payload = msg["payload"]
                 if str(payload.get("nodeId") or "") != node_id:
                     continue
-                await app.state.node_registry.touch(node_id)
+                await app.state.node_registry.touch(node_id, scope_session_id=scoped_session_id)
                 await app.state.node_registry.handle_invoke_result(payload)
                 continue
             if msg.get("type") == "event" and msg.get("event") == "node.process.exited" and isinstance(msg.get("payload"), dict):
                 payload = msg["payload"]
                 if str(payload.get("nodeId") or "") not in ("", node_id):
                     continue
-                await app.state.node_registry.touch(node_id)
-                asyncio.create_task(_enqueue_process_exited_system_event(node_id=node_id, payload=payload))
+                await app.state.node_registry.touch(node_id, scope_session_id=scoped_session_id)
+                asyncio.create_task(
+                    _enqueue_process_exited_system_event(node_id=node_id, payload=payload, scoped_session_id=scoped_session_id)
+                )
                 continue
             if msg.get("type") == "event" and msg.get("event") == "node.heartbeat":
-                await app.state.node_registry.touch(node_id)
+                await app.state.node_registry.touch(node_id, scope_session_id=scoped_session_id)
                 continue
     except WebSocketDisconnect:
         pass
@@ -7067,6 +7178,7 @@ async def ws_nodes(ws: WebSocket):
             asyncio.create_task(
                 _enqueue_node_system_event(
                     event="disconnected",
+                    session_id=removed.scoped_session_id,
                     node_id=node_id,
                     display_name=display_name,
                     platform=platform,
@@ -7200,6 +7312,28 @@ async def ws_proxy(ws: WebSocket):
                                 automation.resolve_agent_session_id(agent_id) or automation._store.state.default_session_id
                             )
                             result = {"ok": True, "chatKey": chat_key, "agentId": agent_id, "sessionId": sess_id}
+                            if has_id:
+                                await ws.send_text(json.dumps({"id": req_id, "result": result}))
+                            continue
+                        if method == "argus/node/token":
+                            raw_chat_key = params.get("chatKey")
+                            if not isinstance(raw_chat_key, str) or not raw_chat_key.strip():
+                                if has_id:
+                                    await ws.send_text(
+                                        json.dumps({"id": req_id, "error": {"code": -32602, "message": "Missing 'chatKey'"}})
+                                    )
+                                continue
+                            chat_key = raw_chat_key.strip()
+                            sid = automation.resolve_session_id_for_chat_key(chat_key) or session_id
+                            master = os.getenv("ARGUS_NODE_TOKEN") or os.getenv("ARGUS_TOKEN") or None
+                            token = _node_derive_session_token(master, sid) if master else None
+                            result = {
+                                "ok": True,
+                                "chatKey": chat_key,
+                                "sessionId": sid,
+                                "path": "/nodes/ws",
+                                "token": token,
+                            }
                             if has_id:
                                 await ws.send_text(json.dumps({"id": req_id, "result": result}))
                             continue

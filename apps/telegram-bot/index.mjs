@@ -1346,9 +1346,25 @@ async function main() {
             } else {
               tid = state.getThreadId(sessionId, chatKey);
             }
+
+            let nodeTokenLine = "";
+            const wantToken = chatType === "private" && isNonEmptyString(cmdArgs) && cmdArgs.toLowerCase().includes("token");
+            if (wantToken) {
+              try {
+                const res = await control.rpc("argus/node/token", { chatKey });
+                const token = isNonEmptyString(res?.token) ? res.token : null;
+                const path = isNonEmptyString(res?.path) ? res.path : "/nodes/ws";
+                nodeTokenLine = `\nnodeWsPath: ${path}\nnodeWsToken: ${token || "(none)"}`;
+              } catch (e) {
+                nodeTokenLine = `\nnodeWsToken: (error: ${e instanceof Error ? e.message : String(e)})`;
+              }
+            }
+
             await tg.sendMessage({
               ...target,
-              text: `agentId: ${agentId}\nsessionId: ${sessionId || "(none)"}\nchatKey: ${chatKey}\nthreadId: ${tid || "(none)"}`
+              text:
+                `agentId: ${agentId}\nsessionId: ${sessionId || "(none)"}\nchatKey: ${chatKey}\nthreadId: ${tid || "(none)"}${nodeTokenLine}` +
+                (wantToken ? "\n\nWARNING: token is sensitive; rotate if leaked." : "")
             });
             typing.stop(chatKey);
             return;
