@@ -313,6 +313,16 @@ HEARTBEAT_TASKS_INTERVAL_MS = 30 * 60 * 1000
 HEARTBEAT_TOKEN = "HEARTBEAT_OK"
 HEARTBEAT_ACK_MAX_CHARS = 300
 
+CRON_EVENT_KIND = "cron"
+CRON_WRITEBACK_EVENT_KIND = "cron_writeback"
+CRON_DEFAULT_SESSION_TARGET = "main"
+CRON_SESSION_TARGETS: set[str] = {"main", "isolated"}
+CRON_WRITEBACK_WHENS: set[str] = {"always", "on-error", "never", "requested"}
+CRON_DEFAULT_WRITEBACK_MAX_CHARS = 2000
+CRON_DEFAULT_ISOLATED_WRITEBACK_WHEN = "always"
+CRON_DEFAULT_WRITEBACK_PROMPT_HINT = True
+CRON_DEFAULT_RETENTION_MAX_UNARCHIVED_THREADS = 50
+
 TELEGRAM_MAX_MESSAGE_CHARS = 4000
 TELEGRAM_MAX_UPLOAD_BYTES = 50 * 1024 * 1024
 TELEGRAM_MAX_DOWNLOAD_BYTES = 20 * 1024 * 1024
@@ -1047,6 +1057,9 @@ class PersistedCronJob:
     enabled: bool = True
     last_run_at_ms: Optional[int] = None
     next_run_at_ms: Optional[int] = None
+    session_target: str = "main"
+    writeback: Optional[dict[str, Any]] = None
+    retention: Optional[dict[str, Any]] = None
 
     def to_json(self) -> dict[str, Any]:
         out: dict[str, Any] = {
@@ -1059,6 +1072,11 @@ class PersistedCronJob:
             out["lastRunAtMs"] = self.last_run_at_ms
         if self.next_run_at_ms is not None:
             out["nextRunAtMs"] = self.next_run_at_ms
+        out["sessionTarget"] = self.session_target
+        if isinstance(self.writeback, dict) and self.writeback:
+            out["writeback"] = dict(self.writeback)
+        if isinstance(self.retention, dict) and self.retention:
+            out["retention"] = dict(self.retention)
         return out
 
     @staticmethod
@@ -1071,6 +1089,18 @@ class PersistedCronJob:
         if not job_id or not expr:
             return None
         enabled = bool(obj.get("enabled", True))
+
+        session_target = str(obj.get("sessionTarget") or "main").strip().lower()
+        if session_target not in ("main", "isolated"):
+            session_target = "main"
+
+        writeback = obj.get("writeback")
+        if not isinstance(writeback, dict):
+            writeback = None
+
+        retention = obj.get("retention")
+        if not isinstance(retention, dict):
+            retention = None
 
         last_run_at_ms = obj.get("lastRunAtMs")
         if last_run_at_ms is not None:
@@ -1093,6 +1123,81 @@ class PersistedCronJob:
             enabled=enabled,
             last_run_at_ms=last_run_at_ms,
             next_run_at_ms=next_run_at_ms,
+            session_target=session_target,
+            writeback=writeback,
+            retention=retention,
+        )
+
+
+@dataclass
+class PersistedCronRunMeta:
+    run_id: str
+    thread_id: str
+    turn_id: Optional[str] = None
+    started_at_ms: int = 0
+    ended_at_ms: Optional[int] = None
+    status: str = "running"
+    summary: Optional[str] = None
+    error: Optional[str] = None
+    archived: bool = False
+
+    def to_json(self) -> dict[str, Any]:
+        out: dict[str, Any] = {
+            "runId": self.run_id,
+            "threadId": self.thread_id,
+            "startedAtMs": int(self.started_at_ms),
+            "status": self.status,
+            "archived": bool(self.archived),
+        }
+        if isinstance(self.turn_id, str) and self.turn_id.strip():
+            out["turnId"] = self.turn_id.strip()
+        if self.ended_at_ms is not None:
+            out["endedAtMs"] = int(self.ended_at_ms)
+        if isinstance(self.summary, str) and self.summary.strip():
+            out["summary"] = self.summary
+        if isinstance(self.error, str) and self.error.strip():
+            out["error"] = self.error
+        return out
+
+    @staticmethod
+    def from_json(obj: Any) -> Optional["PersistedCronRunMeta"]:
+        if not isinstance(obj, dict):
+            return None
+        run_id = str(obj.get("runId") or "").strip()
+        thread_id = str(obj.get("threadId") or "").strip()
+        if not run_id or not thread_id:
+            return None
+        turn_id = obj.get("turnId")
+        turn_id = turn_id.strip() if isinstance(turn_id, str) and turn_id.strip() else None
+        started_at_ms = obj.get("startedAtMs")
+        try:
+            started_at_ms_int = int(started_at_ms) if started_at_ms is not None else _now_ms()
+        except Exception:
+            started_at_ms_int = _now_ms()
+        ended_at_ms = obj.get("endedAtMs")
+        if ended_at_ms is not None:
+            try:
+                ended_at_ms = int(ended_at_ms)
+            except Exception:
+                ended_at_ms = None
+        status = str(obj.get("status") or "running").strip().lower()
+        if status not in ("running", "success", "error", "canceled", "timeout", "unknown"):
+            status = "unknown"
+        summary = obj.get("summary")
+        summary = summary if isinstance(summary, str) else None
+        error = obj.get("error")
+        error = error if isinstance(error, str) else None
+        archived = bool(obj.get("archived", False))
+        return PersistedCronRunMeta(
+            run_id=run_id,
+            thread_id=thread_id,
+            turn_id=turn_id,
+            started_at_ms=started_at_ms_int,
+            ended_at_ms=ended_at_ms,
+            status=status,
+            summary=summary,
+            error=error,
+            archived=archived,
         )
 
 @dataclass
@@ -1177,6 +1282,7 @@ class PersistedAgentRuntime:
 class PersistedSessionAutomation:
     main_thread_id: Optional[str] = None
     cron_jobs: list[PersistedCronJob] = field(default_factory=list)
+    cron_runs_by_job: dict[str, list[PersistedCronRunMeta]] = field(default_factory=dict)
     system_event_queues: dict[str, list[PersistedSystemEvent]] = field(default_factory=dict)
     last_active_by_thread: dict[str, PersistedLastActiveTarget] = field(default_factory=dict)
 
@@ -1193,9 +1299,23 @@ class PersistedSessionAutomation:
             if not isinstance(tgt, PersistedLastActiveTarget):
                 continue
             last_active[tid] = tgt.to_json()
+        cron_runs: dict[str, Any] = {}
+        for jid, runs in (self.cron_runs_by_job or {}).items():
+            if not isinstance(jid, str) or not jid.strip():
+                continue
+            if not isinstance(runs, list) or not runs:
+                continue
+            out_runs: list[dict[str, Any]] = []
+            for r in runs:
+                if not isinstance(r, PersistedCronRunMeta):
+                    continue
+                out_runs.append(r.to_json())
+            if out_runs:
+                cron_runs[jid.strip()] = out_runs
         return {
             "mainThreadId": self.main_thread_id,
             "cronJobs": [j.to_json() for j in self.cron_jobs],
+            "cronRunsByJob": cron_runs,
             "systemEventQueues": queues,
             "lastActiveByThread": last_active,
         }
@@ -1214,6 +1334,21 @@ class PersistedSessionAutomation:
                 pj = PersistedCronJob.from_json(j)
                 if pj is not None:
                     cron_jobs.append(pj)
+        cron_runs_raw = obj.get("cronRunsByJob")
+        cron_runs_by_job: dict[str, list[PersistedCronRunMeta]] = {}
+        if isinstance(cron_runs_raw, dict):
+            for jid, runs_raw in cron_runs_raw.items():
+                if not isinstance(jid, str) or not jid.strip():
+                    continue
+                if not isinstance(runs_raw, list):
+                    continue
+                out_runs: list[PersistedCronRunMeta] = []
+                for r in runs_raw:
+                    pr = PersistedCronRunMeta.from_json(r)
+                    if pr is not None:
+                        out_runs.append(pr)
+                if out_runs:
+                    cron_runs_by_job[jid.strip()] = out_runs
         queues_raw = obj.get("systemEventQueues")
         queues: dict[str, list[PersistedSystemEvent]] = {}
         if isinstance(queues_raw, dict):
@@ -1241,6 +1376,7 @@ class PersistedSessionAutomation:
         return PersistedSessionAutomation(
             main_thread_id=main_thread_id.strip() if isinstance(main_thread_id, str) else None,
             cron_jobs=cron_jobs,
+            cron_runs_by_job=cron_runs_by_job,
             system_event_queues=queues,
             last_active_by_thread=last_active_by_thread,
         )
@@ -1369,6 +1505,19 @@ class ThreadLane:
     last_unstick_attempt_at_ms: Optional[int] = None
 
 
+@dataclass
+class IsolatedCronTurnContext:
+    session_id: str
+    job_id: str
+    run_id: str
+    main_thread_id: str
+    writeback_when: str
+    writeback_max_chars: int
+    writeback_prompt_hint: bool
+    retention_max_unarchived_threads: int
+    started_at_ms: int
+
+
 class AutomationManager:
     def __init__(
         self,
@@ -1394,6 +1543,7 @@ class AutomationManager:
         self._session_backoff_until_ms: dict[str, int] = {}
         self._session_backoff_failures: dict[str, int] = {}
         self._turn_text_by_key: dict[tuple[str, str, str], dict[str, Any]] = {}
+        self._isolated_cron_context_by_key: dict[tuple[str, str, str], IsolatedCronTurnContext] = {}
         self._session_restart_locks: dict[str, asyncio.Lock] = {}
 
     async def start(self) -> None:
@@ -1942,6 +2092,17 @@ class AutomationManager:
             return
 
         if method == "turn/completed":
+            turn_status_raw = None
+            turn_error_message = None
+            turn_obj = params.get("turn")
+            if isinstance(turn_obj, dict):
+                turn_status_raw = turn_obj.get("status")
+                err = turn_obj.get("error")
+                if isinstance(err, dict):
+                    emsg = err.get("message")
+                    if isinstance(emsg, str) and emsg.strip():
+                        turn_error_message = emsg.strip()
+
             if thread_id:
                 lane = self.lane(session_id, thread_id)
                 self._mark_lane_idle(lane)
@@ -1958,9 +2119,207 @@ class AutomationManager:
                             final_text = full
                         elif isinstance(delta, str) and delta.strip():
                             final_text = delta
+                if key:
+                    asyncio.create_task(
+                        self._handle_isolated_cron_turn_completed(
+                            session_id=session_id,
+                            thread_id=thread_id,
+                            turn_id=turn_id,
+                            final_text=final_text,
+                            turn_status_raw=turn_status_raw,
+                            turn_error_message=turn_error_message,
+                        )
+                    )
                 if final_text.strip():
                     asyncio.create_task(self._deliver_turn_text(session_id, thread_id, final_text))
             return
+
+    async def _handle_isolated_cron_turn_completed(
+        self,
+        *,
+        session_id: str,
+        thread_id: str,
+        turn_id: Optional[str],
+        final_text: str,
+        turn_status_raw: Any,
+        turn_error_message: Optional[str],
+    ) -> None:
+        if not turn_id:
+            return
+        sid = session_id.strip() if isinstance(session_id, str) else ""
+        tid = thread_id.strip() if isinstance(thread_id, str) else ""
+        turn_id = turn_id.strip() if isinstance(turn_id, str) else ""
+        if not sid or not tid or not turn_id:
+            return
+
+        key = (sid, tid, turn_id)
+        ctx = self._isolated_cron_context_by_key.pop(key, None)
+        if ctx is None:
+            return
+
+        status_raw = str(turn_status_raw or "").strip().lower()
+        if status_raw == "failed":
+            status = "error"
+        elif status_raw == "interrupted":
+            status = "canceled"
+        elif status_raw == "completed":
+            status = "success"
+        else:
+            status = "unknown"
+
+        ended_at_ms = _now_ms()
+        summary = str(final_text or "").strip()
+        if not summary:
+            if status == "error" and isinstance(turn_error_message, str) and turn_error_message.strip():
+                summary = turn_error_message.strip()
+            else:
+                summary = "(no output)"
+
+        if len(summary) > ctx.writeback_max_chars:
+            summary = summary[: ctx.writeback_max_chars]
+
+        def _patch_run(st: PersistedGatewayAutomationState) -> None:
+            sess = st.sessions.get(sid)
+            if sess is None:
+                return
+            runs = sess.cron_runs_by_job.get(ctx.job_id) or []
+            for r in reversed(runs):
+                if not isinstance(r, PersistedCronRunMeta):
+                    continue
+                if r.run_id == ctx.run_id and r.thread_id == tid:
+                    r.status = status
+                    r.ended_at_ms = ended_at_ms
+                    r.summary = summary
+                    if status == "error" and isinstance(turn_error_message, str) and turn_error_message.strip():
+                        r.error = turn_error_message.strip()
+                    break
+
+        await self._store.update(_patch_run)
+
+        try:
+            await self._enforce_cron_retention(
+                session_id=sid,
+                job_id=ctx.job_id,
+                max_unarchived_threads=ctx.retention_max_unarchived_threads,
+            )
+        except Exception:
+            log.exception("Cron retention enforcement failed for %s/%s", sid, ctx.job_id)
+
+        when = (ctx.writeback_when or "").strip().lower()
+        if when == "never":
+            return
+        if when == "on-error" and status != "error":
+            return
+
+        # Write back a short status/pointer event to the current main thread.
+        main_tid = None
+        sess_state = self._store.state.sessions.get(sid)
+        if sess_state is not None:
+            main_tid = sess_state.main_thread_id
+        if not isinstance(main_tid, str) or not main_tid.strip():
+            try:
+                main_tid = await self.ensure_main_thread(sid)
+            except Exception:
+                main_tid = ctx.main_thread_id
+
+        text = f"Cron: {ctx.job_id} [{status}] {summary}".strip()
+        meta = {
+            "jobId": ctx.job_id,
+            "runId": ctx.run_id,
+            "threadId": tid,
+            "turnId": turn_id,
+            "status": status,
+            "endedAtMs": ended_at_ms,
+            "wakeHeartbeat": False,
+        }
+        try:
+            await self.enqueue_system_event(
+                session_id=sid,
+                thread_id=main_tid.strip(),
+                kind=CRON_WRITEBACK_EVENT_KIND,
+                text=text,
+                meta=meta,
+            )
+        except Exception:
+            log.exception("Failed to enqueue cron writeback for %s/%s/%s", sid, ctx.job_id, ctx.run_id)
+        return
+
+    async def _enforce_cron_retention(
+        self,
+        *,
+        session_id: str,
+        job_id: str,
+        max_unarchived_threads: int,
+    ) -> None:
+        sid = session_id.strip() if isinstance(session_id, str) else ""
+        jid = job_id.strip() if isinstance(job_id, str) else ""
+        if not sid or not jid:
+            return
+        max_unarchived_threads = int(max_unarchived_threads or 0)
+        if max_unarchived_threads <= 0:
+            return
+
+        sess_state = self._store.state.sessions.get(sid)
+        if sess_state is None:
+            return
+        runs = sess_state.cron_runs_by_job.get(jid) or []
+        if not runs:
+            return
+
+        unarchived: list[PersistedCronRunMeta] = []
+        for r in runs:
+            if not isinstance(r, PersistedCronRunMeta):
+                continue
+            if r.archived:
+                continue
+            if not isinstance(r.thread_id, str) or not r.thread_id.strip():
+                continue
+            unarchived.append(r)
+
+        if len(unarchived) <= max_unarchived_threads:
+            return
+
+        # Prefer archiving the oldest completed runs; never archive a currently-running run.
+        candidates = [r for r in unarchived if (r.status or "").strip().lower() != "running"]
+        candidates.sort(key=lambda r: (r.started_at_ms or 0, r.run_id))
+        surplus = len(unarchived) - max_unarchived_threads
+        to_archive = candidates[:surplus]
+        if not to_archive:
+            return
+
+        live, _ = await _ensure_live_docker_session(sid, allow_create=True)
+        await self._ensure_initialized(live)
+
+        archived_ids: set[str] = set()
+        for r in to_archive:
+            try:
+                await self._rpc(live, "thread/archive", {"threadId": r.thread_id})
+                archived_ids.add(r.run_id)
+            except Exception as e:
+                log.warning(
+                    "Failed to archive cron run thread for %s/%s runId=%s threadId=%s: %s",
+                    sid,
+                    jid,
+                    r.run_id,
+                    r.thread_id,
+                    str(e),
+                )
+
+        if not archived_ids:
+            return
+
+        def _mark_archived(st: PersistedGatewayAutomationState) -> None:
+            sess = st.sessions.get(sid)
+            if sess is None:
+                return
+            runs2 = sess.cron_runs_by_job.get(jid) or []
+            for r2 in runs2:
+                if not isinstance(r2, PersistedCronRunMeta):
+                    continue
+                if r2.run_id in archived_ids:
+                    r2.archived = True
+
+        await self._store.update(_mark_archived)
 
     async def _deliver_turn_text(self, session_id: str, thread_id: str, text: str) -> None:
         # Gateway-owned delivery: send a single final message on turn/completed.
@@ -2340,8 +2699,38 @@ class AutomationManager:
                     lane.active_turn_id = turn_id
                     self._note_lane_progress(lane)
                 return {"ok": True, "threadId": thread_id, "queued": False, "started": True, "turnId": turn_id}
-            except Exception:
+            except Exception as e:
                 self._mark_lane_idle(lane)
+                try:
+                    ended_at_ms = _now_ms()
+
+                    def _mark_failed(st: PersistedGatewayAutomationState) -> None:
+                        sess = st.sessions.get(sid)
+                        if sess is None:
+                            return
+                        runs = sess.cron_runs_by_job.get(job.job_id) or []
+                        for r in reversed(runs):
+                            if not isinstance(r, PersistedCronRunMeta):
+                                continue
+                            if r.run_id == run_id and r.thread_id == thread_id:
+                                r.status = "error"
+                                r.ended_at_ms = ended_at_ms
+                                msg = str(e).strip()
+                                r.error = msg or "turn/start failed"
+                                r.summary = r.error
+                                break
+
+                    await self._store.update(_mark_failed)
+                except Exception:
+                    pass
+                try:
+                    await self._enforce_cron_retention(
+                        session_id=sid,
+                        job_id=job.job_id,
+                        max_unarchived_threads=retention_max_unarchived,
+                    )
+                except Exception:
+                    pass
                 raise
 
     async def _prepare_telegram_local_images(
@@ -2771,7 +3160,7 @@ class AutomationManager:
                             "- This heartbeat turn is a poll/automation tick, NOT a user question.",
                             "- Your decision MUST be based ONLY on: (a) HEARTBEAT.md in # Project Context, and (b) the system events shown in this message.",
                             "- Ignore the rest of the conversation history. Do NOT answer or re-answer any previous user message, and do NOT restate previous assistant outputs.",
-                            "- Treat `kind=node` (connected/disconnected) system events as status-only; never message the user for them.",
+                            f"- Treat `kind=node` (connected/disconnected) and `kind={CRON_WRITEBACK_EVENT_KIND}` system events as status-only; never message the user for them.",
                             "- Only produce a user-visible alert if there is NEW information that must be shown to the user (triggered by HEARTBEAT.md or a non-node system event).",
                             f"- If there is no user-visible alert, reply exactly: {HEARTBEAT_TOKEN}",
                             f"- If any system event includes directives like 'Do NOT message the user' / 'no user-facing report' / 'silent', you MUST reply exactly: {HEARTBEAT_TOKEN} (even if you performed actions).",
@@ -2917,6 +3306,212 @@ class AutomationManager:
             return
         await self._rpc(live, "thread/resume", {"threadId": tid})
 
+    def _cron_resolve_writeback(
+        self,
+        job: PersistedCronJob,
+        *,
+        requested: bool,
+    ) -> tuple[str, int, bool]:
+        raw = job.writeback if isinstance(job.writeback, dict) else {}
+
+        when = str(raw.get("when") or "").strip().lower() if raw else ""
+        if not when:
+            when = CRON_DEFAULT_ISOLATED_WRITEBACK_WHEN
+        if when not in CRON_WRITEBACK_WHENS:
+            when = CRON_DEFAULT_ISOLATED_WRITEBACK_WHEN
+        if when == "requested" and not requested:
+            when = "never"
+
+        max_chars = raw.get("maxChars") if raw else None
+        try:
+            max_chars_int = int(max_chars) if max_chars is not None else CRON_DEFAULT_WRITEBACK_MAX_CHARS
+        except Exception:
+            max_chars_int = CRON_DEFAULT_WRITEBACK_MAX_CHARS
+        max_chars_int = max(200, min(20_000, max_chars_int))
+
+        prompt_hint = raw.get("promptHint") if raw else None
+        prompt_hint_bool = bool(CRON_DEFAULT_WRITEBACK_PROMPT_HINT if prompt_hint is None else prompt_hint)
+        return when, max_chars_int, prompt_hint_bool
+
+    def _cron_resolve_retention_max_unarchived_threads(self, job: PersistedCronJob) -> int:
+        raw = job.retention if isinstance(job.retention, dict) else {}
+        n = raw.get("maxUnarchivedThreads") if raw else None
+        try:
+            n_int = int(n) if n is not None else CRON_DEFAULT_RETENTION_MAX_UNARCHIVED_THREADS
+        except Exception:
+            n_int = CRON_DEFAULT_RETENTION_MAX_UNARCHIVED_THREADS
+        return max(1, min(2000, n_int))
+
+    async def _start_isolated_cron_run(
+        self,
+        *,
+        session_id: str,
+        job: PersistedCronJob,
+        triggered_at_ms: int,
+        manual: bool,
+        writeback_requested: bool,
+    ) -> tuple[str, Optional[str], str]:
+        if _provision_mode() != "docker":
+            raise RuntimeError("Cron automation is only supported in docker provision mode")
+
+        sid = session_id.strip() if isinstance(session_id, str) else ""
+        if not sid:
+            raise ValueError("session_id must not be empty")
+
+        run_id = uuid.uuid4().hex[:12]
+
+        live, _ = await _ensure_live_docker_session(sid, allow_create=True)
+        await self._ensure_initialized(live)
+
+        # Ensure a main thread exists for writeback pointers.
+        main_tid = None
+        sess_state = self._store.state.sessions.get(sid)
+        if sess_state is not None:
+            main_tid = sess_state.main_thread_id
+        if not isinstance(main_tid, str) or not main_tid.strip():
+            main_tid = await self.ensure_main_thread(sid)
+
+        writeback_when, writeback_max_chars, writeback_prompt_hint = self._cron_resolve_writeback(job, requested=writeback_requested)
+        retention_max_unarchived = self._cron_resolve_retention_max_unarchived_threads(job)
+
+        # Create a fresh thread for this run.
+        result = await self._rpc(
+            live,
+            "thread/start",
+            {"cwd": live.cfg.workspace_container_path, "approvalPolicy": "never", "sandbox": "danger-full-access"},
+        )
+        thread_id = None
+        if isinstance(result, dict):
+            thread = result.get("thread")
+            if isinstance(thread, dict):
+                tid_val = thread.get("id")
+                if isinstance(tid_val, str) and tid_val.strip():
+                    thread_id = tid_val.strip()
+        if not thread_id:
+            raise RuntimeError("Invalid thread/start response (missing thread.id)")
+
+        try:
+            ts = _ms_to_dt_utc(triggered_at_ms).strftime("%Y-%m-%d %H:%M:%SZ")
+            name = f"Cron {job.job_id} {ts} run:{run_id}"
+            if len(name) > 120:
+                name = name[:120]
+            await self._rpc(live, "thread/name/set", {"threadId": thread_id, "name": name})
+        except Exception:
+            pass
+
+        # Record run start immediately (so /automation/state and cron.runs can locate the thread).
+        started_at_ms = _now_ms()
+        run_meta = PersistedCronRunMeta(
+            run_id=run_id,
+            thread_id=thread_id,
+            turn_id=None,
+            started_at_ms=started_at_ms,
+            ended_at_ms=None,
+            status="running",
+            summary=None,
+            error=None,
+            archived=False,
+        )
+
+        def _record_start(st: PersistedGatewayAutomationState) -> None:
+            sess = st.sessions.get(sid)
+            if sess is None:
+                sess = PersistedSessionAutomation()
+                st.sessions[sid] = sess
+            runs = sess.cron_runs_by_job.get(job.job_id)
+            if runs is None:
+                runs = []
+                sess.cron_runs_by_job[job.job_id] = runs
+            runs.append(run_meta)
+            # Keep some bounded history; retention is enforced separately.
+            max_keep = max(50, retention_max_unarchived * 2)
+            if len(runs) > max_keep:
+                del runs[: len(runs) - max_keep]
+
+        await self._store.update(_record_start)
+
+        # Start the turn in the new thread.
+        lane = self.lane(sid, thread_id)
+        async with lane.lock:
+            if lane.busy:
+                raise RuntimeError("isolated cron thread lane is unexpectedly busy")
+            self._mark_lane_busy(lane)
+            try:
+                cron_block = "\n".join(
+                    [
+                        "[CRON]",
+                        f"jobId: {job.job_id}",
+                        f"expr: {job.expr}",
+                        f"runId: {run_id}",
+                        f"triggeredAt: {_ms_to_dt_utc(triggered_at_ms).isoformat()}",
+                        f"manual: {bool(manual)}",
+                        f"writebackWhen: {writeback_when}",
+                        f"writebackMaxChars: {writeback_max_chars}",
+                        "[/CRON]",
+                    ]
+                ).strip()
+                user_text = cron_block + "\n\n" + (job.text or "").strip()
+                assembled = await self._assemble_turn_input(sid, thread_id, user_text=user_text, heartbeat=False)
+                if writeback_prompt_hint and writeback_when != "never":
+                    assembled = (
+                        assembled
+                        + "\n\n"
+                        + f"Writeback contract: Return your final summary as plain text (no markdown). Keep it under {writeback_max_chars} characters."
+                    )
+
+                resp = await self._rpc(
+                    live,
+                    "turn/start",
+                    {
+                        "threadId": thread_id,
+                        "input": [{"type": "text", "text": assembled}],
+                        "cwd": live.cfg.workspace_container_path,
+                        "approvalPolicy": "never",
+                        "sandboxPolicy": {"type": "dangerFullAccess"},
+                    },
+                )
+                turn_id = None
+                if isinstance(resp, dict):
+                    turn = resp.get("turn")
+                    if isinstance(turn, dict):
+                        tid_val = turn.get("id")
+                        if isinstance(tid_val, str) and tid_val.strip():
+                            turn_id = tid_val.strip()
+                lane.active_turn_id = turn_id
+                self._note_lane_progress(lane)
+            except Exception:
+                self._mark_lane_idle(lane)
+                raise
+
+        # Patch run meta with the resolved turnId.
+        if turn_id:
+            def _patch_turn_id(st: PersistedGatewayAutomationState) -> None:
+                sess = st.sessions.get(sid)
+                if sess is None:
+                    return
+                runs = sess.cron_runs_by_job.get(job.job_id) or []
+                for r in reversed(runs):
+                    if isinstance(r, PersistedCronRunMeta) and r.run_id == run_id and r.thread_id == thread_id:
+                        r.turn_id = turn_id
+                        break
+
+            await self._store.update(_patch_turn_id)
+
+            key = (sid, thread_id, turn_id)
+            self._isolated_cron_context_by_key[key] = IsolatedCronTurnContext(
+                session_id=sid,
+                job_id=job.job_id,
+                run_id=run_id,
+                main_thread_id=main_tid.strip(),
+                writeback_when=writeback_when,
+                writeback_max_chars=writeback_max_chars,
+                writeback_prompt_hint=writeback_prompt_hint,
+                retention_max_unarchived_threads=retention_max_unarchived,
+                started_at_ms=started_at_ms,
+            )
+
+        return thread_id, turn_id, run_id
+
     async def _cron_loop(self) -> None:
         while True:
             try:
@@ -2962,18 +3557,31 @@ class AutomationManager:
                         changed = True
                     # Run if due.
                     if job.next_run_at_ms is not None and job.next_run_at_ms <= now:
-                        main_tid = sess.main_thread_id
-                        if not main_tid:
-                            main_tid = await self.ensure_main_thread(session_id)
-                            # Refresh session object after persistence updates.
-                            sess = self._store.state.sessions.get(session_id) or sess
-                        await self.enqueue_system_event(
-                            session_id=session_id,
-                            thread_id=main_tid,
-                            kind="cron",
-                            text=job.text,
-                            meta={"jobId": job.job_id, "expr": job.expr},
-                        )
+                        target = (job.session_target or CRON_DEFAULT_SESSION_TARGET).strip().lower()
+                        if target not in CRON_SESSION_TARGETS:
+                            target = CRON_DEFAULT_SESSION_TARGET
+
+                        if target == "isolated":
+                            await self._start_isolated_cron_run(
+                                session_id=session_id,
+                                job=job,
+                                triggered_at_ms=now,
+                                manual=False,
+                                writeback_requested=False,
+                            )
+                        else:
+                            main_tid = sess.main_thread_id
+                            if not main_tid:
+                                main_tid = await self.ensure_main_thread(session_id)
+                                # Refresh session object after persistence updates.
+                                sess = self._store.state.sessions.get(session_id) or sess
+                            await self.enqueue_system_event(
+                                session_id=session_id,
+                                thread_id=main_tid,
+                                kind=CRON_EVENT_KIND,
+                                text=job.text,
+                                meta={"jobId": job.job_id, "expr": job.expr},
+                            )
                         job.last_run_at_ms = now
                         base_dt = _ms_to_dt_utc(now)
                         job.next_run_at_ms = _dt_to_ms(croniter(job.expr, base_dt).get_next(datetime))
@@ -3665,13 +4273,13 @@ async def _mcp_handle_single_message(request: Request, body: dict[str, Any]) -> 
             {
                 "name": "cron",
                 "title": "Cron",
-                "description": "Manage gateway cron jobs (status/list/add/update/remove/run) for the calling runtime session only. Jobs enqueue systemEvents into the session main thread and are processed by heartbeat.",
+                "description": "Manage gateway cron jobs for the calling runtime session only. Jobs can run in the session main thread (systemEvents processed by heartbeat) or as isolated runs (each trigger starts a fresh thread; main thread receives a short writeback pointer).",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
                         "action": {
                             "type": "string",
-                            "enum": ["status", "list", "add", "update", "remove", "run"],
+                            "enum": ["status", "list", "add", "update", "remove", "run", "runs"],
                             "description": "Action to perform.",
                         },
                         "includeDisabled": {"type": "boolean", "description": "For list: include disabled jobs."},
@@ -3679,6 +4287,24 @@ async def _mcp_handle_single_message(request: Request, body: dict[str, Any]) -> 
                         "expr": {"type": "string", "description": "For add/update: cron expression (UTC-based)."},
                         "text": {"type": "string", "description": "For add/update: payload text to enqueue as a systemEvent when due."},
                         "enabled": {"type": "boolean", "description": "For add/update: enable/disable the job."},
+                        "sessionTarget": {"type": "string", "enum": ["main", "isolated"], "description": "For add/update/run: where the job runs. 'main' enqueues to the main thread; 'isolated' runs in a fresh thread per trigger."},
+                        "writeback": {
+                            "type": "object",
+                            "properties": {
+                                "when": {"type": "string", "enum": ["always", "on-error", "never", "requested"]},
+                                "maxChars": {"type": "number", "description": "Max chars for main-thread writeback summary (default 2000)."},
+                                "promptHint": {"type": "boolean", "description": "If true, append a hint to make the final summary short/plain-text."},
+                            },
+                            "additionalProperties": False,
+                        },
+                        "retention": {
+                            "type": "object",
+                            "properties": {
+                                "maxUnarchivedThreads": {"type": "number", "description": "Max unarchived run threads to keep per job (default 50)."},
+                            },
+                            "additionalProperties": False,
+                        },
+                        "writebackRequested": {"type": "boolean", "description": "For run: if writeback.when=requested, force a writeback for this run."},
                     },
                     "required": ["action"],
                     "additionalProperties": False,
@@ -3948,7 +4574,7 @@ async def _mcp_handle_single_message(request: Request, body: dict[str, Any]) -> 
 
         if tool_name == "cron":
             action = str(args.get("action") or "").strip().lower()
-            allowed_actions = {"status", "list", "add", "update", "remove", "run"}
+            allowed_actions = {"status", "list", "runs", "add", "update", "remove", "run"}
             if action not in allowed_actions:
                 return (
                     _jsonrpc_result(
@@ -4021,6 +4647,65 @@ async def _mcp_handle_single_message(request: Request, body: dict[str, Any]) -> 
                 base_dt = _ms_to_dt_utc(base_ms)
                 return _dt_to_ms(croniter(expr, base_dt).get_next(datetime))
 
+            def _cron_validate_session_target(raw: Any) -> Optional[str]:
+                if raw is None:
+                    return None
+                s = str(raw or "").strip().lower()
+                if not s:
+                    return "sessionTarget must not be empty"
+                if s not in CRON_SESSION_TARGETS:
+                    return f"Invalid sessionTarget: {s}"
+                return None
+
+            def _cron_normalize_session_target(raw: Any, *, fallback: str) -> str:
+                err = _cron_validate_session_target(raw)
+                if err is not None:
+                    return fallback
+                s = str(raw or "").strip().lower()
+                return s if s in CRON_SESSION_TARGETS else fallback
+
+            def _cron_normalize_writeback(raw: Any) -> Optional[dict[str, Any]]:
+                if raw is None:
+                    return None
+                if not isinstance(raw, dict):
+                    return None
+                out: dict[str, Any] = {}
+                when = raw.get("when")
+                if when is not None:
+                    w = str(when or "").strip().lower()
+                    if w:
+                        if w not in CRON_WRITEBACK_WHENS:
+                            raise ValueError(f"Invalid writeback.when: {w}")
+                        out["when"] = w
+                max_chars = raw.get("maxChars")
+                if max_chars is not None:
+                    try:
+                        mc = int(max_chars)
+                    except Exception:
+                        raise ValueError("writeback.maxChars must be an integer") from None
+                    mc = max(200, min(20_000, mc))
+                    out["maxChars"] = mc
+                prompt_hint = raw.get("promptHint")
+                if prompt_hint is not None:
+                    out["promptHint"] = bool(prompt_hint)
+                return out or None
+
+            def _cron_normalize_retention(raw: Any) -> Optional[dict[str, Any]]:
+                if raw is None:
+                    return None
+                if not isinstance(raw, dict):
+                    return None
+                out: dict[str, Any] = {}
+                max_unarchived = raw.get("maxUnarchivedThreads")
+                if max_unarchived is not None:
+                    try:
+                        n = int(max_unarchived)
+                    except Exception:
+                        raise ValueError("retention.maxUnarchivedThreads must be an integer") from None
+                    n = max(1, min(2000, n))
+                    out["maxUnarchivedThreads"] = n
+                return out or None
+
             if action == "status":
                 st = automation._store.state
                 sess_state = st.sessions.get(session_id)
@@ -4078,6 +4763,32 @@ async def _mcp_handle_single_message(request: Request, body: dict[str, Any]) -> 
                     {"MCP-Protocol-Version": sess.protocol_version},
                 )
 
+            if action == "runs":
+                st = automation._store.state
+                sess_state = st.sessions.get(session_id)
+                runs_by_job = sess_state.cron_runs_by_job if sess_state is not None else {}
+                if job_id:
+                    runs = runs_by_job.get(job_id) or []
+                    out_runs = [r.to_json() for r in runs if isinstance(r, PersistedCronRunMeta)]
+                    payload = {"ok": True, "sessionId": session_id, "jobId": job_id, "runs": out_runs}
+                else:
+                    out: dict[str, Any] = {}
+                    if isinstance(runs_by_job, dict):
+                        for jid, runs in runs_by_job.items():
+                            if not isinstance(jid, str) or not jid.strip():
+                                continue
+                            if not isinstance(runs, list) or not runs:
+                                continue
+                            out[jid.strip()] = [r.to_json() for r in runs if isinstance(r, PersistedCronRunMeta)]
+                    payload = {"ok": True, "sessionId": session_id, "runsByJob": out}
+                return (
+                    _jsonrpc_result(
+                        request_id=request_id,
+                        result=_mcp_call_tool_result(content=[{"type": "text", "text": json.dumps(payload, ensure_ascii=False)}], structured=payload),
+                    ),
+                    {"MCP-Protocol-Version": sess.protocol_version},
+                )
+
             if action == "add":
                 expr = str(args.get("expr") or "").strip()
                 text = str(args.get("text") or "")
@@ -4095,6 +4806,92 @@ async def _mcp_handle_single_message(request: Request, body: dict[str, Any]) -> 
                         {"MCP-Protocol-Version": sess.protocol_version},
                     )
                 enabled = bool(enabled_val) if isinstance(enabled_val, bool) else True
+
+                has_session_target = "sessionTarget" in args
+                session_target_patch = None
+                if has_session_target:
+                    err = _cron_validate_session_target(args.get("sessionTarget"))
+                    if err is not None:
+                        return (
+                            _jsonrpc_result(
+                                request_id=request_id,
+                                result=_mcp_call_tool_result(
+                                    content=[{"type": "text", "text": err}],
+                                    structured={"ok": False, "error": {"code": "INVALID_ARGUMENT", "field": "sessionTarget", "message": err}},
+                                    is_error=True,
+                                ),
+                            ),
+                            {"MCP-Protocol-Version": sess.protocol_version},
+                        )
+                    session_target_patch = _cron_normalize_session_target(args.get("sessionTarget"), fallback=CRON_DEFAULT_SESSION_TARGET)
+
+                has_writeback = "writeback" in args
+                writeback_patch: Optional[dict[str, Any]] = None
+                if has_writeback:
+                    wb_raw = args.get("writeback")
+                    if wb_raw is not None and not isinstance(wb_raw, dict):
+                        return (
+                            _jsonrpc_result(
+                                request_id=request_id,
+                                result=_mcp_call_tool_result(
+                                    content=[{"type": "text", "text": "writeback must be an object"}],
+                                    structured={"ok": False, "error": {"code": "INVALID_ARGUMENT", "field": "writeback"}},
+                                    is_error=True,
+                                ),
+                            ),
+                            {"MCP-Protocol-Version": sess.protocol_version},
+                        )
+                    if isinstance(wb_raw, dict):
+                        try:
+                            writeback_patch = _cron_normalize_writeback(wb_raw)
+                        except ValueError as e:
+                            return (
+                                _jsonrpc_result(
+                                    request_id=request_id,
+                                    result=_mcp_call_tool_result(
+                                        content=[{"type": "text", "text": str(e)}],
+                                        structured={"ok": False, "error": {"code": "INVALID_ARGUMENT", "field": "writeback", "message": str(e)}},
+                                        is_error=True,
+                                    ),
+                                ),
+                                {"MCP-Protocol-Version": sess.protocol_version},
+                            )
+                    else:
+                        writeback_patch = None
+
+                has_retention = "retention" in args
+                retention_patch: Optional[dict[str, Any]] = None
+                if has_retention:
+                    ret_raw = args.get("retention")
+                    if ret_raw is not None and not isinstance(ret_raw, dict):
+                        return (
+                            _jsonrpc_result(
+                                request_id=request_id,
+                                result=_mcp_call_tool_result(
+                                    content=[{"type": "text", "text": "retention must be an object"}],
+                                    structured={"ok": False, "error": {"code": "INVALID_ARGUMENT", "field": "retention"}},
+                                    is_error=True,
+                                ),
+                            ),
+                            {"MCP-Protocol-Version": sess.protocol_version},
+                        )
+                    if isinstance(ret_raw, dict):
+                        try:
+                            retention_patch = _cron_normalize_retention(ret_raw)
+                        except ValueError as e:
+                            return (
+                                _jsonrpc_result(
+                                    request_id=request_id,
+                                    result=_mcp_call_tool_result(
+                                        content=[{"type": "text", "text": str(e)}],
+                                        structured={"ok": False, "error": {"code": "INVALID_ARGUMENT", "field": "retention", "message": str(e)}},
+                                        is_error=True,
+                                    ),
+                                ),
+                                {"MCP-Protocol-Version": sess.protocol_version},
+                            )
+                    else:
+                        retention_patch = None
 
                 if not expr:
                     return (
@@ -4150,6 +4947,9 @@ async def _mcp_handle_single_message(request: Request, body: dict[str, Any]) -> 
                     prev_enabled = existing.enabled if existing is not None else None
                     last_run_at_ms = existing.last_run_at_ms if existing is not None else None
                     prev_next = existing.next_run_at_ms if existing is not None else None
+                    existing_target = existing.session_target if existing is not None else CRON_DEFAULT_SESSION_TARGET
+                    existing_writeback = existing.writeback if existing is not None else None
+                    existing_retention = existing.retention if existing is not None else None
 
                     # Compute next run time:
                     # - if schedule changed or job was re-enabled: base from now
@@ -4181,6 +4981,9 @@ async def _mcp_handle_single_message(request: Request, body: dict[str, Any]) -> 
                         enabled=enabled,
                         last_run_at_ms=last_run_at_ms,
                         next_run_at_ms=next_run_at_ms,
+                        session_target=session_target_patch if has_session_target else existing_target,
+                        writeback=writeback_patch if has_writeback else existing_writeback,
+                        retention=retention_patch if has_retention else existing_retention,
                     )
                     sess_state.cron_jobs.append(saved)
 
@@ -4212,12 +5015,15 @@ async def _mcp_handle_single_message(request: Request, body: dict[str, Any]) -> 
                 has_expr = "expr" in args
                 has_text = "text" in args
                 has_enabled = "enabled" in args
-                if not (has_expr or has_text or has_enabled):
+                has_session_target = "sessionTarget" in args
+                has_writeback = "writeback" in args
+                has_retention = "retention" in args
+                if not (has_expr or has_text or has_enabled or has_session_target or has_writeback or has_retention):
                     return (
                         _jsonrpc_result(
                             request_id=request_id,
                             result=_mcp_call_tool_result(
-                                content=[{"type": "text", "text": "Nothing to update (provide expr/text/enabled)"}],
+                                content=[{"type": "text", "text": "Nothing to update (provide expr/text/enabled/sessionTarget/writeback/retention)"}],
                                 structured={"ok": False, "error": {"code": "INVALID_ARGUMENT"}},
                                 is_error=True,
                             ),
@@ -4228,6 +5034,89 @@ async def _mcp_handle_single_message(request: Request, body: dict[str, Any]) -> 
                 expr_patch = str(args.get("expr") or "").strip() if has_expr else None
                 text_patch = str(args.get("text") or "") if has_text else None
                 enabled_patch_raw = args.get("enabled") if has_enabled else None
+                session_target_patch = None
+                if has_session_target:
+                    err = _cron_validate_session_target(args.get("sessionTarget"))
+                    if err is not None:
+                        return (
+                            _jsonrpc_result(
+                                request_id=request_id,
+                                result=_mcp_call_tool_result(
+                                    content=[{"type": "text", "text": err}],
+                                    structured={"ok": False, "error": {"code": "INVALID_ARGUMENT", "field": "sessionTarget", "message": err}},
+                                    is_error=True,
+                                ),
+                            ),
+                            {"MCP-Protocol-Version": sess.protocol_version},
+                        )
+                    session_target_patch = _cron_normalize_session_target(args.get("sessionTarget"), fallback=CRON_DEFAULT_SESSION_TARGET)
+
+                writeback_patch: Optional[dict[str, Any]] = None
+                if has_writeback:
+                    wb_raw = args.get("writeback")
+                    if wb_raw is not None and not isinstance(wb_raw, dict):
+                        return (
+                            _jsonrpc_result(
+                                request_id=request_id,
+                                result=_mcp_call_tool_result(
+                                    content=[{"type": "text", "text": "writeback must be an object"}],
+                                    structured={"ok": False, "error": {"code": "INVALID_ARGUMENT", "field": "writeback"}},
+                                    is_error=True,
+                                ),
+                            ),
+                            {"MCP-Protocol-Version": sess.protocol_version},
+                        )
+                    if isinstance(wb_raw, dict):
+                        try:
+                            writeback_patch = _cron_normalize_writeback(wb_raw)
+                        except ValueError as e:
+                            return (
+                                _jsonrpc_result(
+                                    request_id=request_id,
+                                    result=_mcp_call_tool_result(
+                                        content=[{"type": "text", "text": str(e)}],
+                                        structured={"ok": False, "error": {"code": "INVALID_ARGUMENT", "field": "writeback", "message": str(e)}},
+                                        is_error=True,
+                                    ),
+                                ),
+                                {"MCP-Protocol-Version": sess.protocol_version},
+                            )
+                    else:
+                        writeback_patch = None
+
+                retention_patch: Optional[dict[str, Any]] = None
+                if has_retention:
+                    ret_raw = args.get("retention")
+                    if ret_raw is not None and not isinstance(ret_raw, dict):
+                        return (
+                            _jsonrpc_result(
+                                request_id=request_id,
+                                result=_mcp_call_tool_result(
+                                    content=[{"type": "text", "text": "retention must be an object"}],
+                                    structured={"ok": False, "error": {"code": "INVALID_ARGUMENT", "field": "retention"}},
+                                    is_error=True,
+                                ),
+                            ),
+                            {"MCP-Protocol-Version": sess.protocol_version},
+                        )
+                    if isinstance(ret_raw, dict):
+                        try:
+                            retention_patch = _cron_normalize_retention(ret_raw)
+                        except ValueError as e:
+                            return (
+                                _jsonrpc_result(
+                                    request_id=request_id,
+                                    result=_mcp_call_tool_result(
+                                        content=[{"type": "text", "text": str(e)}],
+                                        structured={"ok": False, "error": {"code": "INVALID_ARGUMENT", "field": "retention", "message": str(e)}},
+                                        is_error=True,
+                                    ),
+                                ),
+                                {"MCP-Protocol-Version": sess.protocol_version},
+                            )
+                    else:
+                        retention_patch = None
+
                 if has_enabled and enabled_patch_raw is not None and not isinstance(enabled_patch_raw, bool):
                     return (
                         _jsonrpc_result(
@@ -4298,6 +5187,9 @@ async def _mcp_handle_single_message(request: Request, body: dict[str, Any]) -> 
                     new_expr = expr_patch if expr_patch is not None else existing.expr
                     new_text = text_patch if text_patch is not None else existing.text
                     new_enabled = enabled_patch if enabled_patch is not None else existing.enabled
+                    new_session_target = session_target_patch if has_session_target else existing.session_target
+                    new_writeback = writeback_patch if has_writeback else existing.writeback
+                    new_retention = retention_patch if has_retention else existing.retention
 
                     base_ms = existing.last_run_at_ms or now_ms
                     if new_expr != existing.expr:
@@ -4327,6 +5219,9 @@ async def _mcp_handle_single_message(request: Request, body: dict[str, Any]) -> 
                         enabled=new_enabled,
                         last_run_at_ms=existing.last_run_at_ms,
                         next_run_at_ms=next_run_at_ms,
+                        session_target=new_session_target,
+                        writeback=new_writeback,
+                        retention=new_retention,
                     )
                     sess_state.cron_jobs = [j for j in sess_state.cron_jobs if j.job_id != job_id]
                     sess_state.cron_jobs.append(updated)
@@ -4377,6 +5272,11 @@ async def _mcp_handle_single_message(request: Request, body: dict[str, Any]) -> 
                     before = len(sess_state.cron_jobs)
                     sess_state.cron_jobs = [j for j in sess_state.cron_jobs if j.job_id != job_id]
                     removed = len(sess_state.cron_jobs) != before
+                    if removed:
+                        try:
+                            sess_state.cron_runs_by_job.pop(job_id, None)
+                        except Exception:
+                            pass
 
                 await automation._store.update(_rm)
                 automation._cron_wakeup.set()
@@ -4433,29 +5333,76 @@ async def _mcp_handle_single_message(request: Request, body: dict[str, Any]) -> 
                         {"MCP-Protocol-Version": sess.protocol_version},
                     )
 
-                # Ensure a main thread exists for manual run routing.
-                try:
-                    main_tid = await automation.ensure_main_thread(session_id)
-                except Exception as e:
-                    return (
-                        _jsonrpc_result(
-                            request_id=request_id,
-                            result=_mcp_call_tool_result(
-                                content=[{"type": "text", "text": f"Failed to ensure main thread: {e}"}],
-                                structured={"ok": False, "error": {"code": "INTERNAL_ERROR", "message": str(e)}},
-                                is_error=True,
+                target = (job.session_target or CRON_DEFAULT_SESSION_TARGET).strip().lower()
+                if "sessionTarget" in args:
+                    err = _cron_validate_session_target(args.get("sessionTarget"))
+                    if err is not None:
+                        return (
+                            _jsonrpc_result(
+                                request_id=request_id,
+                                result=_mcp_call_tool_result(
+                                    content=[{"type": "text", "text": err}],
+                                    structured={"ok": False, "error": {"code": "INVALID_ARGUMENT", "field": "sessionTarget", "message": err}},
+                                    is_error=True,
+                                ),
                             ),
-                        ),
-                        {"MCP-Protocol-Version": sess.protocol_version},
-                    )
+                            {"MCP-Protocol-Version": sess.protocol_version},
+                        )
+                    target = _cron_normalize_session_target(args.get("sessionTarget"), fallback=target)
+                if target not in CRON_SESSION_TARGETS:
+                    target = CRON_DEFAULT_SESSION_TARGET
 
-                await automation.enqueue_system_event(
-                    session_id=session_id,
-                    thread_id=main_tid,
-                    kind="cron",
-                    text=job.text,
-                    meta={"jobId": job.job_id, "expr": job.expr, "manual": True},
-                )
+                writeback_requested = bool(args.get("writebackRequested", False))
+
+                started_isolated = False
+                run_info: dict[str, Any] = {}
+                if target == "isolated":
+                    try:
+                        thread_id, turn_id, run_id = await automation._start_isolated_cron_run(
+                            session_id=session_id,
+                            job=job,
+                            triggered_at_ms=now_ms,
+                            manual=True,
+                            writeback_requested=writeback_requested,
+                        )
+                        started_isolated = True
+                        run_info = {"runId": run_id, "threadId": thread_id, "turnId": turn_id}
+                    except Exception as e:
+                        return (
+                            _jsonrpc_result(
+                                request_id=request_id,
+                                result=_mcp_call_tool_result(
+                                    content=[{"type": "text", "text": f"Failed to start isolated cron run: {e}"}],
+                                    structured={"ok": False, "error": {"code": "INTERNAL_ERROR", "message": str(e)}},
+                                    is_error=True,
+                                ),
+                            ),
+                            {"MCP-Protocol-Version": sess.protocol_version},
+                        )
+                else:
+                    # Ensure a main thread exists for manual run routing.
+                    try:
+                        main_tid = await automation.ensure_main_thread(session_id)
+                    except Exception as e:
+                        return (
+                            _jsonrpc_result(
+                                request_id=request_id,
+                                result=_mcp_call_tool_result(
+                                    content=[{"type": "text", "text": f"Failed to ensure main thread: {e}"}],
+                                    structured={"ok": False, "error": {"code": "INTERNAL_ERROR", "message": str(e)}},
+                                    is_error=True,
+                                ),
+                            ),
+                            {"MCP-Protocol-Version": sess.protocol_version},
+                        )
+
+                    await automation.enqueue_system_event(
+                        session_id=session_id,
+                        thread_id=main_tid,
+                        kind=CRON_EVENT_KIND,
+                        text=job.text,
+                        meta={"jobId": job.job_id, "expr": job.expr, "manual": True},
+                    )
 
                 def _mark_run(st2: PersistedGatewayAutomationState) -> None:
                     sess2 = st2.sessions.get(session_id)
@@ -4472,7 +5419,8 @@ async def _mcp_handle_single_message(request: Request, body: dict[str, Any]) -> 
 
                 await automation._store.update(_mark_run)
                 automation._cron_wakeup.set()
-                payload = {"ok": True, "sessionId": session_id, "jobId": job_id, "enqueued": True}
+                payload = {"ok": True, "sessionId": session_id, "jobId": job_id, "target": target, "started": started_isolated, "enqueued": (not started_isolated)}
+                payload.update(run_info)
                 return (
                     _jsonrpc_result(
                         request_id=request_id,
@@ -5628,6 +6576,51 @@ async def cron_create_job(request: Request):
     text = str(body.get("text") or "")
     enabled = bool(body.get("enabled", True))
     job_id = str(body.get("jobId") or "").strip() or uuid.uuid4().hex[:10]
+    session_target = str(body.get("sessionTarget") or CRON_DEFAULT_SESSION_TARGET).strip().lower()
+    if session_target not in CRON_SESSION_TARGETS:
+        raise HTTPException(status_code=400, detail="Invalid sessionTarget (must be 'main' or 'isolated')")
+    writeback_raw = body.get("writeback")
+    if writeback_raw is not None and not isinstance(writeback_raw, dict):
+        raise HTTPException(status_code=400, detail="writeback must be an object")
+    retention_raw = body.get("retention")
+    if retention_raw is not None and not isinstance(retention_raw, dict):
+        raise HTTPException(status_code=400, detail="retention must be an object")
+
+    writeback: Optional[dict[str, Any]] = None
+    if isinstance(writeback_raw, dict):
+        writeback = {}
+        when = writeback_raw.get("when")
+        if when is not None:
+            w = str(when or "").strip().lower()
+            if w and w not in CRON_WRITEBACK_WHENS:
+                raise HTTPException(status_code=400, detail="Invalid writeback.when")
+            if w:
+                writeback["when"] = w
+        max_chars = writeback_raw.get("maxChars")
+        if max_chars is not None:
+            try:
+                mc = int(max_chars)
+            except Exception as e:
+                raise HTTPException(status_code=400, detail="writeback.maxChars must be an integer") from e
+            writeback["maxChars"] = max(200, min(20_000, mc))
+        prompt_hint = writeback_raw.get("promptHint")
+        if prompt_hint is not None:
+            writeback["promptHint"] = bool(prompt_hint)
+        if not writeback:
+            writeback = None
+
+    retention: Optional[dict[str, Any]] = None
+    if isinstance(retention_raw, dict):
+        retention = {}
+        max_unarchived = retention_raw.get("maxUnarchivedThreads")
+        if max_unarchived is not None:
+            try:
+                n = int(max_unarchived)
+            except Exception as e:
+                raise HTTPException(status_code=400, detail="retention.maxUnarchivedThreads must be an integer") from e
+            retention["maxUnarchivedThreads"] = max(1, min(2000, n))
+        if not retention:
+            retention = None
     if not expr:
         raise HTTPException(status_code=400, detail="Missing 'expr'")
     if not text.strip():
@@ -5643,18 +6636,30 @@ async def cron_create_job(request: Request):
     if not sid:
         sid = await automation.ensure_default_ready()
 
+    saved: Optional[PersistedCronJob] = None
+
     def _add(st: PersistedGatewayAutomationState) -> None:
+        nonlocal saved
         sess = st.sessions.get(sid)
         if sess is None:
             sess = PersistedSessionAutomation()
             st.sessions[sid] = sess
         # Replace if same id exists.
         sess.cron_jobs = [j for j in sess.cron_jobs if j.job_id != job_id]
-        sess.cron_jobs.append(PersistedCronJob(job_id=job_id, expr=expr, text=text, enabled=enabled))
+        saved = PersistedCronJob(
+            job_id=job_id,
+            expr=expr,
+            text=text,
+            enabled=enabled,
+            session_target=session_target,
+            writeback=writeback,
+            retention=retention,
+        )
+        sess.cron_jobs.append(saved)
 
     await automation._store.update(_add)
     automation._cron_wakeup.set()
-    return {"ok": True, "sessionId": sid, "job": {"jobId": job_id, "expr": expr, "text": text, "enabled": enabled}}
+    return {"ok": True, "sessionId": sid, "job": saved.to_json() if saved is not None else None}
 
 
 @app.delete("/automation/cron/jobs/{job_id}")
@@ -5675,6 +6680,11 @@ async def cron_delete_job(job_id: str, request: Request):
         before = len(sess.cron_jobs)
         sess.cron_jobs = [j for j in sess.cron_jobs if j.job_id != job_id]
         removed = len(sess.cron_jobs) != before
+        if removed:
+            try:
+                sess.cron_runs_by_job.pop(job_id, None)
+            except Exception:
+                pass
 
     await automation._store.update(_rm)
     automation._cron_wakeup.set()
