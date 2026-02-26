@@ -519,6 +519,22 @@ function userInputsToText(inputs: unknown): string {
   return parts.join("\n").trim();
 }
 
+function extractTaggedBlock(text: string, tag: string): string | null {
+  if (!text.trim()) return null;
+  const re = new RegExp(
+    `(?:^|\\r?\\n)\\[${tag}\\]\\r?\\n([\\s\\S]*?)\\r?\\n\\[\\/${tag}\\](?:\\r?\\n|$)`
+  );
+  const m = re.exec(text);
+  return m ? m[1] : null;
+}
+
+function turnKindFromText(text: string): string | null {
+  const block = extractTaggedBlock(text, "TURN");
+  if (!block) return null;
+  const m = /^TURN_KIND:\s*([A-Za-z0-9_.-]+)\s*$/m.exec(block);
+  return m ? m[1] : null;
+}
+
 function userMessageToUiText(rawText: string): string {
   const trimmed = rawText.trim();
   if (!trimmed) return "";
@@ -527,9 +543,10 @@ function userMessageToUiText(rawText: string): string {
   // For the chat UI we want the user's actual message, not the full injected context/instructions.
   if (!trimmed.startsWith("# Project Context")) return trimmed;
 
+  const turnKind = turnKindFromText(trimmed);
   const isHeartbeat = trimmed.includes(
     "HEARTBEAT: You are running a background heartbeat. Read and follow HEARTBEAT.md in # Project Context."
-  );
+  ) || turnKind === "heartbeat";
 
   let main = trimmed;
   const instructionsIdx = main.lastIndexOf("\n\nInstructions:");
@@ -545,10 +562,18 @@ function userMessageToUiText(rawText: string): string {
       main = main.slice(0, contractIdx).trimEnd();
     }
   } else {
-    const systemEventsIdx = main.lastIndexOf("\n\nSystem events (batched):");
+    const systemEventsIdx = Math.max(
+      main.lastIndexOf("\n\nSystem events (batched):"),
+      main.lastIndexOf("\n\nSystem events (batched, highest priority):")
+    );
     if (systemEventsIdx !== -1) {
       main = main.slice(0, systemEventsIdx).trimEnd();
     }
+  }
+
+  const userText = extractTaggedBlock(main, "USER_TEXT");
+  if (!isHeartbeat && userText !== null) {
+    return userText.trim();
   }
 
   const lines = main.split(/\r?\n/);
@@ -561,11 +586,16 @@ function userMessageToUiText(rawText: string): string {
   const extracted = lines.slice(lastClose + 1).join("\n").trim();
   if (!isHeartbeat) return extracted || trimmed;
 
+  const prefix = turnKind ? `TURN_KIND: ${turnKind}\n\n` : "";
+
   // Heartbeat turns may have no system events; show that explicitly to help debugging.
-  if (!extracted.includes("\n\nSystem events (batched):")) {
-    return (extracted ? extracted + "\n\n" : "") + "System events (batched):\n(none)";
+  const hasSystemEvents =
+    extracted.includes("\n\nSystem events (batched):") ||
+    extracted.includes("\n\nSystem events (batched, highest priority):");
+  if (!hasSystemEvents) {
+    return prefix + (extracted ? extracted + "\n\n" : "") + "System events (batched):\n(none)";
   }
-  return extracted || trimmed;
+  return prefix + (extracted || trimmed);
 }
 
 function turnsToChatMessages(turns: unknown): ChatMessage[] {

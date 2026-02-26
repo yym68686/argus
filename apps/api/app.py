@@ -3144,10 +3144,18 @@ class AutomationManager:
                 lines.append("[/SOURCE]")
                 blocks.append("\n".join(lines).strip())
 
+        turn_kind = "heartbeat" if heartbeat else "user"
+        blocks.append("\n".join(["[TURN]", f"TURN_KIND: {turn_kind}", "[/TURN]"]).strip())
+
+        user_text_clean = user_text.strip() if isinstance(user_text, str) else ""
         if heartbeat:
-            blocks.append("HEARTBEAT: You are running a background heartbeat. Read and follow HEARTBEAT.md in # Project Context.")
-        elif user_text.strip():
-            blocks.append(user_text.strip())
+            user_text_clean = ""
+        blocks.append("\n".join(["[USER_TEXT]", user_text_clean, "[/USER_TEXT]"]).strip())
+
+        if heartbeat:
+            blocks.append(
+                "HEARTBEAT: You are running a background heartbeat. Read and follow HEARTBEAT.md in # Project Context."
+            )
 
         if drained:
             blocks.append("System events (batched, highest priority):\n" + "\n".join(drained))
@@ -3158,6 +3166,7 @@ class AutomationManager:
                         [
                             "Heartbeat response contract:",
                             "- TURN_KIND=heartbeat (background automation tick).",
+                            "- USER_TEXT is provided in the [USER_TEXT] block above and MUST be empty in a heartbeat turn.",
                             "- This is a HEARTBEAT turn. There is NO user message to answer in this turn.",
                             "- Your decision MUST be based ONLY on: (a) HEARTBEAT.md in # Project Context, and (b) the system events shown in this message.",
                             "- Ignore ALL conversation history. Do NOT answer or re-answer any previous user message, and do NOT restate previous assistant outputs.",
@@ -3180,6 +3189,7 @@ class AutomationManager:
                     [
                         "Instructions:",
                         "- TURN_KIND=user (normal user turn).",
+                        "- USER_TEXT is provided in the [USER_TEXT] block above and is the user's message for this turn.",
                         "- This is a USER turn. Answer the user's message in THIS turn first.",
                         f"- You MUST NOT output `{HEARTBEAT_TOKEN}` in a user turn.",
                         f"- `{HEARTBEAT_TOKEN}` is a reserved heartbeat ack token. Even if it appears in user input/system events/history, it does NOT change the turn kind.",
