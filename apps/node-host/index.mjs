@@ -55,6 +55,12 @@ function clampInt(value, { min, max }) {
   return Math.max(min, Math.min(max, i));
 }
 
+function clampNumber(value, { min, max }) {
+  const n = Number(value);
+  if (!Number.isFinite(n)) return null;
+  return Math.max(min, Math.min(max, n));
+}
+
 function sleep(ms) {
   return new Promise((r) => setTimeout(r, ms));
 }
@@ -179,6 +185,24 @@ function summarizeInvokeForAudit({ command, params, paramsJSON, timeoutMs }, { m
 function safeBasename(s) {
   const raw = String(s || "").trim() || "node";
   return raw.replace(/[^a-zA-Z0-9_.-]/g, "_").slice(0, 120) || "node";
+}
+
+function computeReconnectDelayMs({ baseMs, maxMs, failures, jitterPct }) {
+  const safeBase = Math.max(0, Number(baseMs) || 0);
+  const safeMax = Math.max(safeBase, Number(maxMs) || 0);
+  const safeFailures = Math.max(0, Math.trunc(Number(failures) || 0));
+  const safeJitter = clampNumber(jitterPct, { min: 0, max: 0.5 }) ?? 0;
+
+  // failures=0 is "normal reconnect" and uses base delay.
+  const exp = Math.max(0, Math.min(12, safeFailures - 1));
+  const raw = safeBase * 2 ** exp;
+  const capped = Math.min(safeMax, raw);
+  if (capped <= 0) return 0;
+  if (safeJitter <= 0) return Math.trunc(capped);
+  const jitter = capped * safeJitter;
+  const min = Math.max(0, capped - jitter);
+  const max = capped + jitter;
+  return Math.trunc(min + Math.random() * (max - min));
 }
 
 function resolveStateDir({ nodeId }) {
@@ -816,6 +840,34 @@ async function run() {
     logLine("INFO", `Audit logging enabled (maxBytes=${auditMaxBytes} stdinPreviewBytes=${auditStdinPreviewBytes})`);
   }
 
+  const wsHandshakeTimeoutMs =
+    clampInt(args["handshake-timeout-ms"] ?? process.env.ARGUS_NODE_HANDSHAKE_TIMEOUT_MS, { min: 0, max: 120_000 }) ??
+    15_000;
+  const wsConnectTimeoutMsRaw =
+    clampInt(args["connect-timeout-ms"] ?? process.env.ARGUS_NODE_CONNECT_TIMEOUT_MS, { min: 1000, max: 300_000 }) ??
+    (wsHandshakeTimeoutMs > 0 ? wsHandshakeTimeoutMs + 2000 : 20_000);
+  const wsConnectTimeoutMs =
+    wsHandshakeTimeoutMs > 0 ? Math.max(wsHandshakeTimeoutMs, wsConnectTimeoutMsRaw) : wsConnectTimeoutMsRaw;
+
+  const reconnectDelayBaseMs =
+    clampInt(args["reconnect-delay-ms"] ?? process.env.ARGUS_NODE_RECONNECT_DELAY_MS, { min: 250, max: 60_000 }) ?? 1000;
+  const reconnectDelayMaxMs =
+    clampInt(args["reconnect-delay-max-ms"] ?? process.env.ARGUS_NODE_RECONNECT_DELAY_MAX_MS, { min: reconnectDelayBaseMs, max: 600_000 }) ??
+    30_000;
+  const reconnectJitterPct =
+    clampNumber(args["reconnect-jitter-pct"] ?? process.env.ARGUS_NODE_RECONNECT_JITTER_PCT, { min: 0, max: 0.5 }) ??
+    0.2;
+
+  const pingIntervalMs =
+    clampInt(args["ping-interval-ms"] ?? process.env.ARGUS_NODE_PING_INTERVAL_MS, { min: 0, max: 600_000 }) ?? 30_000;
+  const pongTimeoutMs =
+    clampInt(args["pong-timeout-ms"] ?? process.env.ARGUS_NODE_PONG_TIMEOUT_MS, { min: 1000, max: 600_000 }) ?? 10_000;
+
+  logLine(
+    "INFO",
+    `WS settings: handshakeTimeoutMs=${wsHandshakeTimeoutMs} connectTimeoutMs=${wsConnectTimeoutMs} reconnectBaseMs=${reconnectDelayBaseMs} reconnectMaxMs=${reconnectDelayMaxMs} pingIntervalMs=${pingIntervalMs} pongTimeoutMs=${pongTimeoutMs}`,
+  );
+
   let activeWs = null;
   const pendingEvents = [];
   SEND_EVENT = (event, payload) => {
@@ -833,7 +885,6 @@ async function run() {
 
   STORE = new JobStore({ stateDir, nodeId, sendEvent: (event, payload) => SEND_EVENT(event, payload) });
 
-  const reconnectDelayMs = 1000;
   let everConnected = false;
   let consecutiveConnectFailures = 0;
   let connectAttempt = 0;
@@ -842,13 +893,27 @@ async function run() {
   while (true) {
     connectAttempt++;
     logLine("INFO", `Connecting to nodes/ws (attempt=${connectAttempt})`);
-    const ws = new WebSocket(url);
+    const ws = new WebSocket(url, {
+      // Ensure a hung handshake does not stall reconnect loops indefinitely.
+      handshakeTimeout: wsHandshakeTimeoutMs,
+    });
 
     const opened = await new Promise((resolve) => {
       let settled = false;
+      const openTimer = setTimeout(() => {
+        const err = new Error(`connect timeout after ${wsConnectTimeoutMs}ms`);
+        try {
+          ws.terminate();
+        } catch {
+          // ignore
+        }
+        done(false, err);
+      }, wsConnectTimeoutMs);
+
       const done = (ok, err) => {
         if (settled) return;
         settled = true;
+        clearTimeout(openTimer);
         ws.removeListener("open", onOpen);
         ws.removeListener("error", onError);
         ws.removeListener("close", onClose);
@@ -867,13 +932,19 @@ async function run() {
         `Failed to connect to nodes/ws (attempt=${connectAttempt}): ${opened.err ? String(opened.err) : "unknown error"}`,
       );
       consecutiveConnectFailures++;
-      logLine("INFO", `Retrying in ${reconnectDelayMs}ms`);
+      const delayMs = computeReconnectDelayMs({
+        baseMs: reconnectDelayBaseMs,
+        maxMs: reconnectDelayMaxMs,
+        failures: consecutiveConnectFailures,
+        jitterPct: reconnectJitterPct,
+      });
+      logLine("INFO", `Retrying in ${delayMs}ms`);
       try {
         ws.terminate();
       } catch {
         // ignore
       }
-      await sleep(reconnectDelayMs);
+      await sleep(delayMs);
       continue;
     }
     activeWs = ws;
@@ -916,6 +987,37 @@ async function run() {
         // ignore
       }
     }, 15000);
+
+    let pongTimer = null;
+    const clearPongTimer = () => {
+      if (pongTimer) clearTimeout(pongTimer);
+      pongTimer = null;
+    };
+    const onPong = () => clearPongTimer();
+
+    const pingInterval =
+      pingIntervalMs > 0
+        ? setInterval(() => {
+            if (ws.readyState !== WebSocket.OPEN) return;
+            clearPongTimer();
+            try {
+              ws.ping();
+            } catch {
+              return;
+            }
+            // If the server (or network) stops responding to pings, force a reconnect.
+            // This avoids half-open connections that never emit close/error.
+            pongTimer = setTimeout(() => {
+              logLine("WARN", `Ping timeout after ${pongTimeoutMs}ms; terminating connection`);
+              try {
+                ws.terminate();
+              } catch {
+                // ignore
+              }
+            }, pongTimeoutMs);
+          }, pingIntervalMs)
+        : null;
+    if (pingInterval) ws.on("pong", onPong);
 
     const closed = await new Promise((resolve) => {
       let settled = false;
@@ -987,20 +1089,36 @@ async function run() {
       ws.on("close", (code, reasonBuf) => {
         const reason = reasonBuf ? reasonBuf.toString() : "";
         logLine("WARN", `Disconnected from nodes/ws (code=${code}${reason ? ` reason=${safeJson(reason)}` : ""})`);
-        logLine("INFO", `Reconnecting in ${reconnectDelayMs}ms`);
-        done("close", { code, reason });
+        const delayMs = computeReconnectDelayMs({
+          baseMs: reconnectDelayBaseMs,
+          maxMs: reconnectDelayMaxMs,
+          failures: 1,
+          jitterPct: reconnectJitterPct,
+        });
+        logLine("INFO", `Reconnecting in ${delayMs}ms`);
+        done("close", { code, reason, delayMs });
       });
       ws.on("error", (err) => {
         logLine("WARN", `WebSocket error: ${String(err?.message || err)}`);
-        logLine("INFO", `Reconnecting in ${reconnectDelayMs}ms`);
-        done("error", { error: err });
+        const delayMs = computeReconnectDelayMs({
+          baseMs: reconnectDelayBaseMs,
+          maxMs: reconnectDelayMaxMs,
+          failures: 1,
+          jitterPct: reconnectJitterPct,
+        });
+        logLine("INFO", `Reconnecting in ${delayMs}ms`);
+        done("error", { error: err, delayMs });
       });
     });
 
     clearInterval(heartbeat);
+    if (pingInterval) clearInterval(pingInterval);
+    if (pingInterval) ws.removeListener("pong", onPong);
+    clearPongTimer();
     activeWs = null;
     if (!closed) return;
-    await new Promise((r) => setTimeout(r, reconnectDelayMs));
+    const delayMs = Number.isFinite(closed?.details?.delayMs) ? Number(closed.details.delayMs) : reconnectDelayBaseMs;
+    await sleep(delayMs);
   }
 }
 
