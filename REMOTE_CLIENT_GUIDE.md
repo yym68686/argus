@@ -15,12 +15,12 @@ export ARGUS_TOKEN="<ARGUS_TOKEN>"
 ```
 
 - 服务器 HOST（IP 或域名）：`$HOST`
-- 网关 HTTP（用于健康检查 / sessions 管理）：`http://$HOST:8080`
+- 网关 HTTP（用于健康检查 / sessions&nodes&automation 管理）：`http://$HOST:8080`
 - 网关健康检查：`http://$HOST:8080/healthz`
   - 期望返回：`{"ok":true}`
 - 网关 WebSocket（给程序接入 app-server runtime）：`ws://$HOST:8080/ws`
 - Node Host WebSocket（可选；设备能力注册）：`ws://$HOST:8080/nodes/ws`
-- 网关 MCP（可选；给容器内 agent 作为 MCP Server）：`http://$HOST:8080/mcp`
+- 网关 MCP（可选；给 runtime 容器内 agent 调用的 MCP Server）：`http://$HOST:8080/mcp`
 - 可选：Web UI（用于验证后端；需要服务器启动 web 服务）：`http://$HOST:3000`
 
 认证方式（二选一）：
@@ -32,7 +32,10 @@ export ARGUS_TOKEN="<ARGUS_TOKEN>"
 > 备注：
 >
 > - 如果服务端配置了分离 token（`ARGUS_NODE_TOKEN` / `ARGUS_MCP_TOKEN`），则 Node Host / MCP 会使用对应的 master secret；未配置时默认复用 `ARGUS_TOKEN`。
-> - Node Host（`/nodes/ws`）是按 **session 隔离** 的：推荐用派生 token `argus-node-v1.<sessionId>.<sig>` 把 node 绑定到指定 session（`sig = base64url(hmac_sha256(master, sessionId))[:32]`）；直接用 master token 只会绑定到默认 session。
+> - Node Host（`/nodes/ws`）是按 **session 隔离** 的：推荐用派生 token `argus-node-v1.<sessionId>.<sig>` 把 node 绑定到指定 session（`sig = base64url(hmac_sha256(master, sessionId)).rstrip("=")[:32]`）。
+>   - 兼容：直接用 master token 连接 `/nodes/ws`（只会绑定到**默认 session**）。
+> - MCP（`/mcp`）是按 **session 隔离** 的：**必须**使用派生 token `argus-mcp-v1.<sessionId>.<sig>`（raw master token **不会被接受**）。
+>   - Docker provisioning 模式下，runtime 容器会自动获得自己的派生 `ARGUS_MCP_TOKEN`（通常外部客户端不需要直接调用 `/mcp`）。
 
 ## 2. 系统架构（你在写客户端时需要知道的）
 
@@ -41,8 +44,9 @@ export ARGUS_TOKEN="<ARGUS_TOKEN>"
 3) 当前部署模式通常是：**一个 WebSocket 连接 = 网关创建一个 runtime 容器**  
 4) 成功连上后，网关会先发一个通知给客户端（可忽略，但建议保存）：
 ```json
-{"method":"argus/session","params":{"id":"<SESSION_ID>","mode":"docker","attached":false}}
+{"method":"argus/session","params":{"id":"<SESSION_ID>","mode":"docker","attached":false,"created":true}}
 ```
+字段含义：`attached=true` 表示你通过 `?session=<SESSION_ID>` 重新挂载到已有 session；`created=true` 表示本次连接新建了 runtime 容器（否则为复用已有容器）。
 5) WebSocket 断开后：容器会被保留（你可以通过 `DELETE /sessions/<SESSION_ID>` 手动删除）  
 6) 对话线程（thread）会写入 runtime 的持久化 home 目录（由 `ARGUS_HOME_HOST_PATH` 挂载）
    - 恢复“工作上下文”：`thread/resume`
@@ -58,6 +62,8 @@ export ARGUS_TOKEN="<ARGUS_TOKEN>"
 ```
 ws://$HOST:8080/ws?token=<ARGUS_TOKEN>
 ```
+
+（浏览器无法设置 `Authorization` header，所以这里用 `?token=`；写 Node/Python 客户端时建议用 `Authorization: Bearer ...`。）
 
 3) 点 `Connect`，成功后状态会显示 `connected`，并自动初始化 + 新建/恢复 thread  
 4) 输入框里发消息即可（UI 支持连续发送；同一 thread 忙时会排队成 follow-up，在当前 turn 完成后自动触发下一次 turn）
@@ -202,7 +208,7 @@ curl -sS -X DELETE -H "Authorization: Bearer $ARGUS_TOKEN" "http://$HOST:8080/se
 npm i ws
 ```
 
-示例 `client.js`（把 token 通过环境变量注入，不要写死）：
+示例 `client.mjs`（把 token 通过环境变量注入，不要写死）：
 ```js
 import WebSocket from "ws";
 
@@ -212,8 +218,13 @@ if (!token) throw new Error("Missing ARGUS_TOKEN");
 const host = process.env.HOST;
 if (!host) throw new Error("Missing HOST");
 
-const url = `ws://${host}:8080/ws?token=${encodeURIComponent(token)}`;
-const ws = new WebSocket(url);
+const sessionId = process.env.ARGUS_SESSION_ID; // optional: reattach to an existing session
+const url = new URL(`ws://${host}:8080/ws`);
+if (sessionId) url.searchParams.set("session", sessionId);
+
+const ws = new WebSocket(url.toString(), {
+  headers: { Authorization: `Bearer ${token}` },
+});
 
 let nextId = 1;
 const pending = new Map();
@@ -266,6 +277,9 @@ ws.on("message", (data) => {
   }
 
   // notifications (streaming)
+  if (msg.method === "argus/session") {
+    console.log("sessionId =", msg.params?.id, "created =", msg.params?.created, "attached =", msg.params?.attached);
+  }
   if (msg.method === "item/agentMessage/delta") {
     process.stdout.write(msg.params?.delta ?? "");
   }
@@ -280,7 +294,9 @@ ws.on("error", (e) => console.error("ws error:", e));
 
 运行：
 ```bash
-ARGUS_TOKEN="<ARGUS_TOKEN>" node client.js
+HOST="<YOUR_SERVER_HOST>" ARGUS_TOKEN="<ARGUS_TOKEN>" node client.mjs
+# 可选：重连同一个容器
+# HOST="<YOUR_SERVER_HOST>" ARGUS_TOKEN="<ARGUS_TOKEN>" ARGUS_SESSION_ID="<SESSION_ID>" node client.mjs
 ```
 
 ### 5.2 Python（可选）
@@ -296,8 +312,9 @@ python3 -m pip install websockets
 
 客户端要做两件事：
 
-1) **保存 threadId**：第一次 `thread/start` 的 response 里拿到 `result.thread.id` 后保存（浏览器可以用 localStorage；桌面/移动端用本地存储）
-2) 重连后走：`initialize` → `initialized` → `thread/resume(threadId)` → 继续 `turn/start`
+1) **保存 sessionId**：从 `argus/session` 通知里拿到 `params.id` 后保存；重连时用 `ws://.../ws?session=<SESSION_ID>`（并保持同样的认证方式：header 或 `?token=`）挂载回同一个容器（避免每次断线都创建新容器）
+2) **保存 threadId**：第一次 `thread/start` 的 response 里拿到 `result.thread.id` 后保存（浏览器可以用 localStorage；桌面/移动端用本地存储）
+3) 重连后走：`initialize` → `initialized` → `thread/resume(threadId)` → 继续 `turn/start`（或用 `argus/input/enqueue`）
 
 > 注意：恢复的是“对话/上下文 + workspace 文件”，不是“容器里跑着的进程”。容器销毁后，后台进程/内存态都会消失。
 
