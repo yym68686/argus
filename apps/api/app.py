@@ -4497,59 +4497,49 @@ async def _mcp_handle_single_message(request: Request, body: dict[str, Any]) -> 
                     {"MCP-Protocol-Version": sess.protocol_version},
                 )
 
-            allow_unknown = str(os.getenv("ARGUS_MCP_MESSAGE_ALLOW_UNKNOWN_TARGETS") or "").strip().lower() in (
-                "1",
-                "true",
-                "yes",
-                "on",
-            )
-            if not allow_unknown:
-                automation: Optional[AutomationManager] = getattr(app.state, "automation", None)
-                if automation is None:
-                    return (
-                        _jsonrpc_result(
-                            request_id=request_id,
-                            result=_mcp_call_tool_result(
-                                content=[{"type": "text", "text": "Automation is not initialized; cannot validate target"}],
-                                structured={"ok": False, "error": {"code": "NOT_READY", "message": "automation is not initialized"}},
-                                is_error=True,
-                            ),
+            automation: Optional[AutomationManager] = getattr(app.state, "automation", None)
+            if automation is None:
+                return (
+                    _jsonrpc_result(
+                        request_id=request_id,
+                        result=_mcp_call_tool_result(
+                            content=[{"type": "text", "text": "Automation is not initialized; cannot validate target"}],
+                            structured={"ok": False, "error": {"code": "NOT_READY", "message": "automation is not initialized"}},
+                            is_error=True,
                         ),
-                        {"MCP-Protocol-Version": sess.protocol_version},
-                    )
+                    ),
+                    {"MCP-Protocol-Version": sess.protocol_version},
+                )
 
-                chat_id = target.get("chat_id")
-                known = False
-                st = automation._store.state
-                for sess_state in (st.sessions or {}).values():
-                    last_active = getattr(sess_state, "last_active_by_thread", None)
-                    if not isinstance(last_active, dict):
+            # Treat targets present in persisted chatBindings as allowed. This is more stable than
+            # lastActiveByThread, which can be overwritten by the most recent inbound message.
+            chat_id = target.get("chat_id")
+            known = False
+            st = automation._store.state
+            bindings = getattr(st, "chat_bindings", None)
+            if isinstance(bindings, dict):
+                for ck in bindings.keys():
+                    if not isinstance(ck, str) or not ck.strip():
                         continue
-                    for tgt in last_active.values():
-                        ck = getattr(tgt, "chat_key", None)
-                        if not isinstance(ck, str) or not ck.strip():
-                            continue
-                        cand = _telegram_target_from_chat_key(ck)
-                        if cand is None:
-                            continue
-                        if cand.get("chat_id") == chat_id:
-                            known = True
-                            break
-                    if known:
+                    cand = _telegram_target_from_chat_key(ck)
+                    if cand is None:
+                        continue
+                    if cand.get("chat_id") == chat_id:
+                        known = True
                         break
 
-                if not known:
-                    return (
-                        _jsonrpc_result(
-                            request_id=request_id,
-                            result=_mcp_call_tool_result(
-                                content=[{"type": "text", "text": "Target not allowed (unknown chatKey). Set ARGUS_MCP_MESSAGE_ALLOW_UNKNOWN_TARGETS=1 to override."}],
-                                structured={"ok": False, "error": {"code": "FORBIDDEN", "field": "target"}},
-                                is_error=True,
-                            ),
+            if not known:
+                return (
+                    _jsonrpc_result(
+                        request_id=request_id,
+                        result=_mcp_call_tool_result(
+                            content=[{"type": "text", "text": "Target not allowed (unknown chatKey). Expected target to exist in chatBindings."}],
+                            structured={"ok": False, "error": {"code": "FORBIDDEN", "field": "target"}},
+                            is_error=True,
                         ),
-                        {"MCP-Protocol-Version": sess.protocol_version},
-                    )
+                    ),
+                    {"MCP-Protocol-Version": sess.protocol_version},
+                )
 
             raw_format = args.get("format")
             fmt = str(raw_format or "markdown").strip().lower()
