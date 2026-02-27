@@ -86,6 +86,7 @@ When using `apps/telegram-bot`, the gateway can isolate runtime containers (agen
 Migration notes:
 
 - Enabling this does not delete existing session containers.
+- By default, the gateway deletes orphan docker runtime containers on startup (set `ARGUS_GC_DELETE_ORPHAN_RUNTIMES=off` to disable, or `dry-run` to preview).
 - If older sessions still have enabled cron jobs in automation state, the gateway will keep scheduling them until you disable/delete those jobs and remove the sessions.
 
 ## Automation (system events, heartbeat, cron)

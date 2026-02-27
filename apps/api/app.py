@@ -1511,22 +1511,37 @@ class AutomationStateStore:
         self._path = state_path
         self._lock = asyncio.Lock()
         self._state = PersistedGatewayAutomationState()
+        self._loaded_from_disk_ok: bool = False
+        self._last_load_path_existed: bool = False
 
     @property
     def state(self) -> PersistedGatewayAutomationState:
         return self._state
 
+    @property
+    def loaded_from_disk_ok(self) -> bool:
+        return self._loaded_from_disk_ok
+
+    @property
+    def last_load_path_existed(self) -> bool:
+        return self._last_load_path_existed
+
     async def load(self) -> PersistedGatewayAutomationState:
         async with self._lock:
             try:
+                self._last_load_path_existed = await asyncio.to_thread(self._path.exists)
                 raw = await asyncio.to_thread(self._path.read_text, "utf-8")
                 parsed = json.loads(raw)
                 self._state = PersistedGatewayAutomationState.from_json(parsed)
+                self._loaded_from_disk_ok = True
             except FileNotFoundError:
+                self._last_load_path_existed = False
                 self._state = PersistedGatewayAutomationState()
+                self._loaded_from_disk_ok = False
             except Exception:
                 log.exception("Failed to load automation state from %s", str(self._path))
                 self._state = PersistedGatewayAutomationState()
+                self._loaded_from_disk_ok = False
             return self._state
 
     async def save(self) -> None:
@@ -1603,6 +1618,7 @@ class AutomationManager:
     async def start(self) -> None:
         await self._store.load()
         await self._ensure_main_agent()
+        await self._gc_orphan_runtime_containers()
         await self._ensure_workspace_files()
         await self._prune_persisted_sessions()
         self._tasks.append(asyncio.create_task(self._cron_loop()))
@@ -1917,6 +1933,95 @@ class AutomationManager:
                 st.sessions[main_session_id] = PersistedSessionAutomation()
 
         await self._store.update(_write)
+
+    async def _gc_orphan_runtime_containers(self) -> None:
+        mode = _gc_delete_orphan_runtimes_mode()
+        if mode == "off":
+            return
+        if _provision_mode() != "docker":
+            log.info("Orphan runtime GC is enabled (%s) but provision mode is not docker; skipping", mode)
+            return
+        if not self._store.loaded_from_disk_ok:
+            log.info("Orphan runtime GC is enabled (%s) but automation state did not load cleanly; skipping", mode)
+            return
+
+        st = self._store.state
+        referenced: set[str] = set()
+        for sid in (st.sessions or {}).keys():
+            if isinstance(sid, str) and sid.strip():
+                referenced.add(sid.strip())
+        for agent in (st.agents or {}).values():
+            if isinstance(agent, PersistedAgentRuntime) and isinstance(agent.session_id, str) and agent.session_id.strip():
+                referenced.add(agent.session_id.strip())
+        if not referenced:
+            log.warning("Orphan runtime GC is enabled (%s) but no referenced sessionIds found; skipping for safety", mode)
+            return
+
+        try:
+            containers = await asyncio.to_thread(_docker_list_argus_containers_sync)
+        except Exception as e:
+            log.warning("Failed to list docker sessions for orphan GC: %s", str(e))
+            return
+
+        orphans: list[dict[str, Any]] = []
+        for c in containers:
+            if not isinstance(c, dict):
+                continue
+            sid = c.get("sessionId")
+            layout = c.get("runtimeLayout")
+            if layout != RUNTIME_LAYOUT:
+                continue
+            if not isinstance(sid, str) or not sid.strip():
+                continue
+            sid_norm = sid.strip()
+            if sid_norm in referenced:
+                continue
+            orphans.append(c)
+
+        if not orphans:
+            return
+
+        log.info(
+            "Orphan runtime GC: mode=%s referenced=%d total=%d orphan=%d",
+            mode,
+            len(referenced),
+            len(containers),
+            len(orphans),
+        )
+        for o in orphans[:50]:
+            cid = str(o.get("containerId") or "")
+            log.info(
+                "Orphan runtime container: sessionId=%s containerId=%s name=%s status=%s",
+                o.get("sessionId"),
+                (cid[:12] if cid else None),
+                o.get("name"),
+                o.get("status"),
+            )
+        if len(orphans) > 50:
+            log.info("Orphan runtime GC: ... and %d more", len(orphans) - 50)
+
+        if mode == "dry-run":
+            return
+
+        deleted = 0
+        for o in orphans:
+            sid = str(o.get("sessionId") or "").strip()
+            if not sid:
+                continue
+            try:
+                await self._force_close_live_session(sid)
+            except Exception:
+                pass
+            try:
+                container = await asyncio.to_thread(_docker_get_container_by_session_sync, sid)
+                if container is None:
+                    continue
+                await asyncio.to_thread(_docker_remove_container_sync, container)
+                deleted += 1
+            except Exception as e:
+                log.warning("Failed to delete orphan runtime container for session %s: %s", sid, str(e))
+
+        log.info("Orphan runtime GC complete: deleted=%d", deleted)
 
     async def _prune_persisted_sessions(self) -> None:
         # Keep persisted automation state in sync with existing docker runtime containers.
@@ -4173,6 +4278,24 @@ class McpSessionState:
 
 def _provision_mode() -> str:
     return os.getenv("ARGUS_PROVISION_MODE", "static").strip().lower()
+
+
+def _gc_delete_orphan_runtimes_mode() -> str:
+    raw = (os.getenv("ARGUS_GC_DELETE_ORPHAN_RUNTIMES") or "").strip().lower()
+    if raw in ("0", "false", "no", "off", "disabled"):
+        return "off"
+    if not raw:
+        # Default: enabled (delete).
+        return "delete"
+    if raw in ("dry-run", "dryrun", "dry_run", "plan", "preview"):
+        return "dry-run"
+    if raw in ("1", "true", "yes", "on", "delete"):
+        return "delete"
+    log.warning(
+        "Invalid ARGUS_GC_DELETE_ORPHAN_RUNTIMES=%r; expected one of: off|dry-run|true",
+        raw,
+    )
+    return "off"
 
 
 def _load_upstreams() -> dict[str, Upstream]:

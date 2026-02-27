@@ -91,6 +91,7 @@ docker compose down
 迁移提示：
 
 - 启用该隔离方案不会自动删除旧 session 容器。
+- 默认情况下，gateway 启动时会删除 **未被** `${ARGUS_HOME_HOST_PATH}/gateway/state.json` **引用** 的 docker runtime 容器（可设置 `ARGUS_GC_DELETE_ORPHAN_RUNTIMES=off` 关闭，或 `dry-run` 仅预览）。
 - 如果旧 session 在 automation state 中仍存在启用的 cron job，它会继续被 gateway 调度执行；要停止请禁用/删除 cron job，并在需要时删除对应 session 容器。
 
 ## 自动化（system events / heartbeat / cron）
