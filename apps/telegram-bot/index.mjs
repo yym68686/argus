@@ -788,6 +788,15 @@ function truncateTelegramMessage(text) {
   return text.slice(0, Math.max(0, max - suffix.length)) + suffix;
 }
 
+function formatGatewayErrorForUser(err) {
+  const msg = err instanceof Error ? err.message : String(err);
+  if (msg.includes("/start")) return "请先 /start 初始化。";
+  if (/forbidden/i.test(msg)) return "error: 没有权限。";
+  const already = /agent already exists:\s*([a-z0-9_-]+)/i.exec(msg);
+  if (already) return `error: 已存在：${already[1]}`;
+  return `error: ${msg}`;
+}
+
 const TELEGRAM_HTML_PARSE_ERR_RE = /can't parse entities|parse entities|find end of the entity/i;
 const TELEGRAM_MESSAGE_TOO_LONG_RE = /message is too long/i;
 
@@ -1285,6 +1294,7 @@ async function main() {
               "",
               "Notes:",
               "- In private chat, messages go to the current agent session main thread.",
+              "- You can only /useagent agents you own, or agents shared to you by the admin.",
               "- In groups/topics, the bot maps chat/topic -> thread per session."
             ].join("\n");
             await tg.sendMessage({ ...target, text: helpText });
@@ -1342,8 +1352,7 @@ async function main() {
               }
               await tg.sendMessage({ ...target, text: truncateTelegramMessage(lines.join("\n")) });
             } catch (e) {
-              const msg = e instanceof Error ? e.message : String(e);
-              await tg.sendMessage({ ...target, text: msg.includes("/start") ? "请先 /start 初始化。" : `error: ${msg}` });
+              await tg.sendMessage({ ...target, text: formatGatewayErrorForUser(e) });
             }
             typing.stop(chatKey);
             return;
@@ -1371,8 +1380,7 @@ async function main() {
               }
               await tg.sendMessage({ ...target, text: `ok (new agent): ${name}` });
             } catch (e) {
-              const msg = e instanceof Error ? e.message : String(e);
-              await tg.sendMessage({ ...target, text: msg.includes("/start") ? "请先 /start 初始化。" : `error: ${msg}` });
+              await tg.sendMessage({ ...target, text: formatGatewayErrorForUser(e) });
             }
             typing.stop(chatKey);
             return;
@@ -1399,8 +1407,7 @@ async function main() {
               }
               await tg.sendMessage({ ...target, text: `ok (use agent): ${name}` });
             } catch (e) {
-              const msg = e instanceof Error ? e.message : String(e);
-              await tg.sendMessage({ ...target, text: msg.includes("/start") ? "请先 /start 初始化。" : `error: ${msg}` });
+              await tg.sendMessage({ ...target, text: formatGatewayErrorForUser(e) });
             }
             typing.stop(chatKey);
             return;
@@ -1410,8 +1417,7 @@ async function main() {
           try {
             route = await resolveRouteForChatKey(chatKey);
           } catch (e) {
-            const msg = e instanceof Error ? e.message : String(e);
-            await tg.sendMessage({ ...target, text: msg.includes("/start") ? "请先 /start 初始化。" : `error: ${msg}` });
+            await tg.sendMessage({ ...target, text: formatGatewayErrorForUser(e) });
             typing.stop(chatKey);
             return;
           }

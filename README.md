@@ -71,6 +71,23 @@ On first run, the runtime bootstraps these workspace files **if missing** (it wi
 
 These files are used to build the assistant’s “project context”. Every turn injects `AGENTS.md` / `SOUL.md` / `USER.md`; **`HEARTBEAT.md` is injected only for heartbeat turns**.
 
+### Telegram multi-user agents (DM isolation)
+
+When using `apps/telegram-bot`, the gateway can isolate runtime containers (agents) per Telegram private user:
+
+- First `/start` in a private chat bootstraps a dedicated per-user `main` agent (one session container + one workspace).
+  - Host workspace directory: `${ARGUS_HOME_HOST_PATH}/workspace-<tgid>-main`
+- Subsequent `/start` reuses the existing `main`.
+- `/newagent foo` creates `${ARGUS_HOME_HOST_PATH}/workspace-<tgid>-foo` and switches to it (duplicate names error).
+- `/agents` only shows agents you own (including `main`) plus admin-shared agents.
+- Admin sharing: edit `${ARGUS_HOME_HOST_PATH}/gateway/state.json` and add the target user tgid into `allowedUserIds` for the desired `agentId`.
+  - Recommended: edit with the gateway stopped, or restart after edits (the gateway continuously writes back `state.json`).
+
+Migration notes:
+
+- Enabling this does not delete existing session containers.
+- If older sessions still have enabled cron jobs in automation state, the gateway will keep scheduling them until you disable/delete those jobs and remove the sessions.
+
 ## Automation (system events, heartbeat, cron)
 
 Argus has a minimal automation layer in the gateway:

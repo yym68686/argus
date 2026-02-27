@@ -71,6 +71,28 @@ docker compose down
 
 这些文件会组成“项目上下文”。每一轮 turn 都会注入 `AGENTS.md` / `SOUL.md` / `USER.md`；**只有 heartbeat turn 才会注入 `HEARTBEAT.md`**。
 
+### Telegram 多用户 Agent（私聊隔离）
+
+如果你使用 `apps/telegram-bot` 接入 Telegram，则网关支持按 Telegram 用户隔离 runtime 容器（agent）：
+
+- **首次 `/start`**：网关会为该 Telegram 私聊用户创建一个专属 `main` agent（一个独立 session 容器 + 独立 workspace），并自动绑定为当前 agent。
+  - 宿主机工作区目录命名：`${ARGUS_HOME_HOST_PATH}/workspace-<tgid>-main`
+- **重复 `/start`**：不会重复创建；只会复用并确保绑定到自己的 `main`。
+- **创建新 agent**：`/newagent foo` 会创建 `${ARGUS_HOME_HOST_PATH}/workspace-<tgid>-foo` 并切换过去；同名会报“已存在”。
+- **列出可用 agent**：`/agents` 只展示：
+  - 自己拥有的 agent（含 `main`）
+  - 管理员额外授权给你的共享 agent
+- **切换 agent**：
+  - 切换自己的：`/useagent foo`
+  - 切换共享的：`/useagent <agentId>`（例如 `u123456-foo`）
+- **共享/授权**：管理员可编辑 `${ARGUS_HOME_HOST_PATH}/gateway/state.json`，在对应 `agentId` 下把目标用户的 tgid 加入 `allowedUserIds`。
+  - 建议在停止 gateway 后编辑，或编辑后重启（gateway 运行中会持续写回 `state.json`，手动修改可能被覆盖）。
+
+迁移提示：
+
+- 启用该隔离方案不会自动删除旧 session 容器。
+- 如果旧 session 在 automation state 中仍存在启用的 cron job，它会继续被 gateway 调度执行；要停止请禁用/删除 cron job，并在需要时删除对应 session 容器。
+
 ## 自动化（system events / heartbeat / cron）
 
 网关内置一个最小自动化层：
