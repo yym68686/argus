@@ -162,5 +162,5 @@ They apply to **new** sessions. Existing containers need `docker update` or recr
 ## Debug
 
 ```bash
-python3 -m py_compile apps/api/app.py client_smoke.py
+python3 -m py_compile apps/api/app.py
 ```

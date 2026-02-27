@@ -33,7 +33,6 @@ A skill is a set of local instructions to follow that is stored in a `SKILL.md` 
 - `apps/api/`: FastAPI 网关（HTTP + WebSocket `/ws`）
   - `ARGUS_PROVISION_MODE=docker` 时：每个 WebSocket 连接自动创建一个 runtime 容器；断开后默认保留（由客户端调用 `GET /sessions` / `DELETE /sessions/<id>` 管理）
 - `apps/web/`: React 前端（Next.js + Tailwind v4），可选启动（用于验证/调试后端）
-- `client_smoke.py`: 最小化 JSON-RPC/JSONL 客户端（用于回归/调试）
 - `docker-compose.yml`: 一键启动网关（并提前 build runtime 镜像）
 - `REMOTE_CLIENT_GUIDE.md`: 给外部客户端接入的详细文档
 

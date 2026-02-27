@@ -162,5 +162,5 @@ export ARGUS_RUNTIME_PIDS_LIMIT="512"     # 可选
 ## Debug
 
 ```bash
-python3 -m py_compile apps/api/app.py client_smoke.py
+python3 -m py_compile apps/api/app.py
 ```
