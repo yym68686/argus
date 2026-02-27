@@ -1228,6 +1228,7 @@ class PersistedLastActiveTarget:
 
 
 AGENT_ID_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9_-]{0,63}$")
+TELEGRAM_PRIVATE_CHAT_ID_RE = re.compile(r"^[1-9]\d{0,19}$")
 
 
 def _normalize_agent_id(raw: Any) -> str:
@@ -1241,12 +1242,42 @@ def _normalize_agent_id(raw: Any) -> str:
     return agent_id
 
 
+def _parse_telegram_private_user_id(chat_key: Any) -> Optional[int]:
+    if not isinstance(chat_key, str):
+        return None
+    ck = chat_key.strip()
+    if not ck:
+        return None
+    if not TELEGRAM_PRIVATE_CHAT_ID_RE.match(ck):
+        return None
+    try:
+        user_id = int(ck)
+    except Exception:
+        return None
+    return user_id if user_id > 0 else None
+
+
+def _normalize_agent_short_name(raw: Any) -> str:
+    name = _normalize_agent_id(raw)
+    # Avoid confusion between "short name" and explicit agentId.
+    if re.match(r"^u\d+-", name):
+        return ""
+    return name
+
+
+def _user_agent_id(*, user_id: int, short_name: str) -> str:
+    return f"u{user_id}-{short_name}"
+
+
 @dataclass
 class PersistedAgentRuntime:
     agent_id: str
     session_id: str
     workspace_host_path: str
     created_at_ms: int
+    owner_user_id: Optional[int] = None
+    short_name: Optional[str] = None
+    allowed_user_ids: list[int] = field(default_factory=list)
 
     def to_json(self) -> dict[str, Any]:
         return {
@@ -1254,6 +1285,9 @@ class PersistedAgentRuntime:
             "sessionId": self.session_id,
             "workspaceHostPath": self.workspace_host_path,
             "createdAtMs": int(self.created_at_ms),
+            "ownerUserId": int(self.owner_user_id) if isinstance(self.owner_user_id, int) else None,
+            "shortName": self.short_name,
+            "allowedUserIds": list(self.allowed_user_ids or []),
         }
 
     @staticmethod
@@ -1264,6 +1298,29 @@ class PersistedAgentRuntime:
         session_id = str(obj.get("sessionId") or "").strip()
         workspace_host_path = str(obj.get("workspaceHostPath") or "").strip()
         created_at_ms = obj.get("createdAtMs")
+        owner_user_id = None
+        owner_raw = obj.get("ownerUserId")
+        if owner_raw is not None:
+            try:
+                owner_int = int(owner_raw)
+                if owner_int > 0:
+                    owner_user_id = owner_int
+            except Exception:
+                owner_user_id = None
+        short_name = str(obj.get("shortName") or "").strip().lower() or None
+        allowed_user_ids: list[int] = []
+        allowed_raw = obj.get("allowedUserIds")
+        if isinstance(allowed_raw, list):
+            seen: set[int] = set()
+            for x in allowed_raw:
+                try:
+                    n = int(x)
+                except Exception:
+                    continue
+                if n <= 0 or n in seen:
+                    continue
+                seen.add(n)
+                allowed_user_ids.append(n)
         try:
             created_at_int = int(created_at_ms) if created_at_ms is not None else _now_ms()
         except Exception:
@@ -1275,6 +1332,9 @@ class PersistedAgentRuntime:
             session_id=session_id,
             workspace_host_path=workspace_host_path,
             created_at_ms=created_at_int,
+            owner_user_id=owner_user_id,
+            short_name=short_name,
+            allowed_user_ids=allowed_user_ids,
         )
 
 
@@ -1384,7 +1444,7 @@ class PersistedSessionAutomation:
 
 @dataclass
 class PersistedGatewayAutomationState:
-    version: int = 2
+    version: int = 3
     default_session_id: Optional[str] = None
     sessions: dict[str, PersistedSessionAutomation] = field(default_factory=dict)
     agents: dict[str, PersistedAgentRuntime] = field(default_factory=dict)
@@ -1591,6 +1651,162 @@ class AutomationManager:
         aid = self.resolve_agent_for_chat_key(chat_key)
         return self.resolve_agent_session_id(aid) or self._store.state.default_session_id
 
+    def _can_user_access_agent(self, *, user_id: int, agent: PersistedAgentRuntime) -> bool:
+        if not isinstance(user_id, int) or user_id <= 0:
+            return False
+        if isinstance(agent.owner_user_id, int) and agent.owner_user_id == user_id:
+            return True
+        allowed = agent.allowed_user_ids if isinstance(agent.allowed_user_ids, list) else []
+        return user_id in allowed
+
+    def _user_main_agent_id(self, *, user_id: int) -> str:
+        return _user_agent_id(user_id=user_id, short_name="main")
+
+    def list_agents_for_user(self, *, user_id: int) -> list[dict[str, Any]]:
+        st = self._store.state
+        out: list[dict[str, Any]] = []
+        main_id = self._user_main_agent_id(user_id=user_id)
+        prefix = f"u{user_id}-"
+        for aid, agent in (st.agents or {}).items():
+            if not isinstance(agent, PersistedAgentRuntime):
+                continue
+            if not self._can_user_access_agent(user_id=user_id, agent=agent):
+                continue
+            short = agent.short_name
+            if not short:
+                if isinstance(agent.agent_id, str) and agent.agent_id.startswith(prefix):
+                    short = agent.agent_id[len(prefix) :].strip() or None
+            entry = agent.to_json()
+            entry["isOwner"] = bool(isinstance(agent.owner_user_id, int) and agent.owner_user_id == user_id)
+            entry["isDefault"] = bool(aid == main_id)
+            if short:
+                entry["shortName"] = short
+            out.append(entry)
+        out.sort(key=lambda x: (not bool(x.get("isDefault")), not bool(x.get("isOwner")), str(x.get("agentId") or "")))
+        return out
+
+    def _get_agent(self, agent_id: str) -> Optional[PersistedAgentRuntime]:
+        agent = self._store.state.agents.get(agent_id)
+        return agent if isinstance(agent, PersistedAgentRuntime) else None
+
+    async def ensure_user_main_agent(self, *, user_id: int) -> tuple[PersistedAgentRuntime, bool]:
+        if _provision_mode() != "docker":
+            raise RuntimeError("User agents are only supported in docker provision mode")
+        if not self._home_host_path:
+            raise RuntimeError("ARGUS_HOME_HOST_PATH is required to create user agents")
+        if not isinstance(user_id, int) or user_id <= 0:
+            raise ValueError("Invalid userId")
+
+        aid = self._user_main_agent_id(user_id=user_id)
+        created_at_ms = _now_ms()
+        created = False
+
+        def _write(st: PersistedGatewayAutomationState) -> None:
+            nonlocal created
+            st.version = max(int(getattr(st, "version", 1) or 1), 3)
+            existing = st.agents.get(aid)
+            if isinstance(existing, PersistedAgentRuntime):
+                return
+            created = True
+            session_id = uuid.uuid4().hex[:12]
+            workspace_host_path = str((Path(self._home_host_path) / f"workspace-{user_id}-main").resolve())
+            st.agents[aid] = PersistedAgentRuntime(
+                agent_id=aid,
+                session_id=session_id,
+                workspace_host_path=workspace_host_path,
+                created_at_ms=created_at_ms,
+                owner_user_id=user_id,
+                short_name="main",
+                allowed_user_ids=[],
+            )
+            if session_id not in st.sessions:
+                st.sessions[session_id] = PersistedSessionAutomation()
+
+        await self._store.update(_write)
+        agent = self._get_agent(aid)
+        if agent is None:
+            raise RuntimeError("Failed to persist user main agent")
+        await self._ensure_workspace_files_at(Path(agent.workspace_host_path), legacy_home=None)
+        await _ensure_live_docker_session(agent.session_id, allow_create=True)
+        return agent, created
+
+    async def create_user_agent(self, *, user_id: int, short_name: str) -> PersistedAgentRuntime:
+        if _provision_mode() != "docker":
+            raise RuntimeError("User agents are only supported in docker provision mode")
+        if not self._home_host_path:
+            raise RuntimeError("ARGUS_HOME_HOST_PATH is required to create user agents")
+        if not isinstance(user_id, int) or user_id <= 0:
+            raise ValueError("Invalid userId")
+        name = _normalize_agent_short_name(short_name)
+        if not name:
+            raise ValueError("Invalid agent name")
+        if name == "main":
+            raise ValueError("agent name 'main' is reserved")
+
+        aid = _user_agent_id(user_id=user_id, short_name=name)
+        if not AGENT_ID_RE.match(aid):
+            raise ValueError("Invalid agent name (too long)")
+
+        created_at_ms = _now_ms()
+
+        def _write(st: PersistedGatewayAutomationState) -> None:
+            st.version = max(int(getattr(st, "version", 1) or 1), 3)
+            if aid in st.agents:
+                raise ValueError(f"Agent already exists: {name}")
+            session_id = uuid.uuid4().hex[:12]
+            workspace_host_path = str((Path(self._home_host_path) / f"workspace-{user_id}-{name}").resolve())
+            st.agents[aid] = PersistedAgentRuntime(
+                agent_id=aid,
+                session_id=session_id,
+                workspace_host_path=workspace_host_path,
+                created_at_ms=created_at_ms,
+                owner_user_id=user_id,
+                short_name=name,
+                allowed_user_ids=[],
+            )
+            if session_id not in st.sessions:
+                st.sessions[session_id] = PersistedSessionAutomation()
+
+        await self._store.update(_write)
+        agent = self._get_agent(aid)
+        if agent is None:
+            raise RuntimeError("Failed to persist user agent")
+        await self._ensure_workspace_files_at(Path(agent.workspace_host_path), legacy_home=None)
+        await _ensure_live_docker_session(agent.session_id, allow_create=True)
+        return agent
+
+    def can_user_access_agent_id(self, *, user_id: int, agent_id: str) -> bool:
+        aid = _normalize_agent_id(agent_id)
+        if not aid:
+            return False
+        agent = self._get_agent(aid)
+        if agent is None:
+            return False
+        return self._can_user_access_agent(user_id=user_id, agent=agent)
+
+    async def bind_private_user_to_agent(self, *, user_id: int, chat_key: str, agent_id: str) -> PersistedAgentRuntime:
+        ck = chat_key.strip() if isinstance(chat_key, str) else ""
+        if not ck:
+            raise ValueError("Missing chatKey")
+        aid = _normalize_agent_id(agent_id)
+        if not aid:
+            raise ValueError("Invalid agentId")
+        agent = self._get_agent(aid)
+        if agent is None:
+            raise ValueError(f"Unknown agent: {aid}")
+        if not self._can_user_access_agent(user_id=user_id, agent=agent):
+            raise PermissionError("Forbidden")
+
+        def _write(st: PersistedGatewayAutomationState) -> None:
+            st.version = max(int(getattr(st, "version", 1) or 1), 3)
+            st.chat_bindings[ck] = aid
+
+        await self._store.update(_write)
+        agent2 = self._get_agent(aid)
+        if agent2 is None:
+            raise RuntimeError("Agent not found after update")
+        return agent2
+
     async def create_agent(self, *, agent_id: str) -> PersistedAgentRuntime:
         if _provision_mode() != "docker":
             raise RuntimeError("Agent containers are only supported in docker provision mode")
@@ -1607,7 +1823,7 @@ class AutomationManager:
         created_at_ms = _now_ms()
 
         def _write(st: PersistedGatewayAutomationState) -> None:
-            st.version = max(int(getattr(st, "version", 1) or 1), 2)
+            st.version = max(int(getattr(st, "version", 1) or 1), 3)
             if aid in st.agents:
                 raise ValueError(f"Agent already exists: {aid}")
             st.agents[aid] = PersistedAgentRuntime(
@@ -1637,7 +1853,7 @@ class AutomationManager:
             raise ValueError("Invalid agentId")
 
         def _write(st: PersistedGatewayAutomationState) -> None:
-            st.version = max(int(getattr(st, "version", 1) or 1), 2)
+            st.version = max(int(getattr(st, "version", 1) or 1), 3)
             if aid not in st.agents:
                 raise ValueError(f"Unknown agent: {aid}")
             st.chat_bindings[ck] = aid
@@ -1682,7 +1898,7 @@ class AutomationManager:
             return
 
         def _write(st: PersistedGatewayAutomationState) -> None:
-            st.version = max(int(getattr(st, "version", 1) or 1), 2)
+            st.version = max(int(getattr(st, "version", 1) or 1), 3)
             existing = st.agents.get("main")
             main_session_id = None
             if isinstance(existing, PersistedAgentRuntime) and isinstance(existing.session_id, str) and existing.session_id.strip():
@@ -7267,7 +7483,9 @@ async def ws_proxy(ws: WebSocket):
                         if has_id:
                             try:
                                 await ws.send_text(
-                                    json.dumps({"id": req_id, "error": {"code": -32000, "message": "Automation is not available"}})
+                                    json.dumps(
+                                        {"id": req_id, "error": {"code": -32000, "message": "Automation is not available"}}
+                                    )
                                 )
                             except Exception:
                                 pass
@@ -7278,26 +7496,92 @@ async def ws_proxy(ws: WebSocket):
                             if has_id:
                                 await ws.send_text(json.dumps({"id": req_id, "result": {"threadId": tid}}))
                             continue
-                        if method == "argus/agent/list":
-                            chat_key = None
+
+                        if method == "argus/user/bootstrap":
                             raw_chat_key = params.get("chatKey")
-                            if isinstance(raw_chat_key, str) and raw_chat_key.strip():
-                                chat_key = raw_chat_key.strip()
-                            source = params.get("source")
-                            if chat_key is None and isinstance(source, dict):
-                                ck = source.get("chatKey")
-                                if isinstance(ck, str) and ck.strip():
-                                    chat_key = ck.strip()
-                            current_agent = automation.resolve_agent_for_chat_key(chat_key or "")
+                            if not isinstance(raw_chat_key, str) or not raw_chat_key.strip():
+                                if has_id:
+                                    await ws.send_text(
+                                        json.dumps({"id": req_id, "error": {"code": -32602, "message": "Missing 'chatKey'"}})
+                                    )
+                                continue
+                            chat_key = raw_chat_key.strip()
+                            user_id = _parse_telegram_private_user_id(chat_key)
+                            if user_id is None:
+                                if has_id:
+                                    await ws.send_text(
+                                        json.dumps({"id": req_id, "error": {"code": -32602, "message": "Invalid 'chatKey'"}})
+                                    )
+                                continue
+                            agent, created_main = await automation.ensure_user_main_agent(user_id=user_id)
+
+                            # Keep the current binding if it points to an accessible agent. Otherwise, bind to main.
+                            st = automation._store.state
+                            bound = (
+                                st.chat_bindings.get(chat_key) if isinstance(getattr(st, "chat_bindings", None), dict) else None
+                            )
+                            current_agent_id = bound if isinstance(bound, str) and bound.strip() else None
+                            if current_agent_id and not automation.can_user_access_agent_id(user_id=user_id, agent_id=current_agent_id):
+                                current_agent_id = None
+                            if not current_agent_id:
+                                await automation.bind_private_user_to_agent(
+                                    user_id=user_id, chat_key=chat_key, agent_id=agent.agent_id
+                                )
+                                current_agent_id = agent.agent_id
+                            current_session_id = automation.resolve_agent_session_id(current_agent_id) if current_agent_id else None
                             result = {
                                 "ok": True,
-                                "agents": automation.list_agents(),
-                                "currentAgentId": current_agent,
-                                "currentSessionId": automation.resolve_agent_session_id(current_agent),
+                                "userId": user_id,
+                                "chatKey": chat_key,
+                                "createdMain": created_main,
+                                "currentAgentId": current_agent_id,
+                                "currentSessionId": current_session_id,
+                                "agent": agent.to_json(),
                             }
                             if has_id:
                                 await ws.send_text(json.dumps({"id": req_id, "result": result}))
                             continue
+
+                        if method == "argus/agent/list":
+                            raw_chat_key = params.get("chatKey")
+                            if not isinstance(raw_chat_key, str) or not raw_chat_key.strip():
+                                if has_id:
+                                    await ws.send_text(
+                                        json.dumps({"id": req_id, "error": {"code": -32602, "message": "Missing 'chatKey'"}})
+                                    )
+                                continue
+                            chat_key = raw_chat_key.strip()
+                            user_id = _parse_telegram_private_user_id(chat_key)
+                            if user_id is None:
+                                if has_id:
+                                    await ws.send_text(
+                                        json.dumps({"id": req_id, "error": {"code": -32602, "message": "Invalid 'chatKey'"}})
+                                    )
+                                continue
+                            main_id = _user_agent_id(user_id=user_id, short_name="main")
+                            if not automation.can_user_access_agent_id(user_id=user_id, agent_id=main_id):
+                                raise ValueError("Not initialized (run /start)")
+
+                            st = automation._store.state
+                            bound = (
+                                st.chat_bindings.get(chat_key) if isinstance(getattr(st, "chat_bindings", None), dict) else None
+                            )
+                            current_agent_id = bound if isinstance(bound, str) and bound.strip() else None
+                            if current_agent_id and not automation.can_user_access_agent_id(user_id=user_id, agent_id=current_agent_id):
+                                current_agent_id = None
+                            if not current_agent_id:
+                                current_agent_id = main_id
+                            current_session_id = automation.resolve_agent_session_id(current_agent_id) if current_agent_id else None
+                            result = {
+                                "ok": True,
+                                "agents": automation.list_agents_for_user(user_id=user_id),
+                                "currentAgentId": current_agent_id,
+                                "currentSessionId": current_session_id,
+                            }
+                            if has_id:
+                                await ws.send_text(json.dumps({"id": req_id, "result": result}))
+                            continue
+
                         if method == "argus/agent/resolve":
                             raw_chat_key = params.get("chatKey")
                             if not isinstance(raw_chat_key, str) or not raw_chat_key.strip():
@@ -7307,14 +7591,35 @@ async def ws_proxy(ws: WebSocket):
                                     )
                                 continue
                             chat_key = raw_chat_key.strip()
-                            agent_id = automation.resolve_agent_for_chat_key(chat_key)
-                            sess_id = (
-                                automation.resolve_agent_session_id(agent_id) or automation._store.state.default_session_id
-                            )
-                            result = {"ok": True, "chatKey": chat_key, "agentId": agent_id, "sessionId": sess_id}
+                            user_id = _parse_telegram_private_user_id(chat_key)
+                            if user_id is None:
+                                agent_id = automation.resolve_agent_for_chat_key(chat_key)
+                                sess_id = automation.resolve_agent_session_id(agent_id) or automation._store.state.default_session_id
+                                result = {"ok": True, "chatKey": chat_key, "agentId": agent_id, "sessionId": sess_id}
+                            else:
+                                st = automation._store.state
+                                bound = (
+                                    st.chat_bindings.get(chat_key)
+                                    if isinstance(getattr(st, "chat_bindings", None), dict)
+                                    else None
+                                )
+                                bound_id = bound.strip() if isinstance(bound, str) and bound.strip() else None
+                                if bound_id and automation.can_user_access_agent_id(user_id=user_id, agent_id=bound_id):
+                                    agent_id = bound_id
+                                else:
+                                    main_id = _user_agent_id(user_id=user_id, short_name="main")
+                                    if automation.can_user_access_agent_id(user_id=user_id, agent_id=main_id):
+                                        agent_id = main_id
+                                    else:
+                                        raise ValueError("Not initialized (run /start)")
+                                sess_id = automation.resolve_agent_session_id(agent_id)
+                                if not sess_id:
+                                    raise RuntimeError("Agent has no sessionId")
+                                result = {"ok": True, "chatKey": chat_key, "agentId": agent_id, "sessionId": sess_id}
                             if has_id:
                                 await ws.send_text(json.dumps({"id": req_id, "result": result}))
                             continue
+
                         if method == "argus/node/token":
                             raw_chat_key = params.get("chatKey")
                             if not isinstance(raw_chat_key, str) or not raw_chat_key.strip():
@@ -7337,20 +7642,33 @@ async def ws_proxy(ws: WebSocket):
                             if has_id:
                                 await ws.send_text(json.dumps({"id": req_id, "result": result}))
                             continue
+
                         if method == "argus/agent/create":
-                            raw_aid = params.get("agentId") or params.get("name")
-                            aid = _normalize_agent_id(raw_aid)
-                            if not aid:
+                            raw_chat_key = params.get("chatKey")
+                            raw_name = params.get("agentId") or params.get("name")
+                            if not isinstance(raw_chat_key, str) or not raw_chat_key.strip():
                                 if has_id:
                                     await ws.send_text(
-                                        json.dumps({"id": req_id, "error": {"code": -32602, "message": "Invalid 'agentId'"}})
+                                        json.dumps({"id": req_id, "error": {"code": -32602, "message": "Missing 'chatKey'"}})
                                     )
                                 continue
-                            agent = await automation.create_agent(agent_id=aid)
+                            chat_key = raw_chat_key.strip()
+                            user_id = _parse_telegram_private_user_id(chat_key)
+                            if user_id is None:
+                                if has_id:
+                                    await ws.send_text(
+                                        json.dumps({"id": req_id, "error": {"code": -32602, "message": "Invalid 'chatKey'"}})
+                                    )
+                                continue
+                            main_id = _user_agent_id(user_id=user_id, short_name="main")
+                            if not automation.can_user_access_agent_id(user_id=user_id, agent_id=main_id):
+                                raise ValueError("Not initialized (run /start)")
+                            agent = await automation.create_user_agent(user_id=user_id, short_name=str(raw_name or ""))
                             result = {"ok": True, "agent": agent.to_json()}
                             if has_id:
                                 await ws.send_text(json.dumps({"id": req_id, "result": result}))
                             continue
+
                         if method == "argus/agent/use":
                             raw_chat_key = params.get("chatKey")
                             raw_aid = params.get("agentId") or params.get("name")
@@ -7360,18 +7678,36 @@ async def ws_proxy(ws: WebSocket):
                                         json.dumps({"id": req_id, "error": {"code": -32602, "message": "Missing 'chatKey'"}})
                                     )
                                 continue
-                            aid = _normalize_agent_id(raw_aid)
-                            if not aid:
+                            chat_key = raw_chat_key.strip()
+                            user_id = _parse_telegram_private_user_id(chat_key)
+                            if user_id is None:
+                                if has_id:
+                                    await ws.send_text(
+                                        json.dumps({"id": req_id, "error": {"code": -32602, "message": "Invalid 'chatKey'"}})
+                                    )
+                                continue
+                            main_id = _user_agent_id(user_id=user_id, short_name="main")
+                            if not automation.can_user_access_agent_id(user_id=user_id, agent_id=main_id):
+                                raise ValueError("Not initialized (run /start)")
+                            aid_raw = _normalize_agent_id(raw_aid)
+                            if not aid_raw:
                                 if has_id:
                                     await ws.send_text(
                                         json.dumps({"id": req_id, "error": {"code": -32602, "message": "Invalid 'agentId'"}})
                                     )
                                 continue
-                            agent = await automation.bind_chat_to_agent(chat_key=raw_chat_key.strip(), agent_id=aid)
-                            result = {"ok": True, "chatKey": raw_chat_key.strip(), "agent": agent.to_json()}
+                            if re.match(r"^u\d+-", aid_raw):
+                                agent_id = aid_raw
+                            else:
+                                agent_id = _user_agent_id(user_id=user_id, short_name=aid_raw)
+                            agent = await automation.bind_private_user_to_agent(
+                                user_id=user_id, chat_key=chat_key, agent_id=agent_id
+                            )
+                            result = {"ok": True, "chatKey": chat_key, "agent": agent.to_json()}
                             if has_id:
                                 await ws.send_text(json.dumps({"id": req_id, "result": result}))
                             continue
+
                         if method == "argus/thread/main/set":
                             raw_tid = params.get("threadId")
                             if not isinstance(raw_tid, str) or not raw_tid.strip():
@@ -7384,6 +7720,7 @@ async def ws_proxy(ws: WebSocket):
                             if has_id:
                                 await ws.send_text(json.dumps({"id": req_id, "result": {"ok": True, "threadId": tid}}))
                             continue
+
                         if method == "argus/input/enqueue":
                             telegram_images = params.get("telegramImages")
                             if not isinstance(telegram_images, list):
@@ -7427,6 +7764,7 @@ async def ws_proxy(ws: WebSocket):
                             if has_id:
                                 await ws.send_text(json.dumps({"id": req_id, "result": res}))
                             continue
+
                         if method == "argus/systemEvent/enqueue":
                             text_param = params.get("text")
                             if not isinstance(text_param, str) or not text_param.strip():
@@ -7452,16 +7790,16 @@ async def ws_proxy(ws: WebSocket):
                             )
                             if has_id:
                                 await ws.send_text(
-                                    json.dumps(
-                                        {"id": req_id, "result": {"ok": True, "event": ev.to_json(), "threadId": thread_id}}
-                                    )
+                                    json.dumps({"id": req_id, "result": {"ok": True, "event": ev.to_json(), "threadId": thread_id}})
                                 )
                             continue
+
                         if method == "argus/heartbeat/request":
                             automation.request_heartbeat_now()
                             if has_id:
                                 await ws.send_text(json.dumps({"id": req_id, "result": {"ok": True}}))
                             continue
+
                         if has_id:
                             await ws.send_text(
                                 json.dumps({"id": req_id, "error": {"code": -32601, "message": f"Method not found: {method}"}})
@@ -7474,7 +7812,6 @@ async def ws_proxy(ws: WebSocket):
                             except Exception:
                                 pass
                     continue
-
                 if isinstance(msg, dict) and msg.get("method") == "initialize":
                     req_id = msg.get("id")
                     if req_id is None:

@@ -1175,8 +1175,11 @@ async function main() {
       const res = await control.rpc("argus/agent/resolve", { chatKey });
       const sessionId = isNonEmptyString(res?.sessionId) ? res.sessionId : null;
       const agentId = isNonEmptyString(res?.agentId) ? res.agentId : "main";
-      return { agentId, sessionId: sessionId || control.sessionId };
+      if (!sessionId) throw new Error("Missing sessionId");
+      return { agentId, sessionId };
     } catch (e) {
+      const chatId = chatIdFromChatKey(chatKey);
+      if (Number.isFinite(chatId) && chatId > 0) throw e;
       return { agentId: "main", sessionId: control.sessionId };
     }
   }
@@ -1268,23 +1271,80 @@ async function main() {
           const cmd = parsedCmd?.cmd || null;
           const cmdArgs = parsedCmd?.args || "";
 
-          if (cmd === "agents") {
-            const data = await control.rpc("argus/agent/list", { chatKey });
-            const current = data?.currentAgentId;
-            const agents = Array.isArray(data?.agents) ? data.agents : [];
-            const lines = [];
-            lines.push(`currentAgentId: ${current || "(none)"}`);
-            lines.push(`currentSessionId: ${data?.currentSessionId || "(none)"}`);
-            lines.push("");
-            lines.push("agents:");
-            for (const a of agents) {
-              if (!a || typeof a !== "object") continue;
-              const aid = isNonEmptyString(a.agentId) ? a.agentId : "(unknown)";
-              const sid = isNonEmptyString(a.sessionId) ? a.sessionId : "(none)";
-              const ws = isNonEmptyString(a.workspaceHostPath) ? path.basename(a.workspaceHostPath) : "";
-              lines.push(`- ${aid} (sessionId=${sid}${ws ? `, workspace=${ws}` : ""})`);
+          if (cmd === "help") {
+            const helpText = [
+              "Commands:",
+              "/start — initialize your personal workspace (private chat)",
+              "/help — show this help",
+              "/where — show current agent/session/thread ids (debug)",
+              "/agents — list agents (workspaces)",
+              "/newagent <name> — create a new agent (private chat)",
+              "/useagent <name|agentId> — switch current agent (private chat)",
+              "/new — start a new thread (group/topic)",
+              "/newmain — start a new main thread (private chat)",
+              "",
+              "Notes:",
+              "- In private chat, messages go to the current agent session main thread.",
+              "- In groups/topics, the bot maps chat/topic -> thread per session."
+            ].join("\n");
+            await tg.sendMessage({ ...target, text: helpText });
+            typing.stop(chatKey);
+            return;
+          }
+
+          if (cmd === "start") {
+            const chatId = chatIdFromChatKey(chatKey);
+            if (chatType !== "private" || !Number.isFinite(chatId) || chatId <= 0) {
+              await tg.sendMessage({ ...target, text: "请在私聊中使用 /start。" });
+              typing.stop(chatKey);
+              return;
             }
-            await tg.sendMessage({ ...target, text: truncateTelegramMessage(lines.join("\n")) });
+            const boot = await control.rpc("argus/user/bootstrap", { chatKey });
+            const currentSessionId = isNonEmptyString(boot?.currentSessionId) ? boot.currentSessionId : null;
+            if (currentSessionId) {
+              await getClient(currentSessionId);
+            }
+            const createdMain = Boolean(boot?.createdMain);
+            await tg.sendMessage({
+              ...target,
+              text: createdMain ? "ok（已初始化）：已创建你的 main 工作区/容器。" : "ok（已初始化）：你的 main 已存在。"
+            });
+            typing.stop(chatKey);
+            return;
+          }
+
+          if (cmd === "agents") {
+            const chatId = chatIdFromChatKey(chatKey);
+            if (chatType !== "private" || !Number.isFinite(chatId) || chatId <= 0) {
+              await tg.sendMessage({ ...target, text: "只能在私聊中使用 /agents。" });
+              typing.stop(chatKey);
+              return;
+            }
+            try {
+              const data = await control.rpc("argus/agent/list", { chatKey });
+              const current = data?.currentAgentId;
+              const agents = Array.isArray(data?.agents) ? data.agents : [];
+              const lines = [];
+              lines.push(`currentAgentId: ${current || "(none)"}`);
+              lines.push(`currentSessionId: ${data?.currentSessionId || "(none)"}`);
+              lines.push("");
+              lines.push("agents:");
+              for (const a of agents) {
+                if (!a || typeof a !== "object") continue;
+                const aid = isNonEmptyString(a.agentId) ? a.agentId : "(unknown)";
+                const short = isNonEmptyString(a.shortName) ? a.shortName : null;
+                const isOwner = Boolean(a.isOwner);
+                if (isOwner && short) {
+                  lines.push(`- ${short}`);
+                } else {
+                  lines.push(`- ${aid} (shared)`);
+                }
+              }
+              await tg.sendMessage({ ...target, text: truncateTelegramMessage(lines.join("\n")) });
+            } catch (e) {
+              const msg = e instanceof Error ? e.message : String(e);
+              await tg.sendMessage({ ...target, text: msg.includes("/start") ? "请先 /start 初始化。" : `error: ${msg}` });
+            }
             typing.stop(chatKey);
             return;
           }
@@ -1302,35 +1362,59 @@ async function main() {
               typing.stop(chatKey);
               return;
             }
-            const created = await control.rpc("argus/agent/create", { agentId: name });
-            await control.rpc("argus/agent/use", { chatKey, agentId: name });
-            const sid = created?.agent?.sessionId;
-            if (isNonEmptyString(sid)) {
-              await getClient(sid);
+            try {
+              const created = await control.rpc("argus/agent/create", { chatKey, agentId: name });
+              await control.rpc("argus/agent/use", { chatKey, agentId: name });
+              const sid = created?.agent?.sessionId;
+              if (isNonEmptyString(sid)) {
+                await getClient(sid);
+              }
+              await tg.sendMessage({ ...target, text: `ok (new agent): ${name}` });
+            } catch (e) {
+              const msg = e instanceof Error ? e.message : String(e);
+              await tg.sendMessage({ ...target, text: msg.includes("/start") ? "请先 /start 初始化。" : `error: ${msg}` });
             }
-            await tg.sendMessage({ ...target, text: `ok (new agent): ${name}` });
             typing.stop(chatKey);
             return;
           }
 
           if (cmd === "useagent") {
-            const name = cmdArgs.split(/\s+/, 1)[0]?.trim().toLowerCase();
-            if (!isNonEmptyString(name)) {
-              await tg.sendMessage({ ...target, text: "用法：/useagent <name>" });
+            const chatId = chatIdFromChatKey(chatKey);
+            if (chatType !== "private" || !Number.isFinite(chatId) || chatId <= 0) {
+              await tg.sendMessage({ ...target, text: "只能在私聊中使用 /useagent。" });
               typing.stop(chatKey);
               return;
             }
-            const used = await control.rpc("argus/agent/use", { chatKey, agentId: name });
-            const sid = used?.agent?.sessionId;
-            if (isNonEmptyString(sid)) {
-              await getClient(sid);
+            const name = cmdArgs.split(/\s+/, 1)[0]?.trim().toLowerCase();
+            if (!isNonEmptyString(name)) {
+              await tg.sendMessage({ ...target, text: "用法：/useagent <name|agentId>" });
+              typing.stop(chatKey);
+              return;
             }
-            await tg.sendMessage({ ...target, text: `ok (use agent): ${name}` });
+            try {
+              const used = await control.rpc("argus/agent/use", { chatKey, agentId: name });
+              const sid = used?.agent?.sessionId;
+              if (isNonEmptyString(sid)) {
+                await getClient(sid);
+              }
+              await tg.sendMessage({ ...target, text: `ok (use agent): ${name}` });
+            } catch (e) {
+              const msg = e instanceof Error ? e.message : String(e);
+              await tg.sendMessage({ ...target, text: msg.includes("/start") ? "请先 /start 初始化。" : `error: ${msg}` });
+            }
             typing.stop(chatKey);
             return;
           }
 
-          const route = await resolveRouteForChatKey(chatKey);
+          let route;
+          try {
+            route = await resolveRouteForChatKey(chatKey);
+          } catch (e) {
+            const msg = e instanceof Error ? e.message : String(e);
+            await tg.sendMessage({ ...target, text: msg.includes("/start") ? "请先 /start 初始化。" : `error: ${msg}` });
+            typing.stop(chatKey);
+            return;
+          }
           const sessionId = route.sessionId;
           const agentId = route.agentId;
           const client = await getClient(sessionId);
@@ -1393,26 +1477,6 @@ async function main() {
             const tid = await client.startThread();
             const mainTid = await client.setMainThread(tid);
             await tg.sendMessage({ ...target, text: `ok (new main thread): ${mainTid}` });
-            typing.stop(chatKey);
-            return;
-          }
-
-          if (cmd === "help" || cmd === "start") {
-            const helpText = [
-              "Commands:",
-              "/help — show this help",
-              "/where — show current agent/session/thread ids (debug)",
-              "/agents — list agents (workspaces)",
-              "/newagent <name> — create a new agent (private chat)",
-              "/useagent <name> — switch current agent",
-              "/new — start a new thread (group/topic)",
-              "/newmain — start a new main thread (private chat)",
-              "",
-              "Notes:",
-              "- In private chat, messages go to the current agent session main thread.",
-              "- In groups/topics, the bot maps chat/topic -> thread per session."
-            ].join("\n");
-            await tg.sendMessage({ ...target, text: helpText });
             typing.stop(chatKey);
             return;
           }
