@@ -115,7 +115,7 @@ Nodes 用于让助手在你的设备上执行命令（例如你的 Mac）。
 cd apps/node-host
 npm i
 node index.mjs \
-  --url "ws://127.0.0.1:8080/nodes/ws?token=$ARGUS_TOKEN" \
+  --url "ws://127.0.0.1:8080/nodes/ws?token=argus-node-v1.<sessionId>.<sig>" \
   --node-id "mac" \
   --display-name "My Mac"
 ```
@@ -125,8 +125,8 @@ node index.mjs \
 - 每个 runtime session 容器也会内置一个 node-host，并注册为 `runtime:<sessionId>`。
 - 在 runtime 内优先用 `node="self"`；如果同时在线的 runtime 不止一个，则用 `node="runtime:<sessionId>"`。
 - Node host 是**按 session 隔离**的：
-  - 直接使用网关主 token（例如 `$ARGUS_TOKEN`）只会把 node 绑定到**默认 session**。
-  - 要绑定到指定 session，请使用派生 token：`argus-node-v1.<sessionId>.<sig>`（master secret：`ARGUS_NODE_TOKEN`，否则回退 `ARGUS_TOKEN`；`sig = base64url(hmac_sha256(master, sessionId))[:32]`）。
+  - 如果服务端开启了认证，必须使用派生 token：`argus-node-v1.<sessionId>.<sig>`（master secret：`ARGUS_NODE_TOKEN`，否则回退 `ARGUS_TOKEN`；`sig = base64url(hmac_sha256(master, sessionId))[:32]`）。
+  - 开发模式（未配置认证）下可以不带 token。
 - node-host 会把连接/重连状态，以及收到的远程命令审计日志输出到 stderr。
   - 关闭审计日志：`ARGUS_NODE_AUDIT=0`（或 `node index.mjs --audit false ...`）
   - 调整输出：`ARGUS_NODE_AUDIT_MAX_BYTES`、`ARGUS_NODE_AUDIT_STDIN_PREVIEW_BYTES`

@@ -110,7 +110,7 @@ Start a node-host on your Mac:
 cd apps/node-host
 npm i
 node index.mjs \
-  --url "ws://127.0.0.1:8080/nodes/ws?token=$ARGUS_TOKEN" \
+  --url "ws://127.0.0.1:8080/nodes/ws?token=argus-node-v1.<sessionId>.<sig>" \
   --node-id "mac" \
   --display-name "My Mac"
 ```
@@ -120,8 +120,8 @@ Notes:
 - Each runtime session container also runs a built-in node-host and registers as `runtime:<sessionId>`.
 - Inside the runtime, prefer `node="self"`; if multiple runtimes are online, use `node="runtime:<sessionId>"`.
 - Node hosts are **session-scoped**:
-  - Using the raw gateway token (e.g. `$ARGUS_TOKEN`) attaches the node to the **default session** only.
-  - To attach a node to a specific session, use a derived token: `argus-node-v1.<sessionId>.<sig>` (master secret: `ARGUS_NODE_TOKEN`, fallback: `ARGUS_TOKEN`; `sig = base64url(hmac_sha256(master, sessionId))[:32]`).
+  - When auth is configured, you must use a derived token: `argus-node-v1.<sessionId>.<sig>` (master secret: `ARGUS_NODE_TOKEN`, fallback: `ARGUS_TOKEN`; `sig = base64url(hmac_sha256(master, sessionId))[:32]`).
+  - In dev mode with no auth configured, the node token can be omitted.
 - node-host prints connection/reconnect status and an audit log of received remote commands to stderr.
   - Disable audit logs: `ARGUS_NODE_AUDIT=0` (or `node index.mjs --audit false ...`)
   - Tune output: `ARGUS_NODE_AUDIT_MAX_BYTES`, `ARGUS_NODE_AUDIT_STDIN_PREVIEW_BYTES`

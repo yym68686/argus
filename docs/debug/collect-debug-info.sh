@@ -164,18 +164,21 @@ import json
 from pathlib import Path
 st = json.loads(Path(__import__("os").environ["OUTDIR"] + "/automation_state.json").read_text())
 persisted = st.get("persisted") or {}
-default_sid = persisted.get("defaultSessionId") or ""
 sessions = persisted.get("sessions") or {}
-print("defaultSessionId:", default_sid or "<empty>")
+agents = persisted.get("agents") or {}
+main_agent = agents.get("main") or {}
+main_sid = (main_agent.get("sessionId") or "").strip()
 print("persisted.sessions count:", len(sessions))
-if default_sid and default_sid in sessions:
-  sess = sessions[default_sid] or {}
+print("persisted.agents count:", len(agents))
+print("main agent sessionId:", main_sid or "<empty>")
+if main_sid and main_sid in sessions:
+  sess = sessions[main_sid] or {}
   main_tid = sess.get("mainThreadId") or ""
   print("mainThreadId:", main_tid or "<empty>")
   lanes = (st.get("runtime") or {}).get("lanes") or []
   # show lane for main thread if present
   for lane in lanes:
-    if lane.get("sessionId") == default_sid and lane.get("threadId") == main_tid:
+    if lane.get("sessionId") == main_sid and lane.get("threadId") == main_tid:
       print("lane(main) busy:", lane.get("busy"), "followupDepth:", lane.get("followupDepth"))
   q = (sess.get("systemEventQueues") or {}).get(main_tid) or []
   print("systemEventQueues[main] len:", len(q))
@@ -188,9 +191,9 @@ if default_sid and default_sid in sessions:
     text = (ev.get("text") or "").splitlines()[0][:200]
     print("-", kind, "createdAtMs=", created, "meta=", meta, "text[0]=", text)
 else:
-  print("note: defaultSessionId missing or not found in persisted.sessions")
   lanes = (st.get("runtime") or {}).get("lanes") or []
   print("runtime.lanes count:", len(lanes))
+  # show a few lanes for quick debugging
   for lane in lanes[:10]:
     print("-", lane)
 PY
@@ -199,7 +202,7 @@ PY
   fi
 
   section "Gateway cron/jobs (summary)"
-  if curl_auth "$GATEWAY_HTTP/automation/cron/jobs" >"$OUTDIR/cron_jobs.json"; then
+  if curl_auth "$GATEWAY_HTTP/automation/cron/jobs?agentId=main" >"$OUTDIR/cron_jobs.json"; then
     python3 - <<'PY'
 import json
 from pathlib import Path
@@ -226,7 +229,7 @@ PY
     echo "(failed) cannot fetch /nodes" >&2
   fi
 
-  section "Runtime node-host process.list (default session only)"
+  section "Runtime node-host process.list (main agent session, best-effort)"
   if [[ -f "$OUTDIR/automation_state.json" ]] && [[ -f "$OUTDIR/nodes.json" ]]; then
     local sid
     sid="$(
@@ -234,7 +237,9 @@ PY
 import json, os
 st = json.loads(open(os.environ["OUTDIR"] + "/automation_state.json", "r", encoding="utf-8").read())
 persisted = st.get("persisted") or {}
-print((persisted.get("defaultSessionId") or "").strip(), end="")
+agents = persisted.get("agents") or {}
+main = agents.get("main") or {}
+print((main.get("sessionId") or "").strip(), end="")
 PY
     )"
     if [[ -n "$sid" ]]; then
@@ -247,7 +252,7 @@ PY
         cat "$OUTDIR/process_list.json" | json_pretty | redact || true
       fi
     else
-      echo "(skip) defaultSessionId empty; cannot query runtime node-host" >&2
+      echo "(skip) main agent sessionId empty; cannot query runtime node-host" >&2
     fi
   fi
 

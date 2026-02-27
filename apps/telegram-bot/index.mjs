@@ -69,7 +69,6 @@ class StateStore {
     this.path = statePath;
     this.state = {
       version: 3,
-      defaultSessionId: null,
       lastUpdateId: null,
       threadsBySession: {}
     };
@@ -82,18 +81,16 @@ class StateStore {
       const parsed = parseJson(raw);
       if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return;
 
-      const defaultSessionId = isNonEmptyString(parsed.defaultSessionId) ? parsed.defaultSessionId : null;
-
       const threadsBySession =
         parsed.threadsBySession && typeof parsed.threadsBySession === "object" && !Array.isArray(parsed.threadsBySession)
           ? parsed.threadsBySession
           : {};
 
-      // Back-compat: v2 stored a flat threads map (assumed to belong to defaultSessionId).
+      // Back-compat: v2 stored a flat threads map (assumed to belong to a single session).
       const legacyThreads =
         parsed.threads && typeof parsed.threads === "object" && !Array.isArray(parsed.threads) ? parsed.threads : null;
       if (legacyThreads && Object.keys(legacyThreads).length > 0) {
-        const sid = defaultSessionId || "default";
+        const sid = "default";
         if (!threadsBySession[sid] || typeof threadsBySession[sid] !== "object" || Array.isArray(threadsBySession[sid])) {
           threadsBySession[sid] = legacyThreads;
         }
@@ -101,7 +98,6 @@ class StateStore {
 
       this.state = {
         version: 3,
-        defaultSessionId,
         lastUpdateId: Number.isFinite(parsed.lastUpdateId) ? parsed.lastUpdateId : null,
         threadsBySession
       };
@@ -146,11 +142,6 @@ class StateStore {
   setThreadId(sessionId, chatKey, threadId) {
     const bucket = this._threadsForSession(sessionId);
     bucket[chatKey] = { threadId };
-    return this.save();
-  }
-
-  setDefaultSessionId(sessionId) {
-    this.state.defaultSessionId = sessionId;
     return this.save();
   }
 
@@ -368,6 +359,38 @@ class ArgusClient {
 
   async getAutomationState() {
     return await this._httpJson("GET", "/automation/state");
+  }
+
+  async automationUserBootstrap(chatKey) {
+    if (!isNonEmptyString(chatKey)) throw new Error("Missing chatKey");
+    return await this._httpJson("POST", "/automation/user/bootstrap", { chatKey });
+  }
+
+  async automationAgentList(chatKey) {
+    if (!isNonEmptyString(chatKey)) throw new Error("Missing chatKey");
+    return await this._httpJson("POST", "/automation/agent/list", { chatKey });
+  }
+
+  async automationAgentResolve(chatKey) {
+    if (!isNonEmptyString(chatKey)) throw new Error("Missing chatKey");
+    return await this._httpJson("POST", "/automation/agent/resolve", { chatKey });
+  }
+
+  async automationAgentCreate(chatKey, agentId) {
+    if (!isNonEmptyString(chatKey)) throw new Error("Missing chatKey");
+    if (!isNonEmptyString(agentId)) throw new Error("Missing agentId");
+    return await this._httpJson("POST", "/automation/agent/create", { chatKey, agentId });
+  }
+
+  async automationAgentUse(chatKey, agentId) {
+    if (!isNonEmptyString(chatKey)) throw new Error("Missing chatKey");
+    if (!isNonEmptyString(agentId)) throw new Error("Missing agentId");
+    return await this._httpJson("POST", "/automation/agent/use", { chatKey, agentId });
+  }
+
+  async automationNodeToken(chatKey) {
+    if (!isNonEmptyString(chatKey)) throw new Error("Missing chatKey");
+    return await this._httpJson("POST", "/automation/node/token", { chatKey });
   }
 
   async ensureMainThread() {
@@ -1126,81 +1149,13 @@ async function main() {
     return Number.isFinite(chatId) ? chatId : null;
   }
 
-  async function ensureDefaultSession() {
-    let preferred = state.state.defaultSessionId;
-
-    try {
-      const auto = await argusHttp.getAutomationState();
-      const sid = auto?.persisted?.defaultSessionId;
-      if (isNonEmptyString(sid)) preferred = sid;
-    } catch {
-      // ignore; gateway may be booting or auth may be unset
-    }
-
-    if (isNonEmptyString(preferred)) {
-      try {
-        await getClient(preferred);
-        if (state.state.defaultSessionId !== preferred) {
-          await state.setDefaultSessionId(preferred);
-        }
-        return preferred;
-      } catch (e) {
-        log("Failed to attach to defaultSessionId, will reselect:", e instanceof Error ? e.message : String(e));
-      }
-    }
-
-    let sessions = [];
-    try {
-      sessions = await argusHttp.listSessions();
-    } catch (e) {
-      const msg = e instanceof Error ? e.message : String(e);
-      const cause = e instanceof Error && e.cause instanceof Error ? e.cause.message : null;
-      log("Failed to list sessions, will try creating a new one:", cause ? `${msg} (${cause})` : msg);
-    }
-
-    if (sessions.length > 0 && isNonEmptyString(sessions[0]?.sessionId)) {
-      const sid = sessions[0].sessionId;
-      await getClient(sid);
-      await state.setDefaultSessionId(sid);
-      return sid;
-    }
-
-    const tmp = new ArgusClient({ gatewayHttpUrl, gatewayWsUrl, token: argusToken, cwd });
-    attachClientHooks(tmp);
-    const sid = await tmp.connectNewSession();
-    clients.set(sid, tmp);
-    await state.setDefaultSessionId(sid);
-    return sid;
-  }
-
-  async function getControlClient() {
-    const sid = await ensureDefaultSession();
-    return await getClient(sid);
-  }
-
   async function resolveRouteForChatKey(chatKey) {
-    const control = await getControlClient();
-    try {
-      const res = await control.rpc("argus/agent/resolve", { chatKey });
-      const sessionId = isNonEmptyString(res?.sessionId) ? res.sessionId : null;
-      const agentId = isNonEmptyString(res?.agentId) ? res.agentId : "main";
-      if (!sessionId) throw new Error("Missing sessionId");
-      return { agentId, sessionId };
-    } catch (e) {
-      const chatId = chatIdFromChatKey(chatKey);
-      if (Number.isFinite(chatId) && chatId > 0) throw e;
-      return { agentId: "main", sessionId: control.sessionId };
-    }
+    const res = await argusHttp.automationAgentResolve(chatKey);
+    const sessionId = isNonEmptyString(res?.sessionId) ? res.sessionId : null;
+    const agentId = isNonEmptyString(res?.agentId) ? res.agentId : "main";
+    if (!sessionId) throw new Error("Missing sessionId");
+    return { agentId, sessionId };
   }
-
-  await queue.enqueue(async () => {
-    try {
-      const sid = await ensureDefaultSession();
-      log("Using defaultSessionId:", sid);
-    } catch (e) {
-      log("Gateway not ready yet; will retry on demand:", e instanceof Error ? e.message : String(e));
-    }
-  });
 
   let offset;
   if (Number.isFinite(state.state.lastUpdateId)) {
@@ -1276,7 +1231,6 @@ async function main() {
 
       queue.enqueue(async () => {
         try {
-          const control = await getControlClient();
           const cmd = parsedCmd?.cmd || null;
           const cmdArgs = parsedCmd?.args || "";
 
@@ -1309,7 +1263,7 @@ async function main() {
               typing.stop(chatKey);
               return;
             }
-            const boot = await control.rpc("argus/user/bootstrap", { chatKey });
+            const boot = await argusHttp.automationUserBootstrap(chatKey);
             const currentSessionId = isNonEmptyString(boot?.currentSessionId) ? boot.currentSessionId : null;
             if (currentSessionId) {
               await getClient(currentSessionId);
@@ -1331,7 +1285,7 @@ async function main() {
               return;
             }
             try {
-              const data = await control.rpc("argus/agent/list", { chatKey });
+              const data = await argusHttp.automationAgentList(chatKey);
               const current = data?.currentAgentId;
               const agents = Array.isArray(data?.agents) ? data.agents : [];
               const lines = [];
@@ -1372,8 +1326,8 @@ async function main() {
               return;
             }
             try {
-              const created = await control.rpc("argus/agent/create", { chatKey, agentId: name });
-              await control.rpc("argus/agent/use", { chatKey, agentId: name });
+              const created = await argusHttp.automationAgentCreate(chatKey, name);
+              await argusHttp.automationAgentUse(chatKey, name);
               const sid = created?.agent?.sessionId;
               if (isNonEmptyString(sid)) {
                 await getClient(sid);
@@ -1400,7 +1354,7 @@ async function main() {
               return;
             }
             try {
-              const used = await control.rpc("argus/agent/use", { chatKey, agentId: name });
+              const used = await argusHttp.automationAgentUse(chatKey, name);
               const sid = used?.agent?.sessionId;
               if (isNonEmptyString(sid)) {
                 await getClient(sid);
@@ -1441,7 +1395,7 @@ async function main() {
             const wantToken = chatType === "private" && isNonEmptyString(cmdArgs) && cmdArgs.toLowerCase().includes("token");
             if (wantToken) {
               try {
-                const res = await control.rpc("argus/node/token", { chatKey });
+                const res = await argusHttp.automationNodeToken(chatKey);
                 const token = isNonEmptyString(res?.token) ? res.token : null;
                 const path = isNonEmptyString(res?.path) ? res.path : "/nodes/ws";
                 nodeTokenLine = `\nnodeWsPath: ${path}\nnodeWsToken: ${token || "(none)"}`;

@@ -33,7 +33,7 @@ export ARGUS_TOKEN="<ARGUS_TOKEN>"
 >
 > - 如果服务端配置了分离 token（`ARGUS_NODE_TOKEN` / `ARGUS_MCP_TOKEN`），则 Node Host / MCP 会使用对应的 master secret；未配置时默认复用 `ARGUS_TOKEN`。
 > - Node Host（`/nodes/ws`）是按 **session 隔离** 的：推荐用派生 token `argus-node-v1.<sessionId>.<sig>` 把 node 绑定到指定 session（`sig = base64url(hmac_sha256(master, sessionId)).rstrip("=")[:32]`）。
->   - 兼容：直接用 master token 连接 `/nodes/ws`（只会绑定到**默认 session**）。
+>   - 如果服务端开启了认证，raw master token **不会被接受**（必须用派生 token）。
 > - MCP（`/mcp`）是按 **session 隔离** 的：**必须**使用派生 token `argus-mcp-v1.<sessionId>.<sig>`（raw master token **不会被接受**）。
 >   - Docker provisioning 模式下，runtime 容器会自动获得自己的派生 `ARGUS_MCP_TOKEN`（通常外部客户端不需要直接调用 `/mcp`）。
 

@@ -1445,7 +1445,6 @@ class PersistedSessionAutomation:
 @dataclass
 class PersistedGatewayAutomationState:
     version: int = 3
-    default_session_id: Optional[str] = None
     sessions: dict[str, PersistedSessionAutomation] = field(default_factory=dict)
     agents: dict[str, PersistedAgentRuntime] = field(default_factory=dict)
     chat_bindings: dict[str, str] = field(default_factory=dict)
@@ -1453,7 +1452,6 @@ class PersistedGatewayAutomationState:
     def to_json(self) -> dict[str, Any]:
         return {
             "version": int(self.version),
-            "defaultSessionId": self.default_session_id,
             "sessions": {sid: sess.to_json() for sid, sess in self.sessions.items()},
             "agents": {aid: a.to_json() for aid, a in self.agents.items()},
             "chatBindings": dict(self.chat_bindings),
@@ -1468,9 +1466,6 @@ class PersistedGatewayAutomationState:
             version_int = int(version) if version is not None else 1
         except Exception:
             version_int = 1
-        default_session_id = obj.get("defaultSessionId")
-        if not isinstance(default_session_id, str) or not default_session_id.strip():
-            default_session_id = None
         sessions_raw = obj.get("sessions")
         sessions: dict[str, PersistedSessionAutomation] = {}
         if isinstance(sessions_raw, dict):
@@ -1505,7 +1500,6 @@ class PersistedGatewayAutomationState:
 
         return PersistedGatewayAutomationState(
             version=version_int,
-            default_session_id=default_session_id.strip() if isinstance(default_session_id, str) else None,
             sessions=sessions,
             agents=agents,
             chat_bindings=chat_bindings,
@@ -1610,7 +1604,6 @@ class AutomationManager:
         await self._store.load()
         await self._ensure_main_agent()
         await self._ensure_workspace_files()
-        await self._restore_default_session_if_singleton()
         await self._prune_persisted_sessions()
         self._tasks.append(asyncio.create_task(self._cron_loop()))
         self._tasks.append(asyncio.create_task(self._heartbeat_loop()))
@@ -1649,7 +1642,7 @@ class AutomationManager:
 
     def resolve_session_id_for_chat_key(self, chat_key: str) -> Optional[str]:
         aid = self.resolve_agent_for_chat_key(chat_key)
-        return self.resolve_agent_session_id(aid) or self._store.state.default_session_id
+        return self.resolve_agent_session_id(aid)
 
     def _can_user_access_agent(self, *, user_id: int, agent: PersistedAgentRuntime) -> bool:
         if not isinstance(user_id, int) or user_id <= 0:
@@ -1904,32 +1897,26 @@ class AutomationManager:
             if isinstance(existing, PersistedAgentRuntime) and isinstance(existing.session_id, str) and existing.session_id.strip():
                 main_session_id = existing.session_id.strip()
             if not main_session_id:
-                main_session_id = st.default_session_id.strip() if isinstance(st.default_session_id, str) and st.default_session_id.strip() else None
+                # Back-compat: if the state predates agents, adopt a singleton persisted session.
+                keys = [sid.strip() for sid in st.sessions.keys() if isinstance(sid, str) and sid.strip()]
+                if len(keys) == 1:
+                    main_session_id = keys[0]
             if not main_session_id:
                 main_session_id = uuid.uuid4().hex[:12]
 
-            st.default_session_id = main_session_id
             st.agents["main"] = PersistedAgentRuntime(
                 agent_id="main",
                 session_id=main_session_id,
                 workspace_host_path=main_workspace_host_path,
                 created_at_ms=getattr(existing, "created_at_ms", None) or now,
+                owner_user_id=getattr(existing, "owner_user_id", None) if isinstance(existing, PersistedAgentRuntime) else None,
+                short_name=getattr(existing, "short_name", None) if isinstance(existing, PersistedAgentRuntime) else None,
+                allowed_user_ids=list(getattr(existing, "allowed_user_ids", None) or []) if isinstance(existing, PersistedAgentRuntime) else [],
             )
             if main_session_id not in st.sessions:
                 st.sessions[main_session_id] = PersistedSessionAutomation()
 
         await self._store.update(_write)
-
-    async def _restore_default_session_if_singleton(self) -> None:
-        st = self._store.state
-        if isinstance(st.default_session_id, str) and st.default_session_id.strip():
-            return
-        keys = [sid.strip() for sid in st.sessions.keys() if isinstance(sid, str) and sid.strip()]
-        if len(keys) != 1:
-            return
-        sid = keys[0]
-        await self._store.update(lambda st2: setattr(st2, "default_session_id", sid))
-        log.info("Restored missing defaultSessionId to singleton persisted session %s", sid)
 
     async def _prune_persisted_sessions(self) -> None:
         # Keep persisted automation state in sync with existing docker runtime containers.
@@ -1954,42 +1941,29 @@ class AutomationManager:
         if not live_session_ids:
             # Safety: if Docker returns no live session containers (common right after a clean rebuild, or during
             # transient Docker API issues), pruning would wipe persisted automation state including cron jobs.
-            # Keep state; a session can be recreated later with the persisted defaultSessionId.
+            # Keep state; a session can be recreated later from persisted automation state.
             log.info("No live docker sessions found; skipping automation-state pruning")
             return
         live_set = set(live_session_ids)
 
         st = self._store.state
         protected: set[str] = set()
-        if isinstance(st.default_session_id, str) and st.default_session_id.strip():
-            protected.add(st.default_session_id.strip())
         for agent in (st.agents or {}).values():
             if isinstance(agent, PersistedAgentRuntime) and isinstance(agent.session_id, str) and agent.session_id.strip():
                 protected.add(agent.session_id.strip())
 
         removed = [sid for sid in st.sessions.keys() if sid not in live_set and sid not in protected]
-        default_missing = bool(
-            st.default_session_id and st.default_session_id not in live_set and st.default_session_id not in protected
-        )
-        if not removed and not default_missing:
+        if not removed:
             return
-
-        next_default = None
-        if live_session_ids:
-            # `_docker_list_argus_containers_sync` is already sorted (running first).
-            next_default = live_session_ids[0]
 
         def _prune(st2: PersistedGatewayAutomationState) -> None:
             for sid in removed:
                 st2.sessions.pop(sid, None)
-            if st2.default_session_id and st2.default_session_id not in live_set:
-                st2.default_session_id = next_default
 
         await self._store.update(_prune)
         log.info(
-            "Pruned automation state sessions: removed=%d default_missing=%s kept=%d",
+            "Pruned automation state sessions: removed=%d kept=%d",
             len(removed),
-            "yes" if default_missing else "no",
             len(live_set),
         )
 
@@ -2650,50 +2624,6 @@ class AutomationManager:
         if not delivered_any:
             return
 
-    async def ensure_default_ready(self) -> str:
-        if _provision_mode() != "docker":
-            raise RuntimeError("Automation is only supported in docker provision mode")
-
-        async with self._bootstrap_lock:
-            session_id = await self._choose_default_session_id()
-            live, _ = await _ensure_live_docker_session(session_id, allow_create=True)
-            await self._ensure_initialized(live)
-            await self.ensure_main_thread(session_id)
-            return session_id
-
-    async def _choose_default_session_id(self) -> str:
-        existing = self._store.state.default_session_id
-        if isinstance(existing, str) and existing.strip():
-            return existing.strip()
-
-        # If defaultSessionId is missing but we have exactly one persisted session, adopt it.
-        persisted_ids = [sid.strip() for sid in self._store.state.sessions.keys() if isinstance(sid, str) and sid.strip()]
-        if len(persisted_ids) == 1:
-            sid = persisted_ids[0]
-            await self._store.update(lambda st: setattr(st, "default_session_id", sid))
-            return sid
-
-        sessions: list[dict[str, Any]] = []
-        try:
-            sessions = await asyncio.to_thread(_docker_list_argus_containers_sync)
-        except Exception as e:
-            # Docker might be slow/unavailable; don't spam stack traces for background bootstrap.
-            log.warning("Failed to list docker sessions while choosing default session: %s", str(e))
-
-        sid: Optional[str] = None
-        for s in sessions:
-            cand = s.get("sessionId")
-            layout = s.get("runtimeLayout")
-            if isinstance(cand, str) and cand.strip() and layout == RUNTIME_LAYOUT:
-                sid = cand.strip()
-                break
-
-        if sid is None:
-            sid = uuid.uuid4().hex[:12]
-
-        await self._store.update(lambda st: setattr(st, "default_session_id", sid))
-        return sid
-
     async def ensure_main_thread(self, session_id: str) -> str:
         lock = self._main_thread_locks.get(session_id)
         if lock is None:
@@ -2769,8 +2699,6 @@ class AutomationManager:
             await self._ensure_thread_loaded_or_resumed(live, thread_id)
 
             def _save_main(st: PersistedGatewayAutomationState) -> None:
-                if not st.default_session_id:
-                    st.default_session_id = session_id
                 sess = st.sessions.get(session_id)
                 if sess is None:
                     sess = PersistedSessionAutomation()
@@ -2812,11 +2740,6 @@ class AutomationManager:
             text = "<media:image>"
         if not text.strip():
             raise ValueError("text must not be empty")
-
-        # Adopt the first actively-used session as the gateway default session if missing.
-        # This prevents "TG works but defaultSessionId stays null" after a clean rebuild.
-        if not self._store.state.default_session_id:
-            await self._store.update(lambda st: setattr(st, "default_session_id", session_id))
 
         live, _ = await _ensure_live_docker_session(session_id, allow_create=True)
         await self._ensure_initialized(live)
@@ -4100,9 +4023,7 @@ class NodeRegistry:
         ids.sort()
         return ids
 
-    async def resolve_self_runtime_node_id(
-        self, *, scope_session_id: Optional[str] = None, default_session_id: Optional[str] = None
-    ) -> Optional[str]:
+    async def resolve_self_runtime_node_id(self, *, scope_session_id: Optional[str] = None) -> Optional[str]:
         scope = self._norm_scope(scope_session_id) if scope_session_id is not None else None
         if scope:
             cand = f"runtime:{scope}"
@@ -4113,10 +4034,6 @@ class NodeRegistry:
         runtime_ids = await self.list_runtime_node_ids(scope_session_id=scope)
         if len(runtime_ids) == 1:
             return runtime_ids[0]
-        if default_session_id:
-            cand = f"runtime:{default_session_id}"
-            if cand in runtime_ids:
-                return cand
         return None
 
     async def resolve_implicit_runtime_node_id(self, *, scope_session_id: Optional[str] = None) -> Optional[str]:
@@ -5000,7 +4917,6 @@ async def _mcp_handle_single_message(request: Request, body: dict[str, Any]) -> 
                 payload = {
                     "ok": True,
                     "sessionId": session_id,
-                    "defaultSessionId": st.default_session_id,
                     "jobs": len(jobs),
                     "enabledJobs": len(enabled_jobs),
                     "nextDueAtMs": next_due_ms,
@@ -5736,7 +5652,7 @@ async def _mcp_handle_single_message(request: Request, body: dict[str, Any]) -> 
                 )
 
             # Node selection:
-            # - node="self": prefer the runtime node for the default session (or the only runtime node if unique)
+            # - node="self": prefer the runtime node for the scoped session (or the only runtime node if unique)
             # - node omitted: only allowed when exactly one runtime node is connected
             scoped_sid = getattr(request.state, "mcp_scoped_session_id", None) or sess.scoped_session_id
             node_id: Optional[str] = None
@@ -6859,14 +6775,246 @@ async def automation_state(request: Request):
     return {"ok": True, "persisted": st.to_json(), "runtime": {"lanes": lanes}}
 
 
+@app.post("/automation/user/bootstrap")
+async def automation_user_bootstrap(request: Request):
+    _http_require_token(request)
+    automation = _get_automation_or_500()
+    try:
+        body = await request.json()
+    except Exception as e:
+        raise HTTPException(status_code=400, detail="Invalid JSON body") from e
+    if not isinstance(body, dict):
+        raise HTTPException(status_code=400, detail="Invalid JSON body")
+
+    raw_chat_key = body.get("chatKey")
+    if not isinstance(raw_chat_key, str) or not raw_chat_key.strip():
+        raise HTTPException(status_code=400, detail="Missing 'chatKey'")
+    chat_key = raw_chat_key.strip()
+
+    user_id = _parse_telegram_private_user_id(chat_key)
+    if user_id is None:
+        raise HTTPException(status_code=400, detail="Invalid 'chatKey' (expected a Telegram private chat id)")
+
+    agent, created_main = await automation.ensure_user_main_agent(user_id=user_id)
+
+    # Keep the current binding if it points to an accessible agent. Otherwise, bind to main.
+    st = automation._store.state
+    bound = st.chat_bindings.get(chat_key) if isinstance(getattr(st, "chat_bindings", None), dict) else None
+    current_agent_id = bound if isinstance(bound, str) and bound.strip() else None
+    if current_agent_id and not automation.can_user_access_agent_id(user_id=user_id, agent_id=current_agent_id):
+        current_agent_id = None
+    if not current_agent_id:
+        await automation.bind_private_user_to_agent(user_id=user_id, chat_key=chat_key, agent_id=agent.agent_id)
+        current_agent_id = agent.agent_id
+    current_session_id = automation.resolve_agent_session_id(current_agent_id) if current_agent_id else None
+
+    return {
+        "ok": True,
+        "userId": user_id,
+        "chatKey": chat_key,
+        "createdMain": created_main,
+        "currentAgentId": current_agent_id,
+        "currentSessionId": current_session_id,
+        "agent": agent.to_json(),
+    }
+
+
+@app.post("/automation/agent/list")
+async def automation_agent_list(request: Request):
+    _http_require_token(request)
+    automation = _get_automation_or_500()
+    try:
+        body = await request.json()
+    except Exception as e:
+        raise HTTPException(status_code=400, detail="Invalid JSON body") from e
+    if not isinstance(body, dict):
+        raise HTTPException(status_code=400, detail="Invalid JSON body")
+
+    raw_chat_key = body.get("chatKey")
+    if not isinstance(raw_chat_key, str) or not raw_chat_key.strip():
+        raise HTTPException(status_code=400, detail="Missing 'chatKey'")
+    chat_key = raw_chat_key.strip()
+
+    user_id = _parse_telegram_private_user_id(chat_key)
+    if user_id is None:
+        raise HTTPException(status_code=400, detail="Invalid 'chatKey'")
+
+    main_id = _user_agent_id(user_id=user_id, short_name="main")
+    if not automation.can_user_access_agent_id(user_id=user_id, agent_id=main_id):
+        raise HTTPException(status_code=400, detail="Not initialized (run /start)")
+
+    st = automation._store.state
+    bound = st.chat_bindings.get(chat_key) if isinstance(getattr(st, "chat_bindings", None), dict) else None
+    current_agent_id = bound if isinstance(bound, str) and bound.strip() else None
+    if current_agent_id and not automation.can_user_access_agent_id(user_id=user_id, agent_id=current_agent_id):
+        current_agent_id = None
+    if not current_agent_id:
+        current_agent_id = main_id
+    current_session_id = automation.resolve_agent_session_id(current_agent_id) if current_agent_id else None
+
+    return {
+        "ok": True,
+        "agents": automation.list_agents_for_user(user_id=user_id),
+        "currentAgentId": current_agent_id,
+        "currentSessionId": current_session_id,
+    }
+
+
+@app.post("/automation/agent/resolve")
+async def automation_agent_resolve(request: Request):
+    _http_require_token(request)
+    automation = _get_automation_or_500()
+    try:
+        body = await request.json()
+    except Exception as e:
+        raise HTTPException(status_code=400, detail="Invalid JSON body") from e
+    if not isinstance(body, dict):
+        raise HTTPException(status_code=400, detail="Invalid JSON body")
+
+    raw_chat_key = body.get("chatKey")
+    if not isinstance(raw_chat_key, str) or not raw_chat_key.strip():
+        raise HTTPException(status_code=400, detail="Missing 'chatKey'")
+    chat_key = raw_chat_key.strip()
+
+    user_id = _parse_telegram_private_user_id(chat_key)
+    if user_id is None:
+        agent_id = automation.resolve_agent_for_chat_key(chat_key)
+        sess_id = automation.resolve_agent_session_id(agent_id)
+        if not sess_id:
+            raise HTTPException(status_code=400, detail="Agent has no sessionId")
+        return {"ok": True, "chatKey": chat_key, "agentId": agent_id, "sessionId": sess_id}
+
+    st = automation._store.state
+    bound = st.chat_bindings.get(chat_key) if isinstance(getattr(st, "chat_bindings", None), dict) else None
+    bound_id = bound.strip() if isinstance(bound, str) and bound.strip() else None
+    if bound_id and automation.can_user_access_agent_id(user_id=user_id, agent_id=bound_id):
+        agent_id = bound_id
+    else:
+        main_id = _user_agent_id(user_id=user_id, short_name="main")
+        if automation.can_user_access_agent_id(user_id=user_id, agent_id=main_id):
+            agent_id = main_id
+        else:
+            raise HTTPException(status_code=400, detail="Not initialized (run /start)")
+    sess_id = automation.resolve_agent_session_id(agent_id)
+    if not sess_id:
+        raise HTTPException(status_code=500, detail="Agent has no sessionId")
+    return {"ok": True, "chatKey": chat_key, "agentId": agent_id, "sessionId": sess_id}
+
+
+@app.post("/automation/agent/create")
+async def automation_agent_create(request: Request):
+    _http_require_token(request)
+    automation = _get_automation_or_500()
+    try:
+        body = await request.json()
+    except Exception as e:
+        raise HTTPException(status_code=400, detail="Invalid JSON body") from e
+    if not isinstance(body, dict):
+        raise HTTPException(status_code=400, detail="Invalid JSON body")
+
+    raw_chat_key = body.get("chatKey")
+    raw_name = body.get("agentId") or body.get("name")
+    if not isinstance(raw_chat_key, str) or not raw_chat_key.strip():
+        raise HTTPException(status_code=400, detail="Missing 'chatKey'")
+    chat_key = raw_chat_key.strip()
+
+    user_id = _parse_telegram_private_user_id(chat_key)
+    if user_id is None:
+        raise HTTPException(status_code=400, detail="Invalid 'chatKey'")
+
+    main_id = _user_agent_id(user_id=user_id, short_name="main")
+    if not automation.can_user_access_agent_id(user_id=user_id, agent_id=main_id):
+        raise HTTPException(status_code=400, detail="Not initialized (run /start)")
+
+    try:
+        agent = await automation.create_user_agent(user_id=user_id, short_name=str(raw_name or ""))
+    except PermissionError as e:
+        raise HTTPException(status_code=403, detail=str(e)) from e
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    return {"ok": True, "agent": agent.to_json()}
+
+
+@app.post("/automation/agent/use")
+async def automation_agent_use(request: Request):
+    _http_require_token(request)
+    automation = _get_automation_or_500()
+    try:
+        body = await request.json()
+    except Exception as e:
+        raise HTTPException(status_code=400, detail="Invalid JSON body") from e
+    if not isinstance(body, dict):
+        raise HTTPException(status_code=400, detail="Invalid JSON body")
+
+    raw_chat_key = body.get("chatKey")
+    raw_aid = body.get("agentId") or body.get("name")
+    if not isinstance(raw_chat_key, str) or not raw_chat_key.strip():
+        raise HTTPException(status_code=400, detail="Missing 'chatKey'")
+    chat_key = raw_chat_key.strip()
+
+    user_id = _parse_telegram_private_user_id(chat_key)
+    if user_id is None:
+        raise HTTPException(status_code=400, detail="Invalid 'chatKey'")
+
+    main_id = _user_agent_id(user_id=user_id, short_name="main")
+    if not automation.can_user_access_agent_id(user_id=user_id, agent_id=main_id):
+        raise HTTPException(status_code=400, detail="Not initialized (run /start)")
+
+    aid_raw = _normalize_agent_id(raw_aid)
+    if not aid_raw:
+        raise HTTPException(status_code=400, detail="Invalid 'agentId'")
+    if re.match(r"^u\d+-", aid_raw):
+        agent_id = aid_raw
+    else:
+        agent_id = _user_agent_id(user_id=user_id, short_name=aid_raw)
+
+    try:
+        agent = await automation.bind_private_user_to_agent(user_id=user_id, chat_key=chat_key, agent_id=agent_id)
+    except PermissionError as e:
+        raise HTTPException(status_code=403, detail=str(e)) from e
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    return {"ok": True, "chatKey": chat_key, "agent": agent.to_json()}
+
+
+@app.post("/automation/node/token")
+async def automation_node_token(request: Request):
+    _http_require_token(request)
+    automation = _get_automation_or_500()
+    try:
+        body = await request.json()
+    except Exception as e:
+        raise HTTPException(status_code=400, detail="Invalid JSON body") from e
+    if not isinstance(body, dict):
+        raise HTTPException(status_code=400, detail="Invalid JSON body")
+
+    raw_chat_key = body.get("chatKey")
+    if not isinstance(raw_chat_key, str) or not raw_chat_key.strip():
+        raise HTTPException(status_code=400, detail="Missing 'chatKey'")
+    chat_key = raw_chat_key.strip()
+
+    sid = automation.resolve_session_id_for_chat_key(chat_key)
+    if not sid:
+        raise HTTPException(status_code=400, detail="Unknown session (run /start)")
+
+    master = os.getenv("ARGUS_NODE_TOKEN") or os.getenv("ARGUS_TOKEN") or None
+    token = _node_derive_session_token(master, sid) if master else None
+    return {"ok": True, "chatKey": chat_key, "sessionId": sid, "path": "/nodes/ws", "token": token}
+
+
 @app.get("/automation/cron/jobs")
 async def cron_list_jobs(request: Request):
     _http_require_token(request)
     automation = _get_automation_or_500()
-    st = automation._store.state
-    sid = st.default_session_id
+    sid = (request.query_params.get("sessionId") or "").strip() or None
     if not sid:
-        sid = await automation.ensure_default_ready()
+        aid = _normalize_agent_id(request.query_params.get("agentId"))
+        if aid:
+            sid = automation.resolve_agent_session_id(aid)
+            if not sid:
+                raise HTTPException(status_code=404, detail="Unknown agent")
+    if not sid:
+        raise HTTPException(status_code=400, detail="Missing 'sessionId' (or 'agentId')")
     sess = automation._store.state.sessions.get(sid) or PersistedSessionAutomation()
     return {"ok": True, "sessionId": sid, "jobs": [j.to_json() for j in sess.cron_jobs]}
 
@@ -6881,6 +7029,16 @@ async def cron_create_job(request: Request):
         raise HTTPException(status_code=400, detail="Invalid JSON body") from e
     if not isinstance(body, dict):
         raise HTTPException(status_code=400, detail="Invalid JSON body")
+
+    sid = str(body.get("sessionId") or "").strip() or None
+    if not sid:
+        aid = _normalize_agent_id(body.get("agentId"))
+        if aid:
+            sid = automation.resolve_agent_session_id(aid)
+            if not sid:
+                raise HTTPException(status_code=404, detail="Unknown agent")
+    if not sid:
+        raise HTTPException(status_code=400, detail="Missing 'sessionId' (or 'agentId')")
 
     expr = str(body.get("expr") or "").strip()
     text = str(body.get("text") or "")
@@ -6942,10 +7100,6 @@ async def cron_create_job(request: Request):
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Invalid cron expr: {e}") from e
 
-    sid = automation._store.state.default_session_id
-    if not sid:
-        sid = await automation.ensure_default_ready()
-
     saved: Optional[PersistedCronJob] = None
 
     def _add(st: PersistedGatewayAutomationState) -> None:
@@ -6976,9 +7130,15 @@ async def cron_create_job(request: Request):
 async def cron_delete_job(job_id: str, request: Request):
     _http_require_token(request)
     automation = _get_automation_or_500()
-    sid = automation._store.state.default_session_id
+    sid = (request.query_params.get("sessionId") or "").strip() or None
     if not sid:
-        sid = await automation.ensure_default_ready()
+        aid = _normalize_agent_id(request.query_params.get("agentId"))
+        if aid:
+            sid = automation.resolve_agent_session_id(aid)
+            if not sid:
+                raise HTTPException(status_code=404, detail="Unknown agent")
+    if not sid:
+        raise HTTPException(status_code=400, detail="Missing 'sessionId' (or 'agentId')")
 
     removed = False
 
@@ -7016,9 +7176,13 @@ async def automation_enqueue_system_event(request: Request):
 
     session_id = str(body.get("sessionId") or "").strip() or None
     if not session_id:
-        session_id = automation._store.state.default_session_id
+        aid = _normalize_agent_id(body.get("agentId"))
+        if aid:
+            session_id = automation.resolve_agent_session_id(aid)
+            if not session_id:
+                raise HTTPException(status_code=404, detail="Unknown agent")
     if not session_id:
-        session_id = await automation.ensure_default_ready()
+        raise HTTPException(status_code=400, detail="Missing 'sessionId' (or 'agentId')")
 
     target = str(body.get("target") or "").strip()
     thread_id = str(body.get("threadId") or "").strip() or None
@@ -7119,8 +7283,7 @@ async def _enqueue_node_system_event(
         return
 
     st = automation._store.state
-    sid = session_id.strip() if isinstance(session_id, str) and session_id.strip() else st.default_session_id
-    sid = sid.strip() if isinstance(sid, str) and sid.strip() else None
+    sid = session_id.strip() if isinstance(session_id, str) and session_id.strip() else None
     if not sid:
         return
     sess = st.sessions.get(sid)
@@ -7223,7 +7386,7 @@ async def _enqueue_process_exited_system_event(
 
     session_id = payload.get("sessionId")
     if not isinstance(session_id, str) or not session_id.strip():
-        session_id = scoped_session_id or _session_id_from_node_id(node_id) or automation._store.state.default_session_id
+        session_id = scoped_session_id or _session_id_from_node_id(node_id)
     session_id = (session_id or "").strip()
     if not session_id:
         return
@@ -7280,22 +7443,13 @@ async def _enqueue_process_exited_system_event(
 async def ws_nodes(ws: WebSocket):
     provided = _extract_token(ws) or ""
     master = os.getenv("ARGUS_NODE_TOKEN") or os.getenv("ARGUS_TOKEN") or None
-    scoped_session_id: Optional[str] = None
+    scope_from_token: Optional[str] = None
 
     if master is not None:
-        # Back-compat: allow the raw master token, but scope it to the gateway default session only.
-        if provided == master:
-            automation: Optional[AutomationManager] = getattr(app.state, "automation", None)
-            scoped_session_id = automation._store.state.default_session_id if automation is not None else None
-        else:
-            scoped_session_id = _node_verify_derived_session_token(master, provided)
-    else:
-        # No auth configured: best-effort scope to default session (dev mode).
-        automation = getattr(app.state, "automation", None)
-        scoped_session_id = automation._store.state.default_session_id if automation is not None else None
+        scope_from_token = _node_verify_derived_session_token(master, provided)
 
     await ws.accept()
-    if master is not None and not (isinstance(scoped_session_id, str) and scoped_session_id.strip()):
+    if master is not None and not (isinstance(scope_from_token, str) and scope_from_token.strip()):
         await ws.close(code=1008, reason="Unauthorized")
         return
     conn_id = uuid.uuid4().hex[:12]
@@ -7319,6 +7473,10 @@ async def ws_nodes(ws: WebSocket):
         await ws.close(code=1008, reason="Missing nodeId")
         return
 
+    scoped_session_id = scope_from_token.strip() if isinstance(scope_from_token, str) and scope_from_token.strip() else None
+    if not scoped_session_id:
+        scoped_session_id = _session_id_from_node_id(node_id)
+
     display_name = (str(msg.get("displayName")) if msg.get("displayName") is not None else None) or None
     platform = (str(msg.get("platform")) if msg.get("platform") is not None else None) or None
     version = (str(msg.get("version")) if msg.get("version") is not None else None) or None
@@ -7330,7 +7488,7 @@ async def ws_nodes(ws: WebSocket):
         node_id=node_id,
         conn_id=conn_id,
         ws=ws,
-        scoped_session_id=scoped_session_id.strip() if isinstance(scoped_session_id, str) and scoped_session_id.strip() else None,
+        scoped_session_id=scoped_session_id,
         display_name=display_name,
         platform=platform,
         version=version,
@@ -7427,8 +7585,13 @@ async def ws_proxy(ws: WebSocket):
                 automation: Optional[AutomationManager] = getattr(app.state, "automation", None)
                 if automation is not None:
                     st = automation._store.state
-                    if requested_session == st.default_session_id or requested_session in st.sessions:
+                    if requested_session in st.sessions:
                         allow_create = True
+                    else:
+                        for a in (st.agents or {}).values():
+                            if isinstance(a, PersistedAgentRuntime) and a.session_id == requested_session:
+                                allow_create = True
+                                break
             live, created = await _ensure_live_docker_session(session_id, allow_create=allow_create)
         except KeyError:
             await ws.close(code=1008, reason="Unknown session")
@@ -7594,7 +7757,9 @@ async def ws_proxy(ws: WebSocket):
                             user_id = _parse_telegram_private_user_id(chat_key)
                             if user_id is None:
                                 agent_id = automation.resolve_agent_for_chat_key(chat_key)
-                                sess_id = automation.resolve_agent_session_id(agent_id) or automation._store.state.default_session_id
+                                sess_id = automation.resolve_agent_session_id(agent_id)
+                                if not sess_id:
+                                    raise RuntimeError("Agent has no sessionId")
                                 result = {"ok": True, "chatKey": chat_key, "agentId": agent_id, "sessionId": sess_id}
                             else:
                                 st = automation._store.state
