@@ -1512,7 +1512,6 @@ class AutomationStateStore:
         self._lock = asyncio.Lock()
         self._state = PersistedGatewayAutomationState()
         self._loaded_from_disk_ok: bool = False
-        self._last_load_path_existed: bool = False
 
     @property
     def state(self) -> PersistedGatewayAutomationState:
@@ -1522,20 +1521,14 @@ class AutomationStateStore:
     def loaded_from_disk_ok(self) -> bool:
         return self._loaded_from_disk_ok
 
-    @property
-    def last_load_path_existed(self) -> bool:
-        return self._last_load_path_existed
-
     async def load(self) -> PersistedGatewayAutomationState:
         async with self._lock:
             try:
-                self._last_load_path_existed = await asyncio.to_thread(self._path.exists)
                 raw = await asyncio.to_thread(self._path.read_text, "utf-8")
                 parsed = json.loads(raw)
                 self._state = PersistedGatewayAutomationState.from_json(parsed)
                 self._loaded_from_disk_ok = True
             except FileNotFoundError:
-                self._last_load_path_existed = False
                 self._state = PersistedGatewayAutomationState()
                 self._loaded_from_disk_ok = False
             except Exception:
@@ -1618,7 +1611,6 @@ class AutomationManager:
     async def start(self) -> None:
         await self._store.load()
         await self._gc_orphan_runtime_containers()
-        await self._ensure_workspace_files()
         await self._prune_persisted_sessions()
         self._tasks.append(asyncio.create_task(self._cron_loop()))
         self._tasks.append(asyncio.create_task(self._heartbeat_loop()))
@@ -1734,7 +1726,7 @@ class AutomationManager:
         agent = self._get_agent(aid)
         if agent is None:
             raise RuntimeError("Failed to persist user main agent")
-        await self._ensure_workspace_files_at(Path(agent.workspace_host_path), legacy_home=None)
+        await self._ensure_workspace_files_at(Path(agent.workspace_host_path))
         await _ensure_live_docker_session(agent.session_id, allow_create=True)
         return agent, created
 
@@ -1779,7 +1771,7 @@ class AutomationManager:
         agent = self._get_agent(aid)
         if agent is None:
             raise RuntimeError("Failed to persist user agent")
-        await self._ensure_workspace_files_at(Path(agent.workspace_host_path), legacy_home=None)
+        await self._ensure_workspace_files_at(Path(agent.workspace_host_path))
         await _ensure_live_docker_session(agent.session_id, allow_create=True)
         return agent
 
@@ -1814,81 +1806,6 @@ class AutomationManager:
         if agent2 is None:
             raise RuntimeError("Agent not found after update")
         return agent2
-
-    async def create_agent(self, *, agent_id: str) -> PersistedAgentRuntime:
-        if _provision_mode() != "docker":
-            raise RuntimeError("Agent containers are only supported in docker provision mode")
-        aid = _normalize_agent_id(agent_id)
-        if not aid:
-            raise ValueError("Invalid agentId (must match [a-zA-Z0-9][a-zA-Z0-9_-]{0,63})")
-        if aid == "main":
-            raise ValueError("agentId 'main' is reserved")
-        if not self._home_host_path:
-            raise RuntimeError("ARGUS_HOME_HOST_PATH is required to create agents")
-
-        workspace_host_path = str((Path(self._home_host_path) / f"workspace-{aid}").resolve())
-        session_id = uuid.uuid4().hex[:12]
-        created_at_ms = _now_ms()
-
-        def _write(st: PersistedGatewayAutomationState) -> None:
-            st.version = max(int(getattr(st, "version", 1) or 1), 3)
-            if aid in st.agents:
-                raise ValueError(f"Agent already exists: {aid}")
-            st.agents[aid] = PersistedAgentRuntime(
-                agent_id=aid,
-                session_id=session_id,
-                workspace_host_path=workspace_host_path,
-                created_at_ms=created_at_ms,
-            )
-            if session_id not in st.sessions:
-                st.sessions[session_id] = PersistedSessionAutomation()
-
-        await self._store.update(_write)
-        await self._ensure_workspace_files_at(Path(workspace_host_path), legacy_home=None)
-        # Eagerly create the container so /newagent immediately works even before first user message.
-        await _ensure_live_docker_session(session_id, allow_create=True)
-        agent = self._store.state.agents.get(aid)
-        if not isinstance(agent, PersistedAgentRuntime):
-            raise RuntimeError("Failed to persist agent")
-        return agent
-
-    async def bind_chat_to_agent(self, *, chat_key: str, agent_id: str) -> PersistedAgentRuntime:
-        ck = chat_key.strip() if isinstance(chat_key, str) else ""
-        if not ck:
-            raise ValueError("Missing chatKey")
-        aid = _normalize_agent_id(agent_id)
-        if not aid:
-            raise ValueError("Invalid agentId")
-
-        def _write(st: PersistedGatewayAutomationState) -> None:
-            st.version = max(int(getattr(st, "version", 1) or 1), 3)
-            if aid not in st.agents:
-                raise ValueError(f"Unknown agent: {aid}")
-            st.chat_bindings[ck] = aid
-
-        await self._store.update(_write)
-        agent = self._store.state.agents.get(aid)
-        if not isinstance(agent, PersistedAgentRuntime):
-            raise RuntimeError("Agent not found after update")
-        return agent
-
-    def list_agents(self) -> list[dict[str, Any]]:
-        st = self._store.state
-        out: list[dict[str, Any]] = []
-        for aid, agent in (st.agents or {}).items():
-            if not isinstance(agent, PersistedAgentRuntime):
-                continue
-            out.append(
-                {
-                    "agentId": aid,
-                    "sessionId": agent.session_id,
-                    "workspaceHostPath": agent.workspace_host_path,
-                    "createdAtMs": agent.created_at_ms,
-                    "isDefault": bool(aid == "main"),
-                }
-            )
-        out.sort(key=lambda x: (not x.get("isDefault"), x.get("agentId") or ""))
-        return out
 
     async def _gc_orphan_runtime_containers(self) -> None:
         mode = _gc_delete_orphan_runtimes_mode()
@@ -2043,33 +1960,13 @@ class AutomationManager:
                 return Path(p)
         return self._workspace_root()
 
-    async def _ensure_workspace_files(self) -> None:
-        root = self._workspace_root()
-        if root is None:
-            return
-
-        legacy_home = Path(self._home_host_path) if self._home_host_path else None
-        try:
-            await self._ensure_workspace_files_at(root, legacy_home=legacy_home)
-        except Exception:
-            log.exception("Failed to initialize workspace templates under %s", str(root))
-
-    async def _ensure_workspace_files_at(self, root: Path, *, legacy_home: Optional[Path]) -> None:
+    async def _ensure_workspace_files_at(self, root: Path) -> None:
         def _ensure() -> None:
             root.mkdir(parents=True, exist_ok=True)
             for template_name, target_name in WORKSPACE_BOOTSTRAP_TEMPLATES:
                 target_path = root / target_name
                 if target_path.exists():
                     continue
-                # Migration: if legacy HEARTBEAT.md exists in home, keep it (main workspace only).
-                if legacy_home is not None and target_name == HEARTBEAT_FILENAME:
-                    legacy_heartbeat = legacy_home / HEARTBEAT_FILENAME
-                    if legacy_heartbeat.exists():
-                        try:
-                            _atomic_write_text(target_path, legacy_heartbeat.read_text(encoding="utf-8"))
-                            continue
-                        except Exception:
-                            pass
 
                 template_raw = _load_template_text(template_name) or f"# {target_name}\n"
                 template_clean = _strip_yaml_front_matter(template_raw).strip()
