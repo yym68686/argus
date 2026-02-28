@@ -1,3 +1,9 @@
+FROM golang:1.22-bookworm AS node-host-go-builder
+
+WORKDIR /src/apps/node-host-go
+COPY apps/node-host-go/ ./
+RUN CGO_ENABLED=0 go build -trimpath -ldflags "-s -w" -o /out/argus ./cmd/argus
+
 FROM node:22-bookworm-slim
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -27,10 +33,8 @@ COPY docs/templates /app/docs/templates
 COPY run_app_server.sh /app/run_app_server.sh
 RUN chmod +x /app/run_app_server.sh
 
-COPY apps/node-host/package.json /app/node-host/package.json
-COPY apps/node-host/package-lock.json /app/node-host/package-lock.json
-RUN cd /app/node-host && npm ci --omit=dev
-COPY apps/node-host/index.mjs /app/node-host/index.mjs
+RUN mkdir -p /app/node-host
+COPY --from=node-host-go-builder /out/argus /app/node-host/argus
 
 WORKDIR /root/.argus/workspace
 
@@ -38,4 +42,4 @@ EXPOSE 7777
 
 # Expose an app-server (JSONL over stdio) as a TCP stream.
 # Also starts a long-lived node-host daemon (if configured) for background job execution.
-CMD ["sh","-lc","set -eu; NODE_PID=\"\"; if [ -n \"${ARGUS_NODE_WS_URL:-}\" ]; then node /app/node-host/index.mjs & NODE_PID=$!; fi; socat TCP-LISTEN:7777,reuseaddr,fork EXEC:'/app/run_app_server.sh',stderr & SOCAT_PID=$!; trap 'kill -TERM $SOCAT_PID 2>/dev/null || true; if [ -n \"$NODE_PID\" ]; then kill -TERM $NODE_PID 2>/dev/null || true; fi; wait' TERM INT; wait $SOCAT_PID; if [ -n \"$NODE_PID\" ]; then kill -TERM $NODE_PID 2>/dev/null || true; wait $NODE_PID 2>/dev/null || true; fi"]
+CMD ["sh","-lc","set -eu; NODE_PID=\"\"; if [ -n \"${ARGUS_NODE_WS_URL:-}\" ]; then /app/node-host/argus & NODE_PID=$!; fi; socat TCP-LISTEN:7777,reuseaddr,fork EXEC:'/app/run_app_server.sh',stderr & SOCAT_PID=$!; trap 'kill -TERM $SOCAT_PID 2>/dev/null || true; if [ -n \"$NODE_PID\" ]; then kill -TERM $NODE_PID 2>/dev/null || true; fi; wait' TERM INT; wait $SOCAT_PID; if [ -n \"$NODE_PID\" ]; then kill -TERM $NODE_PID 2>/dev/null || true; wait $NODE_PID 2>/dev/null || true; fi"]

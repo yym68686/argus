@@ -113,9 +113,9 @@ Nodes 用于让助手在你的设备上执行命令（例如你的 Mac）。
 在 Mac 上启动 node-host：
 
 ```bash
-cd apps/node-host
-npm i
-node index.mjs \
+cd apps/node-host-go
+go build -o argus ./cmd/argus
+./argus \
   --url "ws://127.0.0.1:8080/nodes/ws?token=argus-node-v1.<sessionId>.<sig>" \
   --node-id "mac" \
   --display-name "My Mac"
@@ -129,7 +129,7 @@ node index.mjs \
   - 如果服务端开启了认证，必须使用派生 token：`argus-node-v1.<sessionId>.<sig>`（master secret：`ARGUS_NODE_TOKEN`，否则回退 `ARGUS_TOKEN`；`sig = base64url(hmac_sha256(master, sessionId))[:32]`）。
   - 开发模式（未配置认证）下可以不带 token。
 - node-host 会把连接/重连状态，以及收到的远程命令审计日志输出到 stderr。
-  - 关闭审计日志：`ARGUS_NODE_AUDIT=0`（或 `node index.mjs --audit false ...`）
+  - 关闭审计日志：`ARGUS_NODE_AUDIT=0`（或 `./argus --audit false ...`）
   - 调整输出：`ARGUS_NODE_AUDIT_MAX_BYTES`、`ARGUS_NODE_AUDIT_STDIN_PREVIEW_BYTES`
 
 ## 可选 Web UI
@@ -177,7 +177,8 @@ export ARGUS_RUNTIME_PIDS_LIMIT="512"     # 可选
 - `Dockerfile`: runtime 镜像（JSONL over stdio → TCP `:7777` bridge）
 - `apps/api/`: 网关（HTTP + WS `/ws`）
 - `apps/telegram-bot/`: Telegram bot（入站 + typing）
-- `apps/node-host/`: node-host（设备命令执行）
+- `apps/node-host-go/`: node-host（Go；设备命令执行）
+- `apps/node-host/`: 旧版 node-host（JS）
 - `apps/web/`: 可选 Web UI（调试用）
 - `docker-compose.yml`: 一键部署
 - `REMOTE_CLIENT_GUIDE.md`: 客户端接入（协议、重连、示例）

@@ -108,9 +108,9 @@ Nodes let the assistant execute commands on your devices (e.g. your Mac).
 Start a node-host on your Mac:
 
 ```bash
-cd apps/node-host
-npm i
-node index.mjs \
+cd apps/node-host-go
+go build -o argus ./cmd/argus
+./argus \
   --url "ws://127.0.0.1:8080/nodes/ws?token=argus-node-v1.<sessionId>.<sig>" \
   --node-id "mac" \
   --display-name "My Mac"
@@ -124,7 +124,7 @@ Notes:
   - When auth is configured, you must use a derived token: `argus-node-v1.<sessionId>.<sig>` (master secret: `ARGUS_NODE_TOKEN`, fallback: `ARGUS_TOKEN`; `sig = base64url(hmac_sha256(master, sessionId))[:32]`).
   - In dev mode with no auth configured, the node token can be omitted.
 - node-host prints connection/reconnect status and an audit log of received remote commands to stderr.
-  - Disable audit logs: `ARGUS_NODE_AUDIT=0` (or `node index.mjs --audit false ...`)
+  - Disable audit logs: `ARGUS_NODE_AUDIT=0` (or `./argus --audit false ...`)
   - Tune output: `ARGUS_NODE_AUDIT_MAX_BYTES`, `ARGUS_NODE_AUDIT_STDIN_PREVIEW_BYTES`
 
 ## Optional web UI
@@ -172,7 +172,8 @@ They apply to **new** sessions. Existing containers need `docker update` or recr
 - `Dockerfile`: runtime image (JSONL over stdio → TCP `:7777` bridge)
 - `apps/api/`: gateway (HTTP + WS `/ws`)
 - `apps/telegram-bot/`: Telegram bot (inbound + typing)
-- `apps/node-host/`: node-host (device command runner)
+- `apps/node-host-go/`: node-host (Go; device command runner)
+- `apps/node-host/`: legacy node-host (JS)
 - `apps/web/`: optional web UI (debug)
 - `docker-compose.yml`: one-command local/server deployment
 - `REMOTE_CLIENT_GUIDE.md`: client integration (protocol, reconnection, examples)
