@@ -166,19 +166,40 @@ st = json.loads(Path(__import__("os").environ["OUTDIR"] + "/automation_state.jso
 persisted = st.get("persisted") or {}
 sessions = persisted.get("sessions") or {}
 agents = persisted.get("agents") or {}
-main_agent = agents.get("main") or {}
-main_sid = (main_agent.get("sessionId") or "").strip()
+
+selected_aid = ""
+selected_sid = ""
+if isinstance(agents, dict) and agents:
+  if "main" in agents:
+    selected_aid = "main"
+  else:
+    main_like = []
+    for aid, a in agents.items():
+      if not isinstance(aid, str) or not aid.strip():
+        continue
+      if not isinstance(a, dict):
+        continue
+      if str(a.get("shortName") or "").strip().lower() == "main":
+        main_like.append(aid.strip())
+    if main_like:
+      selected_aid = sorted(main_like)[0]
+    else:
+      selected_aid = sorted([str(k).strip() for k in agents.keys() if isinstance(k, str) and k.strip()])[0]
+  selected_sid = str((agents.get(selected_aid) or {}).get("sessionId") or "").strip()
+if not selected_sid and isinstance(sessions, dict) and sessions:
+  selected_sid = sorted([str(k).strip() for k in sessions.keys() if isinstance(k, str) and k.strip()])[0]
 print("persisted.sessions count:", len(sessions))
 print("persisted.agents count:", len(agents))
-print("main agent sessionId:", main_sid or "<empty>")
-if main_sid and main_sid in sessions:
-  sess = sessions[main_sid] or {}
+print("selectedAgentId:", selected_aid or "<none>")
+print("selectedSessionId:", selected_sid or "<empty>")
+if selected_sid and selected_sid in sessions:
+  sess = sessions[selected_sid] or {}
   main_tid = sess.get("mainThreadId") or ""
   print("mainThreadId:", main_tid or "<empty>")
   lanes = (st.get("runtime") or {}).get("lanes") or []
   # show lane for main thread if present
   for lane in lanes:
-    if lane.get("sessionId") == main_sid and lane.get("threadId") == main_tid:
+    if lane.get("sessionId") == selected_sid and lane.get("threadId") == main_tid:
       print("lane(main) busy:", lane.get("busy"), "followupDepth:", lane.get("followupDepth"))
   q = (sess.get("systemEventQueues") or {}).get(main_tid) or []
   print("systemEventQueues[main] len:", len(q))
@@ -202,7 +223,42 @@ PY
   fi
 
   section "Gateway cron/jobs (summary)"
-  if curl_auth "$GATEWAY_HTTP/automation/cron/jobs?agentId=main" >"$OUTDIR/cron_jobs.json"; then
+  sid="$(
+    python3 - <<'PY'
+import json, os
+st = json.loads(open(os.environ["OUTDIR"] + "/automation_state.json", "r", encoding="utf-8").read())
+persisted = st.get("persisted") or {}
+sessions = persisted.get("sessions") or {}
+agents = persisted.get("agents") or {}
+selected_sid = ""
+if isinstance(agents, dict) and agents:
+  if "main" in agents:
+    selected_sid = str((agents.get("main") or {}).get("sessionId") or "").strip()
+  if not selected_sid:
+    # prefer a per-user main if present
+    main_like = []
+    for aid, a in agents.items():
+      if not isinstance(a, dict):
+        continue
+      if str(a.get("shortName") or "").strip().lower() == "main":
+        main_like.append(str(aid))
+    if main_like:
+      selected_sid = str((agents.get(sorted(main_like)[0]) or {}).get("sessionId") or "").strip()
+  if not selected_sid:
+    for aid in sorted([str(k).strip() for k in agents.keys() if isinstance(k, str) and k.strip()]):
+      selected_sid = str((agents.get(aid) or {}).get("sessionId") or "").strip()
+      if selected_sid:
+        break
+if not selected_sid and isinstance(sessions, dict) and sessions:
+  keys = [str(k).strip() for k in sessions.keys() if isinstance(k, str) and k.strip()]
+  if keys:
+    selected_sid = sorted(keys)[0]
+print(selected_sid, end="")
+PY
+  )"
+  if [[ -z "$sid" ]]; then
+    echo "(skip) no sessionId found in automation state; cannot query cron/jobs" >&2
+  elif curl_auth "$GATEWAY_HTTP/automation/cron/jobs?sessionId=${sid}" >"$OUTDIR/cron_jobs.json"; then
     python3 - <<'PY'
 import json
 from pathlib import Path
@@ -229,7 +285,7 @@ PY
     echo "(failed) cannot fetch /nodes" >&2
   fi
 
-  section "Runtime node-host process.list (main agent session, best-effort)"
+  section "Runtime node-host process.list (selected session, best-effort)"
   if [[ -f "$OUTDIR/automation_state.json" ]] && [[ -f "$OUTDIR/nodes.json" ]]; then
     local sid
     sid="$(
@@ -237,9 +293,31 @@ PY
 import json, os
 st = json.loads(open(os.environ["OUTDIR"] + "/automation_state.json", "r", encoding="utf-8").read())
 persisted = st.get("persisted") or {}
+sessions = persisted.get("sessions") or {}
 agents = persisted.get("agents") or {}
-main = agents.get("main") or {}
-print((main.get("sessionId") or "").strip(), end="")
+selected_sid = ""
+if isinstance(agents, dict) and agents:
+  if "main" in agents:
+    selected_sid = str((agents.get("main") or {}).get("sessionId") or "").strip()
+  if not selected_sid:
+    main_like = []
+    for aid, a in agents.items():
+      if not isinstance(a, dict):
+        continue
+      if str(a.get("shortName") or "").strip().lower() == "main":
+        main_like.append(str(aid))
+    if main_like:
+      selected_sid = str((agents.get(sorted(main_like)[0]) or {}).get("sessionId") or "").strip()
+  if not selected_sid:
+    for aid in sorted([str(k).strip() for k in agents.keys() if isinstance(k, str) and k.strip()]):
+      selected_sid = str((agents.get(aid) or {}).get("sessionId") or "").strip()
+      if selected_sid:
+        break
+if not selected_sid and isinstance(sessions, dict) and sessions:
+  keys = [str(k).strip() for k in sessions.keys() if isinstance(k, str) and k.strip()]
+  if keys:
+    selected_sid = sorted(keys)[0]
+print(selected_sid, end="")
 PY
     )"
     if [[ -n "$sid" ]]; then

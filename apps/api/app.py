@@ -1617,7 +1617,6 @@ class AutomationManager:
 
     async def start(self) -> None:
         await self._store.load()
-        await self._ensure_main_agent()
         await self._gc_orphan_runtime_containers()
         await self._ensure_workspace_files()
         await self._prune_persisted_sessions()
@@ -1640,11 +1639,11 @@ class AutomationManager:
     def resolve_agent_for_chat_key(self, chat_key: str) -> str:
         ck = chat_key.strip() if isinstance(chat_key, str) else ""
         if not ck:
-            return "main"
+            return ""
         st = self._store.state
         agent_id = st.chat_bindings.get(ck) if isinstance(st.chat_bindings, dict) else None
         agent_id = _normalize_agent_id(agent_id) if isinstance(agent_id, str) else ""
-        return agent_id or "main"
+        return agent_id
 
     def resolve_agent_session_id(self, agent_id: str) -> Optional[str]:
         aid = _normalize_agent_id(agent_id)
@@ -1890,49 +1889,6 @@ class AutomationManager:
             )
         out.sort(key=lambda x: (not x.get("isDefault"), x.get("agentId") or ""))
         return out
-
-    async def _ensure_main_agent(self) -> None:
-        if not self._home_host_path and not self._workspace_host_path:
-            return
-
-        now = _now_ms()
-        home = Path(self._home_host_path) if self._home_host_path else None
-        main_workspace_host_path = None
-        if home is not None:
-            main_workspace_host_path = str((home / "workspace").resolve())
-        elif self._workspace_host_path:
-            main_workspace_host_path = str(Path(self._workspace_host_path).resolve())
-
-        if not main_workspace_host_path:
-            return
-
-        def _write(st: PersistedGatewayAutomationState) -> None:
-            st.version = max(int(getattr(st, "version", 1) or 1), 3)
-            existing = st.agents.get("main")
-            main_session_id = None
-            if isinstance(existing, PersistedAgentRuntime) and isinstance(existing.session_id, str) and existing.session_id.strip():
-                main_session_id = existing.session_id.strip()
-            if not main_session_id:
-                # Back-compat: if the state predates agents, adopt a singleton persisted session.
-                keys = [sid.strip() for sid in st.sessions.keys() if isinstance(sid, str) and sid.strip()]
-                if len(keys) == 1:
-                    main_session_id = keys[0]
-            if not main_session_id:
-                main_session_id = uuid.uuid4().hex[:12]
-
-            st.agents["main"] = PersistedAgentRuntime(
-                agent_id="main",
-                session_id=main_session_id,
-                workspace_host_path=main_workspace_host_path,
-                created_at_ms=getattr(existing, "created_at_ms", None) or now,
-                owner_user_id=getattr(existing, "owner_user_id", None) if isinstance(existing, PersistedAgentRuntime) else None,
-                short_name=getattr(existing, "short_name", None) if isinstance(existing, PersistedAgentRuntime) else None,
-                allowed_user_ids=list(getattr(existing, "allowed_user_ids", None) or []) if isinstance(existing, PersistedAgentRuntime) else [],
-            )
-            if main_session_id not in st.sessions:
-                st.sessions[main_session_id] = PersistedSessionAutomation()
-
-        await self._store.update(_write)
 
     async def _gc_orphan_runtime_containers(self) -> None:
         mode = _gc_delete_orphan_runtimes_mode()
@@ -7002,9 +6958,11 @@ async def automation_agent_resolve(request: Request):
     user_id = _parse_telegram_private_user_id(chat_key)
     if user_id is None:
         agent_id = automation.resolve_agent_for_chat_key(chat_key)
+        if not agent_id:
+            raise HTTPException(status_code=404, detail="No agent bound for chatKey")
         sess_id = automation.resolve_agent_session_id(agent_id)
         if not sess_id:
-            raise HTTPException(status_code=400, detail="Agent has no sessionId")
+            raise HTTPException(status_code=404, detail="Unknown agent")
         return {"ok": True, "chatKey": chat_key, "agentId": agent_id, "sessionId": sess_id}
 
     st = automation._store.state
@@ -7880,9 +7838,11 @@ async def ws_proxy(ws: WebSocket):
                             user_id = _parse_telegram_private_user_id(chat_key)
                             if user_id is None:
                                 agent_id = automation.resolve_agent_for_chat_key(chat_key)
+                                if not agent_id:
+                                    raise ValueError("No agent bound for chatKey")
                                 sess_id = automation.resolve_agent_session_id(agent_id)
                                 if not sess_id:
-                                    raise RuntimeError("Agent has no sessionId")
+                                    raise RuntimeError("Unknown agent")
                                 result = {"ok": True, "chatKey": chat_key, "agentId": agent_id, "sessionId": sess_id}
                             else:
                                 st = automation._store.state
