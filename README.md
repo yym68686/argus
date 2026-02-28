@@ -37,16 +37,15 @@ docker compose --profile tg up --build
 3) Verify:
 
 - Open Telegram → DM your bot
-- Run `/where` (shows the current `sessionId` / `threadId`)
-- Run `/new` (starts a new thread for this chat)
-- Run `/newmain` (starts a new main thread for this session; affects heartbeat + private chats)
+- Run `/start`
+- Run `/menu` (open the control panel)
 - Send a message
+- (Groups/topics) Run `/menu` → **Bind This Chat** → (optional) **New Thread**
 
 Notes:
 
 - If you want the bot to respond to all group messages, disable **Group Privacy** in BotFather.
 - Outbound replies are delivered by the **gateway** (one final message per turn). The bot handles inbound messages + typing indicators.
-- If you set `TELEGRAM_ADMIN_CHAT_IDS`, only those private chat ids can run `/newmain`.
 
 Stop:
 
@@ -78,8 +77,11 @@ When using `apps/telegram-bot`, the gateway can isolate runtime containers (agen
 - First `/start` in a private chat bootstraps a dedicated per-user `main` agent (one session container + one workspace).
   - Host workspace directory: `${ARGUS_HOME_HOST_PATH}/workspace-<tgid>-main`
 - Subsequent `/start` reuses the existing `main`.
-- `/newagent foo` creates `${ARGUS_HOME_HOST_PATH}/workspace-<tgid>-foo` and switches to it (duplicate names error).
-- `/agents` only shows agents you own (including `main`) plus admin-shared agents.
+- Use `/menu` to open the control panel:
+  - **Switch Agent**: switch the current DM agent (workspace/session).
+  - **Create Agent**: create a new agent (workspace/session) and switch to it.
+  - **New Main Thread**: reset the main thread for the current agent (affects heartbeat + DM routing).
+- In groups/topics, run `/menu` in the chat/topic and use **Bind This Chat** to route that chat/topic to an agent.
 - Admin sharing: edit `${ARGUS_HOME_HOST_PATH}/gateway/state.json` and add the target user tgid into `allowedUserIds` for the desired `agentId`.
   - Recommended: edit with the gateway stopped, or restart after edits (the gateway continuously writes back `state.json`).
 

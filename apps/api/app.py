@@ -6955,6 +6955,60 @@ async def automation_agent_use(request: Request):
     return {"ok": True, "chatKey": chat_key, "agent": agent.to_json()}
 
 
+@app.post("/automation/chat/bind")
+async def automation_chat_bind(request: Request):
+    _http_require_token(request)
+    automation = _get_automation_or_500()
+    try:
+        body = await request.json()
+    except Exception as e:
+        raise HTTPException(status_code=400, detail="Invalid JSON body") from e
+    if not isinstance(body, dict):
+        raise HTTPException(status_code=400, detail="Invalid JSON body")
+
+    raw_chat_key = body.get("chatKey")
+    raw_aid = body.get("agentId") or body.get("name")
+    raw_actor = body.get("actorUserId") or body.get("userId")
+    if not isinstance(raw_chat_key, str) or not raw_chat_key.strip():
+        raise HTTPException(status_code=400, detail="Missing 'chatKey'")
+    chat_key = raw_chat_key.strip()
+
+    actor_user_id: Optional[int] = None
+    if raw_actor is not None:
+        try:
+            actor_user_id = int(raw_actor)
+        except Exception:
+            actor_user_id = None
+    if actor_user_id is None or actor_user_id <= 0:
+        raise HTTPException(status_code=400, detail="Missing/invalid 'actorUserId'")
+
+    # Prevent binding someone else's private chat key.
+    private_id = _parse_telegram_private_user_id(chat_key)
+    if private_id is not None and private_id != actor_user_id:
+        raise HTTPException(status_code=403, detail="Forbidden")
+
+    aid_raw = _normalize_agent_id(raw_aid)
+    if not aid_raw:
+        raise HTTPException(status_code=400, detail="Invalid 'agentId'")
+    if re.match(r"^u\d+-", aid_raw):
+        agent_id = aid_raw
+    else:
+        agent_id = _user_agent_id(user_id=actor_user_id, short_name=aid_raw)
+
+    agent = automation._get_agent(agent_id)
+    if agent is None:
+        raise HTTPException(status_code=404, detail="Unknown agent")
+    if not automation._can_user_access_agent(user_id=actor_user_id, agent=agent):
+        raise HTTPException(status_code=403, detail="Forbidden")
+
+    def _write(st: PersistedGatewayAutomationState) -> None:
+        st.version = max(int(getattr(st, "version", 1) or 1), 3)
+        st.chat_bindings[chat_key] = agent_id
+
+    await automation._store.update(_write)
+    return {"ok": True, "chatKey": chat_key, "agentId": agent_id, "sessionId": agent.session_id, "agent": agent.to_json()}
+
+
 @app.post("/automation/node/token")
 async def automation_node_token(request: Request):
     _http_require_token(request)

@@ -37,16 +37,15 @@ docker compose --profile tg up --build
 3) 验证：
 
 - 打开 Telegram → 私聊你的 bot
-- 发送 `/where`（查看当前 `sessionId` / `threadId`）
-- 发送 `/new`（为当前 chat 新开一个 thread）
-- 发送 `/newmain`（为该 session 新开并切换 main thread；会影响 heartbeat 与私聊）
+- 发送 `/start`
+- 发送 `/menu`（打开控制面板）
 - 直接发一句话测试
+-（群聊/话题）在群里发送 `/menu` → 点击 **Bind This Chat** →（可选）点击 **New Thread**
 
 备注：
 
 - 如果你希望 bot 在群里对“所有消息”都触发回复，需要在 BotFather 里关闭 **Group Privacy**。
 - 出站回复由 **gateway** 统一投递（每轮 turn 只发 1 条最终文本）；bot 负责入站消息与 “typing…” 指示。
-- 如果设置了 `TELEGRAM_ADMIN_CHAT_IDS`，则只有白名单里的私聊 chat id 才能使用 `/newmain`。
 
 停止：
 
@@ -78,13 +77,11 @@ docker compose down
 - **首次 `/start`**：网关会为该 Telegram 私聊用户创建一个专属 `main` agent（一个独立 session 容器 + 独立 workspace），并自动绑定为当前 agent。
   - 宿主机工作区目录命名：`${ARGUS_HOME_HOST_PATH}/workspace-<tgid>-main`
 - **重复 `/start`**：不会重复创建；只会复用并确保绑定到自己的 `main`。
-- **创建新 agent**：`/newagent foo` 会创建 `${ARGUS_HOME_HOST_PATH}/workspace-<tgid>-foo` 并切换过去；同名会报“已存在”。
-- **列出可用 agent**：`/agents` 只展示：
-  - 自己拥有的 agent（含 `main`）
-  - 管理员额外授权给你的共享 agent
-- **切换 agent**：
-  - 切换自己的：`/useagent foo`
-  - 切换共享的：`/useagent <agentId>`（例如 `u123456-foo`）
+- 使用 `/menu` 打开控制面板：
+  - **Switch Agent**：切换当前私聊使用的 agent（workspace/session）。
+  - **Create Agent**：创建新的 agent 并切换过去（同名会报“已存在”）。
+  - **New Main Thread**：重置当前 agent 的 main thread（会影响 heartbeat 与私聊路由）。
+- 在群聊/话题中发送 `/menu`，使用 **Bind This Chat** 把该 chat/topic 绑定到一个 agent。
 - **共享/授权**：管理员可编辑 `${ARGUS_HOME_HOST_PATH}/gateway/state.json`，在对应 `agentId` 下把目标用户的 tgid 加入 `allowedUserIds`。
   - 建议在停止 gateway 后编辑，或编辑后重启（gateway 运行中会持续写回 `state.json`，手动修改可能被覆盖）。
 
