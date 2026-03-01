@@ -1775,6 +1775,109 @@ class AutomationManager:
         await _ensure_live_docker_session(agent.session_id, allow_create=True)
         return agent
 
+    async def rename_user_agent(self, *, user_id: int, agent_id: str, new_short_name: str) -> PersistedAgentRuntime:
+        if _provision_mode() != "docker":
+            raise RuntimeError("User agents are only supported in docker provision mode")
+        if not self._home_host_path:
+            raise RuntimeError("ARGUS_HOME_HOST_PATH is required to rename user agents")
+        if not isinstance(user_id, int) or user_id <= 0:
+            raise ValueError("Invalid userId")
+
+        old_aid = _normalize_agent_id(agent_id)
+        if not old_aid:
+            raise ValueError("Invalid agentId")
+        old_agent = self._get_agent(old_aid)
+        if old_agent is None:
+            raise ValueError(f"Unknown agent: {old_aid}")
+        if not (isinstance(old_agent.owner_user_id, int) and old_agent.owner_user_id == user_id):
+            raise PermissionError("Forbidden")
+        if old_aid == self._user_main_agent_id(user_id=user_id):
+            raise ValueError("main agent cannot be renamed")
+
+        name = _normalize_agent_short_name(new_short_name)
+        if not name:
+            raise ValueError("Invalid agent name")
+        if name == "main":
+            raise ValueError("agent name 'main' is reserved")
+
+        new_aid = _user_agent_id(user_id=user_id, short_name=name)
+        if not AGENT_ID_RE.match(new_aid):
+            raise ValueError("Invalid agent name (too long)")
+        if new_aid == old_aid:
+            return old_agent
+
+        session_id = str(old_agent.session_id or "").strip()
+        if not session_id:
+            raise RuntimeError("Agent has no sessionId")
+
+        lock = self._session_restart_locks.get(session_id)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._session_restart_locks[session_id] = lock
+
+        async with lock:
+            home_root = Path(self._home_host_path).resolve()
+            new_workspace_host_path = str((home_root / f"workspace-{user_id}-{name}").resolve())
+
+            def _write(st: PersistedGatewayAutomationState) -> None:
+                st.version = max(int(getattr(st, "version", 1) or 1), 3)
+                agent = st.agents.get(old_aid)
+                if not isinstance(agent, PersistedAgentRuntime):
+                    raise ValueError(f"Unknown agent: {old_aid}")
+                if not (isinstance(agent.owner_user_id, int) and agent.owner_user_id == user_id):
+                    raise PermissionError("Forbidden")
+                if old_aid == _user_agent_id(user_id=user_id, short_name="main"):
+                    raise ValueError("main agent cannot be renamed")
+                if new_aid in st.agents:
+                    raise ValueError(f"Agent already exists: {name}")
+
+                ws_raw = str(agent.workspace_host_path or "").strip()
+                if not ws_raw:
+                    raise RuntimeError("Agent has no workspaceHostPath")
+                old_ws = Path(ws_raw).resolve()
+                if not str(old_ws).startswith(str(home_root) + os.sep):
+                    raise PermissionError("Forbidden")
+                if not old_ws.exists() or not old_ws.is_dir():
+                    raise FileNotFoundError(f"Workspace not found: {old_ws}")
+                new_ws = Path(new_workspace_host_path).resolve()
+                if not str(new_ws).startswith(str(home_root) + os.sep):
+                    raise PermissionError("Forbidden")
+                if new_ws.exists():
+                    raise ValueError(f"Workspace already exists: {new_ws}")
+
+                old_ws.rename(new_ws)
+
+                # Update chat bindings to the new agentId.
+                for ck, aid in list(st.chat_bindings.items()):
+                    if aid == old_aid:
+                        st.chat_bindings[ck] = new_aid
+
+                updated = replace(agent, agent_id=new_aid, short_name=name, workspace_host_path=str(new_ws))
+                st.agents.pop(old_aid, None)
+                st.agents[new_aid] = updated
+
+            await self._store.update(_write)
+
+            agent2 = self._get_agent(new_aid)
+            if agent2 is None:
+                raise RuntimeError("Agent not found after rename")
+
+            # Ensure the runtime container is recreated with the new workspace bind mount.
+            try:
+                await self._force_close_live_session(session_id)
+            except Exception:
+                pass
+            if _provision_mode() == "docker":
+                try:
+                    container = await asyncio.to_thread(_docker_get_container_by_session_sync, session_id)
+                    if container is not None:
+                        await asyncio.to_thread(_docker_remove_container_sync, container)
+                except Exception as e:
+                    log.warning("Failed to remove runtime container for session %s after rename: %s", session_id, str(e))
+            self._clear_session_backoff(session_id)
+
+            return agent2
+
     def can_user_access_agent_id(self, *, user_id: int, agent_id: str) -> bool:
         aid = _normalize_agent_id(agent_id)
         if not aid:
@@ -6950,6 +7053,51 @@ async def automation_agent_use(request: Request):
         agent = await automation.bind_private_user_to_agent(user_id=user_id, chat_key=chat_key, agent_id=agent_id)
     except PermissionError as e:
         raise HTTPException(status_code=403, detail=str(e)) from e
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    return {"ok": True, "chatKey": chat_key, "agent": agent.to_json()}
+
+
+@app.post("/automation/agent/rename")
+async def automation_agent_rename(request: Request):
+    _http_require_token(request)
+    automation = _get_automation_or_500()
+    try:
+        body = await request.json()
+    except Exception as e:
+        raise HTTPException(status_code=400, detail="Invalid JSON body") from e
+    if not isinstance(body, dict):
+        raise HTTPException(status_code=400, detail="Invalid JSON body")
+
+    raw_chat_key = body.get("chatKey")
+    raw_aid = body.get("agentId") or body.get("name")
+    raw_new = body.get("newAgentId") or body.get("newName")
+    if not isinstance(raw_chat_key, str) or not raw_chat_key.strip():
+        raise HTTPException(status_code=400, detail="Missing 'chatKey'")
+    chat_key = raw_chat_key.strip()
+
+    user_id = _parse_telegram_private_user_id(chat_key)
+    if user_id is None:
+        raise HTTPException(status_code=400, detail="Invalid 'chatKey'")
+
+    main_id = _user_agent_id(user_id=user_id, short_name="main")
+    if not automation.can_user_access_agent_id(user_id=user_id, agent_id=main_id):
+        raise HTTPException(status_code=400, detail="Not initialized (run /start)")
+
+    aid_raw = _normalize_agent_id(raw_aid)
+    if not aid_raw:
+        raise HTTPException(status_code=400, detail="Invalid 'agentId'")
+    if re.match(r"^u\d+-", aid_raw):
+        agent_id = aid_raw
+    else:
+        agent_id = _user_agent_id(user_id=user_id, short_name=aid_raw)
+
+    try:
+        agent = await automation.rename_user_agent(user_id=user_id, agent_id=agent_id, new_short_name=str(raw_new or ""))
+    except PermissionError as e:
+        raise HTTPException(status_code=403, detail=str(e)) from e
+    except FileNotFoundError as e:
+        raise HTTPException(status_code=404, detail=str(e)) from e
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e)) from e
     return {"ok": True, "chatKey": chat_key, "agent": agent.to_json()}

@@ -461,6 +461,13 @@ class ArgusClient {
     return await this._httpJson("POST", "/automation/agent/use", { chatKey, agentId });
   }
 
+  async automationAgentRename(chatKey, agentId, newName) {
+    if (!isNonEmptyString(chatKey)) throw new Error("Missing chatKey");
+    if (!isNonEmptyString(agentId)) throw new Error("Missing agentId");
+    if (!isNonEmptyString(newName)) throw new Error("Missing newName");
+    return await this._httpJson("POST", "/automation/agent/rename", { chatKey, agentId, newName });
+  }
+
   async automationChatBind(chatKey, agentId, actorUserId) {
     if (!isNonEmptyString(chatKey)) throw new Error("Missing chatKey");
     if (!isNonEmptyString(agentId)) throw new Error("Missing agentId");
@@ -908,12 +915,14 @@ const UI_STRINGS = {
     menu_title: "Argus Menu",
     title_switch_agent: "Switch Agent",
     title_create_agent: "Create Agent",
+    title_rename_agent: "Rename Agent",
     title_status: "Status",
     title_node_token: "Node Token",
     title_help: "Help",
 
     btn_switch_agent: "Switch Agent",
     btn_create_agent: "Create Agent",
+    btn_rename_agent: "Rename Agent",
     btn_new_main_thread: "New Main Thread",
     btn_node_token: "Node Token",
     btn_status: "Status",
@@ -951,6 +960,7 @@ const UI_STRINGS = {
     notice_unknown_command: "Unknown command: /{cmd}. Use /menu.",
     notice_switched: "Switched: {agentId}",
     notice_created: "Created: {name}",
+    notice_renamed: "Renamed: {old} -> {name}",
     notice_new_main_thread: "New main thread: {threadId}",
     notice_new_thread: "New thread: {threadId}",
     notice_bound: "Bound: {agentId}",
@@ -962,6 +972,9 @@ const UI_STRINGS = {
 
     create_prompt_prefix: "Send the new agent name (a-z0-9_-), e.g.",
     create_missing: "Missing agent name.",
+
+    rename_prompt_prefix: "Send the new agent name (a-z0-9_-), e.g.",
+    rename_missing: "Missing agent name.",
 
     node_warning: "WARNING: token is sensitive; rotate if leaked.",
     node_press_reveal: "Press Reveal to fetch the current session token.",
@@ -981,12 +994,14 @@ const UI_STRINGS = {
     menu_title: "Argus 菜单",
     title_switch_agent: "切换 Agent",
     title_create_agent: "创建 Agent",
+    title_rename_agent: "重命名 Agent",
     title_status: "状态",
     title_node_token: "节点 Token",
     title_help: "帮助",
 
     btn_switch_agent: "切换 Agent",
     btn_create_agent: "创建 Agent",
+    btn_rename_agent: "重命名 Agent",
     btn_new_main_thread: "新建 Main Thread",
     btn_node_token: "节点 Token",
     btn_status: "状态",
@@ -1024,6 +1039,7 @@ const UI_STRINGS = {
     notice_unknown_command: "未知命令：/{cmd}。请用 /menu。",
     notice_switched: "已切换：{agentId}",
     notice_created: "已创建：{name}",
+    notice_renamed: "已重命名：{old} -> {name}",
     notice_new_main_thread: "已新建 Main Thread：{threadId}",
     notice_new_thread: "已新建 Thread：{threadId}",
     notice_bound: "已绑定：{agentId}",
@@ -1035,6 +1051,9 @@ const UI_STRINGS = {
 
     create_prompt_prefix: "发送新 agent 名称（a-z0-9_-），例如",
     create_missing: "缺少 agent 名称。",
+
+    rename_prompt_prefix: "发送新 agent 名称（a-z0-9_-），例如",
+    rename_missing: "缺少 agent 名称。",
 
     node_warning: "注意：token 很敏感；泄露请立刻轮换。",
     node_press_reveal: "点击“显示”获取当前 session 的 token。",
@@ -1433,7 +1452,7 @@ async function main() {
   }
 
   const callbacks = new CallbackStore();
-  const pendingCreateAgentByChatKey = new Map(); // chatKey -> { expiresAtMs, panelChatId, panelMessageId }
+  const pendingAgentInputByChatKey = new Map(); // chatKey -> { kind, expiresAtMs, panelChatId, panelMessageId, agentId? }
   const unboundWarnedAtByChatKey = new Map(); // chatKey -> ms
   const localeByChatKey = new Map(); // chatKey -> "zh" | "en"
 
@@ -1536,25 +1555,36 @@ async function main() {
     }
   }
 
-  function getPendingCreate(chatKey) {
-    const entry = pendingCreateAgentByChatKey.get(chatKey);
+  function getPendingAgentInput(chatKey) {
+    const entry = pendingAgentInputByChatKey.get(chatKey);
     if (!entry) return null;
     if (nowMs() >= entry.expiresAtMs) {
-      pendingCreateAgentByChatKey.delete(chatKey);
+      pendingAgentInputByChatKey.delete(chatKey);
       return null;
     }
     return entry;
   }
 
-  function clearPendingCreate(chatKey) {
-    pendingCreateAgentByChatKey.delete(chatKey);
+  function clearPendingAgentInput(chatKey) {
+    pendingAgentInputByChatKey.delete(chatKey);
   }
 
-  function setPendingCreate(chatKey, panelChatId, panelMessageId) {
-    pendingCreateAgentByChatKey.set(chatKey, {
+  function setPendingCreateAgent(chatKey, panelChatId, panelMessageId) {
+    pendingAgentInputByChatKey.set(chatKey, {
+      kind: "create",
       expiresAtMs: nowMs() + 10 * 60_000,
       panelChatId,
       panelMessageId
+    });
+  }
+
+  function setPendingRenameAgent(chatKey, panelChatId, panelMessageId, agentId) {
+    pendingAgentInputByChatKey.set(chatKey, {
+      kind: "rename",
+      expiresAtMs: nowMs() + 10 * 60_000,
+      panelChatId,
+      panelMessageId,
+      agentId
     });
   }
 
@@ -1586,18 +1616,27 @@ async function main() {
       if (isNonEmptyString(notice)) lines.push(`<i>${escapeHtml(notice)}</i>`);
       lines.push(`agent: ${htmlCode(route.agentId)}`);
       lines.push(`session: ${htmlCode(route.sessionId)}`);
-      const replyMarkup = kb([
+      const ownPrefix = isNonEmptyString(chatKey) ? `u${chatKey.trim()}-` : "";
+      const canRename = isNonEmptyString(ownPrefix)
+        && isNonEmptyString(route?.agentId)
+        && route.agentId.startsWith(ownPrefix)
+        && !route.agentId.endsWith("-main");
+      const rows = [
         [
           cbButton(S.btn_switch_agent, { action: "p:switch", chatKey, page: 0 }),
           cbButton(S.btn_create_agent, { action: "p:create_begin", chatKey })
-        ],
+        ]
+      ];
+      if (canRename) rows.push([cbButton(S.btn_rename_agent, { action: "p:rename_begin", chatKey })]);
+      rows.push(
         [
           cbButton(S.btn_new_main_thread, { action: "p:newmain", chatKey }),
           cbButton(S.btn_node_token, { action: "p:node", chatKey })
         ],
         [cbButton(S.btn_status, { action: "p:status", chatKey }), cbButton(S.btn_help, { action: "help", chatKey })],
         [cbButton(S.btn_close, { action: "close", chatKey })]
-      ]);
+      );
+      const replyMarkup = kb(rows);
       return { text: lines.join("\n"), replyMarkup };
     } catch {
       const lines = [];
@@ -1670,6 +1709,22 @@ async function main() {
       lines.push(`<b>${escapeHtml(S.label_error)}:</b> ${escapeHtml(error)}`);
     }
     const replyMarkup = kb([[cbButton(S.btn_cancel, { action: "p:create_cancel", chatKey })]]);
+    return { text: lines.join("\n"), replyMarkup };
+  }
+
+  async function renderPrivateRenameMenu(chatKey, agentId, { error, locale } = {}) {
+    const S = uiStrings(locale);
+    const lines = [];
+    lines.push(`<b>${escapeHtml(S.title_rename_agent)}</b>`);
+    if (isNonEmptyString(agentId)) lines.push(`${escapeHtml(S.label_current)}: ${htmlCode(agentId)}`);
+    lines.push(
+      `${escapeHtml(S.rename_prompt_prefix)} ${htmlCode("foo")}${locale === "zh" ? "。" : "."}`
+    );
+    if (isNonEmptyString(error)) {
+      lines.push("");
+      lines.push(`<b>${escapeHtml(S.label_error)}:</b> ${escapeHtml(error)}`);
+    }
+    const replyMarkup = kb([[cbButton(S.btn_cancel, { action: "p:rename_cancel", chatKey })]]);
     return { text: lines.join("\n"), replyMarkup };
   }
 
@@ -1905,7 +1960,7 @@ async function main() {
 
   async function sendMenuMessage({ target, chatKey, chatType, notice, locale } = {}) {
     if (!target || !isNonEmptyString(chatKey)) return null;
-    clearPendingCreate(chatKey);
+    clearPendingAgentInput(chatKey);
     const view = isPrivateChatType(chatType)
       ? await renderPrivateMainMenu(chatKey, { notice, locale })
       : await renderGroupMainMenu(chatKey, { notice, locale });
@@ -1979,7 +2034,7 @@ async function main() {
     try {
       if (action === "close") {
         await answerOnce();
-        clearPendingCreate(chatKey);
+        clearPendingAgentInput(chatKey);
         await safeDeleteMessage({ chat_id: chatId, message_id: messageId });
         return;
       }
@@ -1993,7 +2048,7 @@ async function main() {
 
       if (action === "p:main") {
         await answerOnce();
-        clearPendingCreate(chatKey);
+        clearPendingAgentInput(chatKey);
         const view = await renderPrivateMainMenu(chatKey, { locale });
         await editMenuMessage({ chatId, messageId, view });
         return;
@@ -2001,7 +2056,7 @@ async function main() {
 
       if (action === "p:switch") {
         await answerOnce();
-        clearPendingCreate(chatKey);
+        clearPendingAgentInput(chatKey);
         const view = await renderPrivateSwitchMenu(chatKey, payload.page, { locale });
         await editMenuMessage({ chatId, messageId, view });
         return;
@@ -2009,7 +2064,7 @@ async function main() {
 
       if (action === "p:use") {
         await answerOnce();
-        clearPendingCreate(chatKey);
+        clearPendingAgentInput(chatKey);
         const agentId = payload.agentId;
         if (!isNonEmptyString(agentId)) {
           const view = await renderPrivateSwitchMenu(chatKey, 0, { locale });
@@ -2029,15 +2084,49 @@ async function main() {
 
       if (action === "p:create_begin") {
         await answerOnce();
-        setPendingCreate(chatKey, chatId, messageId);
+        setPendingCreateAgent(chatKey, chatId, messageId);
         const view = await renderPrivateCreateMenu(chatKey, { locale });
+        await editMenuMessage({ chatId, messageId, view });
+        return;
+      }
+
+      if (action === "p:rename_begin") {
+        await answerOnce();
+        let route = null;
+        try {
+          route = await resolveRouteForChatKey(chatKey);
+        } catch (e) {
+          const view = await renderPrivateMainMenu(chatKey, { notice: formatGatewayErrorForUser(e, { locale }), locale });
+          await editMenuMessage({ chatId, messageId, view });
+          return;
+        }
+        const ownPrefix = isNonEmptyString(chatKey) ? `u${chatKey.trim()}-` : "";
+        const canRename = isNonEmptyString(ownPrefix)
+          && isNonEmptyString(route?.agentId)
+          && route.agentId.startsWith(ownPrefix)
+          && !route.agentId.endsWith("-main");
+        if (!canRename) {
+          const view = await renderPrivateMainMenu(chatKey, { notice: S.msg_invalid_agent, locale });
+          await editMenuMessage({ chatId, messageId, view });
+          return;
+        }
+        setPendingRenameAgent(chatKey, chatId, messageId, route.agentId);
+        const view = await renderPrivateRenameMenu(chatKey, route.agentId, { locale });
         await editMenuMessage({ chatId, messageId, view });
         return;
       }
 
       if (action === "p:create_cancel") {
         await answerOnce();
-        clearPendingCreate(chatKey);
+        clearPendingAgentInput(chatKey);
+        const view = await renderPrivateMainMenu(chatKey, { notice: S.notice_canceled, locale });
+        await editMenuMessage({ chatId, messageId, view });
+        return;
+      }
+
+      if (action === "p:rename_cancel") {
+        await answerOnce();
+        clearPendingAgentInput(chatKey);
         const view = await renderPrivateMainMenu(chatKey, { notice: S.notice_canceled, locale });
         await editMenuMessage({ chatId, messageId, view });
         return;
@@ -2045,7 +2134,7 @@ async function main() {
 
       if (action === "p:newmain") {
         await answerOnce();
-        clearPendingCreate(chatKey);
+        clearPendingAgentInput(chatKey);
         const route = await resolveRouteForChatKey(chatKey);
         const client = await getClient(route.sessionId);
         const tid = await client.startThread();
@@ -2245,7 +2334,7 @@ async function main() {
         try {
           if (slash?.forOtherBot) return;
           if (slash || looksSlash) {
-            clearPendingCreate(chatKey);
+            clearPendingAgentInput(chatKey);
             if (slash?.known && slash.cmd === "start") {
               if (!isPrivateChatType(chatType)) {
                 await safeSendMessage({ ...target, text: S.msg_use_start_in_dm });
@@ -2300,8 +2389,8 @@ async function main() {
             return;
           }
 
-          const pending = isPrivateChatType(chatType) ? getPendingCreate(chatKey) : null;
-          if (pending) {
+          const pending = isPrivateChatType(chatType) ? getPendingAgentInput(chatKey) : null;
+          if (pending && pending.kind === "create") {
             const name = isNonEmptyString(text) ? text.trim().split(/\s+/, 1)[0]?.trim().toLowerCase() : "";
             if (!isNonEmptyString(name)) {
               const view = await renderPrivateCreateMenu(chatKey, { error: S.create_missing, locale });
@@ -2313,12 +2402,31 @@ async function main() {
               await argusHttp.automationAgentUse(chatKey, name);
               const sid = created?.agent?.sessionId;
               if (isNonEmptyString(sid)) await getClient(sid);
-              clearPendingCreate(chatKey);
+              clearPendingAgentInput(chatKey);
               const notice = formatTemplate(S.notice_created, { name });
               const view = await renderPrivateMainMenu(chatKey, { notice, locale });
               await editMenuMessage({ chatId: pending.panelChatId, messageId: pending.panelMessageId, view });
             } catch (e) {
               const view = await renderPrivateCreateMenu(chatKey, { error: formatGatewayErrorForUser(e, { locale }), locale });
+              await editMenuMessage({ chatId: pending.panelChatId, messageId: pending.panelMessageId, view });
+            }
+            return;
+          }
+          if (pending && pending.kind === "rename") {
+            const name = isNonEmptyString(text) ? text.trim().split(/\s+/, 1)[0]?.trim().toLowerCase() : "";
+            if (!isNonEmptyString(name)) {
+              const view = await renderPrivateRenameMenu(chatKey, pending.agentId, { error: S.rename_missing, locale });
+              await editMenuMessage({ chatId: pending.panelChatId, messageId: pending.panelMessageId, view });
+              return;
+            }
+            try {
+              await argusHttp.automationAgentRename(chatKey, pending.agentId, name);
+              clearPendingAgentInput(chatKey);
+              const notice = formatTemplate(S.notice_renamed, { old: pending.agentId, name });
+              const view = await renderPrivateMainMenu(chatKey, { notice, locale });
+              await editMenuMessage({ chatId: pending.panelChatId, messageId: pending.panelMessageId, view });
+            } catch (e) {
+              const view = await renderPrivateRenameMenu(chatKey, pending.agentId, { error: formatGatewayErrorForUser(e, { locale }), locale });
               await editMenuMessage({ chatId: pending.panelChatId, messageId: pending.panelMessageId, view });
             }
             return;
