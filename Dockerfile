@@ -1,10 +1,10 @@
-FROM golang:1.22-bookworm AS node-host-go-builder
+FROM golang:1.22-trixie AS node-host-go-builder
 
 WORKDIR /src/apps/node-host-go
 COPY apps/node-host-go/ ./
 RUN CGO_ENABLED=0 go build -trimpath -ldflags "-s -w" -o /out/argus ./cmd/argus
 
-FROM node:22-bookworm-slim
+FROM node:22-trixie-slim
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
   ca-certificates \
