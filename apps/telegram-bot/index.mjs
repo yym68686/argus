@@ -1457,6 +1457,7 @@ async function main() {
   const localeByChatKey = new Map(); // chatKey -> "zh" | "en"
 
   const MENU_AGENT_PAGE_SIZE = 8;
+  const MENU_AUTO_DELETE_MS = 30 * 60_000;
   const UNBOUND_WARN_COOLDOWN_MS = 5 * 60_000;
 
   function localeForChatKey(chatKey, languageCode) {
@@ -1542,6 +1543,21 @@ async function main() {
     } catch {
       return null;
     }
+  }
+
+  function scheduleMenuAutoDelete({ chatId, menuMessageId, commandMessageId } = {}) {
+    const cid = Number(chatId);
+    const menuId = Number(menuMessageId);
+    const cmdId = Number(commandMessageId);
+    if (!Number.isFinite(cid) || !Number.isFinite(menuId)) return;
+    setTimeout(() => {
+      void queue.enqueue(async () => {
+        await safeDeleteMessage({ chat_id: cid, message_id: menuId });
+        if (Number.isFinite(cmdId)) {
+          await safeDeleteMessage({ chat_id: cid, message_id: cmdId });
+        }
+      });
+    }, MENU_AUTO_DELETE_MS);
   }
 
   async function safeAnswerCallbackQuery(id, text) {
@@ -2354,7 +2370,12 @@ async function main() {
             }
 
             if (slash?.known && slash.cmd === "menu") {
-              await sendMenuMessage({ target, chatKey, chatType, locale });
+              const sent = await sendMenuMessage({ target, chatKey, chatType, locale });
+              scheduleMenuAutoDelete({
+                chatId: target.chat_id,
+                menuMessageId: sent?.message_id,
+                commandMessageId: message?.message_id
+              });
               return;
             }
 
