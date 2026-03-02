@@ -7,8 +7,8 @@ import (
 	"os"
 	"os/signal"
 
-	"github.com/yym68686/argus/apps/node-host-go/internal/jobstore"
-	"github.com/yym68686/argus/apps/node-host-go/internal/nodehost"
+	"github.com/yym68686/argus/apps/node-host/internal/jobstore"
+	"github.com/yym68686/argus/apps/node-host/internal/nodehost"
 )
 
 func main() {

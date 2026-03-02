@@ -1,4 +1,4 @@
-name: release-node-host-go
+name: release-node-host
 
 on:
   push:
@@ -39,18 +39,18 @@ jobs:
           echo "value=${{ github.ref_name }}" >> "$GITHUB_OUTPUT"
 
       - name: Test
-        working-directory: apps/node-host-go
+        working-directory: apps/node-host
         run: go test ./...
 
       - name: Build binaries
         shell: bash
         run: |
           set -euo pipefail
-          out_dir="dist/node-host-go"
+          out_dir="dist/node-host"
           rm -rf "$out_dir"
           mkdir -p "$out_dir"
 
-          cd apps/node-host-go
+          cd apps/node-host
           export CGO_ENABLED=0
 
           GOOS=darwin GOARCH=arm64 go build -trimpath -ldflags "-s -w" -o "../../$out_dir/argus-darwin-arm64" ./cmd/argus
@@ -64,6 +64,6 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ steps.tag.outputs.value }}
-          files: dist/node-host-go/*
+          files: dist/node-host/*
           fail_on_unmatched_files: true
           generate_release_notes: true

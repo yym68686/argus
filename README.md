@@ -110,7 +110,7 @@ Nodes let the assistant execute commands on your devices (e.g. your Mac).
 Start a node-host on your Mac:
 
 ```bash
-cd apps/node-host-go
+cd apps/node-host
 go build -o argus ./cmd/argus
 ./argus \
   --url "ws://127.0.0.1:8080/nodes/ws?token=argus-node-v1.<sessionId>.<sig>" \
@@ -174,8 +174,7 @@ They apply to **new** sessions. Existing containers need `docker update` or recr
 - `Dockerfile`: runtime image (JSONL over stdio → TCP `:7777` bridge)
 - `apps/api/`: gateway (HTTP + WS `/ws`)
 - `apps/telegram-bot/`: Telegram bot (inbound + typing)
-- `apps/node-host-go/`: node-host (Go; device command runner)
-- `apps/node-host/`: legacy node-host (JS)
+- `apps/node-host/`: node-host (Go; device command runner)
 - `apps/web/`: optional web UI (debug)
 - `docker-compose.yml`: one-command local/server deployment
 - `REMOTE_CLIENT_GUIDE.md`: client integration (protocol, reconnection, examples)

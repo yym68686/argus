@@ -110,7 +110,7 @@ Nodes 用于让助手在你的设备上执行命令（例如你的 Mac）。
 在 Mac 上启动 node-host：
 
 ```bash
-cd apps/node-host-go
+cd apps/node-host
 go build -o argus ./cmd/argus
 ./argus \
   --url "ws://127.0.0.1:8080/nodes/ws?token=argus-node-v1.<sessionId>.<sig>" \
@@ -174,8 +174,7 @@ export ARGUS_RUNTIME_PIDS_LIMIT="512"     # 可选
 - `Dockerfile`: runtime 镜像（JSONL over stdio → TCP `:7777` bridge）
 - `apps/api/`: 网关（HTTP + WS `/ws`）
 - `apps/telegram-bot/`: Telegram bot（入站 + typing）
-- `apps/node-host-go/`: node-host（Go；设备命令执行）
-- `apps/node-host/`: 旧版 node-host（JS）
+- `apps/node-host/`: node-host（Go；设备命令执行）
 - `apps/web/`: 可选 Web UI（调试用）
 - `docker-compose.yml`: 一键部署
 - `REMOTE_CLIENT_GUIDE.md`: 客户端接入（协议、重连、示例）

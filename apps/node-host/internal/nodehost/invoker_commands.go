@@ -5,8 +5,8 @@ import (
 	"os/exec"
 	"strings"
 
-	"github.com/yym68686/argus/apps/node-host-go/internal/jobstore"
-	"github.com/yym68686/argus/apps/node-host-go/internal/proto"
+	"github.com/yym68686/argus/apps/node-host/internal/jobstore"
+	"github.com/yym68686/argus/apps/node-host/internal/proto"
 )
 
 type CommandInvoker struct {
@@ -141,4 +141,3 @@ func (ci *CommandInvoker) Invoke(ctx context.Context, req InvokeRequest) InvokeO
 		return InvokeOutcome{OK: false, Error: &proto.InvokeError{Code: "UNSUPPORTED", Message: "unsupported command: " + cmd}}
 	}
 }
-

@@ -14,7 +14,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/yym68686/argus/apps/node-host-go/internal/util"
+	"github.com/yym68686/argus/apps/node-host/internal/util"
 )
 
 const (

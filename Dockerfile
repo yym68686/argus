@@ -1,7 +1,7 @@
-FROM golang:1.26-trixie AS node-host-go-builder
+FROM golang:1.26-trixie AS node-host-builder
 
-WORKDIR /src/apps/node-host-go
-COPY apps/node-host-go/ ./
+WORKDIR /src/apps/node-host
+COPY apps/node-host/ ./
 RUN CGO_ENABLED=0 go build -trimpath -ldflags "-s -w" -o /out/argus ./cmd/argus
 
 FROM node:22-trixie-slim
@@ -34,7 +34,7 @@ COPY run_app_server.sh /app/run_app_server.sh
 RUN chmod +x /app/run_app_server.sh
 
 RUN mkdir -p /app/node-host
-COPY --from=node-host-go-builder /out/argus /app/node-host/argus
+COPY --from=node-host-builder /out/argus /app/node-host/argus
 
 WORKDIR /root/.argus/workspace
 
