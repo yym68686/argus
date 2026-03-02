@@ -145,6 +145,18 @@ open http://127.0.0.1:3000
 - 安装/构建命令：`ARGUS_RUNTIME_INSTALL_CMD`（默认安装 `@openai/codex`）
 - 启动命令：`ARGUS_RUNTIME_CMD`（默认 `codex app-server`）
 
+### OpenAI 凭据（推荐）
+
+为了避免把长期有效的 OpenAI API Key 放进每个 runtime 容器里，建议把 `OPENAI_API_KEY` 只配置在 **gateway** 上。
+当 `OPENAI_API_KEY` 存在时，gateway 会暴露一个范围很窄的 `/openai/v1/responses` 代理，并自动把 runtime 配置为走这个代理。
+
+说明：
+
+- Key **不会**被传入 runtime 容器。
+- runtime 会写入一个生成的 `~/.codex/config.toml`（不包含任何 secrets），用于把 Codex 指向 gateway 的 MCP 以及可选的 OpenAI 代理。
+- 代理要求每个 session 的派生 Bearer token（master：`ARGUS_OPENAI_TOKEN`；未设置则回退到 `ARGUS_TOKEN`）。
+- 可选：用 `ARGUS_OPENAI_RESPONSES_UPSTREAM_URL` 覆盖上游地址（默认：`https://api.openai.com/v1/responses`）。
+
 要替换 runtime，在 `docker compose up --build` 之前设置这两个环境变量即可。
 
 高级项：

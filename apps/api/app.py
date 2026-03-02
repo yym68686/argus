@@ -17,9 +17,9 @@ from pathlib import Path
 from typing import Any, Optional
 
 import requests
-from fastapi import FastAPI, HTTPException, Request, Response, WebSocket, WebSocketDisconnect
+from fastapi import Body, FastAPI, HTTPException, Request, Response, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, PlainTextResponse
+from fastapi.responses import JSONResponse, PlainTextResponse, StreamingResponse
 from starlette.websockets import WebSocketState
 
 from croniter import croniter
@@ -4374,6 +4374,72 @@ async def robots():
     return PlainTextResponse("User-agent: *\nDisallow: /\n")
 
 
+@app.post("/openai/v1/responses")
+def openai_responses_proxy(request: Request, body: Any = Body(...)):
+    _openai_proxy_require_token(request)
+
+    if request.url.query:
+        raise HTTPException(status_code=403, detail="Query strings are not allowed on this endpoint")
+
+    openai_api_key = (os.getenv("OPENAI_API_KEY") or os.getenv("ARGUS_OPENAI_API_KEY") or "").strip()
+    if not openai_api_key:
+        raise HTTPException(status_code=503, detail="OpenAI proxy is not configured (missing OPENAI_API_KEY)")
+
+    upstream_url = (os.getenv("ARGUS_OPENAI_RESPONSES_UPSTREAM_URL") or "https://api.openai.com/v1/responses").strip()
+
+    hop_by_hop = {
+        "connection",
+        "keep-alive",
+        "proxy-authenticate",
+        "proxy-authorization",
+        "te",
+        "trailers",
+        "transfer-encoding",
+        "upgrade",
+        "host",
+        "content-length",
+        "authorization",
+    }
+    forward_headers: dict[str, str] = {}
+    for k, v in request.headers.items():
+        lk = k.lower()
+        if lk in hop_by_hop:
+            continue
+        if v is None:
+            continue
+        forward_headers[k] = v
+
+    forward_headers["Authorization"] = f"Bearer {openai_api_key}"
+
+    try:
+        upstream = requests.post(
+            upstream_url,
+            json=body,
+            headers=forward_headers,
+            stream=True,
+            timeout=(10, 600),
+        )
+    except requests.RequestException as e:
+        raise HTTPException(status_code=502, detail=f"OpenAI upstream request failed: {e}") from e
+
+    content_type = upstream.headers.get("content-type") or "application/octet-stream"
+
+    def iter_bytes():
+        try:
+            for chunk in upstream.iter_content(chunk_size=65536):
+                if chunk:
+                    yield chunk
+        finally:
+            upstream.close()
+
+    if "text/event-stream" in content_type.lower():
+        return StreamingResponse(iter_bytes(), status_code=upstream.status_code, media_type=content_type)
+
+    content = upstream.content
+    upstream.close()
+    return Response(content=content, status_code=upstream.status_code, media_type=content_type)
+
+
 @app.get("/mcp")
 async def mcp_get(request: Request):
     _mcp_require_token(request)
@@ -6198,6 +6264,55 @@ def _node_verify_derived_session_token(master: str, token: str) -> Optional[str]
     return sid
 
 
+_OPENAI_PROXY_DERIVED_TOKEN_PREFIX = "argus-openai-v1"
+
+
+def _openai_proxy_derive_session_token(master: str, session_id: str) -> str:
+    sid = str(session_id or "").strip()
+    if not sid:
+        raise ValueError("session_id must not be empty")
+    mac = hmac.new(master.encode("utf-8"), sid.encode("utf-8"), hashlib.sha256).digest()
+    sig = _b64url_no_pad(mac)[:32]
+    return f"{_OPENAI_PROXY_DERIVED_TOKEN_PREFIX}.{sid}.{sig}"
+
+
+def _openai_proxy_verify_derived_session_token(master: str, token: str) -> Optional[str]:
+    t = str(token or "").strip()
+    if not t:
+        return None
+    parts = t.split(".", 2)
+    if len(parts) != 3:
+        return None
+    prefix, sid, sig = parts
+    if prefix != _OPENAI_PROXY_DERIVED_TOKEN_PREFIX:
+        return None
+    if not sid or not sig:
+        return None
+    expected = _openai_proxy_derive_session_token(master, sid)
+    if hmac.compare_digest(expected, t):
+        return sid
+    return None
+
+
+def _openai_proxy_require_token(request: Request):
+    # OpenAI API key proxy auth is scoped per runtime session.
+    #
+    # - The gateway reads a master secret from ARGUS_OPENAI_TOKEN (fallback: ARGUS_TOKEN).
+    # - Each runtime container receives a derived per-session token as ARGUS_OPENAI_TOKEN.
+    # - Requests authenticated with the derived token are accepted.
+    # - The raw master token is NOT accepted directly.
+    master = os.getenv("ARGUS_OPENAI_TOKEN") or os.getenv("ARGUS_TOKEN") or None
+    request.state.openai_scoped_session_id = None
+    if master is None:
+        raise HTTPException(status_code=503, detail="OpenAI proxy is not configured")
+    provided = _extract_token_http(request) or ""
+    scoped = _openai_proxy_verify_derived_session_token(master, provided)
+    if scoped:
+        request.state.openai_scoped_session_id = scoped
+        return
+    raise HTTPException(status_code=401, detail="Unauthorized")
+
+
 def _jsonrpc_error(*, request_id: Any, code: int, message: str, data: Any = None) -> dict[str, Any]:
     err: dict[str, Any] = {"code": code, "message": message}
     if data is not None:
@@ -6450,6 +6565,17 @@ def _docker_create_container_sync(cfg: DockerProvisionConfig, session_id: str):
     env["ARGUS_NODE_ID"] = f"runtime:{session_id}"
     env["ARGUS_NODE_DISPLAY_NAME"] = f"runtime-{session_id}"
     env["ARGUS_SESSION_ID"] = session_id
+
+    # Codex runtime (optional): configure gateway MCP URL for tool access.
+    env["ARGUS_CODEX_MCP_URL"] = f"http://{gateway_internal_host}:8080/mcp"
+
+    # Optional: OpenAI Responses proxy (keeps OPENAI_API_KEY out of the runtime container).
+    openai_api_key = (os.getenv("OPENAI_API_KEY") or os.getenv("ARGUS_OPENAI_API_KEY") or "").strip() or None
+    openai_master = os.getenv("ARGUS_OPENAI_TOKEN") or gateway_token
+    if openai_api_key and openai_master:
+        env["ARGUS_OPENAI_TOKEN"] = _openai_proxy_derive_session_token(openai_master, session_id)
+        env["ARGUS_CODEX_OPENAI_PROXY_BASE_URL"] = f"http://{gateway_internal_host}:8080/openai/v1"
+
     volumes = {}
     if cfg.home_host_path:
         volumes[cfg.home_host_path] = {"bind": cfg.home_container_path, "mode": "rw"}

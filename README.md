@@ -145,6 +145,18 @@ Default runtime (Codex):
 - Build/install command: `ARGUS_RUNTIME_INSTALL_CMD` (defaults to installing `@openai/codex`)
 - Start command: `ARGUS_RUNTIME_CMD` (defaults to `codex app-server`)
 
+### OpenAI credentials (recommended)
+
+To avoid putting your long-lived OpenAI API key inside each runtime container, set `OPENAI_API_KEY` on the **gateway**.
+When `OPENAI_API_KEY` is set, the gateway exposes a narrow `/openai/v1/responses` proxy and each runtime is configured to use it automatically.
+
+Notes:
+
+- The key is **not** passed into runtime containers.
+- The runtime writes a generated `~/.codex/config.toml` (no secrets) to point Codex at the gateway MCP server and optional OpenAI proxy.
+- The proxy requires a per-session derived bearer token (master: `ARGUS_OPENAI_TOKEN`, fallback: `ARGUS_TOKEN`).
+- Optional: override the upstream URL with `ARGUS_OPENAI_RESPONSES_UPSTREAM_URL` (default: `https://api.openai.com/v1/responses`).
+
 To swap runtimes, set these before `docker compose up --build`.
 
 Advanced:

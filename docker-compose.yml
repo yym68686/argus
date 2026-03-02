@@ -28,6 +28,12 @@ services:
       ARGUS_RUNTIME_CMD: ${ARGUS_RUNTIME_CMD:-codex app-server}
       # Optional: require auth for /ws (Authorization: Bearer ... or ?token=...).
       ARGUS_TOKEN: ${ARGUS_TOKEN:-}
+      # Optional: OpenAI key held by the gateway (used by /openai proxy; not passed to runtimes).
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      # Optional: master secret for derived OpenAI proxy tokens (fallback: ARGUS_TOKEN).
+      ARGUS_OPENAI_TOKEN: ${ARGUS_OPENAI_TOKEN:-}
+      # Optional: override OpenAI Responses upstream URL for the gateway proxy.
+      ARGUS_OPENAI_RESPONSES_UPSTREAM_URL: ${ARGUS_OPENAI_RESPONSES_UPSTREAM_URL:-}
       # Optional: separate auth scopes (fallback to ARGUS_TOKEN when unset).
       ARGUS_NODE_TOKEN: ${ARGUS_NODE_TOKEN:-}
       ARGUS_MCP_TOKEN: ${ARGUS_MCP_TOKEN:-}
