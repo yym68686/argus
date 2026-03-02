@@ -90,18 +90,21 @@ http_get() {
     fi
     return $?
   fi
-  python3 - <<PY
-import os, sys, json, urllib.request
-url=sys.argv[1]
-token=sys.argv[2]
-headers={}
+  python3 - "$url" "$token" <<'PY'
+import sys
+import urllib.request
+
+url = sys.argv[1]
+token = sys.argv[2]
+
+headers = {}
 if token:
-  headers["Authorization"]="Bearer "+token
-req=urllib.request.Request(url, headers=headers)
+  headers["Authorization"] = "Bearer " + token
+
+req = urllib.request.Request(url, headers=headers)
 with urllib.request.urlopen(req, timeout=10) as r:
-  data=r.read()
-sys.stdout.buffer.write(data)
-PY "$url" "$token"
+  sys.stdout.buffer.write(r.read())
+PY
 }
 
 write_summary() {
