@@ -60,9 +60,9 @@ docker compose down
 - `ARGUS_HOME_HOST_PATH`（默认：`${HOME}/.argus`）
   - 网关自动化状态：`${ARGUS_HOME_HOST_PATH}/gateway/state.json`
 
-每个 runtime session 容器只会把**一个宿主机 workspace 目录**挂载到 `/root/.argus/workspace`。
+每个 runtime session 容器只会把**一个宿主机 workspace 目录**挂载到 `/workspace`。
 
-- Codex 的状态（threads/历史记录、配置）默认存放在 `/root/.argus/workspace/.codex`（按 workspace 隔离）。
+- Codex 的状态（threads/历史记录、配置）默认存放在 `/workspace/.codex`（按 workspace 隔离）。
 - 宿主机工作区目录：
   - Telegram 私聊 agent：`${ARGUS_HOME_HOST_PATH}/workspace-<tgid>-<name>`（例如 `${ARGUS_HOME_HOST_PATH}/workspace-182262230-main`）
   - 通用 `/ws` session：`${ARGUS_HOME_HOST_PATH}/workspaces/sess-<sessionId>`
@@ -163,7 +163,7 @@ open http://127.0.0.1:3000
 
 - Key **不会**被传入 runtime 容器。
 - runtime 会写入一个生成的 `CODEX_HOME/config.toml`（不包含任何 secrets），用于把 Codex 指向 gateway 的 MCP 以及可选的 OpenAI 代理。
-  - 默认 `CODEX_HOME`：`/root/.argus/workspace/.codex`（按 workspace 隔离）
+  - 默认 `CODEX_HOME`：`/workspace/.codex`（按 workspace 隔离）
 - 代理要求每个 session 的派生 Bearer token（master：`ARGUS_OPENAI_TOKEN`；未设置则回退到 `ARGUS_TOKEN`）。
 - 可选：用 `ARGUS_OPENAI_RESPONSES_UPSTREAM_URL` 覆盖上游地址（默认：`https://api.openai.com/v1/responses`）。
 

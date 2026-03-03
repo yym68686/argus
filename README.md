@@ -60,9 +60,9 @@ By default Argus persists data on the Docker host at:
 - `ARGUS_HOME_HOST_PATH` (default: `${HOME}/.argus`)
   - Gateway automation state: `${ARGUS_HOME_HOST_PATH}/gateway/state.json`
 
-Each runtime session container mounts a **single host workspace directory** at `/root/.argus/workspace`.
+Each runtime session container mounts a **single host workspace directory** at `/workspace`.
 
-- Codex state (threads/history, config) is stored under `/root/.argus/workspace/.codex` by default.
+- Codex state (threads/history, config) is stored under `/workspace/.codex` by default.
 - Host workspace directories:
   - Telegram DM agents: `${ARGUS_HOME_HOST_PATH}/workspace-<tgid>-<name>` (e.g. `${ARGUS_HOME_HOST_PATH}/workspace-182262230-main`)
   - Generic `/ws` sessions: `${ARGUS_HOME_HOST_PATH}/workspaces/sess-<sessionId>`
@@ -163,7 +163,7 @@ Notes:
 
 - The key is **not** passed into runtime containers.
 - The runtime writes a generated `CODEX_HOME/config.toml` (no secrets) to point Codex at the gateway MCP server and optional OpenAI proxy.
-  - Default `CODEX_HOME`: `/root/.argus/workspace/.codex` (workspace-scoped)
+  - Default `CODEX_HOME`: `/workspace/.codex` (workspace-scoped)
 - The proxy requires a per-session derived bearer token (master: `ARGUS_OPENAI_TOKEN`, fallback: `ARGUS_TOKEN`).
 - Optional: override the upstream URL with `ARGUS_OPENAI_RESPONSES_UPSTREAM_URL` (default: `https://api.openai.com/v1/responses`).
 

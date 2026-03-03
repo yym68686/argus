@@ -1346,7 +1346,7 @@ async function main() {
   const gatewayHttpUrl = gatewayHttpUrlRaw || deriveHttpBaseFromWsUrl(gatewayWsUrl) || fromHost.httpBase;
 
   const argusToken = isNonEmptyString(process.env.ARGUS_TOKEN) ? process.env.ARGUS_TOKEN : null;
-  const cwd = process.env.ARGUS_CWD || "/root/.argus/workspace";
+  const cwd = process.env.ARGUS_CWD || "/workspace";
   const statePathEnv = stripOuterQuotes(process.env.STATE_PATH);
   let statePath;
   if (isNonEmptyString(statePathEnv)) {

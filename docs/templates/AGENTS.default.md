@@ -71,7 +71,7 @@ Example (Telegram progress update):
 If you treat this workspace as Clawd’s “memory”, make it a git repo (ideally private) so `AGENTS.md` and your memory files are backed up.
 
 ```bash
-cd ~/.argus/workspace
+cd /workspace
 git init
 git add AGENTS.md
 git commit -m "Add Clawd workspace"

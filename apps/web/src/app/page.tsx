@@ -693,7 +693,7 @@ export default function Page() {
   type ActivePane = "chat" | "connection";
 
   const [wsUrl, setWsUrl] = React.useState<string>("");
-  const [cwd, setCwd] = React.useState<string>("/root/.argus/workspace");
+  const [cwd, setCwd] = React.useState<string>("/workspace");
   const [approvalPolicy, setApprovalPolicy] = React.useState<ApprovalPolicy>("never");
 
   const [activePane, setActivePane] = React.useState<ActivePane>("chat");

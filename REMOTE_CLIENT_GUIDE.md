@@ -48,7 +48,7 @@ export ARGUS_TOKEN="<ARGUS_TOKEN>"
 ```
 字段含义：`attached=true` 表示你通过 `?session=<SESSION_ID>` 重新挂载到已有 session；`created=true` 表示本次连接新建了 runtime 容器（否则为复用已有容器）。
 5) WebSocket 断开后：容器会被保留（你可以通过 `DELETE /sessions/<SESSION_ID>` 手动删除）  
-6) 对话线程（thread）会写入 runtime 的持久化 workspace（默认在 `/root/.argus/workspace/.codex`；网关会为每个 session 挂载独立 workspace）
+6) 对话线程（thread）会写入 runtime 的持久化 workspace（默认在 `/workspace/.codex`；网关会为每个 session 挂载独立 workspace）
    - 恢复“工作上下文”：`thread/resume`
    - 拉取“历史消息/回放记录”：`thread/read` + `includeTurns: true`（用于 UI/客户端刷新后回填聊天记录）
 
@@ -132,7 +132,7 @@ curl -sS -X DELETE -H "Authorization: Bearer $ARGUS_TOKEN" "http://$HOST:8080/se
 
 #### 新开 thread
 ```json
-{"method":"thread/start","id":1,"params":{"cwd":"/root/.argus/workspace","approvalPolicy":"never","sandbox":"workspace-write"}}
+{"method":"thread/start","id":1,"params":{"cwd":"/workspace","approvalPolicy":"never","sandbox":"workspace-write"}}
 ```
 
 响应示例（拿到 `thread.id`，务必保存）：
@@ -152,7 +152,7 @@ curl -sS -X DELETE -H "Authorization: Bearer $ARGUS_TOKEN" "http://$HOST:8080/se
 
 #### 发起一次对话 turn（发 prompt）
 ```json
-{"method":"turn/start","id":3,"params":{"threadId":"thr_123","input":[{"type":"text","text":"say test"}],"cwd":"/root/.argus/workspace","approvalPolicy":"never","sandboxPolicy":{"type":"externalSandbox","networkAccess":"enabled"}}}
+{"method":"turn/start","id":3,"params":{"threadId":"thr_123","input":[{"type":"text","text":"say test"}],"cwd":"/workspace","approvalPolicy":"never","sandboxPolicy":{"type":"externalSandbox","networkAccess":"enabled"}}}
 ```
 
 之后你会收到大量 `notification`（`method` 字段存在、没有 `id`），典型包括：
@@ -243,14 +243,14 @@ ws.on("open", async () => {
   await rpc("initialize", { clientInfo: { name: "node_client", title: "Node Client", version: "0.0.1" } });
   send({ method: "initialized", params: {} });
 
-  const t = await rpc("thread/start", { cwd: "/root/.argus/workspace", approvalPolicy: "never", sandbox: "workspace-write" });
+  const t = await rpc("thread/start", { cwd: "/workspace", approvalPolicy: "never", sandbox: "workspace-write" });
   const threadId = t.thread.id;
   console.log("threadId =", threadId);
 
   await rpc("turn/start", {
     threadId,
     input: [{ type: "text", text: "say test" }],
-    cwd: "/root/.argus/workspace",
+    cwd: "/workspace",
     approvalPolicy: "never",
     sandboxPolicy: { type: "externalSandbox", networkAccess: "enabled" },
   });

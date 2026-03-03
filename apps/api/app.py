@@ -45,7 +45,7 @@ class DockerProvisionConfig:
     home_host_path: Optional[str]
     workspace_host_path: Optional[str]
     home_container_path: str = "/root/.argus"
-    workspace_container_path: str = "/root/.argus/workspace"
+    workspace_container_path: str = "/workspace"
     runtime_cmd: Optional[str] = None
     connect_timeout_s: float = 30.0
     jsonl_line_limit_bytes: int = 8 * 1024 * 1024
@@ -3480,7 +3480,7 @@ class AutomationManager:
                 if not name:
                     continue
                 description = (meta.get("description") or "").strip()
-                location = f"/root/.argus/workspace/{SKILLS_DIRNAME}/{skill_dir.name}/{SKILL_MD_FILENAME}"
+                location = f"/workspace/{SKILLS_DIRNAME}/{skill_dir.name}/{SKILL_MD_FILENAME}"
                 skills.append({"name": name, "description": description, "location": location})
 
             if not skills:
@@ -6746,6 +6746,7 @@ def _docker_create_container_sync(cfg: DockerProvisionConfig, session_id: str):
     if cfg.runtime_cmd:
         env["APP_SERVER_CMD"] = cfg.runtime_cmd
     env["APP_HOME"] = cfg.home_container_path
+    env["APP_WORKSPACE"] = cfg.workspace_container_path
     # Pass gateway tokens through to the runtime so the agent can authenticate
     # against gateway-provided services (e.g. MCP at /mcp).
     #

@@ -8,7 +8,7 @@ if [ -z "${APP_SERVER_CMD:-}" ]; then
 fi
 
 APP_HOME_DIR="${APP_HOME:-/root/.argus}"
-APP_WORKSPACE_DIR="${APP_WORKSPACE:-$APP_HOME_DIR/workspace}"
+APP_WORKSPACE_DIR="${APP_WORKSPACE:-/workspace}"
 
 mkdir -p "$APP_HOME_DIR" "$APP_WORKSPACE_DIR"
 

@@ -22,11 +22,10 @@ RUN if [ -z "${APP_SERVER_INSTALL_CMD:-}" ]; then \
     fi \
     && sh -lc "$APP_SERVER_INSTALL_CMD"
 
-ENV APP_HOME=/root/.argus
+ENV APP_HOME=/root/.argus \
+    APP_WORKSPACE=/workspace
 
-RUN mkdir -p /root/.argus/workspace /app \
-  && if [ -e /workspace ]; then rm -rf /workspace; fi \
-  && ln -s /root/.argus/workspace /workspace
+RUN mkdir -p /root/.argus /workspace /app
 
 COPY docs/templates /app/docs/templates
 
@@ -36,7 +35,7 @@ RUN chmod +x /app/run_app_server.sh
 RUN mkdir -p /app/node-host
 COPY --from=node-host-builder /out/argus /app/node-host/argus
 
-WORKDIR /root/.argus/workspace
+WORKDIR /workspace
 
 EXPOSE 7777
 
