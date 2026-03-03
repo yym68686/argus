@@ -1243,6 +1243,17 @@ def _normalize_runtime_session_id(raw: Any) -> str:
     return sid
 
 
+def _is_missing_thread_for_archive_error(msg: str) -> bool:
+    s = str(msg or "").strip().lower()
+    if not s:
+        return False
+    # Codex app-server uses rollout ids internally for threads; older threads can become
+    # unreachable after storage/layout migrations (e.g. workspace-scoped CODEX_HOME).
+    if "no rollout found" in s and "thread" in s:
+        return True
+    return False
+
+
 def _normalize_agent_id(raw: Any) -> str:
     if not isinstance(raw, str):
         return ""
@@ -2698,17 +2709,55 @@ class AutomationManager:
         archived_ids: set[str] = set()
         for r in to_archive:
             try:
+                await self._ensure_thread_loaded_or_resumed(live, r.thread_id)
+            except Exception as e:
+                msg = str(e)
+                if _is_missing_thread_for_archive_error(msg):
+                    # Treat missing threads as already-archived so we don't spam logs or retry forever.
+                    archived_ids.add(r.run_id)
+                    log.info(
+                        "Cron retention: thread already missing; marking archived for %s/%s runId=%s threadId=%s (%s)",
+                        sid,
+                        jid,
+                        r.run_id,
+                        r.thread_id,
+                        msg,
+                    )
+                else:
+                    log.warning(
+                        "Failed to load cron run thread for archiving %s/%s runId=%s threadId=%s: %s",
+                        sid,
+                        jid,
+                        r.run_id,
+                        r.thread_id,
+                        msg,
+                    )
+                continue
+            try:
                 await self._rpc(live, "thread/archive", {"threadId": r.thread_id})
                 archived_ids.add(r.run_id)
             except Exception as e:
-                log.warning(
-                    "Failed to archive cron run thread for %s/%s runId=%s threadId=%s: %s",
-                    sid,
-                    jid,
-                    r.run_id,
-                    r.thread_id,
-                    str(e),
-                )
+                msg = str(e)
+                if _is_missing_thread_for_archive_error(msg):
+                    # Treat missing threads as already-archived so we don't spam logs or retry forever.
+                    archived_ids.add(r.run_id)
+                    log.info(
+                        "Cron retention: thread already missing; marking archived for %s/%s runId=%s threadId=%s (%s)",
+                        sid,
+                        jid,
+                        r.run_id,
+                        r.thread_id,
+                        msg,
+                    )
+                else:
+                    log.warning(
+                        "Failed to archive cron run thread for %s/%s runId=%s threadId=%s: %s",
+                        sid,
+                        jid,
+                        r.run_id,
+                        r.thread_id,
+                        msg,
+                    )
 
         if not archived_ids:
             return
