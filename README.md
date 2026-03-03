@@ -55,11 +55,18 @@ docker compose down
 
 ## Data & workspace
 
-By default Argus stores data on the Docker host at:
+By default Argus persists data on the Docker host at:
 
 - `ARGUS_HOME_HOST_PATH` (default: `${HOME}/.argus`)
+  - Gateway automation state: `${ARGUS_HOME_HOST_PATH}/gateway/state.json`
 
-Each runtime session container mounts it as `/root/.argus`, with a workspace at `/root/.argus/workspace`.
+Each runtime session container mounts a **single host workspace directory** at `/root/.argus/workspace`.
+
+- Codex state (threads/history, config) is stored under `/root/.argus/workspace/.codex` by default.
+- Host workspace directories:
+  - Telegram DM agents: `${ARGUS_HOME_HOST_PATH}/workspace-<tgid>-<name>` (e.g. `${ARGUS_HOME_HOST_PATH}/workspace-182262230-main`)
+  - Generic `/ws` sessions: `${ARGUS_HOME_HOST_PATH}/workspaces/sess-<sessionId>`
+    - If `ARGUS_WORKSPACE_HOST_PATH` is set, generic sessions use `${ARGUS_WORKSPACE_HOST_PATH}/sess-<sessionId>` instead.
 
 On first run, the runtime bootstraps these workspace files **if missing** (it will not overwrite existing files):
 
@@ -80,6 +87,8 @@ When using `apps/telegram-bot`, the gateway can isolate runtime containers (agen
 - Use `/menu` to open the control panel:
   - **Switch Agent**: switch the current DM agent (workspace/session).
   - **Create Agent**: create a new agent (workspace/session) and switch to it.
+  - **Rename Agent**: rename the current agent (owner-only; non-`main`).
+  - **Delete Agent**: delete the current agent (owner-only; includes `main`). If you delete `main`, you’ll be prompted to create a new `main`.
   - **New Main Thread**: reset the main thread for the current agent (affects heartbeat + DM routing).
 - In groups/topics, run `/menu` in the chat/topic and use **Bind This Chat** to route that chat/topic to an agent.
 - Admin sharing: edit `${ARGUS_HOME_HOST_PATH}/gateway/state.json` and add the target user tgid into `allowedUserIds` for the desired `agentId`.
@@ -153,7 +162,8 @@ When `OPENAI_API_KEY` is set, the gateway exposes a narrow `/openai/v1/responses
 Notes:
 
 - The key is **not** passed into runtime containers.
-- The runtime writes a generated `~/.codex/config.toml` (no secrets) to point Codex at the gateway MCP server and optional OpenAI proxy.
+- The runtime writes a generated `CODEX_HOME/config.toml` (no secrets) to point Codex at the gateway MCP server and optional OpenAI proxy.
+  - Default `CODEX_HOME`: `/root/.argus/workspace/.codex` (workspace-scoped)
 - The proxy requires a per-session derived bearer token (master: `ARGUS_OPENAI_TOKEN`, fallback: `ARGUS_TOKEN`).
 - Optional: override the upstream URL with `ARGUS_OPENAI_RESPONSES_UPSTREAM_URL` (default: `https://api.openai.com/v1/responses`).
 
@@ -161,7 +171,7 @@ To swap runtimes, set these before `docker compose up --build`.
 
 Advanced:
 
-- `ARGUS_WORKSPACE_HOST_PATH`: mount a separate host workspace directory into the runtime (absolute path). If unset, the workspace stays under `${ARGUS_HOME_HOST_PATH}/workspace`.
+- `ARGUS_WORKSPACE_HOST_PATH`: optional base directory for auto-created `/ws` session workspaces (absolute path). When unset, generic sessions use `${ARGUS_HOME_HOST_PATH}/workspaces/sess-<sessionId>`.
 
 ## Resource limits (small servers)
 

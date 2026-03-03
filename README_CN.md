@@ -58,8 +58,15 @@ docker compose down
 默认情况下，Argus 会把数据存到 Docker 宿主机上：
 
 - `ARGUS_HOME_HOST_PATH`（默认：`${HOME}/.argus`）
+  - 网关自动化状态：`${ARGUS_HOME_HOST_PATH}/gateway/state.json`
 
-每个 runtime session 容器会把它挂载到 `/root/.argus`，并使用 `/root/.argus/workspace` 作为工作区。
+每个 runtime session 容器只会把**一个宿主机 workspace 目录**挂载到 `/root/.argus/workspace`。
+
+- Codex 的状态（threads/历史记录、配置）默认存放在 `/root/.argus/workspace/.codex`（按 workspace 隔离）。
+- 宿主机工作区目录：
+  - Telegram 私聊 agent：`${ARGUS_HOME_HOST_PATH}/workspace-<tgid>-<name>`（例如 `${ARGUS_HOME_HOST_PATH}/workspace-182262230-main`）
+  - 通用 `/ws` session：`${ARGUS_HOME_HOST_PATH}/workspaces/sess-<sessionId>`
+    - 如果设置了 `ARGUS_WORKSPACE_HOST_PATH`，通用 session 会改用 `${ARGUS_WORKSPACE_HOST_PATH}/sess-<sessionId>`。
 
 首次运行时，runtime 会在 workspace 根目录初始化这些文件（**仅在缺失时创建，不会覆盖已有文件**）：
 
@@ -80,6 +87,8 @@ docker compose down
 - 使用 `/menu` 打开控制面板：
   - **Switch Agent**：切换当前私聊使用的 agent（workspace/session）。
   - **Create Agent**：创建新的 agent 并切换过去（同名会报“已存在”）。
+  - **Rename Agent**：重命名当前 agent（仅 owner；不包含 `main`）。
+  - **Delete Agent**：删除当前 agent（仅 owner；包含 `main`）。删除 `main` 后，下次会提示创建新的 `main`。
   - **New Main Thread**：重置当前 agent 的 main thread（会影响 heartbeat 与私聊路由）。
 - 在群聊/话题中发送 `/menu`，使用 **Bind This Chat** 把该 chat/topic 绑定到一个 agent。
 - **共享/授权**：管理员可编辑 `${ARGUS_HOME_HOST_PATH}/gateway/state.json`，在对应 `agentId` 下把目标用户的 tgid 加入 `allowedUserIds`。
@@ -153,7 +162,8 @@ open http://127.0.0.1:3000
 说明：
 
 - Key **不会**被传入 runtime 容器。
-- runtime 会写入一个生成的 `~/.codex/config.toml`（不包含任何 secrets），用于把 Codex 指向 gateway 的 MCP 以及可选的 OpenAI 代理。
+- runtime 会写入一个生成的 `CODEX_HOME/config.toml`（不包含任何 secrets），用于把 Codex 指向 gateway 的 MCP 以及可选的 OpenAI 代理。
+  - 默认 `CODEX_HOME`：`/root/.argus/workspace/.codex`（按 workspace 隔离）
 - 代理要求每个 session 的派生 Bearer token（master：`ARGUS_OPENAI_TOKEN`；未设置则回退到 `ARGUS_TOKEN`）。
 - 可选：用 `ARGUS_OPENAI_RESPONSES_UPSTREAM_URL` 覆盖上游地址（默认：`https://api.openai.com/v1/responses`）。
 
@@ -161,7 +171,7 @@ open http://127.0.0.1:3000
 
 高级项：
 
-- `ARGUS_WORKSPACE_HOST_PATH`：把一个宿主机目录单独挂到 runtime 的 workspace（必须是绝对路径）。未设置时，workspace 默认位于 `${ARGUS_HOME_HOST_PATH}/workspace`。
+- `ARGUS_WORKSPACE_HOST_PATH`：可选的通用 `/ws` session workspace 基础目录（必须是绝对路径）。未设置时，通用 session 使用 `${ARGUS_HOME_HOST_PATH}/workspaces/sess-<sessionId>`。
 
 ## 资源限制（小机器推荐）
 

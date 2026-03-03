@@ -36,12 +36,16 @@ bootstrap_workspace_file "$TEMPLATE_DIR/USER.md" "$APP_WORKSPACE_DIR/USER.md"
 bootstrap_workspace_file "$TEMPLATE_DIR/AGENTS.default.md" "$APP_WORKSPACE_DIR/AGENTS.md"
 bootstrap_workspace_file "$TEMPLATE_DIR/HEARTBEAT.md" "$APP_WORKSPACE_DIR/HEARTBEAT.md"
 
+# Scope Codex state (threads/history, config, etc.) to the workspace by default.
+# This avoids cross-session leakage when multiple runtimes share the same host.
+CODEX_HOME_DIR="${CODEX_HOME:-$APP_WORKSPACE_DIR/.codex}"
+export CODEX_HOME="$CODEX_HOME_DIR"
+
 export HOME="$APP_HOME_DIR"
 
 # Seed Codex config in $CODEX_HOME/config.toml (no secrets).
 # Note: this overwrites any existing file.
 if command -v codex >/dev/null 2>&1; then
-  CODEX_HOME_DIR="${CODEX_HOME:-$HOME/.codex}"
   mkdir -p "$CODEX_HOME_DIR"
 
   tmp_cfg="$(mktemp "$CODEX_HOME_DIR/config.toml.XXXXXX")"

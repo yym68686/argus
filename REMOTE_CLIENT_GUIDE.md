@@ -48,7 +48,7 @@ export ARGUS_TOKEN="<ARGUS_TOKEN>"
 ```
 字段含义：`attached=true` 表示你通过 `?session=<SESSION_ID>` 重新挂载到已有 session；`created=true` 表示本次连接新建了 runtime 容器（否则为复用已有容器）。
 5) WebSocket 断开后：容器会被保留（你可以通过 `DELETE /sessions/<SESSION_ID>` 手动删除）  
-6) 对话线程（thread）会写入 runtime 的持久化 home 目录（由 `ARGUS_HOME_HOST_PATH` 挂载）
+6) 对话线程（thread）会写入 runtime 的持久化 workspace（默认在 `/root/.argus/workspace/.codex`；网关会为每个 session 挂载独立 workspace）
    - 恢复“工作上下文”：`thread/resume`
    - 拉取“历史消息/回放记录”：`thread/read` + `includeTurns: true`（用于 UI/客户端刷新后回填聊天记录）
 

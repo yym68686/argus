@@ -28,6 +28,7 @@ from croniter import croniter
 log = logging.getLogger("argus_gateway")
 
 RUNTIME_LAYOUT = "root_argus_v1"
+RUNTIME_SESSION_ID_RE = re.compile(r"^[a-f0-9]{12}$")
 
 
 @dataclass(frozen=True)
@@ -1231,6 +1232,17 @@ AGENT_ID_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9_-]{0,63}$")
 TELEGRAM_PRIVATE_CHAT_ID_RE = re.compile(r"^[1-9]\d{0,19}$")
 
 
+def _normalize_runtime_session_id(raw: Any) -> str:
+    if not isinstance(raw, str):
+        return ""
+    sid = raw.strip().lower()
+    if not sid:
+        return ""
+    if not RUNTIME_SESSION_ID_RE.match(sid):
+        return ""
+    return sid
+
+
 def _normalize_agent_id(raw: Any) -> str:
     if not isinstance(raw, str):
         return ""
@@ -1878,6 +1890,141 @@ class AutomationManager:
 
             return agent2
 
+    async def delete_user_agent(self, *, user_id: int, chat_key: str, agent_id: str) -> dict[str, Any]:
+        if _provision_mode() != "docker":
+            raise RuntimeError("User agents are only supported in docker provision mode")
+        if not self._home_host_path:
+            raise RuntimeError("ARGUS_HOME_HOST_PATH is required to delete user agents")
+        if not isinstance(user_id, int) or user_id <= 0:
+            raise ValueError("Invalid userId")
+
+        ck = chat_key.strip() if isinstance(chat_key, str) else ""
+        if not ck:
+            raise ValueError("Missing chatKey")
+
+        aid = _normalize_agent_id(agent_id)
+        if not aid:
+            raise ValueError("Invalid agentId")
+
+        agent = self._get_agent(aid)
+        if agent is None:
+            raise ValueError(f"Unknown agent: {aid}")
+        if not (isinstance(agent.owner_user_id, int) and agent.owner_user_id == user_id):
+            raise PermissionError("Forbidden")
+
+        session_id = str(agent.session_id or "").strip()
+        if not session_id:
+            raise RuntimeError("Agent has no sessionId")
+
+        lock = self._session_restart_locks.get(session_id)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._session_restart_locks[session_id] = lock
+
+        deleted_container = False
+        archived_workspace_host_path: Optional[str] = None
+
+        async with lock:
+            home_root = Path(self._home_host_path).resolve()
+            main_id = self._user_main_agent_id(user_id=user_id)
+
+            def _write(st: PersistedGatewayAutomationState) -> None:
+                nonlocal archived_workspace_host_path
+                st.version = max(int(getattr(st, "version", 1) or 1), 3)
+                current = st.agents.get(aid)
+                if not isinstance(current, PersistedAgentRuntime):
+                    raise ValueError(f"Unknown agent: {aid}")
+                if not (isinstance(current.owner_user_id, int) and current.owner_user_id == user_id):
+                    raise PermissionError("Forbidden")
+
+                sid = str(current.session_id or "").strip()
+                if sid:
+                    ws_raw = str(current.workspace_host_path or "").strip()
+                    if ws_raw:
+                        try:
+                            old_ws = Path(ws_raw).resolve()
+                            if str(old_ws).startswith(str(home_root) + os.sep) and old_ws.exists() and old_ws.is_dir():
+                                cand = old_ws.with_name(f"{old_ws.name}.deleted-{sid}")
+                                if cand.exists():
+                                    cand = old_ws.with_name(f"{old_ws.name}.deleted-{sid}-{_now_ms()}")
+                                old_ws.rename(cand)
+                                archived_workspace_host_path = str(cand)
+                        except Exception as e:
+                            log.warning("Failed to archive workspace for deleted agent %s: %s", aid, str(e))
+
+                # Rebind the caller's private chat back to main; unbind other chats/topics.
+                for bound_ck, bound_aid in list(st.chat_bindings.items()):
+                    if bound_aid != aid:
+                        continue
+                    if aid == main_id:
+                        # Deleting main means the user has no default agent to fall back to.
+                        st.chat_bindings.pop(bound_ck, None)
+                        continue
+                    if bound_ck != ck:
+                        st.chat_bindings.pop(bound_ck, None)
+                        continue
+                    if main_id in st.agents:
+                        st.chat_bindings[bound_ck] = main_id
+                    else:
+                        st.chat_bindings.pop(bound_ck, None)
+
+                st.agents.pop(aid, None)
+
+                # Remove session automation state only if no other agent references it.
+                if sid:
+                    referenced_elsewhere = False
+                    for a2 in st.agents.values():
+                        if isinstance(a2, PersistedAgentRuntime) and str(a2.session_id or "").strip() == sid:
+                            referenced_elsewhere = True
+                            break
+                    if not referenced_elsewhere:
+                        st.sessions.pop(sid, None)
+
+            await self._store.update(_write)
+
+            try:
+                await self._force_close_live_session(session_id)
+            except Exception:
+                pass
+
+            if _provision_mode() == "docker":
+                try:
+                    container = await asyncio.to_thread(_docker_get_container_by_session_sync, session_id)
+                    if container is not None:
+                        await asyncio.to_thread(_docker_remove_container_sync, container)
+                        deleted_container = True
+                except Exception as e:
+                    log.warning("Failed to remove runtime container for deleted agent %s (session=%s): %s", aid, session_id, str(e))
+
+            self._clear_session_backoff(session_id)
+
+            # Drop in-memory lane state for the deleted session to avoid retrying followups.
+            for (sid, tid) in list(self._lanes.keys()):
+                if sid == session_id:
+                    self._lanes.pop((sid, tid), None)
+            for key in list(self._last_heartbeat_run_at_ms.keys()):
+                if key[0] == session_id:
+                    self._last_heartbeat_run_at_ms.pop(key, None)
+            for key in list(self._turn_text_by_key.keys()):
+                if key[0] == session_id:
+                    self._turn_text_by_key.pop(key, None)
+            for key in list(self._isolated_cron_context_by_key.keys()):
+                if key[0] == session_id:
+                    self._isolated_cron_context_by_key.pop(key, None)
+            self._main_thread_locks.pop(session_id, None)
+
+        main_agent = self._get_agent(main_id)
+        current_agent_id = main_agent.agent_id if main_agent is not None else None
+        current_session_id = self.resolve_agent_session_id(main_id) if current_agent_id else None
+        return {
+            "deletedAgentId": aid,
+            "deletedSessionId": session_id,
+            "archivedWorkspaceHostPath": archived_workspace_host_path,
+            "deletedContainer": deleted_container,
+            "currentAgentId": current_agent_id,
+            "currentSessionId": current_session_id,
+        }
+
     def can_user_access_agent_id(self, *, user_id: int, agent_id: str) -> bool:
         aid = _normalize_agent_id(agent_id)
         if not aid:
@@ -2061,6 +2208,13 @@ class AutomationManager:
             p = self.get_workspace_host_path_for_session(sid)
             if isinstance(p, str) and p.strip():
                 return Path(p)
+            derived = _derive_default_workspace_host_path_for_session(
+                sid,
+                home_host_path=self._home_host_path,
+                workspace_base_host_path=self._workspace_host_path,
+            )
+            if derived:
+                return Path(derived)
         return self._workspace_root()
 
     async def _ensure_workspace_files_at(self, root: Path) -> None:
@@ -6418,6 +6572,27 @@ def _resolve_workspace_host_path_for_session(session_id: str) -> Optional[str]:
         return None
 
 
+def _derive_default_workspace_host_path_for_session(
+    session_id: str,
+    *,
+    home_host_path: Optional[str],
+    workspace_base_host_path: Optional[str],
+) -> Optional[str]:
+    sid = _normalize_runtime_session_id(session_id)
+    if not sid:
+        return None
+    # NOTE: `ARGUS_WORKSPACE_HOST_PATH` is treated as a *base directory* for per-session workspaces.
+    if workspace_base_host_path:
+        if not os.path.isabs(workspace_base_host_path):
+            return None
+        return str((Path(workspace_base_host_path) / f"sess-{sid}").resolve())
+    if home_host_path:
+        if not os.path.isabs(home_host_path):
+            return None
+        return str((Path(home_host_path) / "workspaces" / f"sess-{sid}").resolve())
+    return None
+
+
 def _docker_api_timeout_s() -> float:
     # Keep Docker API calls snappy: the gateway should remain responsive even when Docker is slow/unavailable.
     # Reuse ARGUS_CONNECT_TIMEOUT_S as a coarse upper bound (no new env var).
@@ -6577,10 +6752,9 @@ def _docker_create_container_sync(cfg: DockerProvisionConfig, session_id: str):
         env["ARGUS_CODEX_OPENAI_PROXY_BASE_URL"] = f"http://{gateway_internal_host}:8080/openai/v1"
 
     volumes = {}
-    if cfg.home_host_path:
-        volumes[cfg.home_host_path] = {"bind": cfg.home_container_path, "mode": "rw"}
-    if cfg.workspace_host_path:
-        volumes[cfg.workspace_host_path] = {"bind": cfg.workspace_container_path, "mode": "rw"}
+    if not cfg.workspace_host_path:
+        raise RuntimeError("workspace root is not configured (ARGUS_HOME_HOST_PATH/ARGUS_WORKSPACE_HOST_PATH)")
+    volumes[cfg.workspace_host_path] = {"bind": cfg.workspace_container_path, "mode": "rw"}
 
     labels = {
         "io.argus.gateway": "apps/api",
@@ -6752,12 +6926,26 @@ async def _ensure_live_docker_session(session_id: str, *, allow_create: bool) ->
         return existing, False
 
     cfg = _docker_cfg()
-    # Multi-agent: mount a per-session workspace when configured in automation state.
+    # Resolve a per-session workspace host path (used as the *only* persistent mount for the runtime).
+    #
+    # Priority:
+    # 1) Persisted agent workspace override (Telegram DM isolation, admin-created agents, etc.)
+    # 2) Derived per-session workspace under ARGUS_WORKSPACE_HOST_PATH (base) or ARGUS_HOME_HOST_PATH/workspaces
     workspace_override = _resolve_workspace_host_path_for_session(session_id)
-    if workspace_override:
-        if not os.path.isabs(workspace_override):
-            raise RuntimeError(f"Invalid workspace override for session {session_id}: not an absolute path")
-        cfg = replace(cfg, workspace_host_path=workspace_override)
+    workspace_host_path = workspace_override or _derive_default_workspace_host_path_for_session(
+        session_id,
+        home_host_path=cfg.home_host_path,
+        workspace_base_host_path=cfg.workspace_host_path,
+    )
+    if not workspace_host_path:
+        raise RuntimeError("workspace root is not configured (ARGUS_HOME_HOST_PATH/ARGUS_WORKSPACE_HOST_PATH)")
+    if not os.path.isabs(workspace_host_path):
+        raise RuntimeError(f"Invalid workspaceHostPath for session {session_id}: not an absolute path")
+    try:
+        Path(workspace_host_path).mkdir(parents=True, exist_ok=True)
+    except Exception as e:
+        log.warning("Failed to create workspace directory for session %s at %s: %s", session_id, workspace_host_path, str(e))
+    cfg = replace(cfg, workspace_host_path=workspace_host_path)
     if not cfg.runtime_cmd:
         raise RuntimeError("ARGUS_RUNTIME_CMD is not set")
 
@@ -7227,6 +7415,48 @@ async def automation_agent_rename(request: Request):
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e)) from e
     return {"ok": True, "chatKey": chat_key, "agent": agent.to_json()}
+
+
+@app.post("/automation/agent/delete")
+async def automation_agent_delete(request: Request):
+    _http_require_token(request)
+    automation = _get_automation_or_500()
+    try:
+        body = await request.json()
+    except Exception as e:
+        raise HTTPException(status_code=400, detail="Invalid JSON body") from e
+    if not isinstance(body, dict):
+        raise HTTPException(status_code=400, detail="Invalid JSON body")
+
+    raw_chat_key = body.get("chatKey")
+    raw_aid = body.get("agentId") or body.get("name")
+    if not isinstance(raw_chat_key, str) or not raw_chat_key.strip():
+        raise HTTPException(status_code=400, detail="Missing 'chatKey'")
+    chat_key = raw_chat_key.strip()
+
+    user_id = _parse_telegram_private_user_id(chat_key)
+    if user_id is None:
+        raise HTTPException(status_code=400, detail="Invalid 'chatKey'")
+
+    main_id = _user_agent_id(user_id=user_id, short_name="main")
+    if not automation.can_user_access_agent_id(user_id=user_id, agent_id=main_id):
+        raise HTTPException(status_code=400, detail="Not initialized (run /start)")
+
+    aid_raw = _normalize_agent_id(raw_aid)
+    if not aid_raw:
+        raise HTTPException(status_code=400, detail="Invalid 'agentId'")
+    if re.match(r"^u\d+-", aid_raw):
+        agent_id = aid_raw
+    else:
+        agent_id = _user_agent_id(user_id=user_id, short_name=aid_raw)
+
+    try:
+        result = await automation.delete_user_agent(user_id=user_id, chat_key=chat_key, agent_id=agent_id)
+    except PermissionError as e:
+        raise HTTPException(status_code=403, detail=str(e)) from e
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    return {"ok": True, "chatKey": chat_key, **(result or {})}
 
 
 @app.post("/automation/chat/bind")
@@ -7881,7 +8111,11 @@ async def ws_proxy(ws: WebSocket):
 
         await ws.accept()
 
-        requested_session = (ws.query_params.get("session") or "").strip() or None
+        requested_session_raw = (ws.query_params.get("session") or "").strip() or None
+        requested_session = _normalize_runtime_session_id(requested_session_raw) if requested_session_raw else None
+        if requested_session_raw and not requested_session:
+            await ws.close(code=1008, reason="Invalid session")
+            return
         session_id = requested_session or uuid.uuid4().hex[:12]
         try:
             allow_create = not bool(requested_session)
@@ -7898,6 +8132,14 @@ async def ws_proxy(ws: WebSocket):
                             if isinstance(a, PersistedAgentRuntime) and a.session_id == requested_session:
                                 allow_create = True
                                 break
+                if not allow_create:
+                    derived = _derive_default_workspace_host_path_for_session(
+                        requested_session,
+                        home_host_path=os.getenv("ARGUS_HOME_HOST_PATH") or None,
+                        workspace_base_host_path=os.getenv("ARGUS_WORKSPACE_HOST_PATH") or None,
+                    )
+                    if derived and Path(derived).is_dir():
+                        allow_create = True
             live, created = await _ensure_live_docker_session(session_id, allow_create=allow_create)
         except KeyError:
             await ws.close(code=1008, reason="Unknown session")

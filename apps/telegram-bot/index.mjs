@@ -468,6 +468,12 @@ class ArgusClient {
     return await this._httpJson("POST", "/automation/agent/rename", { chatKey, agentId, newName });
   }
 
+  async automationAgentDelete(chatKey, agentId) {
+    if (!isNonEmptyString(chatKey)) throw new Error("Missing chatKey");
+    if (!isNonEmptyString(agentId)) throw new Error("Missing agentId");
+    return await this._httpJson("POST", "/automation/agent/delete", { chatKey, agentId });
+  }
+
   async automationChatBind(chatKey, agentId, actorUserId) {
     if (!isNonEmptyString(chatKey)) throw new Error("Missing chatKey");
     if (!isNonEmptyString(agentId)) throw new Error("Missing agentId");
@@ -910,12 +916,13 @@ function detectLocaleFromLanguageCode(languageCode) {
   return "en";
 }
 
-const UI_STRINGS = {
+  const UI_STRINGS = {
   en: {
     menu_title: "Argus Menu",
     title_switch_agent: "Switch Agent",
     title_create_agent: "Create Agent",
     title_rename_agent: "Rename Agent",
+    title_delete_agent: "Delete Agent",
     title_status: "Status",
     title_node_token: "Node Token",
     title_help: "Help",
@@ -923,6 +930,8 @@ const UI_STRINGS = {
     btn_switch_agent: "Switch Agent",
     btn_create_agent: "Create Agent",
     btn_rename_agent: "Rename Agent",
+    btn_delete_agent: "Delete Agent",
+    btn_delete_confirm: "Delete",
     btn_new_main_thread: "New Main Thread",
     btn_node_token: "Node Token",
     btn_status: "Status",
@@ -940,7 +949,7 @@ const UI_STRINGS = {
     shared_suffix: "(shared)",
     status_unbound: "UNBOUND",
 
-    msg_not_initialized: "Not initialized. Send /start in this DM first.",
+    msg_not_initialized: "No agent yet. Press Create Agent to create main.",
     msg_use_start_in_dm: "Please use /start in a private chat.",
     msg_unsupported_message: "Unsupported message type (text/images only for now).",
     msg_admins_only: "Admins only",
@@ -948,7 +957,7 @@ const UI_STRINGS = {
     msg_unsupported_cb: "Unsupported",
     msg_invalid_agent: "Invalid agent.",
 
-    err_not_initialized: "Please run /start first.",
+    err_not_initialized: "No agent yet. Open /menu and press Create Agent.",
     err_forbidden: "error: forbidden.",
     err_agent_exists: "error: already exists: {name}",
 
@@ -961,6 +970,7 @@ const UI_STRINGS = {
     notice_switched: "Switched: {agentId}",
     notice_created: "Created: {name}",
     notice_renamed: "Renamed: {old} -> {name}",
+    notice_deleted: "Deleted: {agentId}",
     notice_new_main_thread: "New main thread: {threadId}",
     notice_new_thread: "New thread: {threadId}",
     notice_bound: "Bound: {agentId}",
@@ -976,13 +986,15 @@ const UI_STRINGS = {
     rename_prompt_prefix: "Send the new agent name (a-z0-9_-), e.g.",
     rename_missing: "Missing agent name.",
 
+    delete_warning: "This will remove the agent from the list and delete its runtime container. The workspace will be archived.",
+
     node_warning: "WARNING: token is sensitive; rotate if leaked.",
     node_press_reveal: "Press Reveal to fetch the current session token.",
 
     group_bind_first: "Bind this chat/topic to an agent first.",
 
     bind_select_agent: "Select an agent to route this chat/topic to.",
-    bind_hint_start: "Hint: DM the bot and run /start first.",
+    bind_hint_start: "Hint: DM the bot and create an agent (via /menu).",
 
     help_line_menu: "Use {menu} to open the control panel.",
     help_line_start: "First time: run {start} in a DM to initialize your main agent.",
@@ -995,6 +1007,7 @@ const UI_STRINGS = {
     title_switch_agent: "切换 Agent",
     title_create_agent: "创建 Agent",
     title_rename_agent: "重命名 Agent",
+    title_delete_agent: "删除 Agent",
     title_status: "状态",
     title_node_token: "节点 Token",
     title_help: "帮助",
@@ -1002,6 +1015,8 @@ const UI_STRINGS = {
     btn_switch_agent: "切换 Agent",
     btn_create_agent: "创建 Agent",
     btn_rename_agent: "重命名 Agent",
+    btn_delete_agent: "删除 Agent",
+    btn_delete_confirm: "删除",
     btn_new_main_thread: "新建 Main Thread",
     btn_node_token: "节点 Token",
     btn_status: "状态",
@@ -1019,7 +1034,7 @@ const UI_STRINGS = {
     shared_suffix: "（共享）",
     status_unbound: "未绑定",
 
-    msg_not_initialized: "未初始化：请先在私聊发送 /start。",
+    msg_not_initialized: "尚未创建 agent：点击“创建 Agent”即可创建 main。",
     msg_use_start_in_dm: "请在私聊中使用 /start。",
     msg_unsupported_message: "暂不支持该消息类型（目前仅支持文本/图片）。",
     msg_admins_only: "仅群管理员可操作",
@@ -1027,7 +1042,7 @@ const UI_STRINGS = {
     msg_unsupported_cb: "不支持",
     msg_invalid_agent: "无效的 agent。",
 
-    err_not_initialized: "请先 /start 初始化。",
+    err_not_initialized: "尚未创建 agent：请发送 /menu 并点击“创建 Agent”。",
     err_forbidden: "error: 没有权限。",
     err_agent_exists: "error: 已存在：{name}",
 
@@ -1040,6 +1055,7 @@ const UI_STRINGS = {
     notice_switched: "已切换：{agentId}",
     notice_created: "已创建：{name}",
     notice_renamed: "已重命名：{old} -> {name}",
+    notice_deleted: "已删除：{agentId}",
     notice_new_main_thread: "已新建 Main Thread：{threadId}",
     notice_new_thread: "已新建 Thread：{threadId}",
     notice_bound: "已绑定：{agentId}",
@@ -1055,13 +1071,15 @@ const UI_STRINGS = {
     rename_prompt_prefix: "发送新 agent 名称（a-z0-9_-），例如",
     rename_missing: "缺少 agent 名称。",
 
+    delete_warning: "将从列表中移除该 agent，并删除其 runtime 容器；workspace 会被归档。",
+
     node_warning: "注意：token 很敏感；泄露请立刻轮换。",
     node_press_reveal: "点击“显示”获取当前 session 的 token。",
 
     group_bind_first: "请先把当前群聊/话题绑定到某个 agent。",
 
     bind_select_agent: "选择一个 agent，把当前 chat/topic 路由到它。",
-    bind_hint_start: "提示：先私聊 bot 并发送 /start 完成初始化。",
+    bind_hint_start: "提示：先私聊 bot，用 /menu 创建一个 agent。",
 
     help_line_menu: "用 {menu} 打开控制面板。",
     help_line_start: "首次使用：先在私聊发送 {start} 完成初始化。",
@@ -1633,17 +1651,24 @@ async function main() {
       lines.push(`agent: ${htmlCode(route.agentId)}`);
       lines.push(`session: ${htmlCode(route.sessionId)}`);
       const ownPrefix = isNonEmptyString(chatKey) ? `u${chatKey.trim()}-` : "";
-      const canRename = isNonEmptyString(ownPrefix)
+      const canDelete = isNonEmptyString(ownPrefix)
         && isNonEmptyString(route?.agentId)
-        && route.agentId.startsWith(ownPrefix)
-        && !route.agentId.endsWith("-main");
+        && route.agentId.startsWith(ownPrefix);
+      const canRename = canDelete && !route.agentId.endsWith("-main");
       const rows = [
         [
           cbButton(S.btn_switch_agent, { action: "p:switch", chatKey, page: 0 }),
           cbButton(S.btn_create_agent, { action: "p:create_begin", chatKey })
         ]
       ];
-      if (canRename) rows.push([cbButton(S.btn_rename_agent, { action: "p:rename_begin", chatKey })]);
+      if (canRename) {
+        rows.push([
+          cbButton(S.btn_rename_agent, { action: "p:rename_begin", chatKey }),
+          cbButton(S.btn_delete_agent, { action: "p:delete_begin", chatKey })
+        ]);
+      } else if (canDelete) {
+        rows.push([cbButton(S.btn_delete_agent, { action: "p:delete_begin", chatKey })]);
+      }
       rows.push(
         [
           cbButton(S.btn_new_main_thread, { action: "p:newmain", chatKey }),
@@ -1657,8 +1682,10 @@ async function main() {
     } catch {
       const lines = [];
       lines.push(`<b>${escapeHtml(S.menu_title)}</b>`);
+      if (isNonEmptyString(notice)) lines.push(`<i>${escapeHtml(notice)}</i>`);
       lines.push(escapeHtml(S.msg_not_initialized));
       const replyMarkup = kb([
+        [cbButton(S.btn_create_agent, { action: "p:create_begin", chatKey })],
         [cbButton(S.btn_help, { action: "help", chatKey })],
         [cbButton(S.btn_close, { action: "close", chatKey })]
       ]);
@@ -1741,6 +1768,23 @@ async function main() {
       lines.push(`<b>${escapeHtml(S.label_error)}:</b> ${escapeHtml(error)}`);
     }
     const replyMarkup = kb([[cbButton(S.btn_cancel, { action: "p:rename_cancel", chatKey })]]);
+    return { text: lines.join("\n"), replyMarkup };
+  }
+
+  async function renderPrivateDeleteMenu(chatKey, agentId, { error, locale } = {}) {
+    const S = uiStrings(locale);
+    const lines = [];
+    lines.push(`<b>${escapeHtml(S.title_delete_agent)}</b>`);
+    if (isNonEmptyString(agentId)) lines.push(`${escapeHtml(S.label_current)}: ${htmlCode(agentId)}`);
+    lines.push(escapeHtml(S.delete_warning));
+    if (isNonEmptyString(error)) {
+      lines.push("");
+      lines.push(`<b>${escapeHtml(S.label_error)}:</b> ${escapeHtml(error)}`);
+    }
+    const replyMarkup = kb([
+      [cbButton(S.btn_delete_confirm, { action: "p:delete_confirm", chatKey, agentId })],
+      [cbButton(S.btn_cancel, { action: "p:delete_cancel", chatKey })]
+    ]);
     return { text: lines.join("\n"), replyMarkup };
   }
 
@@ -2100,6 +2144,30 @@ async function main() {
 
       if (action === "p:create_begin") {
         await answerOnce();
+        clearPendingAgentInput(chatKey);
+        try {
+          await resolveRouteForChatKey(chatKey);
+        } catch (e) {
+          const errMsg = formatGatewayErrorForUser(e, { locale });
+          if (errMsg !== S.err_not_initialized) {
+            const view = await renderPrivateMainMenu(chatKey, { notice: errMsg, locale });
+            await editMenuMessage({ chatId, messageId, view });
+            return;
+          }
+          try {
+            const boot = await argusHttp.automationUserBootstrap(chatKey);
+            const currentSessionId = isNonEmptyString(boot?.currentSessionId) ? boot.currentSessionId : null;
+            if (currentSessionId) await getClient(currentSessionId);
+            const notice = Boolean(boot?.createdMain) ? S.notice_initialized_created : S.notice_initialized_exists;
+            const view = await renderPrivateMainMenu(chatKey, { notice, locale });
+            await editMenuMessage({ chatId, messageId, view });
+            return;
+          } catch (e2) {
+            const view = await renderPrivateMainMenu(chatKey, { notice: formatGatewayErrorForUser(e2, { locale }), locale });
+            await editMenuMessage({ chatId, messageId, view });
+            return;
+          }
+        }
         setPendingCreateAgent(chatKey, chatId, messageId);
         const view = await renderPrivateCreateMenu(chatKey, { locale });
         await editMenuMessage({ chatId, messageId, view });
@@ -2132,6 +2200,31 @@ async function main() {
         return;
       }
 
+      if (action === "p:delete_begin") {
+        await answerOnce();
+        clearPendingAgentInput(chatKey);
+        let route = null;
+        try {
+          route = await resolveRouteForChatKey(chatKey);
+        } catch (e) {
+          const view = await renderPrivateMainMenu(chatKey, { notice: formatGatewayErrorForUser(e, { locale }), locale });
+          await editMenuMessage({ chatId, messageId, view });
+          return;
+        }
+        const ownPrefix = isNonEmptyString(chatKey) ? `u${chatKey.trim()}-` : "";
+        const canDelete = isNonEmptyString(ownPrefix)
+          && isNonEmptyString(route?.agentId)
+          && route.agentId.startsWith(ownPrefix);
+        if (!canDelete) {
+          const view = await renderPrivateMainMenu(chatKey, { notice: S.msg_invalid_agent, locale });
+          await editMenuMessage({ chatId, messageId, view });
+          return;
+        }
+        const view = await renderPrivateDeleteMenu(chatKey, route.agentId, { locale });
+        await editMenuMessage({ chatId, messageId, view });
+        return;
+      }
+
       if (action === "p:create_cancel") {
         await answerOnce();
         clearPendingAgentInput(chatKey);
@@ -2144,6 +2237,36 @@ async function main() {
         await answerOnce();
         clearPendingAgentInput(chatKey);
         const view = await renderPrivateMainMenu(chatKey, { notice: S.notice_canceled, locale });
+        await editMenuMessage({ chatId, messageId, view });
+        return;
+      }
+
+      if (action === "p:delete_cancel") {
+        await answerOnce();
+        clearPendingAgentInput(chatKey);
+        const view = await renderPrivateMainMenu(chatKey, { notice: S.notice_canceled, locale });
+        await editMenuMessage({ chatId, messageId, view });
+        return;
+      }
+
+      if (action === "p:delete_confirm") {
+        await answerOnce();
+        clearPendingAgentInput(chatKey);
+        const agentId = payload.agentId;
+        if (!isNonEmptyString(agentId)) {
+          const view = await renderPrivateMainMenu(chatKey, { notice: S.msg_invalid_agent, locale });
+          await editMenuMessage({ chatId, messageId, view });
+          return;
+        }
+        try {
+          await argusHttp.automationAgentDelete(chatKey, agentId);
+        } catch (e) {
+          const view = await renderPrivateDeleteMenu(chatKey, agentId, { error: formatGatewayErrorForUser(e, { locale }), locale });
+          await editMenuMessage({ chatId, messageId, view });
+          return;
+        }
+        const notice = formatTemplate(S.notice_deleted, { agentId });
+        const view = await renderPrivateMainMenu(chatKey, { notice, locale });
         await editMenuMessage({ chatId, messageId, view });
         return;
       }
@@ -2471,7 +2594,12 @@ async function main() {
               }
               return;
             }
-            await safeSendMessage({ ...target, text: formatGatewayErrorForUser(e, { locale }) });
+            const msg2 = formatGatewayErrorForUser(e, { locale });
+            if (msg2 === S.err_not_initialized) {
+              await sendMenuMessage({ target, chatKey, chatType, locale });
+              return;
+            }
+            await safeSendMessage({ ...target, text: msg2 });
             return;
           }
 

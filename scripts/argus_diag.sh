@@ -200,8 +200,8 @@ run_sh_redacted logs/gateway.log '"${COMPOSE_BIN[@]}" logs --no-color --tail 200
 run_sh_redacted logs/telegram-bot.log '"${COMPOSE_BIN[@]}" logs --no-color --tail 2000 telegram-bot || "${COMPOSE_BIN[@]}" logs --tail 2000 telegram-bot || true'
 run_sh_redacted logs/web.log '"${COMPOSE_BIN[@]}" logs --no-color --tail 1000 web || "${COMPOSE_BIN[@]}" logs --tail 1000 web || true'
 
-# Capture current Codex config (no secrets expected, but keep in files/).
-run_sh files/codex_config.toml 'cat /root/.argus/.codex/config.toml 2>/dev/null || true'
+# Capture current Codex config(s) (no secrets expected, but keep in files/).
+run_sh files/codex_config.toml 'set -euo pipefail; shopt -s nullglob; home="${ARGUS_HOME_HOST_PATH:-$HOME/.argus}"; base="${ARGUS_WORKSPACE_HOST_PATH:-}"; echo "home=$home"; if [ -n "$base" ]; then echo "workspace_base=$base"; fi; echo; files=(); for f in "$home/.codex/config.toml" "$home/workspace/.codex/config.toml" "$home"/workspace-*/.codex/config.toml "$home"/workspaces/sess-*/.codex/config.toml; do if [ -f "$f" ]; then files+=("$f"); fi; done; if [ -n "$base" ]; then for f in "$base"/sess-*/.codex/config.toml; do if [ -f "$f" ]; then files+=("$f"); fi; done; fi; if [ "${#files[@]}" -eq 0 ]; then echo "(no Codex config.toml found)"; exit 0; fi; i=0; for f in "${files[@]}"; do i=$((i+1)); if [ "$i" -gt 20 ]; then echo "(truncated; showing first 20)"; break; fi; echo "----- $f"; sed -n "1,200p" "$f"; echo; done'
 
 # Gateway HTTP checks from the host (best-effort).
 HOST_GATEWAY_URL="${HOST_GATEWAY_URL:-http://127.0.0.1:8080}"
