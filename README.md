@@ -89,7 +89,7 @@ When using `apps/telegram-bot`, the gateway can isolate runtime containers (agen
   - **Create Agent**: create a new agent (workspace/session) and switch to it.
   - **Rename Agent**: rename the current agent (owner-only; non-`main`).
   - **Delete Agent**: delete the current agent (owner-only; includes `main`). If you delete `main`, you’ll be prompted to create a new `main`.
-  - **New Main Thread**: reset the main thread for the current agent (affects heartbeat + DM routing).
+  - **New Conversation**: reset the main thread for the current agent (affects heartbeat + DM routing).
 - In groups/topics, run `/menu` in the chat/topic and use **Bind This Chat** to route that chat/topic to an agent.
 - Admin sharing: edit `${ARGUS_HOME_HOST_PATH}/gateway/state.json` and add the target user tgid into `allowedUserIds` for the desired `agentId`.
   - Recommended: edit with the gateway stopped, or restart after edits (the gateway continuously writes back `state.json`).

@@ -89,7 +89,7 @@ docker compose down
   - **Create Agent**：创建新的 agent 并切换过去（同名会报“已存在”）。
   - **Rename Agent**：重命名当前 agent（仅 owner；不包含 `main`）。
   - **Delete Agent**：删除当前 agent（仅 owner；包含 `main`）。删除 `main` 后，下次会提示创建新的 `main`。
-  - **New Main Thread**：重置当前 agent 的 main thread（会影响 heartbeat 与私聊路由）。
+  - **New Conversation**：重置当前 agent 的 main thread（会影响 heartbeat 与私聊路由）。
 - 在群聊/话题中发送 `/menu`，使用 **Bind This Chat** 把该 chat/topic 绑定到一个 agent。
 - **共享/授权**：管理员可编辑 `${ARGUS_HOME_HOST_PATH}/gateway/state.json`，在对应 `agentId` 下把目标用户的 tgid 加入 `allowedUserIds`。
   - 建议在停止 gateway 后编辑，或编辑后重启（gateway 运行中会持续写回 `state.json`，手动修改可能被覆盖）。
