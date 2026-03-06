@@ -137,6 +137,7 @@ go build -o argus ./cmd/argus
 - node-host 会把连接/重连状态，以及收到的远程命令审计日志输出到 stderr。
   - 关闭审计日志：`ARGUS_NODE_AUDIT=0`（或 `./argus --audit false ...`）
   - 调整输出：`ARGUS_NODE_AUDIT_MAX_BYTES`、`ARGUS_NODE_AUDIT_STDIN_PREVIEW_BYTES`
+- 交互式 CLI：先用 `system.run` + `params={"argv":[...],"pty":true,"yieldMs":0}` 启动作业，再用返回的 `jobId` 调 `process.write`、`process.send_keys`、`process.submit` 或 `process.paste`。
 
 ## 可选 Web UI
 

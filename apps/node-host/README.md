@@ -24,3 +24,9 @@ Run:
 ```bash
 ./argus --url "ws://127.0.0.1:8080/nodes/ws?token=argus-node-v1.<sessionId>.<sig>" --node-id "mac"
 ```
+
+Interactive jobs:
+
+- Use `system.run` with `pty: true` to allocate a pseudo-terminal.
+- Set `yieldMs: 0` to get a running `jobId` back immediately.
+- Continue the session with `process.write`, `process.send_keys`, `process.submit`, or `process.paste`.

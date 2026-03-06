@@ -3430,6 +3430,7 @@ class AutomationManager:
                             f"sessionId: {sid}",
                             f"selfNodeId: runtime:{sid}",
                             'node_invoke 建议：优先用 node="self"；多 runtime 在线时用 node="runtime:<sessionId>"（即 selfNodeId）。',
+                            '交互式 CLI：先用 command="system.run" + params={"argv":[...],"pty":true,"yieldMs":0} 拿到 jobId，再继续调用 process.write / process.send_keys / process.submit / process.paste。',
                             "[/ARGUS]",
                         ]
                     )
@@ -4862,7 +4863,7 @@ async def _mcp_handle_single_message(request: Request, body: dict[str, Any]) -> 
             {
                 "name": "node_invoke",
                 "title": "Node Invoke",
-                "description": "Invoke a command on a connected node (device).",
+                "description": "Invoke a command on a connected node (device). For interactive CLIs, start with system.run using params={\"argv\":[...],\"pty\":true,\"yieldMs\":0}, then continue with process.write / process.send_keys / process.submit / process.paste using the returned jobId.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -6194,7 +6195,7 @@ async def _mcp_handle_single_message(request: Request, body: dict[str, Any]) -> 
             {
                 "name": "node_invoke",
                 "title": "Node Invoke",
-                "description": "Invoke a command on a connected node (device).",
+                "description": "Invoke a command on a connected node (device). For interactive CLIs, start with system.run using params={\"argv\":[...],\"pty\":true,\"yieldMs\":0}, then continue with process.write / process.send_keys / process.submit / process.paste using the returned jobId.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {

@@ -91,13 +91,13 @@ func (h *Host) flushPending(c *ws.Conn) {
 		return
 	}
 	out := h.pending
-		h.pending = nil
-		for i := 0; i < len(out); i++ {
-			if err := h.sendJSONBestEffort(c, out[i]); err != nil {
-				h.pending = append(out[i:], h.pending...)
-				return
-			}
+	h.pending = nil
+	for i := 0; i < len(out); i++ {
+		if err := h.sendJSONBestEffort(c, out[i]); err != nil {
+			h.pending = append(out[i:], h.pending...)
+			return
 		}
+	}
 }
 
 func (h *Host) sendJSONBestEffort(c *ws.Conn, v interface{}) error {
@@ -116,6 +116,10 @@ func (h *Host) connectFrame() proto.ConnectFrame {
 		"process.list",
 		"process.get",
 		"process.logs",
+		"process.write",
+		"process.send_keys",
+		"process.submit",
+		"process.paste",
 		"process.kill",
 	}
 	platform := runtime.GOOS
@@ -193,12 +197,12 @@ func (h *Host) Run(ctx context.Context) error {
 			case <-ctx.Done():
 				return ctx.Err()
 			}
-			}
+		}
 
-			h.connMu.Lock()
-			h.connGen++
-			gen := h.connGen
-			h.connMu.Unlock()
+		h.connMu.Lock()
+		h.connGen++
+		gen := h.connGen
+		h.connMu.Unlock()
 
 		if consecutiveConnectFailures > 0 {
 			if everConnected {
@@ -216,20 +220,20 @@ func (h *Host) Run(ctx context.Context) error {
 		everConnected = true
 		consecutiveConnectFailures = 0
 
-			if err := h.sendJSONBestEffort(c, h.connectFrame()); err != nil {
-				h.LogLine("WARN", fmt.Sprintf("Failed to send connect frame: %s", err.Error()))
-				_ = c.Close()
-				h.setDisconnected(gen)
-				continue
-			}
+		if err := h.sendJSONBestEffort(c, h.connectFrame()); err != nil {
+			h.LogLine("WARN", fmt.Sprintf("Failed to send connect frame: %s", err.Error()))
+			_ = c.Close()
+			h.setDisconnected(gen)
+			continue
+		}
 
-			h.connMu.Lock()
-			if h.connGen == gen {
-				h.conn = c
-			}
-			h.connMu.Unlock()
+		h.connMu.Lock()
+		if h.connGen == gen {
+			h.conn = c
+		}
+		h.connMu.Unlock()
 
-			h.flushPending(c)
+		h.flushPending(c)
 
 		connDone := make(chan struct{})
 
@@ -476,15 +480,6 @@ func (h *Host) summarizeInvokeForAudit(command string, params interface{}, timeo
 			notifyOnExit = asBool(pm["notifyOnExit"])
 			notifyOnExitVal = fmt.Sprintf("notifyOnExit=%t", notifyOnExit)
 		}
-		stdinText := asString(pm["stdinText"])
-		stdinBytes := 0
-		stdinPreview := ""
-		if stdinText != "" {
-			stdinBytes = len([]byte(stdinText))
-			if h.cfg.AuditStdinPreviewBytes > 0 {
-				stdinPreview = util.TruncateUTF8Bytes(stdinText, h.cfg.AuditStdinPreviewBytes)
-			}
-		}
 		envKeys := envKeysFrom(pm["env"])
 
 		argvPreview := ""
@@ -514,6 +509,9 @@ func (h *Host) summarizeInvokeForAudit(command string, params interface{}, timeo
 		if yieldMs, ok := asNumber(pm["yieldMs"]); ok {
 			parts = append(parts, fmt.Sprintf("yieldMs=%d", int(yieldMs)))
 		}
+		if mapHasKey(pm, "pty") {
+			parts = append(parts, fmt.Sprintf("pty=%t", asBool(pm["pty"])))
+		}
 		if notifyOnExitVal != "" {
 			parts = append(parts, notifyOnExitVal)
 		}
@@ -524,12 +522,7 @@ func (h *Host) summarizeInvokeForAudit(command string, params interface{}, timeo
 			}
 			parts = append(parts, fmt.Sprintf("envKeys=%s", util.TruncateUTF8Bytes(util.SafeJSON(preview), h.cfg.AuditMaxBytes)))
 		}
-		if stdinText != "" {
-			parts = append(parts, fmt.Sprintf("stdinBytes=%d", stdinBytes))
-			if stdinPreview != "" {
-				parts = append(parts, fmt.Sprintf("stdinPreview=%s", util.TruncateUTF8Bytes(util.SafeJSON(stdinPreview), h.cfg.AuditMaxBytes)))
-			}
-		}
+		parts = append(parts, h.auditTextParts("stdin", asString(pm["stdinText"]))...)
 		return strings.Join(parts, " ")
 	}
 
@@ -539,7 +532,7 @@ func (h *Host) summarizeInvokeForAudit(command string, params interface{}, timeo
 		return fmt.Sprintf("command=%s bin=%s", cmd, util.SafeJSON(bin))
 	}
 
-	if cmd == "process.get" || cmd == "process.kill" || cmd == "process.logs" {
+	if cmd == "process.get" || cmd == "process.kill" || cmd == "process.logs" || cmd == "process.submit" {
 		pm, _ := p.(map[string]interface{})
 		jobID := strings.TrimSpace(asString(pm["jobId"]))
 		extra := ""
@@ -549,6 +542,42 @@ func (h *Host) summarizeInvokeForAudit(command string, params interface{}, timeo
 			}
 		}
 		return fmt.Sprintf("command=%s jobId=%s%s", cmd, util.SafeJSON(jobID), extra)
+	}
+
+	if cmd == "process.write" {
+		pm, _ := p.(map[string]interface{})
+		parts := []string{
+			fmt.Sprintf("command=%s", cmd),
+			fmt.Sprintf("jobId=%s", util.SafeJSON(strings.TrimSpace(asString(pm["jobId"])))),
+		}
+		parts = append(parts, h.auditTextParts("data", asString(pm["data"]))...)
+		return strings.Join(parts, " ")
+	}
+
+	if cmd == "process.paste" {
+		pm, _ := p.(map[string]interface{})
+		parts := []string{
+			fmt.Sprintf("command=%s", cmd),
+			fmt.Sprintf("jobId=%s", util.SafeJSON(strings.TrimSpace(asString(pm["jobId"])))),
+		}
+		if mapHasKey(pm, "bracketed") {
+			parts = append(parts, fmt.Sprintf("bracketed=%t", asBool(pm["bracketed"])))
+		}
+		parts = append(parts, h.auditTextParts("text", asString(pm["text"]))...)
+		return strings.Join(parts, " ")
+	}
+
+	if cmd == "process.send_keys" {
+		pm, _ := p.(map[string]interface{})
+		parts := []string{
+			fmt.Sprintf("command=%s", cmd),
+			fmt.Sprintf("jobId=%s", util.SafeJSON(strings.TrimSpace(asString(pm["jobId"])))),
+		}
+		if keys := coerceStringArray(pm["keys"]); len(keys) > 0 {
+			parts = append(parts, fmt.Sprintf("keys=%s", util.TruncateUTF8Bytes(util.SafeJSON(keys), h.cfg.AuditMaxBytes)))
+		}
+		parts = append(parts, h.auditTextParts("literal", asString(pm["literal"]))...)
+		return strings.Join(parts, " ")
 	}
 
 	if cmd == "process.list" {
@@ -564,6 +593,20 @@ func (h *Host) summarizeInvokeForAudit(command string, params interface{}, timeo
 		return util.TruncateUTF8Bytes(cmd, h.cfg.AuditMaxBytes)
 	}
 	return util.TruncateUTF8Bytes(raw, h.cfg.AuditMaxBytes)
+}
+
+func (h *Host) auditTextParts(prefix string, text string) []string {
+	if text == "" {
+		return nil
+	}
+	parts := []string{fmt.Sprintf("%sBytes=%d", prefix, len([]byte(text)))}
+	if h.cfg.AuditStdinPreviewBytes > 0 {
+		preview := util.TruncateUTF8Bytes(text, h.cfg.AuditStdinPreviewBytes)
+		if preview != "" {
+			parts = append(parts, fmt.Sprintf("%sPreview=%s", prefix, util.TruncateUTF8Bytes(util.SafeJSON(preview), h.cfg.AuditMaxBytes)))
+		}
+	}
+	return parts
 }
 
 func coerceStringArray(v interface{}) []string {

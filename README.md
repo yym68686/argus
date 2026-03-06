@@ -137,6 +137,7 @@ Notes:
 - node-host prints connection/reconnect status and an audit log of received remote commands to stderr.
   - Disable audit logs: `ARGUS_NODE_AUDIT=0` (or `./argus --audit false ...`)
   - Tune output: `ARGUS_NODE_AUDIT_MAX_BYTES`, `ARGUS_NODE_AUDIT_STDIN_PREVIEW_BYTES`
+- Interactive CLI flow: start with `system.run` using `params={"argv":[...],"pty":true,"yieldMs":0}`, then continue with `process.write`, `process.send_keys`, `process.submit`, or `process.paste` using the returned `jobId`.
 
 ## Optional web UI
 

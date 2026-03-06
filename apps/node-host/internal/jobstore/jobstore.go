@@ -34,7 +34,7 @@ type InvokeError struct {
 type JobMeta struct {
 	Version int `json:"version"`
 
-	JobID string `json:"jobId"`
+	JobID  string `json:"jobId"`
 	NodeID string `json:"nodeId"`
 
 	Argv []string `json:"argv"`
@@ -51,8 +51,11 @@ type JobMeta struct {
 	Running  bool `json:"running"`
 	Orphaned bool `json:"orphaned"`
 
-	TimeoutMs *int `json:"timeoutMs"`
-	YieldMs   *int `json:"yieldMs"`
+	TimeoutMs     *int `json:"timeoutMs"`
+	YieldMs       *int `json:"yieldMs"`
+	Pty           bool `json:"pty"`
+	Interactive   bool `json:"interactive"`
+	StdinWritable bool `json:"stdinWritable"`
 
 	NotifyOnExit     bool   `json:"notifyOnExit"`
 	NotifyOnExitMode string `json:"notifyOnExitMode"`
@@ -68,18 +71,21 @@ type JobMeta struct {
 }
 
 type listJob struct {
-	JobID     string   `json:"jobId"`
-	Running   bool     `json:"running"`
-	Orphaned  bool     `json:"orphaned"`
-	PID       *int     `json:"pid"`
-	Argv      []string `json:"argv"`
-	Cwd       *string  `json:"cwd"`
-	CreatedAt *int64   `json:"createdAtMs"`
-	StartedAt *int64   `json:"startedAtMs"`
-	EndedAt   *int64   `json:"endedAtMs"`
-	ExitCode  *int     `json:"exitCode"`
-	Signal    *string  `json:"signal"`
-	TimedOut  bool     `json:"timedOut"`
+	JobID         string   `json:"jobId"`
+	Running       bool     `json:"running"`
+	Orphaned      bool     `json:"orphaned"`
+	Pty           bool     `json:"pty"`
+	Interactive   bool     `json:"interactive"`
+	StdinWritable bool     `json:"stdinWritable"`
+	PID           *int     `json:"pid"`
+	Argv          []string `json:"argv"`
+	Cwd           *string  `json:"cwd"`
+	CreatedAt     *int64   `json:"createdAtMs"`
+	StartedAt     *int64   `json:"startedAtMs"`
+	EndedAt       *int64   `json:"endedAtMs"`
+	ExitCode      *int     `json:"exitCode"`
+	Signal        *string  `json:"signal"`
+	TimedOut      bool     `json:"timedOut"`
 }
 
 type logsPayload struct {
@@ -98,10 +104,13 @@ type logsPayload struct {
 }
 
 type runningPayload struct {
-	JobID   string   `json:"jobId"`
-	Running bool     `json:"running"`
-	Argv    []string `json:"argv"`
-	Cwd     *string  `json:"cwd"`
+	JobID         string   `json:"jobId"`
+	Running       bool     `json:"running"`
+	Pty           bool     `json:"pty"`
+	Interactive   bool     `json:"interactive"`
+	StdinWritable bool     `json:"stdinWritable"`
+	Argv          []string `json:"argv"`
+	Cwd           *string  `json:"cwd"`
 
 	TimeoutMs *int `json:"timeoutMs"`
 	YieldMs   *int `json:"yieldMs"`
@@ -115,10 +124,12 @@ type runningPayload struct {
 }
 
 type runFinishedPayload struct {
-	JobID   string   `json:"jobId"`
-	Running bool     `json:"running"`
-	Argv    []string `json:"argv"`
-	Cwd     *string  `json:"cwd"`
+	JobID       string   `json:"jobId"`
+	Running     bool     `json:"running"`
+	Pty         bool     `json:"pty"`
+	Interactive bool     `json:"interactive"`
+	Argv        []string `json:"argv"`
+	Cwd         *string  `json:"cwd"`
 
 	TimeoutMs *int `json:"timeoutMs"`
 	YieldMs   int  `json:"yieldMs"`
@@ -141,7 +152,10 @@ type runFinishedPayload struct {
 type JobRuntime struct {
 	mu sync.Mutex
 
-	cmd *exec.Cmd
+	cmd       *exec.Cmd
+	ptyMaster io.ReadWriteCloser
+	stdin     io.WriteCloser
+	pty       bool
 
 	running bool
 
@@ -181,11 +195,11 @@ func New(stateDir string, nodeID string, sendEvent func(event string, payload in
 		return nil, err
 	}
 	s := &Store{
-		stateDir:   stateDir,
-		jobsDir:    jobsDir,
-		nodeID:     nodeID,
-		sendEvent:  sendEvent,
-		jobs:       make(map[string]*jobRecord),
+		stateDir:  stateDir,
+		jobsDir:   jobsDir,
+		nodeID:    nodeID,
+		sendEvent: sendEvent,
+		jobs:      make(map[string]*jobRecord),
 	}
 	s.loadFromDisk()
 	s.cleanupCompleted()
@@ -215,6 +229,7 @@ func (s *Store) loadFromDisk() {
 		if meta.Running {
 			meta.Running = false
 			meta.Orphaned = true
+			meta.StdinWritable = false
 			writeMeta(metaPath, meta)
 		}
 		s.jobs[jobID] = &jobRecord{meta: meta, runtime: nil}
@@ -272,19 +287,28 @@ func (s *Store) ListJobs() []interface{} {
 		}
 		m := rec.meta
 		argv := m.Argv
+		stdinWritable := m.StdinWritable
+		if rec.runtime != nil {
+			rec.runtime.mu.Lock()
+			stdinWritable = rec.runtime.running && rec.runtime.stdin != nil
+			rec.runtime.mu.Unlock()
+		}
 		out = append(out, listJob{
-			JobID:     jobID,
-			Running:   m.Running,
-			Orphaned:  m.Orphaned,
-			PID:       m.PID,
-			Argv:      argv,
-			Cwd:       m.Cwd,
-			CreatedAt: &m.CreatedAtMs,
-			StartedAt: m.StartedAtMs,
-			EndedAt:   m.EndedAtMs,
-			ExitCode:  m.ExitCode,
-			Signal:    m.Signal,
-			TimedOut:  m.TimedOut,
+			JobID:         jobID,
+			Running:       m.Running,
+			Orphaned:      m.Orphaned,
+			Pty:           m.Pty,
+			Interactive:   m.Interactive,
+			StdinWritable: stdinWritable,
+			PID:           m.PID,
+			Argv:          argv,
+			Cwd:           m.Cwd,
+			CreatedAt:     &m.CreatedAtMs,
+			StartedAt:     m.StartedAtMs,
+			EndedAt:       m.EndedAtMs,
+			ExitCode:      m.ExitCode,
+			Signal:        m.Signal,
+			TimedOut:      m.TimedOut,
 		})
 	}
 
@@ -322,12 +346,23 @@ func (s *Store) ListJobs() []interface{} {
 
 func (s *Store) GetJob(jobID string) *JobMeta {
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	rec := s.jobs[jobID]
 	if rec == nil || rec.meta == nil {
+		s.mu.Unlock()
 		return nil
 	}
 	cpy := *rec.meta
+	rt := rec.runtime
+	s.mu.Unlock()
+
+	if rt != nil {
+		rt.mu.Lock()
+		cpy.Running = rt.running
+		cpy.StdinWritable = rt.running && rt.stdin != nil
+		cpy.Pty = cpy.Pty || rt.pty
+		cpy.Interactive = cpy.Interactive || cpy.StdinWritable
+		rt.mu.Unlock()
+	}
 	return &cpy
 }
 
@@ -364,14 +399,14 @@ func (s *Store) GetLogs(jobID string, tailBytes int) *logsPayload {
 			stdout := string(lastBytes(stdoutTail, tb))
 			stderr := string(lastBytes(stderrTail, tb))
 			return &logsPayload{
-				JobID:            jobID,
-				Running:          true,
-				Stdout:           stdout,
-				Stderr:           stderr,
-				StdoutBytes:      stdoutBytes,
-				StderrBytes:      stderrBytes,
-				StdoutTruncated:  stdoutBytes > int64(rt.stdoutTail.Cap()),
-				StderrTruncated:  stderrBytes > int64(rt.stderrTail.Cap()),
+				JobID:           jobID,
+				Running:         true,
+				Stdout:          stdout,
+				Stderr:          stderr,
+				StdoutBytes:     stdoutBytes,
+				StderrBytes:     stderrBytes,
+				StdoutTruncated: stdoutBytes > int64(rt.stdoutTail.Cap()),
+				StderrTruncated: stderrBytes > int64(rt.stderrTail.Cap()),
 			}
 		}
 	}
@@ -381,14 +416,14 @@ func (s *Store) GetLogs(jobID string, tailBytes int) *logsPayload {
 	stderr := readTailUTF8(stderrPath, tb)
 
 	return &logsPayload{
-		JobID:            jobID,
-		Running:          false,
-		Stdout:           stdout,
-		Stderr:           stderr,
-		StdoutBytes:      meta.StdoutBytes,
-		StderrBytes:      meta.StderrBytes,
-		StdoutTruncated:  meta.StdoutTruncated,
-		StderrTruncated:  meta.StderrTruncated,
+		JobID:           jobID,
+		Running:         false,
+		Stdout:          stdout,
+		Stderr:          stderr,
+		StdoutBytes:     meta.StdoutBytes,
+		StderrBytes:     meta.StderrBytes,
+		StdoutTruncated: meta.StdoutTruncated,
+		StderrTruncated: meta.StderrTruncated,
 	}
 }
 
@@ -430,13 +465,14 @@ func readTailUTF8(filePath string, tailBytes int) string {
 }
 
 type RunParams struct {
-	Argv        []string
-	Cwd         *string
-	Env         map[string]string
-	TimeoutMs   *int
-	YieldMs     *int
+	Argv         []string
+	Cwd          *string
+	Env          map[string]string
+	TimeoutMs    *int
+	YieldMs      *int
+	Pty          *bool
 	NotifyOnExit *bool
-	StdinText   *string
+	StdinText    *string
 }
 
 type RunResult struct {
@@ -453,6 +489,8 @@ func (s *Store) Run(p RunParams) RunResult {
 	if p.StdinText != nil && len([]byte(*p.StdinText)) > maxStdinTextBytes {
 		return RunResult{OK: false, Error: &InvokeError{Code: "BAD_INPUT", Message: fmt.Sprintf("system.run stdinText too large (max %d bytes)", maxStdinTextBytes)}}
 	}
+
+	usePty := p.Pty != nil && *p.Pty
 
 	jobID, err := util.RandomUUID()
 	if err != nil {
@@ -494,6 +532,9 @@ func (s *Store) Run(p RunParams) RunResult {
 		Orphaned:         false,
 		TimeoutMs:        p.TimeoutMs,
 		YieldMs:          p.YieldMs,
+		Pty:              usePty,
+		Interactive:      usePty,
+		StdinWritable:    usePty,
 		NotifyOnExit:     notifyMode == "always",
 		NotifyOnExitMode: notifyMode,
 		ExitCode:         nil,
@@ -506,35 +547,57 @@ func (s *Store) Run(p RunParams) RunResult {
 	}
 	writeMeta(metaPath, meta)
 
-	cmd := exec.Command(argv[0], argv[1:]...)
-	if p.Cwd != nil && strings.TrimSpace(*p.Cwd) != "" {
-		cmd.Dir = strings.TrimSpace(*p.Cwd)
-	}
-	if p.Env != nil {
-		env := os.Environ()
-		for k, v := range p.Env {
-			if strings.TrimSpace(k) == "" {
-				continue
-			}
-			env = append(env, fmt.Sprintf("%s=%s", k, v))
+	var (
+		cmd        *exec.Cmd
+		stdoutPipe io.ReadCloser
+		stderrPipe io.ReadCloser
+		ptyMaster  io.ReadWriteCloser
+	)
+
+	cleanupSpawnFailure := func(spawnErr error) RunResult {
+		if ptyMaster != nil {
+			_ = ptyMaster.Close()
 		}
-		cmd.Env = env
-	}
-	if p.StdinText != nil {
-		cmd.Stdin = strings.NewReader(*p.StdinText)
+		_ = os.RemoveAll(dir)
+		return RunResult{OK: false, Error: &InvokeError{Code: "SPAWN_FAILED", Message: spawnErr.Error()}}
 	}
 
-	stdoutPipe, err := cmd.StdoutPipe()
-	if err != nil {
-		return RunResult{OK: false, Error: &InvokeError{Code: "SPAWN_FAILED", Message: err.Error()}}
-	}
-	stderrPipe, err := cmd.StderrPipe()
-	if err != nil {
-		return RunResult{OK: false, Error: &InvokeError{Code: "SPAWN_FAILED", Message: err.Error()}}
-	}
-
-	if err := cmd.Start(); err != nil {
-		return RunResult{OK: false, Error: &InvokeError{Code: "SPAWN_FAILED", Message: err.Error()}}
+	if usePty {
+		var ptyFile *os.File
+		cmd, ptyFile, err = startPTYCommand(argv, p.Cwd, p.Env, 120, 30)
+		if err != nil {
+			return cleanupSpawnFailure(err)
+		}
+		ptyMaster = ptyFile
+	} else {
+		cmd = exec.Command(argv[0], argv[1:]...)
+		if p.Cwd != nil && strings.TrimSpace(*p.Cwd) != "" {
+			cmd.Dir = strings.TrimSpace(*p.Cwd)
+		}
+		if p.Env != nil {
+			env := os.Environ()
+			for k, v := range p.Env {
+				if strings.TrimSpace(k) == "" {
+					continue
+				}
+				env = append(env, fmt.Sprintf("%s=%s", k, v))
+			}
+			cmd.Env = env
+		}
+		if p.StdinText != nil {
+			cmd.Stdin = strings.NewReader(*p.StdinText)
+		}
+		stdoutPipe, err = cmd.StdoutPipe()
+		if err != nil {
+			return cleanupSpawnFailure(err)
+		}
+		stderrPipe, err = cmd.StderrPipe()
+		if err != nil {
+			return cleanupSpawnFailure(err)
+		}
+		if err := cmd.Start(); err != nil {
+			return cleanupSpawnFailure(err)
+		}
 	}
 
 	startedAtMs := util.NowUnixMs()
@@ -545,8 +608,16 @@ func (s *Store) Run(p RunParams) RunResult {
 	}
 	writeMeta(metaPath, meta)
 
+	var stdinWriter io.WriteCloser
+	if usePty {
+		stdinWriter = ptyMaster
+	}
+
 	rt := &JobRuntime{
 		cmd:        cmd,
+		ptyMaster:  ptyMaster,
+		stdin:      stdinWriter,
+		pty:        usePty,
 		running:    true,
 		stdoutTail: NewTailBuffer(defaultLogTailBytes),
 		stderrTail: NewTailBuffer(defaultLogTailBytes),
@@ -560,15 +631,26 @@ func (s *Store) Run(p RunParams) RunResult {
 	s.mu.Unlock()
 
 	var wg sync.WaitGroup
-	wg.Add(2)
-	go func() {
-		defer wg.Done()
-		io.Copy(&tailWriter{rt: rt, which: "stdout"}, stdoutPipe)
-	}()
-	go func() {
-		defer wg.Done()
-		io.Copy(&tailWriter{rt: rt, which: "stderr"}, stderrPipe)
-	}()
+	if usePty {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			_, _ = io.Copy(&tailWriter{rt: rt, which: "stdout"}, ptyMaster)
+		}()
+		if p.StdinText != nil && *p.StdinText != "" {
+			_, _ = io.WriteString(ptyMaster, *p.StdinText)
+		}
+	} else {
+		wg.Add(2)
+		go func() {
+			defer wg.Done()
+			_, _ = io.Copy(&tailWriter{rt: rt, which: "stdout"}, stdoutPipe)
+		}()
+		go func() {
+			defer wg.Done()
+			_, _ = io.Copy(&tailWriter{rt: rt, which: "stderr"}, stderrPipe)
+		}()
+	}
 
 	if p.TimeoutMs != nil && *p.TimeoutMs > 0 {
 		to := time.Duration(*p.TimeoutMs) * time.Millisecond
@@ -599,7 +681,14 @@ func (s *Store) Run(p RunParams) RunResult {
 		stdoutTail := rt.stdoutTail.Bytes()
 		stderrTail := rt.stderrTail.Bytes()
 		timedOut := rt.timedOut
+		ptyMaster := rt.ptyMaster
+		rt.stdin = nil
+		rt.ptyMaster = nil
 		rt.mu.Unlock()
+
+		if ptyMaster != nil {
+			_ = ptyMaster.Close()
+		}
 
 		endedAtMs := util.NowUnixMs()
 
@@ -610,6 +699,7 @@ func (s *Store) Run(p RunParams) RunResult {
 		meta.ExitCode = exitCode
 		meta.Signal = signal
 		meta.TimedOut = timedOut
+		meta.StdinWritable = false
 		meta.StdoutBytes = stdoutBytes
 		meta.StderrBytes = stderrBytes
 		meta.StdoutTruncated = stdoutBytes > int64(rt.stdoutTail.Cap())
@@ -672,22 +762,24 @@ func (s *Store) Run(p RunParams) RunResult {
 		stdout := string(rt.stdoutTail.Bytes())
 		stderr := string(rt.stderrTail.Bytes())
 		return RunResult{OK: true, Payload: runFinishedPayload{
-			JobID:            jobID,
-			Running:          false,
-			Argv:             argv,
-			Cwd:              p.Cwd,
-			TimeoutMs:        p.TimeoutMs,
-			YieldMs:          ym,
-			PID:              meta.PID,
-			ExitCode:         meta.ExitCode,
-			Signal:           meta.Signal,
-			TimedOut:         meta.TimedOut,
-			Stdout:           stdout,
-			Stderr:           stderr,
-			StdoutBytes:      meta.StdoutBytes,
-			StderrBytes:      meta.StderrBytes,
-			StdoutTruncated:  meta.StdoutTruncated,
-			StderrTruncated:  meta.StderrTruncated,
+			JobID:           jobID,
+			Running:         false,
+			Pty:             meta.Pty,
+			Interactive:     meta.Interactive,
+			Argv:            argv,
+			Cwd:             p.Cwd,
+			TimeoutMs:       p.TimeoutMs,
+			YieldMs:         ym,
+			PID:             meta.PID,
+			ExitCode:        meta.ExitCode,
+			Signal:          meta.Signal,
+			TimedOut:        meta.TimedOut,
+			Stdout:          stdout,
+			Stderr:          stderr,
+			StdoutBytes:     meta.StdoutBytes,
+			StderrBytes:     meta.StderrBytes,
+			StdoutTruncated: meta.StdoutTruncated,
+			StderrTruncated: meta.StderrTruncated,
 		}}
 	case <-time.After(time.Duration(ym) * time.Millisecond):
 		if notifyMode == "auto" && !meta.NotifyOnExit {
@@ -702,15 +794,18 @@ func (s *Store) Run(p RunParams) RunResult {
 
 func (s *Store) runningPayload(jobID string, rec *jobRecord, ym int) runningPayload {
 	var (
-		argv        []string
-		cwd         *string
-		timeoutMs   *int
-		yieldMs     *int
-		pid         *int
-		stdoutTail  string
-		stderrTail  string
-		stdoutBytes int64
-		stderrBytes int64
+		argv          []string
+		cwd           *string
+		timeoutMs     *int
+		yieldMs       *int
+		pid           *int
+		pty           bool
+		interactive   bool
+		stdinWritable bool
+		stdoutTail    string
+		stderrTail    string
+		stdoutBytes   int64
+		stderrBytes   int64
 	)
 	s.mu.Lock()
 	if rec != nil && rec.meta != nil {
@@ -718,9 +813,19 @@ func (s *Store) runningPayload(jobID string, rec *jobRecord, ym int) runningPayl
 		cwd = rec.meta.Cwd
 		timeoutMs = rec.meta.TimeoutMs
 		yieldMs = rec.meta.YieldMs
+		if yieldMs == nil {
+			v := ym
+			yieldMs = &v
+		}
 		pid = rec.meta.PID
+		pty = rec.meta.Pty
+		interactive = rec.meta.Interactive
+		stdinWritable = rec.meta.StdinWritable
 	}
-	rt := rec.runtime
+	var rt *JobRuntime
+	if rec != nil {
+		rt = rec.runtime
+	}
 	s.mu.Unlock()
 
 	if rt != nil {
@@ -729,22 +834,77 @@ func (s *Store) runningPayload(jobID string, rec *jobRecord, ym int) runningPayl
 		stderrTail = util.LastNRunes(string(rt.stderrTail.Bytes()), 4000)
 		stdoutBytes = rt.stdoutBytes
 		stderrBytes = rt.stderrBytes
+		pty = pty || rt.pty
+		stdinWritable = rt.running && rt.stdin != nil
+		interactive = interactive || stdinWritable
 		rt.mu.Unlock()
 	}
 
 	return runningPayload{
-		JobID:       jobID,
-		Running:     true,
-		Argv:        argv,
-		Cwd:         cwd,
-		TimeoutMs:   timeoutMs,
-		YieldMs:     yieldMs,
-		PID:         pid,
-		StdoutTail:  stdoutTail,
-		StderrTail:  stderrTail,
-		StdoutBytes: stdoutBytes,
-		StderrBytes: stderrBytes,
+		JobID:         jobID,
+		Running:       true,
+		Pty:           pty,
+		Interactive:   interactive,
+		StdinWritable: stdinWritable,
+		Argv:          argv,
+		Cwd:           cwd,
+		TimeoutMs:     timeoutMs,
+		YieldMs:       yieldMs,
+		PID:           pid,
+		StdoutTail:    stdoutTail,
+		StderrTail:    stderrTail,
+		StdoutBytes:   stdoutBytes,
+		StderrBytes:   stderrBytes,
 	}
+}
+
+func (s *Store) Write(jobID string, data string) RunResult {
+	if strings.TrimSpace(jobID) == "" {
+		return RunResult{OK: false, Error: &InvokeError{Code: "BAD_INPUT", Message: "process.write requires jobId"}}
+	}
+	if data == "" {
+		return RunResult{OK: false, Error: &InvokeError{Code: "BAD_INPUT", Message: "process.write requires data"}}
+	}
+
+	s.mu.Lock()
+	rec := s.jobs[jobID]
+	if rec == nil || rec.meta == nil {
+		s.mu.Unlock()
+		return RunResult{OK: false, Error: &InvokeError{Code: "NOT_FOUND", Message: fmt.Sprintf("unknown jobId: %s", jobID)}}
+	}
+	rt := rec.runtime
+	interactive := rec.meta.Interactive
+	s.mu.Unlock()
+
+	if rt == nil {
+		return RunResult{OK: false, Error: &InvokeError{Code: "NOT_RUNNING", Message: fmt.Sprintf("job not running: %s", jobID)}}
+	}
+
+	rt.mu.Lock()
+	running := rt.running
+	writer := rt.stdin
+	pty := rt.pty
+	rt.mu.Unlock()
+
+	if !running {
+		return RunResult{OK: false, Error: &InvokeError{Code: "NOT_RUNNING", Message: fmt.Sprintf("job not running: %s", jobID)}}
+	}
+	if writer == nil {
+		return RunResult{OK: false, Error: &InvokeError{Code: "NOT_WRITABLE", Message: fmt.Sprintf("job does not accept interactive input: %s", jobID)}}
+	}
+
+	n, err := io.WriteString(writer, data)
+	if err != nil {
+		return RunResult{OK: false, Error: &InvokeError{Code: "WRITE_FAILED", Message: err.Error()}}
+	}
+
+	return RunResult{OK: true, Payload: map[string]interface{}{
+		"jobId":         jobID,
+		"writtenBytes":  n,
+		"pty":           pty,
+		"interactive":   interactive,
+		"stdinWritable": true,
+	}}
 }
 
 func (s *Store) Kill(jobID string) RunResult {

@@ -30,9 +30,9 @@ function defaultWsUrl(): string {
 
 function httpBaseFromWsUrl(url: string): string {
   try {
-    const u = new URL(url);
-    const proto = u.protocol === "wss:" ? "https:" : "http:";
-    return `${proto}//${u.host}`;
+    const parsed = new URL(url);
+    const proto = parsed.protocol === "wss:" ? "https:" : "http:";
+    return `${proto}//${parsed.host}`;
   } catch {
     return "";
   }
@@ -40,8 +40,8 @@ function httpBaseFromWsUrl(url: string): string {
 
 function extractTokenFromWsUrl(url: string): string {
   try {
-    const u = new URL(url);
-    const token = u.searchParams.get("token");
+    const parsed = new URL(url);
+    const token = parsed.searchParams.get("token");
     return token && token.trim() ? token : "";
   } catch {
     return "";
@@ -54,6 +54,36 @@ function safeParseJson(text: string): unknown | null {
   } catch {
     return null;
   }
+}
+
+function extractJobIdFromResponse(text: string): string {
+  const parsed = safeParseJson(text);
+  if (!parsed || typeof parsed !== "object") return "";
+
+  const payload = (parsed as { payload?: unknown }).payload;
+  if (!payload || typeof payload !== "object") return "";
+
+  const directJobId = (payload as { jobId?: unknown }).jobId;
+  if (typeof directJobId === "string" && directJobId.trim()) {
+    return directJobId.trim();
+  }
+
+  const job = (payload as { job?: unknown }).job;
+  if (!job || typeof job !== "object") return "";
+
+  const nestedJobId = (job as { jobId?: unknown }).jobId;
+  if (typeof nestedJobId === "string" && nestedJobId.trim()) {
+    return nestedJobId.trim();
+  }
+
+  return "";
+}
+
+function splitKeys(text: string): string[] {
+  return text
+    .split(",")
+    .map((part) => part.trim())
+    .filter(Boolean);
 }
 
 export default function NodesPage() {
@@ -73,12 +103,19 @@ export default function NodesPage() {
   const [timeoutMs, setTimeoutMs] = React.useState<string>("30000");
   const [invokeOut, setInvokeOut] = React.useState<string>("");
 
+  const [jobId, setJobId] = React.useState<string>("");
+  const [tailBytes, setTailBytes] = React.useState<string>("65536");
+  const [writeData, setWriteData] = React.useState<string>("");
+  const [sendKeys, setSendKeys] = React.useState<string>("up,down,enter");
+  const [sendLiteral, setSendLiteral] = React.useState<string>("");
+  const [pasteText, setPasteText] = React.useState<string>("");
+  const [pasteBracketed, setPasteBracketed] = React.useState<boolean>(true);
+
   function syncFromWsUrl(nextWsUrl: string): void {
     setWsUrl(nextWsUrl);
     const derived = httpBaseFromWsUrl(nextWsUrl);
     if (derived) setHttpBase(derived);
-    const t = extractTokenFromWsUrl(nextWsUrl);
-    setToken(t);
+    setToken(extractTokenFromWsUrl(nextWsUrl));
   }
 
   async function refreshNodes(): Promise<void> {
@@ -90,31 +127,36 @@ export default function NodesPage() {
       const res = await fetch(url.toString(), { cache: "no-store" });
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       const data = (await res.json()) as { nodes?: NodeInfo[] };
-      const next = Array.isArray(data.nodes) ? data.nodes : [];
-      setNodes(next);
-      if (!nodePick && next.length) setNodePick(next[0].nodeId);
-    } catch (e) {
-      setError(String(e));
+      const nextNodes = Array.isArray(data.nodes) ? data.nodes : [];
+      setNodes(nextNodes);
+      if (!nodePick && nextNodes.length) setNodePick(nextNodes[0].nodeId);
+    } catch (event) {
+      setError(String(event));
     } finally {
       setLoading(false);
     }
   }
 
-  async function invoke(): Promise<void> {
+  async function invokeRequest(nextCommand: string, nextParams: unknown): Promise<void> {
     setInvokeOut("");
     setError(null);
-    const params = safeParseJson(paramsText);
-    if (paramsText.trim() && params === null) {
-      setError("Params must be valid JSON");
+    setCommand(nextCommand);
+
+    const trimmedCommand = nextCommand.trim();
+    if (!trimmedCommand) {
+      setError("Command is required");
       return;
     }
-    const timeoutNum = Number(timeoutMs);
+
     const body: Record<string, unknown> = {
       node: nodePick,
-      command: command.trim(),
-      params: paramsText.trim() ? params : null
+      command: trimmedCommand,
+      params: nextParams
     };
-    if (Number.isFinite(timeoutNum)) body.timeoutMs = timeoutNum;
+    const timeoutNum = Number(timeoutMs);
+    if (Number.isFinite(timeoutNum)) {
+      body.timeoutMs = timeoutNum;
+    }
 
     setLoading(true);
     try {
@@ -127,15 +169,39 @@ export default function NodesPage() {
       });
       const text = await res.text();
       setInvokeOut(text);
+
+      const nextJobId = extractJobIdFromResponse(text);
+      if (nextJobId) {
+        setJobId(nextJobId);
+      }
+
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
-    } catch (e) {
-      setError(String(e));
+    } catch (event) {
+      setError(String(event));
     } finally {
       setLoading(false);
     }
   }
 
-  const selected = nodes.find((n) => n.nodeId === nodePick) ?? null;
+  async function invoke(): Promise<void> {
+    const parsedParams = safeParseJson(paramsText);
+    if (paramsText.trim() && parsedParams === null) {
+      setError("Params must be valid JSON");
+      return;
+    }
+    await invokeRequest(command, paramsText.trim() ? parsedParams : null);
+  }
+
+  async function invokeForJob(nextCommand: string, extraParams?: Record<string, unknown>): Promise<void> {
+    const trimmedJobId = jobId.trim();
+    if (!trimmedJobId) {
+      setError("jobId is required");
+      return;
+    }
+    await invokeRequest(nextCommand, { jobId: trimmedJobId, ...(extraParams ?? {}) });
+  }
+
+  const selected = nodes.find((node) => node.nodeId === nodePick) ?? null;
 
   return (
     <main className="min-h-dvh bg-background text-foreground">
@@ -152,16 +218,16 @@ export default function NodesPage() {
           <div className="rounded-2xl border border-border bg-background/50 p-4">
             <div className="grid gap-3">
               <label className="text-sm font-medium">WebSocket URL (for deriving base + token)</label>
-              <Input value={wsUrl} onChange={(e) => syncFromWsUrl(e.target.value)} />
+              <Input value={wsUrl} onChange={(event) => syncFromWsUrl(event.target.value)} />
 
               <div className="grid grid-cols-1 gap-3 md:grid-cols-2">
                 <div className="grid gap-2">
                   <label className="text-sm font-medium">HTTP Base</label>
-                  <Input value={httpBase} onChange={(e) => setHttpBase(e.target.value)} />
+                  <Input value={httpBase} onChange={(event) => setHttpBase(event.target.value)} />
                 </div>
                 <div className="grid gap-2">
                   <label className="text-sm font-medium">Token (optional)</label>
-                  <Input value={token} onChange={(e) => setToken(e.target.value)} />
+                  <Input value={token} onChange={(event) => setToken(event.target.value)} />
                 </div>
               </div>
 
@@ -190,29 +256,29 @@ export default function NodesPage() {
               </div>
               {nodes.length ? (
                 <div className="grid gap-2">
-                  {nodes.map((n) => (
+                  {nodes.map((node) => (
                     <button
-                      key={n.nodeId}
+                      key={node.nodeId}
                       type="button"
                       className={cn(
                         "flex w-full items-start justify-between gap-3 rounded-xl border border-border/60 bg-background/60 p-3 text-left",
                         "transition-colors hover:border-border hover:bg-background/70",
-                        nodePick === n.nodeId ? "border-primary/40 bg-background/80" : ""
+                        nodePick === node.nodeId ? "border-primary/40 bg-background/80" : ""
                       )}
-                      onClick={() => setNodePick(n.nodeId)}
+                      onClick={() => setNodePick(node.nodeId)}
                     >
                       <div className="min-w-0">
                         <div className="truncate text-sm font-medium">
-                          {n.displayName || n.nodeId}
+                          {node.displayName || node.nodeId}
                         </div>
                         <div className="truncate text-xs text-muted-foreground">
-                          {n.nodeId}
-                          {n.platform ? ` • ${n.platform}` : ""}
-                          {n.version ? ` • v${n.version}` : ""}
+                          {node.nodeId}
+                          {node.platform ? ` • ${node.platform}` : ""}
+                          {node.version ? ` • v${node.version}` : ""}
                         </div>
                       </div>
                       <div className="shrink-0 text-xs text-muted-foreground">
-                        {(n.commands || []).length} cmds
+                        {(node.commands || []).length} cmds
                       </div>
                     </button>
                   ))}
@@ -227,7 +293,12 @@ export default function NodesPage() {
 
           <div className="rounded-2xl border border-border bg-background/50 p-4">
             <div className="grid gap-3">
-              <h2 className="text-base font-semibold">Invoke</h2>
+              <div className="flex flex-wrap items-center justify-between gap-2">
+                <h2 className="text-base font-semibold">Invoke</h2>
+                <span className="text-xs text-muted-foreground">
+                  Interactive tip: use <code>pty: true</code> + <code>yieldMs: 0</code>
+                </span>
+              </div>
 
               <div className="grid gap-2">
                 <label className="text-sm font-medium">Node</label>
@@ -238,12 +309,12 @@ export default function NodesPage() {
                     "outline-none focus-visible:ring-4 focus-visible:ring-ring/25"
                   )}
                   value={nodePick}
-                  onChange={(e) => setNodePick(e.target.value)}
+                  onChange={(event) => setNodePick(event.target.value)}
                   disabled={!nodes.length}
                 >
-                  {nodes.map((n) => (
-                    <option key={n.nodeId} value={n.nodeId}>
-                      {n.displayName || n.nodeId}
+                  {nodes.map((node) => (
+                    <option key={node.nodeId} value={node.nodeId}>
+                      {node.displayName || node.nodeId}
                     </option>
                   ))}
                 </select>
@@ -252,17 +323,17 @@ export default function NodesPage() {
               <div className="grid grid-cols-1 gap-3 md:grid-cols-2">
                 <div className="grid gap-2">
                   <label className="text-sm font-medium">Command</label>
-                  <Input value={command} onChange={(e) => setCommand(e.target.value)} />
+                  <Input value={command} onChange={(event) => setCommand(event.target.value)} />
                   {selected?.commands?.length ? (
                     <div className="flex flex-wrap gap-2">
-                      {selected.commands.slice(0, 8).map((c) => (
+                      {selected.commands.slice(0, 12).map((item) => (
                         <button
-                          key={c}
+                          key={item}
                           type="button"
                           className="rounded-lg border border-border/60 bg-background/60 px-2 py-1 text-xs text-muted-foreground hover:text-foreground"
-                          onClick={() => setCommand(c)}
+                          onClick={() => setCommand(item)}
                         >
-                          {c}
+                          {item}
                         </button>
                       ))}
                     </div>
@@ -270,20 +341,44 @@ export default function NodesPage() {
                 </div>
                 <div className="grid gap-2">
                   <label className="text-sm font-medium">Timeout (ms)</label>
-                  <Input value={timeoutMs} onChange={(e) => setTimeoutMs(e.target.value)} />
+                  <Input value={timeoutMs} onChange={(event) => setTimeoutMs(event.target.value)} />
                 </div>
               </div>
 
               <div className="grid gap-2">
                 <label className="text-sm font-medium">Params (JSON)</label>
-                <Textarea value={paramsText} onChange={(e) => setParamsText(e.target.value)} />
+                <Textarea value={paramsText} onChange={(event) => setParamsText(event.target.value)} />
               </div>
 
               <div className="flex flex-wrap items-center gap-2">
                 <Button type="button" onClick={invoke} disabled={loading || !nodePick || !command.trim()}>
                   {loading ? "Invoking…" : "Invoke"}
                 </Button>
-                {error ? <span className="text-sm text-destructive">{error}</span> : null}
+                <Button
+                  type="button"
+                  variant="outline"
+                  onClick={() => {
+                    setCommand("system.run");
+                    setParamsText(
+                      JSON.stringify(
+                        {
+                          argv: [
+                            "bash",
+                            "-lc",
+                            "read -p 'type agree: ' answer; echo answer=$answer"
+                          ],
+                          pty: true,
+                          yieldMs: 0
+                        },
+                        null,
+                        2
+                      )
+                    );
+                  }}
+                  disabled={loading}
+                >
+                  Load interactive example
+                </Button>
               </div>
 
               <div className="grid gap-2">
@@ -292,9 +387,132 @@ export default function NodesPage() {
               </div>
             </div>
           </div>
+
+          <div className="rounded-2xl border border-border bg-background/50 p-4">
+            <div className="grid gap-4">
+              <div className="flex flex-wrap items-center justify-between gap-2">
+                <div>
+                  <h2 className="text-base font-semibold">Interactive helpers</h2>
+                  <p className="text-sm text-muted-foreground">
+                    Reuse the returned <code>jobId</code> to fetch logs or send more input.
+                  </p>
+                </div>
+              </div>
+
+              <div className="grid grid-cols-1 gap-3 md:grid-cols-2">
+                <div className="grid gap-2">
+                  <label className="text-sm font-medium">Job ID</label>
+                  <Input value={jobId} onChange={(event) => setJobId(event.target.value)} />
+                </div>
+                <div className="grid gap-2">
+                  <label className="text-sm font-medium">Logs tail bytes</label>
+                  <Input value={tailBytes} onChange={(event) => setTailBytes(event.target.value)} />
+                </div>
+              </div>
+
+              <div className="flex flex-wrap items-center gap-2">
+                <Button type="button" variant="outline" onClick={() => invokeForJob("process.get")} disabled={loading || !jobId.trim()}>
+                  Get
+                </Button>
+                <Button
+                  type="button"
+                  variant="outline"
+                  onClick={() => {
+                    const nextTailBytes = Number(tailBytes);
+                    void invokeForJob(
+                      "process.logs",
+                      Number.isFinite(nextTailBytes) ? { tailBytes: nextTailBytes } : undefined
+                    );
+                  }}
+                  disabled={loading || !jobId.trim()}
+                >
+                  Logs
+                </Button>
+                <Button type="button" variant="outline" onClick={() => invokeForJob("process.submit")} disabled={loading || !jobId.trim()}>
+                  Submit
+                </Button>
+                <Button type="button" variant="outline" onClick={() => invokeForJob("process.kill")} disabled={loading || !jobId.trim()}>
+                  Kill
+                </Button>
+              </div>
+
+              <div className="grid gap-2">
+                <label className="text-sm font-medium">Write data</label>
+                <Textarea
+                  value={writeData}
+                  onChange={(event) => setWriteData(event.target.value)}
+                  className="min-h-24"
+                />
+                <div>
+                  <Button
+                    type="button"
+                    variant="outline"
+                    onClick={() => invokeForJob("process.write", { data: writeData })}
+                    disabled={loading || !jobId.trim() || !writeData}
+                  >
+                    Write
+                  </Button>
+                </div>
+              </div>
+
+              <div className="grid grid-cols-1 gap-3 md:grid-cols-2">
+                <div className="grid gap-2">
+                  <label className="text-sm font-medium">Send keys (comma separated)</label>
+                  <Input value={sendKeys} onChange={(event) => setSendKeys(event.target.value)} />
+                </div>
+                <div className="grid gap-2">
+                  <label className="text-sm font-medium">Literal text</label>
+                  <Input value={sendLiteral} onChange={(event) => setSendLiteral(event.target.value)} />
+                </div>
+              </div>
+
+              <div>
+                <Button
+                  type="button"
+                  variant="outline"
+                  onClick={() => {
+                    const keys = splitKeys(sendKeys);
+                    void invokeForJob("process.send_keys", {
+                      ...(keys.length ? { keys } : {}),
+                      ...(sendLiteral ? { literal: sendLiteral } : {})
+                    });
+                  }}
+                  disabled={loading || !jobId.trim() || (!sendKeys.trim() && !sendLiteral)}
+                >
+                  Send keys
+                </Button>
+              </div>
+
+              <div className="grid gap-2">
+                <label className="text-sm font-medium">Paste text</label>
+                <Textarea
+                  value={pasteText}
+                  onChange={(event) => setPasteText(event.target.value)}
+                  className="min-h-24"
+                />
+                <label className="flex items-center gap-2 text-sm text-muted-foreground">
+                  <input
+                    type="checkbox"
+                    checked={pasteBracketed}
+                    onChange={(event) => setPasteBracketed(event.target.checked)}
+                  />
+                  Use bracketed paste markers
+                </label>
+                <div>
+                  <Button
+                    type="button"
+                    variant="outline"
+                    onClick={() => invokeForJob("process.paste", { text: pasteText, bracketed: pasteBracketed })}
+                    disabled={loading || !jobId.trim() || !pasteText}
+                  >
+                    Paste
+                  </Button>
+                </div>
+              </div>
+            </div>
+          </div>
         </div>
       </div>
     </main>
   );
 }
-
