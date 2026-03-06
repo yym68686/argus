@@ -1678,6 +1678,35 @@ async function main() {
     return Number.isFinite(n) && n >= 0 ? Math.floor(n) : 0;
   }
 
+  function buildTwoColumnMenuRows(primaryButtons, secondaryButtons = [], trailingButton = null) {
+    const primary = Array.isArray(primaryButtons) ? primaryButtons.filter(Boolean) : [];
+    const secondary = Array.isArray(secondaryButtons) ? secondaryButtons.filter(Boolean) : [];
+    const rows = [];
+
+    while (primary.length > 0) {
+      const row = [primary.shift()];
+      if (primary.length > 0) row.push(primary.shift());
+      else if (secondary.length > 0) row.push(secondary.shift());
+      rows.push(row);
+    }
+
+    while (secondary.length > 1) {
+      rows.push([secondary.shift(), secondary.shift()]);
+    }
+
+    if (secondary.length === 1) {
+      if (trailingButton) {
+        rows.push([secondary.shift(), trailingButton]);
+        trailingButton = null;
+      } else {
+        rows.push([secondary.shift()]);
+      }
+    }
+
+    if (trailingButton) rows.push([trailingButton]);
+    return rows;
+  }
+
   async function renderPrivateMainMenu(chatKey, { notice, locale } = {}) {
     const S = uiStrings(locale);
     try {
@@ -1693,28 +1722,29 @@ async function main() {
         && isNonEmptyString(route?.agentId)
         && route.agentId.startsWith(ownPrefix);
       const canRename = canDelete && !route.agentId.endsWith("-main");
-      const rows = [
-        [
-          cbButton(S.btn_switch_agent, { action: "p:switch", chatKey, page: 0 }),
-          cbButton(S.btn_switch_model, { action: "p:model", chatKey })
-        ]
+      const agentButtons = [
+        cbButton(S.btn_switch_agent, { action: "p:switch", chatKey, page: 0 }),
+        cbButton(S.btn_create_agent, { action: "p:create_begin", chatKey })
       ];
-      rows.push([cbButton(S.btn_create_agent, { action: "p:create_begin", chatKey })]);
       if (canRename) {
-        rows.push([
+        agentButtons.push(
           cbButton(S.btn_rename_agent, { action: "p:rename_begin", chatKey }),
           cbButton(S.btn_delete_agent, { action: "p:delete_begin", chatKey })
-        ]);
+        );
       } else if (canDelete) {
-        rows.push([cbButton(S.btn_delete_agent, { action: "p:delete_begin", chatKey })]);
+        agentButtons.push(cbButton(S.btn_delete_agent, { action: "p:delete_begin", chatKey }));
       }
-      rows.push(
+
+      const rows = buildTwoColumnMenuRows(
+        agentButtons,
         [
+          cbButton(S.btn_switch_model, { action: "p:model", chatKey }),
           cbButton(S.btn_new_main_thread, { action: "p:newmain", chatKey }),
-          cbButton(S.btn_node_token, { action: "p:node", chatKey })
+          cbButton(S.btn_node_token, { action: "p:node", chatKey }),
+          cbButton(S.btn_status, { action: "p:status", chatKey }),
+          cbButton(S.btn_help, { action: "help", chatKey })
         ],
-        [cbButton(S.btn_status, { action: "p:status", chatKey }), cbButton(S.btn_help, { action: "help", chatKey })],
-        [cbButton(S.btn_close, { action: "close", chatKey })]
+        cbButton(S.btn_close, { action: "close", chatKey })
       );
       const replyMarkup = kb(rows);
       return { text: lines.join("\n"), replyMarkup };
@@ -1723,11 +1753,11 @@ async function main() {
       lines.push(`<b>${escapeHtml(S.menu_title)}</b>`);
       if (isNonEmptyString(notice)) lines.push(`<i>${escapeHtml(notice)}</i>`);
       lines.push(escapeHtml(S.msg_not_initialized));
-      const replyMarkup = kb([
+      const replyMarkup = kb(buildTwoColumnMenuRows(
         [cbButton(S.btn_create_agent, { action: "p:create_begin", chatKey })],
         [cbButton(S.btn_help, { action: "help", chatKey })],
-        [cbButton(S.btn_close, { action: "close", chatKey })]
-      ]);
+        cbButton(S.btn_close, { action: "close", chatKey })
+      ));
       return { text: lines.join("\n"), replyMarkup };
     }
   }
