@@ -567,6 +567,59 @@ def _telegram_truncate(text: str) -> str:
     return raw[: max(0, TELEGRAM_MAX_MESSAGE_CHARS - len(suffix))] + suffix
 
 
+def _telegram_find_split_boundary(text: str) -> int:
+    raw = str(text or "")
+    if not raw:
+        return 0
+    min_index = max(1, int(len(raw) * 0.6))
+    candidates = (
+        "\n\n",
+        "\n",
+        "。",
+        "！",
+        "？",
+        ". ",
+        "! ",
+        "? ",
+        "；",
+        "; ",
+        "，",
+        ", ",
+        "、",
+        " ",
+        "\t",
+    )
+    for needle in candidates:
+        idx = raw.rfind(needle, min_index)
+        if idx >= min_index:
+            return idx + len(needle)
+    return 0
+
+
+def _telegram_split_text(text: str) -> list[str]:
+    raw = str(text or "")
+    if not raw:
+        return []
+    if len(raw) <= TELEGRAM_MAX_MESSAGE_CHARS:
+        return [raw]
+
+    out: list[str] = []
+    start = 0
+    while start < len(raw):
+        end = min(start + TELEGRAM_MAX_MESSAGE_CHARS, len(raw))
+        if end < len(raw):
+            boundary = _telegram_find_split_boundary(raw[start:end])
+            if boundary > 0:
+                end = start + boundary
+        if end <= start:
+            end = min(start + TELEGRAM_MAX_MESSAGE_CHARS, len(raw))
+        chunk = raw[start:end]
+        if chunk:
+            out.append(chunk)
+        start = end
+    return out
+
+
 def _telegram_escape_html(text: str) -> str:
     return str(text).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
@@ -914,6 +967,66 @@ async def _telegram_send_message(
             params.pop("message_thread_id", None)
             return await asyncio.to_thread(_telegram_api_call_sync, token, "sendMessage", params)
         raise
+
+
+async def _telegram_send_plain_message_parts(
+    *,
+    token: str,
+    target: dict[str, Any],
+    text: str,
+    disable_notification: Optional[bool] = None,
+) -> list[Any]:
+    results: list[Any] = []
+    for chunk in _telegram_split_text(text):
+        results.append(
+            await _telegram_send_message(
+                token=token,
+                target=target,
+                text=chunk,
+                parse_mode=None,
+                disable_notification=disable_notification,
+            )
+        )
+    return results
+
+
+async def _telegram_send_markdown_message_parts(
+    *,
+    token: str,
+    target: dict[str, Any],
+    text: str,
+    disable_notification: Optional[bool] = None,
+) -> list[Any]:
+    results: list[Any] = []
+    for chunk in _telegram_split_text(text):
+        html = _markdown_to_telegram_html(chunk)
+        if html:
+            try:
+                results.append(
+                    await _telegram_send_message(
+                        token=token,
+                        target=target,
+                        text=html,
+                        parse_mode="HTML",
+                        disable_notification=disable_notification,
+                    )
+                )
+                continue
+            except Exception as e:  # noqa: BLE001
+                msg = str(e)
+                if not (TELEGRAM_HTML_PARSE_ERR_RE.search(msg) or TELEGRAM_MESSAGE_TOO_LONG_RE.search(msg)):
+                    raise
+
+        results.append(
+            await _telegram_send_message(
+                token=token,
+                target=target,
+                text=chunk,
+                parse_mode=None,
+                disable_notification=disable_notification,
+            )
+        )
+    return results
 
 
 async def _telegram_send_message_draft(
@@ -3321,7 +3434,7 @@ class AutomationManager:
         await self._store.update(_mark_archived)
 
     async def _deliver_turn_text(self, session_id: str, thread_id: str, text: str) -> None:
-        # Gateway-owned delivery: send a single final message on turn/completed.
+        # Gateway-owned delivery: send final text on turn/completed, splitting when needed.
         if not isinstance(text, str) or not text.strip():
             return
         resolved = self._resolve_telegram_target_for_turn(session_id, thread_id)
@@ -3342,23 +3455,9 @@ class AutomationManager:
 
         clean_text = clean_text.strip()
         if clean_text:
-            truncated = _telegram_truncate(clean_text)
-            html = _markdown_to_telegram_html(truncated)
             try:
-                if html:
-                    try:
-                        await _telegram_send_message(token=token, target=target, text=html, parse_mode="HTML")
-                        delivered_any = True
-                    except Exception as e:
-                        msg = str(e)
-                        if TELEGRAM_HTML_PARSE_ERR_RE.search(msg) or TELEGRAM_MESSAGE_TOO_LONG_RE.search(msg):
-                            # Fall back to plain text.
-                            await _telegram_send_message(token=token, target=target, text=truncated, parse_mode=None)
-                            delivered_any = True
-                        else:
-                            raise
-                else:
-                    await _telegram_send_message(token=token, target=target, text=truncated, parse_mode=None)
+                results = await _telegram_send_markdown_message_parts(token=token, target=target, text=clean_text)
+                if results:
                     delivered_any = True
             except Exception as e:
                 log.warning("Failed to deliver to telegram for %s/%s: %s", session_id, thread_id, str(e))
@@ -5565,9 +5664,11 @@ async def _mcp_handle_single_message(request: Request, body: dict[str, Any]) -> 
             fmt = str(raw_format or "markdown").strip().lower()
             silent = bool(args.get("silent")) if args.get("silent") is not None else None
 
-            truncated = _telegram_truncate(text_param.strip())
+            raw_text = text_param.strip()
+            send_results: list[Any] = []
             try:
                 if fmt == "html":
+                    truncated = _telegram_truncate(raw_text)
                     try:
                         res = await _telegram_send_message(
                             token=token,
@@ -5588,45 +5689,21 @@ async def _mcp_handle_single_message(request: Request, body: dict[str, Any]) -> 
                             )
                         else:
                             raise
+                    send_results = [res]
                 elif fmt == "plain":
-                    res = await _telegram_send_message(
+                    send_results = await _telegram_send_plain_message_parts(
                         token=token,
                         target=target,
-                        text=truncated,
-                        parse_mode=None,
+                        text=raw_text,
                         disable_notification=silent,
                     )
                 else:
-                    html = _markdown_to_telegram_html(truncated)
-                    if html:
-                        try:
-                            res = await _telegram_send_message(
-                                token=token,
-                                target=target,
-                                text=html,
-                                parse_mode="HTML",
-                                disable_notification=silent,
-                            )
-                        except Exception as e:  # noqa: BLE001
-                            msg = str(e)
-                            if TELEGRAM_HTML_PARSE_ERR_RE.search(msg) or TELEGRAM_MESSAGE_TOO_LONG_RE.search(msg):
-                                res = await _telegram_send_message(
-                                    token=token,
-                                    target=target,
-                                    text=truncated,
-                                    parse_mode=None,
-                                    disable_notification=silent,
-                                )
-                            else:
-                                raise
-                    else:
-                        res = await _telegram_send_message(
-                            token=token,
-                            target=target,
-                            text=truncated,
-                            parse_mode=None,
-                            disable_notification=silent,
-                        )
+                    send_results = await _telegram_send_markdown_message_parts(
+                        token=token,
+                        target=target,
+                        text=raw_text,
+                        disable_notification=silent,
+                    )
             except Exception as e:  # noqa: BLE001
                 return (
                     _jsonrpc_result(
@@ -5645,7 +5722,14 @@ async def _mcp_handle_single_message(request: Request, body: dict[str, Any]) -> 
                     request_id=request_id,
                     result=_mcp_call_tool_result(
                         content=[{"type": "text", "text": "Sent"}],
-                        structured={"ok": True, "channel": channel, "target": chat_key, "result": res},
+                        structured={
+                            "ok": True,
+                            "channel": channel,
+                            "target": chat_key,
+                            "result": send_results[-1] if send_results else None,
+                            "results": send_results,
+                            "parts": len(send_results),
+                        },
                     ),
                 ),
                 {"MCP-Protocol-Version": sess.protocol_version},

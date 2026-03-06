@@ -9,6 +9,7 @@ FROM node:22-trixie-slim
 RUN apt-get update && apt-get install -y --no-install-recommends \
   ca-certificates \
   curl \
+  git \
   procps \
   python-is-python3 \
   python3 \

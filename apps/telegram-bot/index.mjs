@@ -977,11 +977,53 @@ function extractTelegramImagesFromMessage(message) {
   return out;
 }
 
-function truncateTelegramMessage(text) {
-  const max = 4000;
-  if (text.length <= max) return text;
-  const suffix = "\n…(truncated)";
-  return text.slice(0, Math.max(0, max - suffix.length)) + suffix;
+const TELEGRAM_MAX_MESSAGE_CHARS = 4000;
+
+function findTelegramSplitBoundary(text) {
+  if (!isNonEmptyString(text)) return 0;
+  const min = Math.max(1, Math.floor(text.length * 0.6));
+  const candidates = [
+    "\n\n",
+    "\n",
+    "。",
+    "！",
+    "？",
+    ". ",
+    "! ",
+    "? ",
+    "；",
+    "; ",
+    "，",
+    ", ",
+    "、",
+    " ",
+    "\t",
+  ];
+  for (const needle of candidates) {
+    const idx = text.lastIndexOf(needle);
+    if (idx >= min) return idx + needle.length;
+  }
+  return 0;
+}
+
+function splitTelegramMessage(text) {
+  const raw = String(text ?? "");
+  if (!raw) return [];
+  if (raw.length <= TELEGRAM_MAX_MESSAGE_CHARS) return [raw];
+
+  const out = [];
+  let start = 0;
+  while (start < raw.length) {
+    let end = Math.min(start + TELEGRAM_MAX_MESSAGE_CHARS, raw.length);
+    if (end < raw.length) {
+      const boundary = findTelegramSplitBoundary(raw.slice(start, end));
+      if (boundary > 0) end = start + boundary;
+    }
+    if (end <= start) end = Math.min(start + TELEGRAM_MAX_MESSAGE_CHARS, raw.length);
+    out.push(raw.slice(start, end));
+    start = end;
+  }
+  return out.filter((chunk) => chunk.length > 0);
 }
 
 function detectLocaleFromLanguageCode(languageCode) {
@@ -1677,21 +1719,26 @@ async function main() {
 
   async function sendAssistantMessage(target, text) {
     if (!target || !isNonEmptyString(text)) return null;
-    const truncated = truncateTelegramMessage(text.trim());
-    const html = markdownToTelegramHtml(truncated);
+    const chunks = splitTelegramMessage(text.trim());
 
     try {
-      if (isNonEmptyString(html)) {
-        try {
-          return await tg.sendMessage({ ...target, text: html, parse_mode: "HTML" });
-        } catch (e) {
-          const msg = e instanceof Error ? e.message : String(e);
-          if (!TELEGRAM_HTML_PARSE_ERR_RE.test(msg) && !TELEGRAM_MESSAGE_TOO_LONG_RE.test(msg)) {
-            throw e;
+      let lastResult = null;
+      for (const chunk of chunks) {
+        const html = markdownToTelegramHtml(chunk);
+        if (isNonEmptyString(html)) {
+          try {
+            lastResult = await tg.sendMessage({ ...target, text: html, parse_mode: "HTML" });
+            continue;
+          } catch (e) {
+            const msg = e instanceof Error ? e.message : String(e);
+            if (!TELEGRAM_HTML_PARSE_ERR_RE.test(msg) && !TELEGRAM_MESSAGE_TOO_LONG_RE.test(msg)) {
+              throw e;
+            }
           }
         }
+        lastResult = await tg.sendMessage({ ...target, text: chunk });
       }
-      return await tg.sendMessage({ ...target, text: truncated });
+      return lastResult;
     } catch (e) {
       log("assistant sendMessage failed:", e instanceof Error ? e.message : String(e));
       return null;
