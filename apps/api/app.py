@@ -327,6 +327,7 @@ CRON_DEFAULT_RETENTION_MAX_UNARCHIVED_THREADS = 50
 TELEGRAM_MAX_MESSAGE_CHARS = 4000
 TELEGRAM_MAX_UPLOAD_BYTES = 50 * 1024 * 1024
 TELEGRAM_MAX_DOWNLOAD_BYTES = 20 * 1024 * 1024
+TELEGRAM_DRAFT_FLUSH_INTERVAL_MS = 400
 TELEGRAM_THREAD_NOT_FOUND_RE = re.compile(r"message thread not found", re.IGNORECASE)
 MEDIA_LINE_RE = re.compile(r"^\s*MEDIA:\s*(.*?)\s*$", re.IGNORECASE)
 MARKDOWN_FENCE_RE = re.compile(r"^\s*```")
@@ -659,6 +660,51 @@ def _telegram_target_from_chat_key(chat_key: str) -> Optional[dict[str, Any]]:
     return out
 
 
+def _telegram_private_chat_id_from_chat_key(chat_key: Any) -> Optional[int]:
+    if not isinstance(chat_key, str) or not chat_key.strip():
+        return None
+    chat_id_raw = chat_key.strip().split(":", 1)[0].strip()
+    if not chat_id_raw or not TELEGRAM_PRIVATE_CHAT_ID_RE.match(chat_id_raw):
+        return None
+    try:
+        chat_id = int(chat_id_raw)
+    except Exception:
+        return None
+    return chat_id if chat_id > 0 else None
+
+
+def _telegram_draft_streaming_mode() -> str:
+    raw = (os.getenv("TELEGRAM_DRAFT_STREAMING") or "auto").strip().lower()
+    if raw in ("", "auto", "on", "true", "1", "yes"):
+        return "auto"
+    if raw in ("force", "always"):
+        return "force"
+    return "off"
+
+
+def _new_telegram_draft_id() -> int:
+    value = uuid.uuid4().int % 2_000_000_000
+    return int(value or 1)
+
+
+def _normalize_message_phase(value: Any) -> Optional[str]:
+    if not isinstance(value, str) or not value.strip():
+        return None
+    return value.strip().lower()
+
+
+def _create_turn_text_entry() -> dict[str, Any]:
+    return {
+        "delta": "",
+        "fullText": None,
+        "completedCommentaryTexts": [],
+        "agentMessagePhasesByItemId": {},
+        "agentMessageTextByItemId": {},
+        "activeAgentMessageItemId": None,
+        "draft": None,
+    }
+
+
 TELEGRAM_HTML_PARSE_ERR_RE = re.compile(r"can't parse entities|parse entities|find end of the entity", re.IGNORECASE)
 TELEGRAM_MESSAGE_TOO_LONG_RE = re.compile(r"message is too long", re.IGNORECASE)
 
@@ -816,6 +862,29 @@ async def _telegram_send_message(
         if "message_thread_id" in params and TELEGRAM_THREAD_NOT_FOUND_RE.search(str(e) or ""):
             params.pop("message_thread_id", None)
             return await asyncio.to_thread(_telegram_api_call_sync, token, "sendMessage", params)
+        raise
+
+
+async def _telegram_send_message_draft(
+    *,
+    token: str,
+    target: dict[str, Any],
+    draft_id: int,
+    text: str,
+) -> Any:
+    params = {
+        "chat_id": target.get("chat_id"),
+        "draft_id": int(draft_id),
+        "text": text,
+    }
+    if "message_thread_id" in target:
+        params["message_thread_id"] = target["message_thread_id"]
+    try:
+        return await asyncio.to_thread(_telegram_api_call_sync, token, "sendMessageDraft", params)
+    except Exception as e:  # noqa: BLE001
+        if "message_thread_id" in params and TELEGRAM_THREAD_NOT_FOUND_RE.search(str(e) or ""):
+            params.pop("message_thread_id", None)
+            return await asyncio.to_thread(_telegram_api_call_sync, token, "sendMessageDraft", params)
         raise
 
 
@@ -2114,7 +2183,7 @@ class AutomationManager:
                     self._last_heartbeat_run_at_ms.pop(key, None)
             for key in list(self._turn_text_by_key.keys()):
                 if key[0] == session_id:
-                    self._turn_text_by_key.pop(key, None)
+                    self._pop_turn_text_entry(key)
             for key in list(self._isolated_cron_context_by_key.keys()):
                 if key[0] == session_id:
                     self._isolated_cron_context_by_key.pop(key, None)
@@ -2444,8 +2513,192 @@ class AutomationManager:
         # Clear any partial turn text buffers for this session (memory safety).
         for key in list(self._turn_text_by_key.keys()):
             if key[0] == session_id:
-                self._turn_text_by_key.pop(key, None)
+                self._pop_turn_text_entry(key)
         return affected_tids
+
+    def _get_turn_text_entry(self, key: tuple[str, str, str]) -> dict[str, Any]:
+        entry = self._turn_text_by_key.get(key)
+        if isinstance(entry, dict):
+            return entry
+        entry = _create_turn_text_entry()
+        self._turn_text_by_key[key] = entry
+        return entry
+
+    def _cancel_turn_draft_task(self, draft_state: Any) -> None:
+        if not isinstance(draft_state, dict):
+            return
+        task = draft_state.get("flushTask")
+        if isinstance(task, asyncio.Task) and not task.done():
+            task.cancel()
+        draft_state["flushTask"] = None
+
+    def _pop_turn_text_entry(self, key: tuple[str, str, str]) -> Optional[dict[str, Any]]:
+        entry = self._turn_text_by_key.pop(key, None)
+        if not isinstance(entry, dict):
+            return None
+        self._cancel_turn_draft_task(entry.get("draft"))
+        return entry
+
+    def _resolve_telegram_target_for_turn(
+        self,
+        session_id: str,
+        thread_id: str,
+    ) -> Optional[tuple[str, dict[str, Any], str]]:
+        st = self._store.state
+        sess = st.sessions.get(session_id)
+        if sess is None:
+            return None
+        tgt = sess.last_active_by_thread.get(thread_id)
+        if tgt is None or not isinstance(tgt, PersistedLastActiveTarget):
+            return None
+        channel = (tgt.channel or "").strip().lower()
+        if channel not in ("telegram", "tg"):
+            return None
+        token = os.getenv("TELEGRAM_BOT_TOKEN") or ""
+        if not token.strip():
+            return None
+        chat_key = tgt.chat_key.strip() if isinstance(tgt.chat_key, str) else ""
+        if not chat_key:
+            return None
+        target = _telegram_target_from_chat_key(chat_key)
+        if target is None:
+            return None
+        return token, target, chat_key
+
+    def _turn_draft_candidate_text(self, entry: dict[str, Any]) -> str:
+        phases = entry.get("agentMessagePhasesByItemId")
+        item_texts = entry.get("agentMessageTextByItemId")
+        active_item_id = entry.get("activeAgentMessageItemId")
+        if isinstance(phases, dict) and isinstance(item_texts, dict) and isinstance(active_item_id, str) and active_item_id:
+            if phases.get(active_item_id) != "commentary":
+                text = item_texts.get(active_item_id)
+                if isinstance(text, str) and text.strip():
+                    return text
+
+        commentary_prefix = ""
+        commentary_texts = entry.get("completedCommentaryTexts")
+        if isinstance(commentary_texts, list):
+            commentary_prefix = "".join(x for x in commentary_texts if isinstance(x, str))
+        if not commentary_prefix:
+            return ""
+
+        delta = entry.get("delta")
+        if not isinstance(delta, str) or not delta.strip():
+            return ""
+        delta_candidate = delta
+        if delta_candidate.startswith(commentary_prefix):
+            delta_candidate = delta_candidate[len(commentary_prefix):]
+        return delta_candidate if delta_candidate.strip() else ""
+
+    def _queue_telegram_turn_draft_flush(
+        self,
+        session_id: str,
+        thread_id: str,
+        turn_id: str,
+        *,
+        text: str,
+    ) -> None:
+        if not isinstance(text, str) or not text.strip():
+            return
+        mode = _telegram_draft_streaming_mode()
+        if mode == "off":
+            return
+        resolved = self._resolve_telegram_target_for_turn(session_id, thread_id)
+        if resolved is None:
+            return
+        _token, _target, chat_key = resolved
+        if mode != "force" and _telegram_private_chat_id_from_chat_key(chat_key) is None:
+            return
+
+        key = (session_id, thread_id, turn_id)
+        entry = self._turn_text_by_key.get(key)
+        if not isinstance(entry, dict):
+            return
+        draft = entry.get("draft")
+        if not isinstance(draft, dict):
+            draft = {
+                "draftId": _new_telegram_draft_id(),
+                "latestText": "",
+                "sentText": None,
+                "nextAllowedAtMs": 0,
+                "flushTask": None,
+                "disabled": False,
+            }
+            entry["draft"] = draft
+        if bool(draft.get("disabled")):
+            return
+        draft["latestText"] = text
+        task = draft.get("flushTask")
+        if isinstance(task, asyncio.Task) and not task.done():
+            return
+        draft["flushTask"] = asyncio.create_task(self._flush_telegram_turn_draft(session_id, thread_id, turn_id))
+
+    async def _flush_telegram_turn_draft(self, session_id: str, thread_id: str, turn_id: str) -> None:
+        key = (session_id, thread_id, turn_id)
+        while True:
+            entry = self._turn_text_by_key.get(key)
+            if not isinstance(entry, dict):
+                return
+            draft = entry.get("draft")
+            if not isinstance(draft, dict):
+                return
+
+            latest_raw = draft.get("latestText")
+            latest_text = _telegram_truncate(latest_raw.strip()) if isinstance(latest_raw, str) and latest_raw.strip() else ""
+            if not latest_text:
+                draft["flushTask"] = None
+                return
+
+            sent_text = draft.get("sentText")
+            if isinstance(sent_text, str) and sent_text == latest_text:
+                draft["flushTask"] = None
+                return
+
+            next_allowed_at_ms = draft.get("nextAllowedAtMs")
+            if isinstance(next_allowed_at_ms, int) and next_allowed_at_ms > _now_ms():
+                await asyncio.sleep((next_allowed_at_ms - _now_ms()) / 1000.0)
+                continue
+
+            resolved = self._resolve_telegram_target_for_turn(session_id, thread_id)
+            if resolved is None:
+                draft["disabled"] = True
+                draft["flushTask"] = None
+                return
+            token, target, chat_key = resolved
+
+            mode = _telegram_draft_streaming_mode()
+            if mode == "off":
+                draft["disabled"] = True
+                draft["flushTask"] = None
+                return
+            if mode != "force" and _telegram_private_chat_id_from_chat_key(chat_key) is None:
+                draft["disabled"] = True
+                draft["flushTask"] = None
+                return
+
+            draft_id = int(draft.get("draftId") or 0) or _new_telegram_draft_id()
+            draft["draftId"] = draft_id
+            try:
+                await _telegram_send_message_draft(token=token, target=target, draft_id=draft_id, text=latest_text)
+            except asyncio.CancelledError:
+                draft["flushTask"] = None
+                raise
+            except Exception as e:  # noqa: BLE001
+                draft["disabled"] = True
+                draft["flushTask"] = None
+                log.info("Telegram draft streaming disabled for %s/%s: %s", session_id, thread_id, str(e))
+                return
+
+            draft["sentText"] = latest_text
+            draft["nextAllowedAtMs"] = _now_ms() + TELEGRAM_DRAFT_FLUSH_INTERVAL_MS
+
+            latest_after_raw = draft.get("latestText")
+            latest_after = _telegram_truncate(latest_after_raw.strip()) if isinstance(latest_after_raw, str) and latest_after_raw.strip() else ""
+            if latest_after != latest_text:
+                continue
+
+            draft["flushTask"] = None
+            return
 
     async def _force_close_live_session(self, session_id: str) -> None:
         live: Optional[LiveDockerSession] = None
@@ -2605,17 +2858,71 @@ class AutomationManager:
 
         key = (session_id, thread_id, turn_id) if thread_id and turn_id else None
 
+        if method == "item/started":
+            if not key:
+                return
+            item = params.get("item")
+            if not isinstance(item, dict) or item.get("type") != "agentMessage":
+                return
+            item_id = item.get("id")
+            if not isinstance(item_id, str) or not item_id.strip():
+                return
+            item_id = item_id.strip()
+            entry = self._get_turn_text_entry(key)
+            phase = _normalize_message_phase(item.get("phase"))
+            phases = entry.get("agentMessagePhasesByItemId")
+            if not isinstance(phases, dict):
+                phases = {}
+                entry["agentMessagePhasesByItemId"] = phases
+            phases[item_id] = phase
+            item_texts = entry.get("agentMessageTextByItemId")
+            if not isinstance(item_texts, dict):
+                item_texts = {}
+                entry["agentMessageTextByItemId"] = item_texts
+            item_texts.setdefault(item_id, "")
+            if phase != "commentary":
+                entry["activeAgentMessageItemId"] = item_id
+            if thread_id:
+                self._note_lane_progress(self.lane(session_id, thread_id))
+            return
+
         if method == "item/agentMessage/delta":
             if not key:
                 return
             delta = params.get("delta")
             if not isinstance(delta, str) or not delta:
                 return
-            entry = self._turn_text_by_key.get(key)
-            if entry is None:
-                entry = {"delta": "", "fullText": None, "completedCommentaryTexts": []}
-                self._turn_text_by_key[key] = entry
+            entry = self._get_turn_text_entry(key)
             entry["delta"] = str(entry.get("delta") or "") + delta
+            item_id = params.get("itemId")
+            item_id = item_id.strip() if isinstance(item_id, str) and item_id.strip() else None
+            phases = entry.get("agentMessagePhasesByItemId")
+            if not isinstance(phases, dict):
+                phases = {}
+                entry["agentMessagePhasesByItemId"] = phases
+            item_texts = entry.get("agentMessageTextByItemId")
+            if not isinstance(item_texts, dict):
+                item_texts = {}
+                entry["agentMessageTextByItemId"] = item_texts
+
+            candidate_item_id = item_id
+            if candidate_item_id and candidate_item_id not in phases:
+                phases[candidate_item_id] = None
+            if not candidate_item_id:
+                active_item_id = entry.get("activeAgentMessageItemId")
+                if isinstance(active_item_id, str) and active_item_id.strip():
+                    candidate_item_id = active_item_id.strip()
+
+            draft_candidate = ""
+            if candidate_item_id and phases.get(candidate_item_id) != "commentary":
+                entry["activeAgentMessageItemId"] = candidate_item_id
+                item_texts[candidate_item_id] = str(item_texts.get(candidate_item_id) or "") + delta
+                draft_candidate = str(item_texts.get(candidate_item_id) or "")
+            else:
+                draft_candidate = self._turn_draft_candidate_text(entry)
+
+            if draft_candidate.strip():
+                self._queue_telegram_turn_draft_flush(session_id, thread_id, turn_id, text=draft_candidate)
             if thread_id:
                 self._note_lane_progress(self.lane(session_id, thread_id))
             return
@@ -2629,12 +2936,21 @@ class AutomationManager:
             text = item.get("text")
             if not isinstance(text, str) or not text.strip():
                 return
-            entry = self._turn_text_by_key.get(key)
-            if entry is None:
-                entry = {"delta": "", "fullText": None, "completedCommentaryTexts": []}
-                self._turn_text_by_key[key] = entry
-            phase_raw = item.get("phase")
-            phase = phase_raw.strip().lower() if isinstance(phase_raw, str) and phase_raw.strip() else None
+            entry = self._get_turn_text_entry(key)
+            item_id = item.get("id")
+            item_id = item_id.strip() if isinstance(item_id, str) and item_id.strip() else None
+            phase = _normalize_message_phase(item.get("phase"))
+            phases = entry.get("agentMessagePhasesByItemId")
+            if not isinstance(phases, dict):
+                phases = {}
+                entry["agentMessagePhasesByItemId"] = phases
+            item_texts = entry.get("agentMessageTextByItemId")
+            if not isinstance(item_texts, dict):
+                item_texts = {}
+                entry["agentMessageTextByItemId"] = item_texts
+            if item_id:
+                phases[item_id] = phase
+                item_texts[item_id] = text
             if phase == "commentary":
                 commentary_texts = entry.get("completedCommentaryTexts")
                 if not isinstance(commentary_texts, list):
@@ -2643,6 +2959,9 @@ class AutomationManager:
                 commentary_texts.append(text)
             else:
                 entry["fullText"] = text
+                if item_id:
+                    entry["activeAgentMessageItemId"] = item_id
+                self._queue_telegram_turn_draft_flush(session_id, thread_id, turn_id, text=text)
             if thread_id:
                 self._note_lane_progress(self.lane(session_id, thread_id))
             return
@@ -2673,7 +2992,7 @@ class AutomationManager:
 
                 final_text = ""
                 if key:
-                    entry = self._turn_text_by_key.pop(key, None)
+                    entry = self._pop_turn_text_entry(key)
                     if isinstance(entry, dict):
                         full = entry.get("fullText")
                         delta = entry.get("delta")
@@ -2933,23 +3252,10 @@ class AutomationManager:
         # Gateway-owned delivery: send a single final message on turn/completed.
         if not isinstance(text, str) or not text.strip():
             return
-        st = self._store.state
-        sess = st.sessions.get(session_id)
-        if sess is None:
+        resolved = self._resolve_telegram_target_for_turn(session_id, thread_id)
+        if resolved is None:
             return
-        tgt = sess.last_active_by_thread.get(thread_id)
-        if tgt is None or not isinstance(tgt, PersistedLastActiveTarget):
-            return
-        channel = (tgt.channel or "").strip().lower()
-        if channel not in ("telegram", "tg"):
-            return
-
-        token = os.getenv("TELEGRAM_BOT_TOKEN") or ""
-        if not token.strip():
-            return
-        target = _telegram_target_from_chat_key(tgt.chat_key)
-        if target is None:
-            return
+        token, target, _chat_key = resolved
 
         stripped = _strip_heartbeat_token(text)
         if stripped.get("shouldSkip"):

@@ -26,6 +26,8 @@ Prereqs:
 export TELEGRAM_BOT_TOKEN="123:abc..."
 # Recommended if you expose 8080 beyond localhost:
 export ARGUS_TOKEN="$(openssl rand -hex 16)"
+# Optional: stream private-chat drafts via Telegram Bot API `sendMessageDraft`.
+export TELEGRAM_DRAFT_STREAMING="auto"
 ```
 
 2) Start gateway + Telegram bot:
@@ -45,7 +47,7 @@ docker compose --profile tg up --build
 Notes:
 
 - If you want the bot to respond to all group messages, disable **Group Privacy** in BotFather.
-- Outbound replies are delivered by the **gateway** (one final message per turn). The bot handles inbound messages + typing indicators.
+- Outbound replies are delivered by the **gateway**. With `TELEGRAM_DRAFT_STREAMING=auto`, private chats can show a live draft during generation before the final message is sent; the bot still handles inbound messages + typing indicators.
 
 Stop:
 

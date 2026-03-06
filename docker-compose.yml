@@ -39,6 +39,7 @@ services:
       ARGUS_MCP_TOKEN: ${ARGUS_MCP_TOKEN:-}
       # Optional: enable gateway-owned Telegram delivery (outbound). Inbound is handled by the tg bot/webhook.
       TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:-}
+      TELEGRAM_DRAFT_STREAMING: ${TELEGRAM_DRAFT_STREAMING:-auto}
       # Optional: runtime session container resource limits (applied when the gateway spawns containers).
       ARGUS_RUNTIME_CPUS: ${ARGUS_RUNTIME_CPUS:-}
       ARGUS_RUNTIME_MEM_LIMIT: ${ARGUS_RUNTIME_MEM_LIMIT:-}
@@ -84,6 +85,7 @@ services:
       # Optional: restrict /newmain usage to a comma-separated allowlist of private chat ids.
       # Example: TELEGRAM_ADMIN_CHAT_IDS=123456789,987654321
       TELEGRAM_ADMIN_CHAT_IDS: ${TELEGRAM_ADMIN_CHAT_IDS:-}
+      TELEGRAM_DRAFT_STREAMING: ${TELEGRAM_DRAFT_STREAMING:-auto}
       HOST: ${HOST:-gateway}
     volumes:
       - telegram-bot-data:/data

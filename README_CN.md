@@ -26,6 +26,8 @@ Argus 是一个你可以部署在自己服务器上的“小网关”。
 export TELEGRAM_BOT_TOKEN="123:abc..."
 # 如果你把 8080 暴露到非本机，强烈建议开启访问令牌：
 export ARGUS_TOKEN="$(openssl rand -hex 16)"
+# 可选：通过 Telegram Bot API `sendMessageDraft` 在私聊里显示流式草稿。
+export TELEGRAM_DRAFT_STREAMING="auto"
 ```
 
 2) 启动网关 + Telegram bot：
@@ -45,7 +47,7 @@ docker compose --profile tg up --build
 备注：
 
 - 如果你希望 bot 在群里对“所有消息”都触发回复，需要在 BotFather 里关闭 **Group Privacy**。
-- 出站回复由 **gateway** 统一投递（每轮 turn 只发 1 条最终文本）；bot 负责入站消息与 “typing…” 指示。
+- 出站回复由 **gateway** 统一投递。设置 `TELEGRAM_DRAFT_STREAMING=auto` 后，私聊里会在生成过程中显示实时草稿，完成后仍发送最终消息；bot 继续负责入站消息与 “typing…” 指示。
 
 停止：
 
