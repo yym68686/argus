@@ -654,8 +654,12 @@ class ArgusClient {
     this.initialized = true;
   }
 
-  async startThread() {
-    const result = await this.rpc("thread/start", { cwd: this.cwd, approvalPolicy: "never", sandbox: "danger-full-access" });
+  async startThread(model) {
+    const params = { cwd: this.cwd, approvalPolicy: "never", sandbox: "danger-full-access" };
+    if (AVAILABLE_AGENT_MODELS.includes(model)) {
+      params.model = model;
+    }
+    const result = await this.rpc("thread/start", params);
     const tid = result?.thread?.id;
     if (!isNonEmptyString(tid)) throw new Error("Invalid thread/start response");
     return tid;
@@ -2376,7 +2380,7 @@ async function main() {
         clearPendingAgentInput(chatKey);
         const route = await resolveRouteForChatKey(chatKey);
         const client = await getClient(route.sessionId);
-        const tid = await client.startThread();
+        const tid = await client.startThread(route.model);
         await client.setMainThread(tid);
         const notice = formatTemplate(S.notice_new_main_thread, { threadId: tid });
         const view = await renderPrivateStatusMenu(chatKey, { notice, locale });
@@ -2431,7 +2435,7 @@ async function main() {
         }
 
         const client = await getClient(route.sessionId);
-        const tid = await client.startThread();
+        const tid = await client.startThread(route.model);
         await state.setThreadId(route.sessionId, chatKey, tid);
         const notice = formatTemplate(S.notice_new_thread, { threadId: tid });
         const view = await renderGroupMainMenu(chatKey, { notice, locale });
@@ -2729,7 +2733,7 @@ async function main() {
           } else if (isNonEmptyString(threadId)) {
             // Use mapped thread.
           } else {
-            threadId = await client.startThread();
+            threadId = await client.startThread(route.model);
             await state.setThreadId(sessionId, chatKey, threadId);
           }
 

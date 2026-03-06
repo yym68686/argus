@@ -1801,18 +1801,7 @@ class AutomationManager:
                 log.warning("Failed to persist model file for agent %s at %s: %s", agent.agent_id, str(root), str(e))
 
     async def _sync_live_session_default_model(self, *, session_id: str, model: str) -> bool:
-        sid = session_id.strip() if isinstance(session_id, str) else ""
-        normalized = _normalize_agent_model(model)
-        if not sid or not normalized:
-            return False
-        try:
-            live, _ = await _ensure_live_docker_session(sid, allow_create=False)
-            await self._ensure_initialized(live)
-            await self._rpc(live, "setDefaultModel", {"model": normalized, "reasoningEffort": None})
-            return True
-        except Exception as e:
-            log.warning("Failed to sync live session %s default model to %s: %s", sid, normalized, str(e))
-            return False
+        return False
 
     async def ensure_user_main_agent(self, *, user_id: int) -> tuple[PersistedAgentRuntime, bool]:
         if _provision_mode() != "docker":
@@ -3061,7 +3050,12 @@ class AutomationManager:
             result = await self._rpc(
                 live,
                 "thread/start",
-                {"cwd": live.cfg.workspace_container_path, "approvalPolicy": "never", "sandbox": "danger-full-access"},
+                {
+                    "cwd": live.cfg.workspace_container_path,
+                    "approvalPolicy": "never",
+                    "sandbox": "danger-full-access",
+                    "model": self.get_effective_model_for_session(session_id),
+                },
             )
             tid = None
             if isinstance(result, dict):
@@ -3941,7 +3935,12 @@ class AutomationManager:
         result = await self._rpc(
             live,
             "thread/start",
-            {"cwd": live.cfg.workspace_container_path, "approvalPolicy": "never", "sandbox": "danger-full-access"},
+            {
+                "cwd": live.cfg.workspace_container_path,
+                "approvalPolicy": "never",
+                "sandbox": "danger-full-access",
+                "model": self.get_effective_model_for_session(sid),
+            },
         )
         thread_id = None
         if isinstance(result, dict):
