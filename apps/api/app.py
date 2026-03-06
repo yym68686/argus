@@ -2950,8 +2950,7 @@ class AutomationManager:
                 item_texts = {}
                 entry["agentMessageTextByItemId"] = item_texts
             item_texts.setdefault(item_id, "")
-            if phase != "commentary":
-                entry["activeAgentMessageItemId"] = item_id
+            entry["activeAgentMessageItemId"] = item_id
             if thread_id:
                 self._note_lane_progress(self.lane(session_id, thread_id))
             return
@@ -2984,10 +2983,13 @@ class AutomationManager:
                     candidate_item_id = active_item_id.strip()
 
             draft_candidate = ""
-            if candidate_item_id and phases.get(candidate_item_id) != "commentary":
+            if candidate_item_id:
                 entry["activeAgentMessageItemId"] = candidate_item_id
-                item_texts[candidate_item_id] = str(item_texts.get(candidate_item_id) or "") + delta
-                draft_candidate = str(item_texts.get(candidate_item_id) or "")
+                if phases.get(candidate_item_id) == "commentary":
+                    draft_candidate = ""
+                else:
+                    item_texts[candidate_item_id] = str(item_texts.get(candidate_item_id) or "") + delta
+                    draft_candidate = str(item_texts.get(candidate_item_id) or "")
             else:
                 draft_candidate = self._turn_draft_candidate_text(entry)
 
