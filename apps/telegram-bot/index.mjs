@@ -468,6 +468,13 @@ class ArgusClient {
     return await this._httpJson("POST", "/automation/agent/rename", { chatKey, agentId, newName });
   }
 
+  async automationAgentSetModel(chatKey, agentId, model) {
+    if (!isNonEmptyString(chatKey)) throw new Error("Missing chatKey");
+    if (!isNonEmptyString(agentId)) throw new Error("Missing agentId");
+    if (!isNonEmptyString(model)) throw new Error("Missing model");
+    return await this._httpJson("POST", "/automation/agent/model/set", { chatKey, agentId, model });
+  }
+
   async automationAgentDelete(chatKey, agentId) {
     if (!isNonEmptyString(chatKey)) throw new Error("Missing chatKey");
     if (!isNonEmptyString(agentId)) throw new Error("Missing agentId");
@@ -916,10 +923,24 @@ function detectLocaleFromLanguageCode(languageCode) {
   return "en";
 }
 
+const DEFAULT_AGENT_MODEL = "gpt-5.4";
+const AVAILABLE_AGENT_MODELS = ["gpt-5.2", "gpt-5.4"];
+
+function normalizeAgentModel(model) {
+  return AVAILABLE_AGENT_MODELS.includes(model) ? model : DEFAULT_AGENT_MODEL;
+}
+
+function normalizeAvailableModels(models) {
+  if (!Array.isArray(models)) return [...AVAILABLE_AGENT_MODELS];
+  const out = models.filter((model) => AVAILABLE_AGENT_MODELS.includes(model));
+  return out.length > 0 ? out : [...AVAILABLE_AGENT_MODELS];
+}
+
   const UI_STRINGS = {
   en: {
     menu_title: "Argus Menu",
     title_switch_agent: "Switch Agent",
+    title_switch_model: "Switch Model",
     title_create_agent: "Create Agent",
     title_rename_agent: "Rename Agent",
     title_delete_agent: "Delete Agent",
@@ -928,6 +949,7 @@ function detectLocaleFromLanguageCode(languageCode) {
     title_help: "Help",
 
     btn_switch_agent: "Switch Agent",
+    btn_switch_model: "Switch Model",
     btn_create_agent: "Create Agent",
     btn_rename_agent: "Rename Agent",
     btn_delete_agent: "Delete Agent",
@@ -956,6 +978,7 @@ function detectLocaleFromLanguageCode(languageCode) {
     msg_expired: "Expired. Send /menu.",
     msg_unsupported_cb: "Unsupported",
     msg_invalid_agent: "Invalid agent.",
+    msg_invalid_model: "Invalid model.",
 
     err_not_initialized: "No agent yet. Open /menu and press Create Agent.",
     err_forbidden: "error: forbidden.",
@@ -971,11 +994,13 @@ function detectLocaleFromLanguageCode(languageCode) {
     notice_created: "Created: {name}",
     notice_renamed: "Renamed: {old} -> {name}",
     notice_deleted: "Deleted: {agentId}",
+    notice_model_switched: "Model: {model}",
     notice_new_main_thread: "New conversation: {threadId}",
     notice_new_thread: "New thread: {threadId}",
     notice_bound: "Bound: {agentId}",
 
     label_current: "current",
+    label_model: "model",
     label_page: "page",
     label_status: "status",
     label_error: "error",
@@ -1005,6 +1030,7 @@ function detectLocaleFromLanguageCode(languageCode) {
   zh: {
     menu_title: "Argus 菜单",
     title_switch_agent: "切换 Agent",
+    title_switch_model: "切换模型",
     title_create_agent: "创建 Agent",
     title_rename_agent: "重命名 Agent",
     title_delete_agent: "删除 Agent",
@@ -1013,6 +1039,7 @@ function detectLocaleFromLanguageCode(languageCode) {
     title_help: "帮助",
 
     btn_switch_agent: "切换 Agent",
+    btn_switch_model: "切换模型",
     btn_create_agent: "创建 Agent",
     btn_rename_agent: "重命名 Agent",
     btn_delete_agent: "删除 Agent",
@@ -1041,6 +1068,7 @@ function detectLocaleFromLanguageCode(languageCode) {
     msg_expired: "已过期，请发送 /menu。",
     msg_unsupported_cb: "不支持",
     msg_invalid_agent: "无效的 agent。",
+    msg_invalid_model: "无效的模型。",
 
     err_not_initialized: "尚未创建 agent：请发送 /menu 并点击“创建 Agent”。",
     err_forbidden: "error: 没有权限。",
@@ -1056,11 +1084,13 @@ function detectLocaleFromLanguageCode(languageCode) {
     notice_created: "已创建：{name}",
     notice_renamed: "已重命名：{old} -> {name}",
     notice_deleted: "已删除：{agentId}",
+    notice_model_switched: "已切换模型：{model}",
     notice_new_main_thread: "已新建对话：{threadId}",
     notice_new_thread: "已新建 Thread：{threadId}",
     notice_bound: "已绑定：{agentId}",
 
     label_current: "当前",
+    label_model: "模型",
     label_page: "页",
     label_status: "状态",
     label_error: "错误",
@@ -1105,6 +1135,7 @@ function formatGatewayErrorForUser(err, { locale } = {}) {
   const msg = err instanceof Error ? err.message : String(err);
   if (msg.includes("/start") || /not initialized/i.test(msg)) return S.err_not_initialized;
   if (/forbidden/i.test(msg)) return S.err_forbidden;
+  if (/invalid model/i.test(msg)) return S.msg_invalid_model;
   const already = /agent already exists:\s*([a-z0-9_-]+)/i.exec(msg);
   if (already) return formatTemplate(S.err_agent_exists, { name: already[1] });
   return `error: ${msg}`;
@@ -1465,8 +1496,10 @@ async function main() {
     const res = await argusHttp.automationAgentResolve(chatKey);
     const sessionId = isNonEmptyString(res?.sessionId) ? res.sessionId : null;
     const agentId = isNonEmptyString(res?.agentId) ? res.agentId : "main";
+    const model = normalizeAgentModel(res?.model);
+    const availableModels = normalizeAvailableModels(res?.availableModels);
     if (!sessionId) throw new Error("Missing sessionId");
-    return { agentId, sessionId };
+    return { agentId, sessionId, model, availableModels };
   }
 
   const callbacks = new CallbackStore();
@@ -1649,6 +1682,7 @@ async function main() {
       lines.push(`<b>${escapeHtml(S.menu_title)}</b>`);
       if (isNonEmptyString(notice)) lines.push(`<i>${escapeHtml(notice)}</i>`);
       lines.push(`agent: ${htmlCode(route.agentId)}`);
+      lines.push(`${escapeHtml(S.label_model)}: ${htmlCode(route.model)}`);
       lines.push(`session: ${htmlCode(route.sessionId)}`);
       const ownPrefix = isNonEmptyString(chatKey) ? `u${chatKey.trim()}-` : "";
       const canDelete = isNonEmptyString(ownPrefix)
@@ -1658,9 +1692,10 @@ async function main() {
       const rows = [
         [
           cbButton(S.btn_switch_agent, { action: "p:switch", chatKey, page: 0 }),
-          cbButton(S.btn_create_agent, { action: "p:create_begin", chatKey })
+          cbButton(S.btn_switch_model, { action: "p:model", chatKey })
         ]
       ];
+      rows.push([cbButton(S.btn_create_agent, { action: "p:create_begin", chatKey })]);
       if (canRename) {
         rows.push([
           cbButton(S.btn_rename_agent, { action: "p:rename_begin", chatKey }),
@@ -1740,6 +1775,43 @@ async function main() {
     }
   }
 
+  async function renderPrivateModelMenu(chatKey, { error, locale } = {}) {
+    const S = uiStrings(locale);
+    try {
+      const data = await argusHttp.automationAgentList(chatKey);
+      const currentAgentId = isNonEmptyString(data?.currentAgentId) ? data.currentAgentId : null;
+      const agents = Array.isArray(data?.agents) ? data.agents : [];
+      const availableModels = normalizeAvailableModels(data?.availableModels);
+      const currentAgent = agents.find((agent) => isNonEmptyString(agent?.agentId) && agent.agentId === currentAgentId) || null;
+      const currentModel = normalizeAgentModel(currentAgent?.model);
+
+      const lines = [];
+      lines.push(`<b>${escapeHtml(S.title_switch_model)}</b>`);
+      lines.push(`${escapeHtml(S.label_current)}: ${htmlCode(currentAgentId || "(none)")}`);
+      lines.push(`${escapeHtml(S.label_model)}: ${htmlCode(currentModel)}`);
+      if (isNonEmptyString(error)) {
+        lines.push("");
+        lines.push(`<b>${escapeHtml(S.label_error)}:</b> ${escapeHtml(error)}`);
+      }
+
+      const rows = availableModels.map((model) => [
+        cbButton(`${model === currentModel ? "✅ " : ""}${model}`, { action: "p:model_set", chatKey, agentId: currentAgentId, model })
+      ]);
+      rows.push([
+        cbButton(S.btn_refresh, { action: "p:model", chatKey }),
+        cbButton(S.btn_back, { action: "p:main", chatKey })
+      ]);
+
+      return { text: lines.join("\n"), replyMarkup: kb(rows) };
+    } catch (e) {
+      const lines = [];
+      lines.push(`<b>${escapeHtml(S.title_switch_model)}</b>`);
+      lines.push(escapeHtml(formatGatewayErrorForUser(e, { locale })));
+      const replyMarkup = kb([[cbButton(S.btn_back, { action: "p:main", chatKey })]]);
+      return { text: lines.join("\n"), replyMarkup };
+    }
+  }
+
   async function renderPrivateCreateMenu(chatKey, { error, locale } = {}) {
     const S = uiStrings(locale);
     const lines = [];
@@ -1803,6 +1875,7 @@ async function main() {
         tid = null;
       }
       lines.push(`agentId: ${htmlCode(route.agentId)}`);
+      lines.push(`${escapeHtml(S.label_model)}: ${htmlCode(route.model)}`);
       lines.push(`sessionId: ${htmlCode(route.sessionId)}`);
       lines.push(`chatKey: ${htmlCode(chatKey)}`);
       lines.push(`mainThreadId: ${htmlCode(tid || "(none)")}`);
@@ -1893,6 +1966,7 @@ async function main() {
 
     const threadId = state.getThreadId(route.sessionId, chatKey);
     lines.push(`agent: ${htmlCode(route.agentId)}`);
+    lines.push(`${escapeHtml(S.label_model)}: ${htmlCode(route.model)}`);
     lines.push(`session: ${htmlCode(route.sessionId)}`);
     lines.push(`thread: ${htmlCode(threadId || "(none)")}`);
 
@@ -1917,6 +1991,7 @@ async function main() {
       const route = await resolveRouteForChatKey(chatKey);
       const threadId = state.getThreadId(route.sessionId, chatKey);
       lines.push(`agentId: ${htmlCode(route.agentId)}`);
+      lines.push(`${escapeHtml(S.label_model)}: ${htmlCode(route.model)}`);
       lines.push(`sessionId: ${htmlCode(route.sessionId)}`);
       lines.push(`threadId: ${htmlCode(threadId || "(none)")}`);
     } catch (e) {
@@ -2122,6 +2197,14 @@ async function main() {
         return;
       }
 
+      if (action === "p:model") {
+        await answerOnce();
+        clearPendingAgentInput(chatKey);
+        const view = await renderPrivateModelMenu(chatKey, { locale });
+        await editMenuMessage({ chatId, messageId, view });
+        return;
+      }
+
       if (action === "p:use") {
         await answerOnce();
         clearPendingAgentInput(chatKey);
@@ -2137,6 +2220,23 @@ async function main() {
           await getClient(sid);
         }
         const notice = formatTemplate(S.notice_switched, { agentId });
+        const view = await renderPrivateMainMenu(chatKey, { notice, locale });
+        await editMenuMessage({ chatId, messageId, view });
+        return;
+      }
+
+      if (action === "p:model_set") {
+        await answerOnce();
+        clearPendingAgentInput(chatKey);
+        const agentId = payload.agentId;
+        const model = payload.model;
+        if (!isNonEmptyString(agentId) || !isNonEmptyString(model)) {
+          const view = await renderPrivateModelMenu(chatKey, { error: S.msg_invalid_model, locale });
+          await editMenuMessage({ chatId, messageId, view });
+          return;
+        }
+        await argusHttp.automationAgentSetModel(chatKey, agentId, model);
+        const notice = formatTemplate(S.notice_model_switched, { model });
         const view = await renderPrivateMainMenu(chatKey, { notice, locale });
         await editMenuMessage({ chatId, messageId, view });
         return;

@@ -86,6 +86,7 @@ docker compose down
 - **重复 `/start`**：不会重复创建；只会复用并确保绑定到自己的 `main`。
 - 使用 `/menu` 打开控制面板：
   - **Switch Agent**：切换当前私聊使用的 agent（workspace/session）。
+  - **Switch Model**：在 `gpt-5.2` 和 `gpt-5.4` 之间切换当前 agent 的模型。
   - **Create Agent**：创建新的 agent 并切换过去（同名会报“已存在”）。
   - **Rename Agent**：重命名当前 agent（仅 owner；不包含 `main`）。
   - **Delete Agent**：删除当前 agent（仅 owner；包含 `main`）。删除 `main` 后，下次会提示创建新的 `main`。
@@ -165,6 +166,7 @@ open http://127.0.0.1:3000
 - Key **不会**被传入 runtime 容器。
 - runtime 会写入一个生成的 `CODEX_HOME/config.toml`（不包含任何 secrets），用于把 Codex 指向 gateway 的 MCP 以及可选的 OpenAI 代理。
   - 默认 `CODEX_HOME`：`/workspace/.codex`（按 workspace 隔离）
+  - 默认模型：`gpt-5.4`（Telegram agent 可在 `/menu` 中切换 `gpt-5.2` / `gpt-5.4`，并按 agent 持久化）
 - 代理要求每个 session 的派生 Bearer token（master：`ARGUS_OPENAI_TOKEN`；未设置则回退到 `ARGUS_TOKEN`）。
 - 可选：用 `ARGUS_OPENAI_RESPONSES_UPSTREAM_URL` 覆盖上游地址（默认：`https://api.openai.com/v1/responses`）。
 

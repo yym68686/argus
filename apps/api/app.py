@@ -1230,6 +1230,11 @@ class PersistedLastActiveTarget:
 
 AGENT_ID_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9_-]{0,63}$")
 TELEGRAM_PRIVATE_CHAT_ID_RE = re.compile(r"^[1-9]\d{0,19}$")
+AUTOMATION_STATE_VERSION = 4
+ARGUS_AGENT_MODEL_DEFAULT = "gpt-5.4"
+ARGUS_AGENT_MODELS = ("gpt-5.2", "gpt-5.4")
+ARGUS_AGENT_MODELS_SET = frozenset(ARGUS_AGENT_MODELS)
+ARGUS_AGENT_MODEL_FILE = "argus-agent-model"
 
 
 def _normalize_runtime_session_id(raw: Any) -> str:
@@ -1292,6 +1297,23 @@ def _user_agent_id(*, user_id: int, short_name: str) -> str:
     return f"u{user_id}-{short_name}"
 
 
+def _normalize_agent_model(raw: Any) -> str:
+    if not isinstance(raw, str):
+        return ""
+    model = raw.strip()
+    if model not in ARGUS_AGENT_MODELS_SET:
+        return ""
+    return model
+
+
+def _effective_agent_model(agent: Optional["PersistedAgentRuntime"]) -> str:
+    if isinstance(agent, PersistedAgentRuntime):
+        model = _normalize_agent_model(getattr(agent, "model", None))
+        if model:
+            return model
+    return ARGUS_AGENT_MODEL_DEFAULT
+
+
 @dataclass
 class PersistedAgentRuntime:
     agent_id: str
@@ -1301,6 +1323,7 @@ class PersistedAgentRuntime:
     owner_user_id: Optional[int] = None
     short_name: Optional[str] = None
     allowed_user_ids: list[int] = field(default_factory=list)
+    model: str = ARGUS_AGENT_MODEL_DEFAULT
 
     def to_json(self) -> dict[str, Any]:
         return {
@@ -1311,6 +1334,7 @@ class PersistedAgentRuntime:
             "ownerUserId": int(self.owner_user_id) if isinstance(self.owner_user_id, int) else None,
             "shortName": self.short_name,
             "allowedUserIds": list(self.allowed_user_ids or []),
+            "model": _effective_agent_model(self),
         }
 
     @staticmethod
@@ -1331,6 +1355,7 @@ class PersistedAgentRuntime:
             except Exception:
                 owner_user_id = None
         short_name = str(obj.get("shortName") or "").strip().lower() or None
+        model = _normalize_agent_model(obj.get("model")) or ARGUS_AGENT_MODEL_DEFAULT
         allowed_user_ids: list[int] = []
         allowed_raw = obj.get("allowedUserIds")
         if isinstance(allowed_raw, list):
@@ -1358,6 +1383,7 @@ class PersistedAgentRuntime:
             owner_user_id=owner_user_id,
             short_name=short_name,
             allowed_user_ids=allowed_user_ids,
+            model=model,
         )
 
 
@@ -1633,6 +1659,8 @@ class AutomationManager:
 
     async def start(self) -> None:
         await self._store.load()
+        await self._migrate_agent_models()
+        await self._ensure_agent_model_files()
         await self._gc_orphan_runtime_containers()
         await self._prune_persisted_sessions()
         self._tasks.append(asyncio.create_task(self._cron_loop()))
@@ -1650,6 +1678,18 @@ class AutomationManager:
             if agent.session_id == sid and agent.workspace_host_path:
                 return agent.workspace_host_path
         return None
+
+    def get_effective_model_for_session(self, session_id: str) -> str:
+        sid = session_id.strip() if isinstance(session_id, str) else ""
+        if not sid:
+            return ARGUS_AGENT_MODEL_DEFAULT
+        st = self._store.state
+        for agent in (st.agents or {}).values():
+            if not isinstance(agent, PersistedAgentRuntime):
+                continue
+            if agent.session_id == sid:
+                return _effective_agent_model(agent)
+        return ARGUS_AGENT_MODEL_DEFAULT
 
     def resolve_agent_for_chat_key(self, chat_key: str) -> str:
         ck = chat_key.strip() if isinstance(chat_key, str) else ""
@@ -1712,6 +1752,68 @@ class AutomationManager:
         agent = self._store.state.agents.get(agent_id)
         return agent if isinstance(agent, PersistedAgentRuntime) else None
 
+    async def _migrate_agent_models(self) -> None:
+        changed = False
+
+        def _write(st: PersistedGatewayAutomationState) -> None:
+            nonlocal changed
+            st.version = max(int(getattr(st, "version", 1) or 1), AUTOMATION_STATE_VERSION)
+            for aid, agent in list((st.agents or {}).items()):
+                if not isinstance(agent, PersistedAgentRuntime):
+                    continue
+                model = _effective_agent_model(agent)
+                if _normalize_agent_model(getattr(agent, "model", None)) == model:
+                    continue
+                st.agents[aid] = replace(agent, model=model)
+                changed = True
+
+        if not any(isinstance(agent, PersistedAgentRuntime) for agent in (self._store.state.agents or {}).values()):
+            return
+        await self._store.update(_write)
+        if changed:
+            log.info("Migrated persisted agent models to %s", ARGUS_AGENT_MODEL_DEFAULT)
+
+    def _agent_model_file_for_workspace(self, root: Path) -> Path:
+        return root / ".codex" / ARGUS_AGENT_MODEL_FILE
+
+    async def _write_agent_model_file(self, root: Path, model: str) -> None:
+        normalized = _normalize_agent_model(model) or ARGUS_AGENT_MODEL_DEFAULT
+
+        def _write() -> None:
+            path = self._agent_model_file_for_workspace(root)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            _atomic_write_text(path, normalized + "\n")
+
+        await asyncio.to_thread(_write)
+
+    async def _ensure_agent_model_files(self) -> None:
+        for agent in (self._store.state.agents or {}).values():
+            if not isinstance(agent, PersistedAgentRuntime):
+                continue
+            workspace_host_path = str(agent.workspace_host_path or "").strip()
+            if not workspace_host_path:
+                continue
+            root = Path(workspace_host_path)
+            try:
+                await self._ensure_workspace_files_at(root)
+                await self._write_agent_model_file(root, _effective_agent_model(agent))
+            except Exception as e:
+                log.warning("Failed to persist model file for agent %s at %s: %s", agent.agent_id, str(root), str(e))
+
+    async def _sync_live_session_default_model(self, *, session_id: str, model: str) -> bool:
+        sid = session_id.strip() if isinstance(session_id, str) else ""
+        normalized = _normalize_agent_model(model)
+        if not sid or not normalized:
+            return False
+        try:
+            live, _ = await _ensure_live_docker_session(sid, allow_create=False)
+            await self._ensure_initialized(live)
+            await self._rpc(live, "setDefaultModel", {"model": normalized, "reasoningEffort": None})
+            return True
+        except Exception as e:
+            log.warning("Failed to sync live session %s default model to %s: %s", sid, normalized, str(e))
+            return False
+
     async def ensure_user_main_agent(self, *, user_id: int) -> tuple[PersistedAgentRuntime, bool]:
         if _provision_mode() != "docker":
             raise RuntimeError("User agents are only supported in docker provision mode")
@@ -1726,7 +1828,7 @@ class AutomationManager:
 
         def _write(st: PersistedGatewayAutomationState) -> None:
             nonlocal created
-            st.version = max(int(getattr(st, "version", 1) or 1), 3)
+            st.version = max(int(getattr(st, "version", 1) or 1), AUTOMATION_STATE_VERSION)
             existing = st.agents.get(aid)
             if isinstance(existing, PersistedAgentRuntime):
                 return
@@ -1741,6 +1843,7 @@ class AutomationManager:
                 owner_user_id=user_id,
                 short_name="main",
                 allowed_user_ids=[],
+                model=ARGUS_AGENT_MODEL_DEFAULT,
             )
             if session_id not in st.sessions:
                 st.sessions[session_id] = PersistedSessionAutomation()
@@ -1750,6 +1853,7 @@ class AutomationManager:
         if agent is None:
             raise RuntimeError("Failed to persist user main agent")
         await self._ensure_workspace_files_at(Path(agent.workspace_host_path))
+        await self._write_agent_model_file(Path(agent.workspace_host_path), _effective_agent_model(agent))
         await _ensure_live_docker_session(agent.session_id, allow_create=True)
         return agent, created
 
@@ -1773,7 +1877,7 @@ class AutomationManager:
         created_at_ms = _now_ms()
 
         def _write(st: PersistedGatewayAutomationState) -> None:
-            st.version = max(int(getattr(st, "version", 1) or 1), 3)
+            st.version = max(int(getattr(st, "version", 1) or 1), AUTOMATION_STATE_VERSION)
             if aid in st.agents:
                 raise ValueError(f"Agent already exists: {name}")
             session_id = uuid.uuid4().hex[:12]
@@ -1786,6 +1890,7 @@ class AutomationManager:
                 owner_user_id=user_id,
                 short_name=name,
                 allowed_user_ids=[],
+                model=ARGUS_AGENT_MODEL_DEFAULT,
             )
             if session_id not in st.sessions:
                 st.sessions[session_id] = PersistedSessionAutomation()
@@ -1795,6 +1900,7 @@ class AutomationManager:
         if agent is None:
             raise RuntimeError("Failed to persist user agent")
         await self._ensure_workspace_files_at(Path(agent.workspace_host_path))
+        await self._write_agent_model_file(Path(agent.workspace_host_path), _effective_agent_model(agent))
         await _ensure_live_docker_session(agent.session_id, allow_create=True)
         return agent
 
@@ -1843,7 +1949,7 @@ class AutomationManager:
             new_workspace_host_path = str((home_root / f"workspace-{user_id}-{name}").resolve())
 
             def _write(st: PersistedGatewayAutomationState) -> None:
-                st.version = max(int(getattr(st, "version", 1) or 1), 3)
+                st.version = max(int(getattr(st, "version", 1) or 1), AUTOMATION_STATE_VERSION)
                 agent = st.agents.get(old_aid)
                 if not isinstance(agent, PersistedAgentRuntime):
                     raise ValueError(f"Unknown agent: {old_aid}")
@@ -1884,6 +1990,7 @@ class AutomationManager:
             agent2 = self._get_agent(new_aid)
             if agent2 is None:
                 raise RuntimeError("Agent not found after rename")
+            await self._write_agent_model_file(Path(agent2.workspace_host_path), _effective_agent_model(agent2))
 
             # Ensure the runtime container is recreated with the new workspace bind mount.
             try:
@@ -1941,7 +2048,7 @@ class AutomationManager:
 
             def _write(st: PersistedGatewayAutomationState) -> None:
                 nonlocal archived_workspace_host_path
-                st.version = max(int(getattr(st, "version", 1) or 1), 3)
+                st.version = max(int(getattr(st, "version", 1) or 1), AUTOMATION_STATE_VERSION)
                 current = st.agents.get(aid)
                 if not isinstance(current, PersistedAgentRuntime):
                     raise ValueError(f"Unknown agent: {aid}")
@@ -2045,6 +2152,47 @@ class AutomationManager:
             return False
         return self._can_user_access_agent(user_id=user_id, agent=agent)
 
+    async def set_user_agent_model(self, *, user_id: int, agent_id: str, model: str) -> tuple[PersistedAgentRuntime, bool]:
+        if _provision_mode() != "docker":
+            raise RuntimeError("User agents are only supported in docker provision mode")
+        if not self._home_host_path:
+            raise RuntimeError("ARGUS_HOME_HOST_PATH is required to update user agents")
+        if not isinstance(user_id, int) or user_id <= 0:
+            raise ValueError("Invalid userId")
+
+        aid = _normalize_agent_id(agent_id)
+        if not aid:
+            raise ValueError("Invalid agentId")
+        normalized_model = _normalize_agent_model(model)
+        if not normalized_model:
+            raise ValueError("Invalid model")
+
+        current = self._get_agent(aid)
+        if current is None:
+            raise ValueError(f"Unknown agent: {aid}")
+        if not (isinstance(current.owner_user_id, int) and current.owner_user_id == user_id):
+            raise PermissionError("Forbidden")
+
+        if _effective_agent_model(current) != normalized_model:
+            def _write(st: PersistedGatewayAutomationState) -> None:
+                st.version = max(int(getattr(st, "version", 1) or 1), AUTOMATION_STATE_VERSION)
+                agent = st.agents.get(aid)
+                if not isinstance(agent, PersistedAgentRuntime):
+                    raise ValueError(f"Unknown agent: {aid}")
+                if not (isinstance(agent.owner_user_id, int) and agent.owner_user_id == user_id):
+                    raise PermissionError("Forbidden")
+                st.agents[aid] = replace(agent, model=normalized_model)
+
+            await self._store.update(_write)
+
+        updated = self._get_agent(aid)
+        if updated is None:
+            raise RuntimeError("Agent not found after model update")
+        await self._ensure_workspace_files_at(Path(updated.workspace_host_path))
+        await self._write_agent_model_file(Path(updated.workspace_host_path), normalized_model)
+        synced = await self._sync_live_session_default_model(session_id=updated.session_id, model=normalized_model)
+        return updated, synced
+
     async def bind_private_user_to_agent(self, *, user_id: int, chat_key: str, agent_id: str) -> PersistedAgentRuntime:
         ck = chat_key.strip() if isinstance(chat_key, str) else ""
         if not ck:
@@ -2059,7 +2207,7 @@ class AutomationManager:
             raise PermissionError("Forbidden")
 
         def _write(st: PersistedGatewayAutomationState) -> None:
-            st.version = max(int(getattr(st, "version", 1) or 1), 3)
+            st.version = max(int(getattr(st, "version", 1) or 1), AUTOMATION_STATE_VERSION)
             st.chat_bindings[ck] = aid
 
         await self._store.update(_write)
@@ -3083,13 +3231,7 @@ class AutomationManager:
                 resp = await self._rpc(
                     live,
                     "turn/start",
-                    {
-                        "threadId": thread_id,
-                        "input": input_items,
-                        "cwd": live.cfg.workspace_container_path,
-                        "approvalPolicy": "never",
-                        "sandboxPolicy": {"type": "dangerFullAccess"},
-                    },
+                    self._turn_start_params(session_id=session_id, thread_id=thread_id, input_items=input_items, live=live),
                 )
                 turn_id = None
                 if isinstance(resp, dict):
@@ -3382,13 +3524,7 @@ class AutomationManager:
                 resp = await self._rpc(
                     live,
                     "turn/start",
-                    {
-                        "threadId": thread_id,
-                        "input": input_items,
-                        "cwd": live.cfg.workspace_container_path,
-                        "approvalPolicy": "never",
-                        "sandboxPolicy": {"type": "dangerFullAccess"},
-                    },
+                    self._turn_start_params(session_id=session_id, thread_id=thread_id, input_items=input_items, live=live),
                 )
                 turn_id = None
                 if isinstance(resp, dict):
@@ -3690,6 +3826,16 @@ class AutomationManager:
             raise RuntimeError(msg or "RPC error")
         return resp.get("result")
 
+    def _turn_start_params(self, *, session_id: str, thread_id: str, input_items: list[dict[str, Any]], live: LiveDockerSession) -> dict[str, Any]:
+        return {
+            "threadId": thread_id,
+            "input": input_items,
+            "cwd": live.cfg.workspace_container_path,
+            "approvalPolicy": "never",
+            "sandboxPolicy": {"type": "dangerFullAccess"},
+            "model": self.get_effective_model_for_session(session_id),
+        }
+
     async def _is_thread_loaded(self, live: LiveDockerSession, thread_id: str) -> bool:
         tid = str(thread_id or "").strip()
         if not tid:
@@ -3879,13 +4025,12 @@ class AutomationManager:
                 resp = await self._rpc(
                     live,
                     "turn/start",
-                    {
-                        "threadId": thread_id,
-                        "input": [{"type": "text", "text": assembled}],
-                        "cwd": live.cfg.workspace_container_path,
-                        "approvalPolicy": "never",
-                        "sandboxPolicy": {"type": "dangerFullAccess"},
-                    },
+                    self._turn_start_params(
+                        session_id=sid,
+                        thread_id=thread_id,
+                        input_items=[{"type": "text", "text": assembled}],
+                        live=live,
+                    ),
                 )
                 turn_id = None
                 if isinstance(resp, dict):
@@ -4150,13 +4295,12 @@ class AutomationManager:
                     resp = await self._rpc(
                         live,
                         "turn/start",
-                        {
-                            "threadId": main_tid,
-                            "input": [{"type": "text", "text": assembled}],
-                            "cwd": live.cfg.workspace_container_path,
-                            "approvalPolicy": "never",
-                            "sandboxPolicy": {"type": "dangerFullAccess"},
-                        },
+                        self._turn_start_params(
+                            session_id=session_id,
+                            thread_id=main_tid,
+                            input_items=[{"type": "text", "text": assembled}],
+                            live=live,
+                        ),
                     )
                     turn_id = None
                     if isinstance(resp, dict):
@@ -6622,6 +6766,19 @@ def _resolve_workspace_host_path_for_session(session_id: str) -> Optional[str]:
         return None
 
 
+def _resolve_agent_model_for_session(session_id: str) -> str:
+    sid = session_id.strip() if isinstance(session_id, str) else ""
+    if not sid:
+        return ARGUS_AGENT_MODEL_DEFAULT
+    automation: Optional[AutomationManager] = getattr(app.state, "automation", None)
+    if automation is None:
+        return ARGUS_AGENT_MODEL_DEFAULT
+    try:
+        return automation.get_effective_model_for_session(sid)
+    except Exception:
+        return ARGUS_AGENT_MODEL_DEFAULT
+
+
 def _derive_default_workspace_host_path_for_session(
     session_id: str,
     *,
@@ -6791,6 +6948,7 @@ def _docker_create_container_sync(cfg: DockerProvisionConfig, session_id: str):
     env["ARGUS_NODE_ID"] = f"runtime:{session_id}"
     env["ARGUS_NODE_DISPLAY_NAME"] = f"runtime-{session_id}"
     env["ARGUS_SESSION_ID"] = session_id
+    env["ARGUS_CODEX_MODEL"] = _resolve_agent_model_for_session(session_id)
 
     # Codex runtime (optional): configure gateway MCP URL for tool access.
     env["ARGUS_CODEX_MCP_URL"] = f"http://{gateway_internal_host}:8080/mcp"
@@ -7251,6 +7409,7 @@ async def automation_user_bootstrap(request: Request):
         await automation.bind_private_user_to_agent(user_id=user_id, chat_key=chat_key, agent_id=agent.agent_id)
         current_agent_id = agent.agent_id
     current_session_id = automation.resolve_agent_session_id(current_agent_id) if current_agent_id else None
+    current_agent = automation._get_agent(current_agent_id) if current_agent_id else None
 
     return {
         "ok": True,
@@ -7259,6 +7418,8 @@ async def automation_user_bootstrap(request: Request):
         "createdMain": created_main,
         "currentAgentId": current_agent_id,
         "currentSessionId": current_session_id,
+        "currentModel": _effective_agent_model(current_agent),
+        "availableModels": list(ARGUS_AGENT_MODELS),
         "agent": agent.to_json(),
     }
 
@@ -7295,12 +7456,15 @@ async def automation_agent_list(request: Request):
     if not current_agent_id:
         current_agent_id = main_id
     current_session_id = automation.resolve_agent_session_id(current_agent_id) if current_agent_id else None
+    current_agent = automation._get_agent(current_agent_id) if current_agent_id else None
 
     return {
         "ok": True,
         "agents": automation.list_agents_for_user(user_id=user_id),
         "currentAgentId": current_agent_id,
         "currentSessionId": current_session_id,
+        "currentModel": _effective_agent_model(current_agent),
+        "availableModels": list(ARGUS_AGENT_MODELS),
     }
 
 
@@ -7325,10 +7489,18 @@ async def automation_agent_resolve(request: Request):
         agent_id = automation.resolve_agent_for_chat_key(chat_key)
         if not agent_id:
             raise HTTPException(status_code=404, detail="No agent bound for chatKey")
+        agent = automation._get_agent(agent_id)
         sess_id = automation.resolve_agent_session_id(agent_id)
         if not sess_id:
             raise HTTPException(status_code=404, detail="Unknown agent")
-        return {"ok": True, "chatKey": chat_key, "agentId": agent_id, "sessionId": sess_id}
+        return {
+            "ok": True,
+            "chatKey": chat_key,
+            "agentId": agent_id,
+            "sessionId": sess_id,
+            "model": _effective_agent_model(agent),
+            "availableModels": list(ARGUS_AGENT_MODELS),
+        }
 
     st = automation._store.state
     bound = st.chat_bindings.get(chat_key) if isinstance(getattr(st, "chat_bindings", None), dict) else None
@@ -7344,7 +7516,15 @@ async def automation_agent_resolve(request: Request):
     sess_id = automation.resolve_agent_session_id(agent_id)
     if not sess_id:
         raise HTTPException(status_code=500, detail="Agent has no sessionId")
-    return {"ok": True, "chatKey": chat_key, "agentId": agent_id, "sessionId": sess_id}
+    agent = automation._get_agent(agent_id)
+    return {
+        "ok": True,
+        "chatKey": chat_key,
+        "agentId": agent_id,
+        "sessionId": sess_id,
+        "model": _effective_agent_model(agent),
+        "availableModels": list(ARGUS_AGENT_MODELS),
+    }
 
 
 @app.post("/automation/agent/create")
@@ -7378,7 +7558,7 @@ async def automation_agent_create(request: Request):
         raise HTTPException(status_code=403, detail=str(e)) from e
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e)) from e
-    return {"ok": True, "agent": agent.to_json()}
+    return {"ok": True, "agent": agent.to_json(), "availableModels": list(ARGUS_AGENT_MODELS)}
 
 
 @app.post("/automation/agent/use")
@@ -7420,7 +7600,57 @@ async def automation_agent_use(request: Request):
         raise HTTPException(status_code=403, detail=str(e)) from e
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e)) from e
-    return {"ok": True, "chatKey": chat_key, "agent": agent.to_json()}
+    return {"ok": True, "chatKey": chat_key, "agent": agent.to_json(), "availableModels": list(ARGUS_AGENT_MODELS)}
+
+
+@app.post("/automation/agent/model/set")
+async def automation_agent_model_set(request: Request):
+    _http_require_token(request)
+    automation = _get_automation_or_500()
+    try:
+        body = await request.json()
+    except Exception as e:
+        raise HTTPException(status_code=400, detail="Invalid JSON body") from e
+    if not isinstance(body, dict):
+        raise HTTPException(status_code=400, detail="Invalid JSON body")
+
+    raw_chat_key = body.get("chatKey")
+    raw_aid = body.get("agentId") or body.get("name")
+    raw_model = body.get("model")
+    if not isinstance(raw_chat_key, str) or not raw_chat_key.strip():
+        raise HTTPException(status_code=400, detail="Missing 'chatKey'")
+    chat_key = raw_chat_key.strip()
+
+    user_id = _parse_telegram_private_user_id(chat_key)
+    if user_id is None:
+        raise HTTPException(status_code=400, detail="Invalid 'chatKey'")
+
+    main_id = _user_agent_id(user_id=user_id, short_name="main")
+    if not automation.can_user_access_agent_id(user_id=user_id, agent_id=main_id):
+        raise HTTPException(status_code=400, detail="Not initialized (run /start)")
+
+    aid_raw = _normalize_agent_id(raw_aid)
+    if not aid_raw:
+        raise HTTPException(status_code=400, detail="Invalid 'agentId'")
+    if re.match(r"^u\d+-", aid_raw):
+        agent_id = aid_raw
+    else:
+        agent_id = _user_agent_id(user_id=user_id, short_name=aid_raw)
+
+    try:
+        agent, synced = await automation.set_user_agent_model(user_id=user_id, agent_id=agent_id, model=str(raw_model or ""))
+    except PermissionError as e:
+        raise HTTPException(status_code=403, detail=str(e)) from e
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+
+    return {
+        "ok": True,
+        "chatKey": chat_key,
+        "agent": agent.to_json(),
+        "liveModelSynced": synced,
+        "availableModels": list(ARGUS_AGENT_MODELS),
+    }
 
 
 @app.post("/automation/agent/rename")
@@ -7557,7 +7787,7 @@ async def automation_chat_bind(request: Request):
         raise HTTPException(status_code=403, detail="Forbidden")
 
     def _write(st: PersistedGatewayAutomationState) -> None:
-        st.version = max(int(getattr(st, "version", 1) or 1), 3)
+        st.version = max(int(getattr(st, "version", 1) or 1), AUTOMATION_STATE_VERSION)
         st.chat_bindings[chat_key] = agent_id
 
     await automation._store.update(_write)

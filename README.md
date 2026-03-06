@@ -86,6 +86,7 @@ When using `apps/telegram-bot`, the gateway can isolate runtime containers (agen
 - Subsequent `/start` reuses the existing `main`.
 - Use `/menu` to open the control panel:
   - **Switch Agent**: switch the current DM agent (workspace/session).
+  - **Switch Model**: switch the current agent between `gpt-5.2` and `gpt-5.4`.
   - **Create Agent**: create a new agent (workspace/session) and switch to it.
   - **Rename Agent**: rename the current agent (owner-only; non-`main`).
   - **Delete Agent**: delete the current agent (owner-only; includes `main`). If you delete `main`, you’ll be prompted to create a new `main`.
@@ -165,6 +166,7 @@ Notes:
 - The key is **not** passed into runtime containers.
 - The runtime writes a generated `CODEX_HOME/config.toml` (no secrets) to point Codex at the gateway MCP server and optional OpenAI proxy.
   - Default `CODEX_HOME`: `/workspace/.codex` (workspace-scoped)
+  - Default model: `gpt-5.4` (Telegram agents can switch between `gpt-5.2` / `gpt-5.4` from `/menu`, and the selection is persisted per agent).
 - The proxy requires a per-session derived bearer token (master: `ARGUS_OPENAI_TOKEN`, fallback: `ARGUS_TOKEN`).
 - Optional: override the upstream URL with `ARGUS_OPENAI_RESPONSES_UPSTREAM_URL` (default: `https://api.openai.com/v1/responses`).
 
