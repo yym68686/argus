@@ -30,17 +30,6 @@ function normalizeMessagePhase(value) {
   return value.trim().toLowerCase();
 }
 
-function normalizeTelegramDraftStreamingMode(value) {
-  const raw = isNonEmptyString(value) ? value.trim().toLowerCase() : "auto";
-  if (!raw || raw === "auto" || raw === "on" || raw === "true" || raw === "1" || raw === "yes") {
-    return "auto";
-  }
-  if (raw === "force" || raw === "always") {
-    return "force";
-  }
-  return "off";
-}
-
 function stripOuterQuotes(value) {
   if (!isNonEmptyString(value)) return null;
   const trimmed = value.trim();
@@ -1471,8 +1460,6 @@ async function main() {
 
   const tg = new TelegramApi(telegramToken);
   const typing = new TypingController(tg);
-  const telegramDraftStreamingMode = normalizeTelegramDraftStreamingMode(process.env.TELEGRAM_DRAFT_STREAMING);
-  const sendCommentaryUpdates = telegramDraftStreamingMode === "off";
   const me = await tg.getMe();
   const botUsername = isNonEmptyString(me?.username) ? me.username : null;
   log("Telegram bot:", botUsername ? `@${botUsername}` : "(unknown)");
@@ -1542,20 +1529,22 @@ async function main() {
       typing.start(chatKey, target);
     };
     client.onAgentMessageCompleted = async ({ sessionId, threadId, text, phase }) => {
-      if (phase !== "commentary" || !sendCommentaryUpdates) return;
+      if (phase !== "commentary") return;
       if (!isNonEmptyString(sessionId) || !isNonEmptyString(threadId) || !isNonEmptyString(text)) return;
       const chatKey = lastActiveBySessionThread.get(sessionThreadKey(sessionId, threadId));
       if (!isNonEmptyString(chatKey)) return;
 
-      const sendTarget = sendTargetFromChatKey(chatKey);
-      if (sendTarget) {
-        await sendAssistantMessage(sendTarget, text);
-      }
+      await queue.enqueue(async () => {
+        const sendTarget = sendTargetFromChatKey(chatKey);
+        if (sendTarget) {
+          await sendAssistantMessage(sendTarget, text);
+        }
 
-      const typingTarget = typingTargetFromChatKey(chatKey);
-      if (typingTarget) {
-        typing.start(chatKey, typingTarget);
-      }
+        const typingTarget = typingTargetFromChatKey(chatKey);
+        if (typingTarget) {
+          typing.start(chatKey, typingTarget);
+        }
+      });
     };
     client.onTurnCompleted = async ({ sessionId, threadId }) => {
       if (!isNonEmptyString(sessionId) || !isNonEmptyString(threadId)) return;

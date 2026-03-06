@@ -405,6 +405,57 @@ def _strip_heartbeat_token(raw: Optional[str]) -> dict[str, Any]:
         return {"shouldSkip": True, "text": "", "didStrip": True}
     return {"shouldSkip": False, "text": picked_text, "didStrip": True}
 
+
+def _telegram_draft_probe_text(raw: Optional[str]) -> str:
+    if not isinstance(raw, str):
+        return ""
+    text = raw.strip()
+    if not text:
+        return ""
+    text = re.sub(r"<[^>]*>", " ", text)
+    text = re.sub(r"&nbsp;", " ", text, flags=re.IGNORECASE)
+    text = re.sub(r"^[*`~_]+", "", text)
+    text = re.sub(r"[*`~_]+$", "", text)
+    return text.strip()
+
+
+def _telegram_prepare_draft_payload(raw: Optional[str]) -> dict[str, Any]:
+    if not isinstance(raw, str):
+        return {"action": "skip", "text": "", "parseMode": None, "payloadKey": None}
+
+    trimmed = raw.strip()
+    if not trimmed:
+        return {"action": "skip", "text": "", "parseMode": None, "payloadKey": None}
+
+    probe = _telegram_draft_probe_text(trimmed)
+    if probe and HEARTBEAT_TOKEN.startswith(probe):
+        return {"action": "hold", "text": "", "parseMode": None, "payloadKey": None}
+
+    stripped = _strip_heartbeat_token(trimmed)
+    if stripped.get("shouldSkip"):
+        return {"action": "skip", "text": "", "parseMode": None, "payloadKey": None}
+
+    text = stripped.get("text") if isinstance(stripped.get("text"), str) else trimmed
+    text = _telegram_truncate(text.strip())
+    if not text:
+        return {"action": "skip", "text": "", "parseMode": None, "payloadKey": None}
+
+    html = _markdown_to_telegram_html(text)
+    if html:
+        return {
+            "action": "send",
+            "text": html,
+            "parseMode": "HTML",
+            "payloadKey": f"HTML\0{html}",
+        }
+
+    return {
+        "action": "send",
+        "text": text,
+        "parseMode": None,
+        "payloadKey": f"PLAIN\0{text}",
+    }
+
 def _unwrap_media_quotes(raw: str) -> Optional[str]:
     if not isinstance(raw, str):
         return None
@@ -871,6 +922,7 @@ async def _telegram_send_message_draft(
     target: dict[str, Any],
     draft_id: int,
     text: str,
+    parse_mode: Optional[str] = None,
 ) -> Any:
     params = {
         "chat_id": target.get("chat_id"),
@@ -879,6 +931,8 @@ async def _telegram_send_message_draft(
     }
     if "message_thread_id" in target:
         params["message_thread_id"] = target["message_thread_id"]
+    if parse_mode:
+        params["parse_mode"] = parse_mode
     try:
         return await asyncio.to_thread(_telegram_api_call_sync, token, "sendMessageDraft", params)
     except Exception as e:  # noqa: BLE001
@@ -2619,7 +2673,7 @@ class AutomationManager:
             draft = {
                 "draftId": _new_telegram_draft_id(),
                 "latestText": "",
-                "sentText": None,
+                "sentPayloadKey": None,
                 "nextAllowedAtMs": 0,
                 "flushTask": None,
                 "disabled": False,
@@ -2643,14 +2697,24 @@ class AutomationManager:
             if not isinstance(draft, dict):
                 return
 
-            latest_raw = draft.get("latestText")
-            latest_text = _telegram_truncate(latest_raw.strip()) if isinstance(latest_raw, str) and latest_raw.strip() else ""
-            if not latest_text:
+            prepared = _telegram_prepare_draft_payload(draft.get("latestText"))
+            action = prepared.get("action")
+            if action == "hold":
+                draft["flushTask"] = None
+                return
+            if action != "send":
                 draft["flushTask"] = None
                 return
 
-            sent_text = draft.get("sentText")
-            if isinstance(sent_text, str) and sent_text == latest_text:
+            payload_text = prepared.get("text") if isinstance(prepared.get("text"), str) else ""
+            payload_parse_mode = prepared.get("parseMode") if isinstance(prepared.get("parseMode"), str) else None
+            payload_key = prepared.get("payloadKey") if isinstance(prepared.get("payloadKey"), str) else None
+            if not payload_text or not payload_key:
+                draft["flushTask"] = None
+                return
+
+            sent_payload_key = draft.get("sentPayloadKey")
+            if isinstance(sent_payload_key, str) and sent_payload_key == payload_key:
                 draft["flushTask"] = None
                 return
 
@@ -2679,7 +2743,13 @@ class AutomationManager:
             draft_id = int(draft.get("draftId") or 0) or _new_telegram_draft_id()
             draft["draftId"] = draft_id
             try:
-                await _telegram_send_message_draft(token=token, target=target, draft_id=draft_id, text=latest_text)
+                await _telegram_send_message_draft(
+                    token=token,
+                    target=target,
+                    draft_id=draft_id,
+                    text=payload_text,
+                    parse_mode=payload_parse_mode,
+                )
             except asyncio.CancelledError:
                 draft["flushTask"] = None
                 raise
@@ -2689,12 +2759,12 @@ class AutomationManager:
                 log.info("Telegram draft streaming disabled for %s/%s: %s", session_id, thread_id, str(e))
                 return
 
-            draft["sentText"] = latest_text
+            draft["sentPayloadKey"] = payload_key
             draft["nextAllowedAtMs"] = _now_ms() + TELEGRAM_DRAFT_FLUSH_INTERVAL_MS
 
-            latest_after_raw = draft.get("latestText")
-            latest_after = _telegram_truncate(latest_after_raw.strip()) if isinstance(latest_after_raw, str) and latest_after_raw.strip() else ""
-            if latest_after != latest_text:
+            prepared_after = _telegram_prepare_draft_payload(draft.get("latestText"))
+            latest_after_key = prepared_after.get("payloadKey") if isinstance(prepared_after.get("payloadKey"), str) else None
+            if latest_after_key != payload_key:
                 continue
 
             draft["flushTask"] = None
