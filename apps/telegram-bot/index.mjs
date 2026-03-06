@@ -25,6 +25,11 @@ function isNonEmptyString(value) {
   return typeof value === "string" && value.trim().length > 0;
 }
 
+function normalizeMessagePhase(value) {
+  if (!isNonEmptyString(value)) return null;
+  return value.trim().toLowerCase();
+}
+
 function stripOuterQuotes(value) {
   if (!isNonEmptyString(value)) return null;
   const trimmed = value.trim();
@@ -376,6 +381,10 @@ function isArgusSessionMessage(msg) {
   return msg && typeof msg === "object" && msg.method === "argus/session" && msg.params && typeof msg.params === "object";
 }
 
+function createTurnTextEntry() {
+  return { delta: "", fullText: null, completedCommentaryTexts: [] };
+}
+
 class ArgusClient {
   constructor({ gatewayHttpUrl, gatewayWsUrl, token, cwd }) {
     this.gatewayHttpUrl = gatewayHttpUrl.replace(/\/+$/, "");
@@ -394,6 +403,7 @@ class ArgusClient {
 
     this.turnsByKey = new Map();
     this.onTurnStarted = null;
+    this.onAgentMessageCompleted = null;
     this.onTurnCompleted = null;
     this.onDisconnected = null;
   }
@@ -728,7 +738,7 @@ class ArgusClient {
       if (!key) return;
       const delta = params.delta;
       if (!isNonEmptyString(delta)) return;
-      const existing = this.turnsByKey.get(key) || { delta: "", fullText: null };
+      const existing = this.turnsByKey.get(key) || createTurnTextEntry();
       existing.delta += delta;
       this.turnsByKey.set(key, existing);
       return;
@@ -739,9 +749,31 @@ class ArgusClient {
       const item = params.item && typeof params.item === "object" ? params.item : null;
       if (!item || item.type !== "agentMessage") return;
       if (!isNonEmptyString(item.text)) return;
-      const existing = this.turnsByKey.get(key) || { delta: "", fullText: null };
-      existing.fullText = item.text;
+      const existing = this.turnsByKey.get(key) || createTurnTextEntry();
+      const phase = normalizeMessagePhase(item.phase);
+      if (phase === "commentary") {
+        existing.completedCommentaryTexts.push(item.text);
+      } else {
+        existing.fullText = item.text;
+      }
       this.turnsByKey.set(key, existing);
+
+      const cb = this.onAgentMessageCompleted;
+      if (typeof cb === "function") {
+        try {
+          const res = cb({
+            sessionId: this.sessionId,
+            threadId,
+            turnId,
+            itemId: isNonEmptyString(item.id) ? item.id : null,
+            text: item.text,
+            phase
+          });
+          if (res && typeof res.then === "function") res.catch(() => {});
+        } catch {
+          // ignore
+        }
+      }
       return;
     }
 
@@ -760,9 +792,17 @@ class ArgusClient {
 
     if (msg.method === "turn/completed") {
       if (!key) return;
-      const existing = this.turnsByKey.get(key) || { delta: "", fullText: null };
+      const existing = this.turnsByKey.get(key) || createTurnTextEntry();
       this.turnsByKey.delete(key);
-      const finalText = isNonEmptyString(existing.fullText) ? existing.fullText : existing.delta;
+      let finalText = isNonEmptyString(existing.fullText) ? existing.fullText : existing.delta;
+      if (!isNonEmptyString(existing.fullText) && isNonEmptyString(finalText)) {
+        const commentaryPrefix = Array.isArray(existing.completedCommentaryTexts)
+          ? existing.completedCommentaryTexts.filter(isNonEmptyString).join("")
+          : "";
+        if (isNonEmptyString(commentaryPrefix) && finalText.startsWith(commentaryPrefix)) {
+          finalText = finalText.slice(commentaryPrefix.length);
+        }
+      }
       const cb = this.onTurnCompleted;
       if (typeof cb === "function") {
         try {
@@ -1488,6 +1528,22 @@ async function main() {
       if (!target) return;
       typing.start(chatKey, target);
     };
+    client.onAgentMessageCompleted = async ({ sessionId, threadId, text, phase }) => {
+      if (phase !== "commentary") return;
+      if (!isNonEmptyString(sessionId) || !isNonEmptyString(threadId) || !isNonEmptyString(text)) return;
+      const chatKey = lastActiveBySessionThread.get(sessionThreadKey(sessionId, threadId));
+      if (!isNonEmptyString(chatKey)) return;
+
+      const sendTarget = sendTargetFromChatKey(chatKey);
+      if (sendTarget) {
+        await sendAssistantMessage(sendTarget, text);
+      }
+
+      const typingTarget = typingTargetFromChatKey(chatKey);
+      if (typingTarget) {
+        typing.start(chatKey, typingTarget);
+      }
+    };
     client.onTurnCompleted = async ({ sessionId, threadId }) => {
       if (!isNonEmptyString(sessionId) || !isNonEmptyString(threadId)) return;
       const chatKey = lastActiveBySessionThread.get(sessionThreadKey(sessionId, threadId));
@@ -1613,6 +1669,29 @@ async function main() {
       return await tg.sendMessage(params);
     } catch (e) {
       log("sendMessage failed:", e instanceof Error ? e.message : String(e));
+      return null;
+    }
+  }
+
+  async function sendAssistantMessage(target, text) {
+    if (!target || !isNonEmptyString(text)) return null;
+    const truncated = truncateTelegramMessage(text.trim());
+    const html = markdownToTelegramHtml(truncated);
+
+    try {
+      if (isNonEmptyString(html)) {
+        try {
+          return await tg.sendMessage({ ...target, text: html, parse_mode: "HTML" });
+        } catch (e) {
+          const msg = e instanceof Error ? e.message : String(e);
+          if (!TELEGRAM_HTML_PARSE_ERR_RE.test(msg) && !TELEGRAM_MESSAGE_TOO_LONG_RE.test(msg)) {
+            throw e;
+          }
+        }
+      }
+      return await tg.sendMessage({ ...target, text: truncated });
+    } catch (e) {
+      log("assistant sendMessage failed:", e instanceof Error ? e.message : String(e));
       return null;
     }
   }

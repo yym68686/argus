@@ -2613,7 +2613,7 @@ class AutomationManager:
                 return
             entry = self._turn_text_by_key.get(key)
             if entry is None:
-                entry = {"delta": "", "fullText": None}
+                entry = {"delta": "", "fullText": None, "completedCommentaryTexts": []}
                 self._turn_text_by_key[key] = entry
             entry["delta"] = str(entry.get("delta") or "") + delta
             if thread_id:
@@ -2631,9 +2631,18 @@ class AutomationManager:
                 return
             entry = self._turn_text_by_key.get(key)
             if entry is None:
-                entry = {"delta": "", "fullText": None}
+                entry = {"delta": "", "fullText": None, "completedCommentaryTexts": []}
                 self._turn_text_by_key[key] = entry
-            entry["fullText"] = text
+            phase_raw = item.get("phase")
+            phase = phase_raw.strip().lower() if isinstance(phase_raw, str) and phase_raw.strip() else None
+            if phase == "commentary":
+                commentary_texts = entry.get("completedCommentaryTexts")
+                if not isinstance(commentary_texts, list):
+                    commentary_texts = []
+                    entry["completedCommentaryTexts"] = commentary_texts
+                commentary_texts.append(text)
+            else:
+                entry["fullText"] = text
             if thread_id:
                 self._note_lane_progress(self.lane(session_id, thread_id))
             return
@@ -2668,10 +2677,18 @@ class AutomationManager:
                     if isinstance(entry, dict):
                         full = entry.get("fullText")
                         delta = entry.get("delta")
+                        commentary_prefix = ""
+                        commentary_texts = entry.get("completedCommentaryTexts")
+                        if isinstance(commentary_texts, list):
+                            commentary_prefix = "".join(x for x in commentary_texts if isinstance(x, str))
                         if isinstance(full, str) and full.strip():
                             final_text = full
                         elif isinstance(delta, str) and delta.strip():
-                            final_text = delta
+                            delta_candidate = delta
+                            if commentary_prefix and delta_candidate.startswith(commentary_prefix):
+                                delta_candidate = delta_candidate[len(commentary_prefix):]
+                            if delta_candidate.strip():
+                                final_text = delta_candidate
                 if key:
                     asyncio.create_task(
                         self._handle_isolated_cron_turn_completed(
