@@ -393,6 +393,7 @@ class ArgusClient {
     this._onSessionId = null;
 
     this.turnsByKey = new Map();
+    this.onTurnStarted = null;
     this.onTurnCompleted = null;
     this.onDisconnected = null;
   }
@@ -744,6 +745,19 @@ class ArgusClient {
       return;
     }
 
+    if (msg.method === "turn/started") {
+      const cb = this.onTurnStarted;
+      if (typeof cb === "function") {
+        try {
+          const res = cb({ sessionId: this.sessionId, threadId, turnId });
+          if (res && typeof res.then === "function") res.catch(() => {});
+        } catch {
+          // ignore
+        }
+      }
+      return;
+    }
+
     if (msg.method === "turn/completed") {
       if (!key) return;
       const existing = this.turnsByKey.get(key) || { delta: "", fullText: null };
@@ -823,6 +837,17 @@ function sendTargetFromChatKey(chatKey) {
   const topicId = Number(topicRaw);
   const normalizedTopicId = Number.isFinite(topicId) ? Math.trunc(topicId) : null;
   if (Number.isFinite(normalizedTopicId) && normalizedTopicId !== 1) out.message_thread_id = normalizedTopicId;
+  return out;
+}
+
+function typingTargetFromChatKey(chatKey) {
+  if (!isNonEmptyString(chatKey)) return null;
+  const [chatIdRaw, topicRaw] = chatKey.split(":", 2);
+  const chatId = Number(chatIdRaw);
+  if (!Number.isFinite(chatId)) return null;
+  const out = { chat_id: chatId };
+  const topicId = Number(topicRaw);
+  if (Number.isFinite(topicId)) out.message_thread_id = Math.trunc(topicId);
   return out;
 }
 
@@ -1288,10 +1313,11 @@ function markdownToTelegramHtml(markdown) {
 }
 
 class TypingController {
-  constructor(tg, { intervalSeconds = 6, ttlMs = 2 * 60_000 } = {}) {
+  constructor(tg, { intervalSeconds = 4.5, ttlMs = 0 } = {}) {
     this.tg = tg;
     this.intervalMs = Math.max(1000, Math.floor(Number(intervalSeconds) * 1000));
-    this.ttlMs = Math.max(10_000, Math.floor(Number(ttlMs)));
+    const ttlNumber = Number(ttlMs);
+    this.ttlMs = Number.isFinite(ttlNumber) && ttlNumber > 0 ? Math.max(10_000, Math.floor(ttlNumber)) : null;
     this.activeByChatKey = new Map();
   }
 
@@ -1319,7 +1345,7 @@ class TypingController {
     const normalized = this._normalizeTarget(target);
     if (!normalized) return;
 
-    const expiresAtMs = Date.now() + this.ttlMs;
+    const expiresAtMs = this.ttlMs ? Date.now() + this.ttlMs : null;
     const existing = this.activeByChatKey.get(chatKey);
     if (existing) {
       existing.expiresAtMs = expiresAtMs;
@@ -1338,7 +1364,7 @@ class TypingController {
     entry.timer = setInterval(() => {
       const current = this.activeByChatKey.get(chatKey);
       if (!current) return;
-      if (Date.now() >= current.expiresAtMs) {
+      if (current.expiresAtMs && Date.now() >= current.expiresAtMs) {
         this.stop(chatKey);
         return;
       }
@@ -1454,6 +1480,14 @@ async function main() {
   const sessionThreadKey = (sessionId, threadId) => `${sessionId}:${threadId}`;
 
   const attachClientHooks = (client) => {
+    client.onTurnStarted = async ({ sessionId, threadId }) => {
+      if (!isNonEmptyString(sessionId) || !isNonEmptyString(threadId)) return;
+      const chatKey = lastActiveBySessionThread.get(sessionThreadKey(sessionId, threadId));
+      if (!isNonEmptyString(chatKey)) return;
+      const target = typingTargetFromChatKey(chatKey);
+      if (!target) return;
+      typing.start(chatKey, target);
+    };
     client.onTurnCompleted = async ({ sessionId, threadId }) => {
       if (!isNonEmptyString(sessionId) || !isNonEmptyString(threadId)) return;
       const chatKey = lastActiveBySessionThread.get(sessionThreadKey(sessionId, threadId));
