@@ -1468,7 +1468,7 @@ class PersistedLastActiveTarget:
 AGENT_ID_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9_-]{0,63}$")
 CHANNEL_ID_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,63}$")
 TELEGRAM_PRIVATE_CHAT_ID_RE = re.compile(r"^[1-9]\d{0,19}$")
-AUTOMATION_STATE_VERSION = 5
+AUTOMATION_STATE_VERSION = 6
 ARGUS_AGENT_MODEL_DEFAULT = "gpt-5.4"
 ARGUS_AGENT_MODELS = ("gpt-5.2", "gpt-5.4")
 ARGUS_AGENT_MODELS_SET = frozenset(ARGUS_AGENT_MODELS)
@@ -1720,6 +1720,7 @@ class PersistedSessionAutomation:
     cron_runs_by_job: dict[str, list[PersistedCronRunMeta]] = field(default_factory=dict)
     system_event_queues: dict[str, list[PersistedSystemEvent]] = field(default_factory=dict)
     last_active_by_thread: dict[str, PersistedLastActiveTarget] = field(default_factory=dict)
+    paused_node_ids: list[str] = field(default_factory=list)
 
     def to_json(self) -> dict[str, Any]:
         queues: dict[str, Any] = {}
@@ -1734,6 +1735,16 @@ class PersistedSessionAutomation:
             if not isinstance(tgt, PersistedLastActiveTarget):
                 continue
             last_active[tid] = tgt.to_json()
+        paused_node_ids: list[str] = []
+        seen_node_ids: set[str] = set()
+        for node_id in self.paused_node_ids:
+            if not isinstance(node_id, str) or not node_id.strip():
+                continue
+            node_id_norm = node_id.strip()
+            if node_id_norm in seen_node_ids:
+                continue
+            seen_node_ids.add(node_id_norm)
+            paused_node_ids.append(node_id_norm)
         cron_runs: dict[str, Any] = {}
         for jid, runs in (self.cron_runs_by_job or {}).items():
             if not isinstance(jid, str) or not jid.strip():
@@ -1753,6 +1764,7 @@ class PersistedSessionAutomation:
             "cronRunsByJob": cron_runs,
             "systemEventQueues": queues,
             "lastActiveByThread": last_active,
+            "pausedNodeIds": paused_node_ids,
         }
 
     @staticmethod
@@ -1808,12 +1820,25 @@ class PersistedSessionAutomation:
                 tgt = PersistedLastActiveTarget.from_json(raw_tgt)
                 if tgt is not None:
                     last_active_by_thread[tid.strip()] = tgt
+        paused_node_ids_raw = obj.get("pausedNodeIds")
+        paused_node_ids: list[str] = []
+        if isinstance(paused_node_ids_raw, list):
+            seen_node_ids: set[str] = set()
+            for node_id in paused_node_ids_raw:
+                if not isinstance(node_id, str) or not node_id.strip():
+                    continue
+                node_id_norm = node_id.strip()
+                if node_id_norm in seen_node_ids:
+                    continue
+                seen_node_ids.add(node_id_norm)
+                paused_node_ids.append(node_id_norm)
         return PersistedSessionAutomation(
             main_thread_id=main_thread_id.strip() if isinstance(main_thread_id, str) else None,
             cron_jobs=cron_jobs,
             cron_runs_by_job=cron_runs_by_job,
             system_event_queues=queues,
             last_active_by_thread=last_active_by_thread,
+            paused_node_ids=paused_node_ids,
         )
 
 
@@ -2176,6 +2201,92 @@ class AutomationManager:
     def resolve_session_id_for_chat_key(self, chat_key: str) -> Optional[str]:
         aid = self.resolve_agent_for_chat_key(chat_key)
         return self.resolve_agent_session_id(aid)
+
+    def default_node_id_for_session(self, session_id: str) -> Optional[str]:
+        sid = session_id.strip() if isinstance(session_id, str) else ""
+        if not sid:
+            return None
+        return f"runtime:{sid}"
+
+    def get_paused_node_ids_for_session(self, session_id: str) -> list[str]:
+        sid = session_id.strip() if isinstance(session_id, str) else ""
+        if not sid:
+            return []
+        default_node_id = self.default_node_id_for_session(sid)
+        st = self._store.state
+        sess = st.sessions.get(sid) if isinstance(st.sessions, dict) else None
+        raw_ids = getattr(sess, "paused_node_ids", None) if isinstance(sess, PersistedSessionAutomation) else None
+        if not isinstance(raw_ids, list):
+            return []
+        out: list[str] = []
+        seen: set[str] = set()
+        for node_id in raw_ids:
+            if not isinstance(node_id, str) or not node_id.strip():
+                continue
+            node_id_norm = node_id.strip()
+            if default_node_id and node_id_norm == default_node_id:
+                continue
+            if node_id_norm in seen:
+                continue
+            seen.add(node_id_norm)
+            out.append(node_id_norm)
+        return out
+
+    def is_node_paused(self, *, session_id: str, node_id: str) -> bool:
+        sid = session_id.strip() if isinstance(session_id, str) else ""
+        nid = node_id.strip() if isinstance(node_id, str) else ""
+        if not sid or not nid:
+            return False
+        default_node_id = self.default_node_id_for_session(sid)
+        if default_node_id and nid == default_node_id:
+            return False
+        return nid in self.get_paused_node_ids_for_session(sid)
+
+    async def set_node_paused(self, *, session_id: str, node_id: str, paused: bool) -> bool:
+        sid = session_id.strip() if isinstance(session_id, str) else ""
+        nid = node_id.strip() if isinstance(node_id, str) else ""
+        if not sid:
+            raise ValueError("session_id must not be empty")
+        if not nid:
+            raise ValueError("node_id must not be empty")
+        default_node_id = self.default_node_id_for_session(sid)
+        if paused and default_node_id and nid == default_node_id:
+            raise ValueError("Default node cannot be paused")
+
+        changed = False
+
+        def _write(st: PersistedGatewayAutomationState) -> None:
+            nonlocal changed
+            st.version = max(int(getattr(st, "version", 1) or 1), AUTOMATION_STATE_VERSION)
+            sess = st.sessions.get(sid)
+            if sess is None:
+                sess = PersistedSessionAutomation()
+                st.sessions[sid] = sess
+            current: list[str] = []
+            seen: set[str] = set()
+            for existing in getattr(sess, "paused_node_ids", []) or []:
+                if not isinstance(existing, str) or not existing.strip():
+                    continue
+                existing_norm = existing.strip()
+                if default_node_id and existing_norm == default_node_id:
+                    continue
+                if existing_norm in seen:
+                    continue
+                seen.add(existing_norm)
+                current.append(existing_norm)
+            if paused:
+                if nid not in seen:
+                    current.append(nid)
+                    changed = True
+            else:
+                next_current = [existing for existing in current if existing != nid]
+                if len(next_current) != len(current):
+                    current = next_current
+                    changed = True
+            sess.paused_node_ids = current
+
+        await self._store.update(_write)
+        return changed
 
     def _can_user_access_agent(self, *, user_id: int, agent: PersistedAgentRuntime) -> bool:
         if not isinstance(user_id, int) or user_id <= 0:
@@ -5694,6 +5805,21 @@ class NodeRegistry:
             return matches[0]
         return None
 
+    async def resolve_scope_session_id(self, node_id: str, *, scope_session_id: Optional[str] = None) -> Optional[str]:
+        nid = (node_id or "").strip()
+        if not nid:
+            return None
+        scope = self._norm_scope(scope_session_id) if scope_session_id is not None else None
+        async with self._lock:
+            if scope is not None:
+                if (scope, nid) in self._nodes_by_key:
+                    return scope or None
+                return None
+            matches = [sid or None for (sid, existing_node_id), _ in self._nodes_by_key.items() if existing_node_id == nid]
+        if len(matches) == 1:
+            return matches[0]
+        return None
+
     async def touch(self, node_id: str, *, scope_session_id: Optional[str] = None) -> None:
         scope = self._norm_scope(scope_session_id) if scope_session_id is not None else None
         now_ms = int(time.time() * 1000)
@@ -7410,7 +7536,7 @@ async def _mcp_handle_single_message(request: Request, body: dict[str, Any]) -> 
                     {"MCP-Protocol-Version": sess.protocol_version},
                 )
 
-            res: NodeInvokeResult = await app.state.node_registry.invoke(
+            res: NodeInvokeResult = await _invoke_node_checked(
                 node_id=node_id,
                 scope_session_id=scoped_sid,
                 command=cmd,
@@ -7665,7 +7791,7 @@ async def _mcp_handle_single_message(request: Request, body: dict[str, Any]) -> 
                     status_code=200,
                 )
 
-            res: NodeInvokeResult = await app.state.node_registry.invoke(
+            res: NodeInvokeResult = await _invoke_node_checked(
                 node_id=node_id,
                 scope_session_id=scoped_sid,
                 command=cmd,
@@ -8518,7 +8644,7 @@ async def list_sessions(request: Request):
 @app.get("/nodes")
 async def list_nodes(request: Request):
     _http_require_token(request)
-    nodes = await app.state.node_registry.list_connected()
+    nodes = await _list_nodes_with_state()
     return {"nodes": nodes}
 
 
@@ -8549,7 +8675,7 @@ async def invoke_node(request: Request):
     if not node_id:
         raise HTTPException(status_code=404, detail="Node not found (or ambiguous display name)")
 
-    res: NodeInvokeResult = await app.state.node_registry.invoke(
+    res: NodeInvokeResult = await _invoke_node_checked(
         node_id=node_id,
         command=command,
         params=params,
@@ -8563,6 +8689,82 @@ def _get_automation_or_500() -> AutomationManager:
     if automation is None:
         raise HTTPException(status_code=500, detail="Automation is not initialized")
     return automation
+
+
+def _automation_require_chat_key(body: Any) -> str:
+    if not isinstance(body, dict):
+        raise HTTPException(status_code=400, detail="Invalid JSON body")
+    raw_chat_key = body.get("chatKey")
+    if not isinstance(raw_chat_key, str) or not raw_chat_key.strip():
+        raise HTTPException(status_code=400, detail="Missing 'chatKey'")
+    return raw_chat_key.strip()
+
+
+def _automation_require_session_id_for_chat_key(automation: AutomationManager, chat_key: str) -> str:
+    sid = automation.resolve_session_id_for_chat_key(chat_key)
+    if not sid:
+        raise HTTPException(status_code=400, detail="Unknown session (run /start)")
+    return sid
+
+
+def _node_status_payload(automation: AutomationManager, node: dict[str, Any]) -> dict[str, Any]:
+    out = dict(node)
+    session_id = str(node.get("sessionId") or "").strip()
+    node_id = str(node.get("nodeId") or "").strip()
+    default_node_id = automation.default_node_id_for_session(session_id)
+    is_default = bool(default_node_id and node_id == default_node_id)
+    paused = bool(session_id and node_id and automation.is_node_paused(session_id=session_id, node_id=node_id))
+    out["isDefault"] = is_default
+    out["paused"] = paused
+    out["canPause"] = bool(session_id and node_id and not is_default)
+    out["status"] = "paused" if paused else "ready"
+    return out
+
+
+async def _list_nodes_with_state(*, scope_session_id: Optional[str] = None) -> list[dict[str, Any]]:
+    automation = _get_automation_or_500()
+    nodes = await app.state.node_registry.list_connected(scope_session_id=scope_session_id)
+    out = [_node_status_payload(automation, node) for node in nodes]
+    out.sort(
+        key=lambda item: (
+            0 if item.get("isDefault") else 1,
+            str(item.get("displayName") or item.get("nodeId") or "").lower(),
+        )
+    )
+    return out
+
+
+def _node_command_allowed_while_paused(command: str) -> bool:
+    cmd = str(command or "").strip()
+    return cmd.startswith("process.")
+
+
+async def _invoke_node_checked(
+    *,
+    node_id: str,
+    scope_session_id: Optional[str] = None,
+    command: str,
+    params: Any = None,
+    timeout_ms: Optional[int] = None,
+) -> NodeInvokeResult:
+    automation = _get_automation_or_500()
+    resolved_scope = await app.state.node_registry.resolve_scope_session_id(node_id, scope_session_id=scope_session_id)
+    if resolved_scope and automation.is_node_paused(session_id=resolved_scope, node_id=node_id):
+        if not _node_command_allowed_while_paused(command):
+            return NodeInvokeResult(
+                ok=False,
+                error={
+                    "code": "NODE_PAUSED",
+                    "message": "node is paused; only process.* commands are allowed until it is resumed",
+                },
+            )
+    return await app.state.node_registry.invoke(
+        node_id=node_id,
+        scope_session_id=scope_session_id,
+        command=command,
+        params=params,
+        timeout_ms=timeout_ms,
+    )
 
 
 @app.get("/automation/state")
@@ -9243,6 +9445,103 @@ async def automation_chat_bind(request: Request):
     return {"ok": True, "chatKey": chat_key, "agentId": agent_id, "sessionId": agent.session_id, "agent": agent.to_json()}
 
 
+@app.post("/automation/node/list")
+async def automation_node_list(request: Request):
+    _http_require_token(request)
+    automation = _get_automation_or_500()
+    try:
+        body = await request.json()
+    except Exception as e:
+        raise HTTPException(status_code=400, detail="Invalid JSON body") from e
+    chat_key = _automation_require_chat_key(body)
+    sid = _automation_require_session_id_for_chat_key(automation, chat_key)
+
+    nodes = await _list_nodes_with_state(scope_session_id=sid)
+    default_node_id = automation.default_node_id_for_session(sid)
+    paused_node_ids = automation.get_paused_node_ids_for_session(sid)
+    return {
+        "ok": True,
+        "chatKey": chat_key,
+        "sessionId": sid,
+        "currentNodeId": default_node_id,
+        "defaultNodeId": default_node_id,
+        "defaultNodeConnected": any(node.get("nodeId") == default_node_id for node in nodes),
+        "pausedNodeIds": paused_node_ids,
+        "nodes": nodes,
+    }
+
+
+@app.post("/automation/node/pause")
+async def automation_node_pause(request: Request):
+    _http_require_token(request)
+    automation = _get_automation_or_500()
+    try:
+        body = await request.json()
+    except Exception as e:
+        raise HTTPException(status_code=400, detail="Invalid JSON body") from e
+    chat_key = _automation_require_chat_key(body)
+    sid = _automation_require_session_id_for_chat_key(automation, chat_key)
+
+    node_raw = str(body.get("nodeId") or body.get("node") or "").strip()
+    if not node_raw:
+        raise HTTPException(status_code=400, detail="Missing 'nodeId'")
+
+    node_id = await app.state.node_registry.resolve_node_id(node_raw, scope_session_id=sid)
+    if not node_id:
+        raise HTTPException(status_code=404, detail="Node not found")
+    default_node_id = automation.default_node_id_for_session(sid)
+    if default_node_id and node_id == default_node_id:
+        raise HTTPException(status_code=400, detail="Default node cannot be paused")
+
+    await automation.set_node_paused(session_id=sid, node_id=node_id, paused=True)
+    nodes = await _list_nodes_with_state(scope_session_id=sid)
+    return {
+        "ok": True,
+        "chatKey": chat_key,
+        "sessionId": sid,
+        "nodeId": node_id,
+        "paused": True,
+        "defaultNodeId": default_node_id,
+        "pausedNodeIds": automation.get_paused_node_ids_for_session(sid),
+        "nodes": nodes,
+    }
+
+
+@app.post("/automation/node/resume")
+async def automation_node_resume(request: Request):
+    _http_require_token(request)
+    automation = _get_automation_or_500()
+    try:
+        body = await request.json()
+    except Exception as e:
+        raise HTTPException(status_code=400, detail="Invalid JSON body") from e
+    chat_key = _automation_require_chat_key(body)
+    sid = _automation_require_session_id_for_chat_key(automation, chat_key)
+
+    node_raw = str(body.get("nodeId") or body.get("node") or "").strip()
+    if not node_raw:
+        raise HTTPException(status_code=400, detail="Missing 'nodeId'")
+
+    node_id = await app.state.node_registry.resolve_node_id(node_raw, scope_session_id=sid)
+    if not node_id and node_raw in automation.get_paused_node_ids_for_session(sid):
+        node_id = node_raw
+    if not node_id:
+        raise HTTPException(status_code=404, detail="Node not found")
+
+    await automation.set_node_paused(session_id=sid, node_id=node_id, paused=False)
+    nodes = await _list_nodes_with_state(scope_session_id=sid)
+    return {
+        "ok": True,
+        "chatKey": chat_key,
+        "sessionId": sid,
+        "nodeId": node_id,
+        "paused": False,
+        "defaultNodeId": automation.default_node_id_for_session(sid),
+        "pausedNodeIds": automation.get_paused_node_ids_for_session(sid),
+        "nodes": nodes,
+    }
+
+
 @app.post("/automation/node/token")
 async def automation_node_token(request: Request):
     _http_require_token(request)
@@ -9251,17 +9550,8 @@ async def automation_node_token(request: Request):
         body = await request.json()
     except Exception as e:
         raise HTTPException(status_code=400, detail="Invalid JSON body") from e
-    if not isinstance(body, dict):
-        raise HTTPException(status_code=400, detail="Invalid JSON body")
-
-    raw_chat_key = body.get("chatKey")
-    if not isinstance(raw_chat_key, str) or not raw_chat_key.strip():
-        raise HTTPException(status_code=400, detail="Missing 'chatKey'")
-    chat_key = raw_chat_key.strip()
-
-    sid = automation.resolve_session_id_for_chat_key(chat_key)
-    if not sid:
-        raise HTTPException(status_code=400, detail="Unknown session (run /start)")
+    chat_key = _automation_require_chat_key(body)
+    sid = _automation_require_session_id_for_chat_key(automation, chat_key)
 
     master = os.getenv("ARGUS_NODE_TOKEN") or os.getenv("ARGUS_TOKEN") or None
     token = _node_derive_session_token(master, sid) if master else None

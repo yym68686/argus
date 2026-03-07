@@ -544,6 +544,23 @@ class ArgusClient {
     return await this._httpJson("POST", "/automation/chat/bind", { chatKey, agentId, actorUserId });
   }
 
+  async automationNodeList(chatKey) {
+    if (!isNonEmptyString(chatKey)) throw new Error("Missing chatKey");
+    return await this._httpJson("POST", "/automation/node/list", { chatKey });
+  }
+
+  async automationNodePause(chatKey, nodeId) {
+    if (!isNonEmptyString(chatKey)) throw new Error("Missing chatKey");
+    if (!isNonEmptyString(nodeId)) throw new Error("Missing nodeId");
+    return await this._httpJson("POST", "/automation/node/pause", { chatKey, nodeId });
+  }
+
+  async automationNodeResume(chatKey, nodeId) {
+    if (!isNonEmptyString(chatKey)) throw new Error("Missing chatKey");
+    if (!isNonEmptyString(nodeId)) throw new Error("Missing nodeId");
+    return await this._httpJson("POST", "/automation/node/resume", { chatKey, nodeId });
+  }
+
   async automationNodeToken(chatKey) {
     if (!isNonEmptyString(chatKey)) throw new Error("Missing chatKey");
     return await this._httpJson("POST", "/automation/node/token", { chatKey });
@@ -1101,7 +1118,7 @@ function normalizeAvailableModels(models) {
     title_rename_agent: "Rename Agent",
     title_delete_agent: "Delete Agent",
     title_status: "Status",
-    title_node_token: "Node Token",
+    title_node_token: "Node Management",
     title_help: "Help",
 
     btn_switch_agent: "Switch Agent",
@@ -1111,7 +1128,10 @@ function normalizeAvailableModels(models) {
     btn_delete_agent: "Delete Agent",
     btn_delete_confirm: "Delete",
     btn_new_main_thread: "New Conversation",
-    btn_node_token: "Node Token",
+    btn_node_token: "Node Management",
+    btn_pause_node: "Pause",
+    btn_resume_node: "Resume",
+    btn_show_node_token: "Show Token",
     btn_status: "Status",
     btn_help: "Help",
     btn_close: "Close",
@@ -1154,12 +1174,15 @@ function normalizeAvailableModels(models) {
     notice_new_main_thread: "New conversation: {threadId}",
     notice_new_thread: "New thread: {threadId}",
     notice_bound: "Bound: {agentId}",
+    notice_node_paused: "Paused: {nodeId}",
+    notice_node_resumed: "Resumed: {nodeId}",
 
     label_current: "current",
     label_model: "model",
     label_page: "page",
     label_status: "status",
     label_error: "error",
+    label_node: "node",
 
     create_prompt_prefix: "Send the new agent name (a-z0-9_-), e.g.",
     create_missing: "Missing agent name.",
@@ -1170,7 +1193,16 @@ function normalizeAvailableModels(models) {
     delete_warning: "This will remove the agent from the list and delete its runtime container. The workspace will be archived.",
 
     node_warning: "WARNING: token is sensitive; rotate if leaked.",
-    node_press_reveal: "Press Reveal to fetch the current session token.",
+    node_pause_hint: "Paused nodes stay connected, but new non-process commands are blocked.",
+    node_default_note: "The default node stays connected and cannot be paused.",
+    node_connected_label: "Connected nodes",
+    node_none_connected: "No nodes are currently connected for this session.",
+    node_token_label: "Connection token",
+    node_status_active: "active",
+    node_status_paused: "paused",
+    node_status_default: "default",
+    node_status_not_connected: "not connected",
+    node_press_reveal: "Press Show Token to fetch the current session token.",
 
     group_bind_first: "Bind this chat/topic to an agent first.",
 
@@ -1243,7 +1275,7 @@ function normalizeAvailableModels(models) {
     title_rename_agent: "重命名 Agent",
     title_delete_agent: "删除 Agent",
     title_status: "状态",
-    title_node_token: "节点 Token",
+    title_node_token: "节点管理",
     title_help: "帮助",
 
     btn_switch_agent: "切换 Agent",
@@ -1253,7 +1285,10 @@ function normalizeAvailableModels(models) {
     btn_delete_agent: "删除 Agent",
     btn_delete_confirm: "删除",
     btn_new_main_thread: "新建对话",
-    btn_node_token: "节点 Token",
+    btn_node_token: "节点管理",
+    btn_pause_node: "暂停",
+    btn_resume_node: "恢复",
+    btn_show_node_token: "显示 Token",
     btn_status: "状态",
     btn_help: "帮助",
     btn_close: "关闭",
@@ -1296,12 +1331,15 @@ function normalizeAvailableModels(models) {
     notice_new_main_thread: "已新建对话：{threadId}",
     notice_new_thread: "已新建 Thread：{threadId}",
     notice_bound: "已绑定：{agentId}",
+    notice_node_paused: "已暂停：{nodeId}",
+    notice_node_resumed: "已恢复：{nodeId}",
 
     label_current: "当前",
     label_model: "模型",
     label_page: "页",
     label_status: "状态",
     label_error: "错误",
+    label_node: "节点",
 
     create_prompt_prefix: "发送新 agent 名称（a-z0-9_-），例如",
     create_missing: "缺少 agent 名称。",
@@ -1312,7 +1350,16 @@ function normalizeAvailableModels(models) {
     delete_warning: "将从列表中移除该 agent，并删除其 runtime 容器；workspace 会被归档。",
 
     node_warning: "注意：token 很敏感；泄露请立刻轮换。",
-    node_press_reveal: "点击“显示”获取当前 session 的 token。",
+    node_pause_hint: "暂停后节点仍保持连接，但新的非 process.* 命令会被阻止。",
+    node_default_note: "默认节点会保持连接，且不可暂停。",
+    node_connected_label: "已连接节点",
+    node_none_connected: "当前 session 下还没有已连接节点。",
+    node_token_label: "连接 Token",
+    node_status_active: "活跃",
+    node_status_paused: "已暂停",
+    node_status_default: "默认",
+    node_status_not_connected: "未连接",
+    node_press_reveal: "点击“显示 Token”获取当前 session 的 token。",
 
     group_bind_first: "请先把当前群聊/话题绑定到某个 agent。",
 
@@ -2088,6 +2135,27 @@ async function main() {
     return `${prefix}${name}`;
   }
 
+  function nodeDisplayName(node) {
+    const n = node && typeof node === "object" ? node : null;
+    if (isNonEmptyString(n?.displayName)) return n.displayName;
+    if (isNonEmptyString(n?.nodeId)) return n.nodeId;
+    return "(unknown)";
+  }
+
+  function nodeStatusText(node, { locale } = {}) {
+    const S = uiStrings(locale);
+    const labels = [];
+    if (node?.isDefault) labels.push(S.node_status_default);
+    labels.push(node?.paused ? S.node_status_paused : S.node_status_active);
+    return labels.join(" • ");
+  }
+
+  function trimMenuLabel(text, maxLen = 20) {
+    const value = String(text || "").trim();
+    if (value.length <= maxLen) return value;
+    return `${value.slice(0, Math.max(1, maxLen - 1))}…`;
+  }
+
   function normalizePage(pageRaw) {
     const n = Number(pageRaw);
     return Number.isFinite(n) && n >= 0 ? Math.floor(n) : 0;
@@ -2578,32 +2646,75 @@ async function main() {
     return { text: lines.join("\n"), replyMarkup };
   }
 
-  async function renderPrivateNodeMenu(chatKey, { reveal = false, error, locale } = {}) {
+  async function renderPrivateNodeMenu(chatKey, { reveal = false, notice, error, locale } = {}) {
     const S = uiStrings(locale);
     const lines = [];
+    const rows = [];
     lines.push(`<b>${escapeHtml(S.title_node_token)}</b>`);
-    lines.push(escapeHtml(S.node_warning));
-    if (!reveal) {
-      lines.push("");
-      lines.push(escapeHtml(S.node_press_reveal));
-      const replyMarkup = kb([
-        [cbButton(S.btn_reveal, { action: "p:node_reveal", chatKey })],
-        [cbButton(S.btn_back, { action: "p:main", chatKey })]
-      ]);
-      return { text: lines.join("\n"), replyMarkup };
-    }
+    if (isNonEmptyString(notice)) lines.push(`<i>${escapeHtml(notice)}</i>`);
 
     try {
-      const res = await argusHttp.automationNodeToken(chatKey);
+      const res = await argusHttp.automationNodeList(chatKey);
       const sid = isNonEmptyString(res?.sessionId) ? res.sessionId : null;
-      const token = isNonEmptyString(res?.token) ? res.token : null;
-      const pathName = isNonEmptyString(res?.path) ? res.path : "/nodes/ws";
-      const wsUrl = deriveNodeWsUrl({ httpBase: gatewayHttpUrl, pathName, token });
+      const defaultNodeId = isNonEmptyString(res?.defaultNodeId) ? res.defaultNodeId : null;
+      const defaultNodeConnected = Boolean(res?.defaultNodeConnected);
+      const nodes = Array.isArray(res?.nodes) ? res.nodes : [];
+
       lines.push(`sessionId: ${htmlCode(sid || "(none)")}`);
-      lines.push(`path: ${htmlCode(pathName)}`);
-      lines.push(`token:\n<pre><code>${escapeHtml(token || "(none)")}</code></pre>`);
-      if (wsUrl) {
-        lines.push(`wsUrl:\n<pre><code>${escapeHtml(wsUrl)}</code></pre>`);
+      lines.push(`${escapeHtml(S.label_current)} ${escapeHtml(S.label_node)}: ${htmlCode(defaultNodeId || "(none)")}`);
+      lines.push(`${escapeHtml(S.label_status)}: ${escapeHtml(defaultNodeConnected ? S.node_status_active : S.node_status_not_connected)}`);
+      lines.push(escapeHtml(S.node_default_note));
+      lines.push(escapeHtml(S.node_pause_hint));
+      lines.push("");
+      lines.push(`<b>${escapeHtml(S.node_connected_label)}</b>`);
+
+      if (nodes.length) {
+        for (const [index, node] of nodes.entries()) {
+          const extra = [];
+          if (isNonEmptyString(node?.platform)) extra.push(String(node.platform));
+          if (isNonEmptyString(node?.version)) extra.push(`v${node.version}`);
+          if (Array.isArray(node?.commands) && node.commands.length) extra.push(`${node.commands.length} cmds`);
+          lines.push(`${index + 1}. ${escapeHtml(nodeDisplayName(node))}`);
+          lines.push(`${escapeHtml(S.label_node)}: ${htmlCode(node?.nodeId || "(unknown)")}`);
+          lines.push(`${escapeHtml(S.label_status)}: ${escapeHtml(nodeStatusText(node, { locale }))}${extra.length ? ` • ${escapeHtml(extra.join(" • "))}` : ""}`);
+        }
+      } else {
+        lines.push(escapeHtml(S.node_none_connected));
+      }
+
+      for (const node of nodes) {
+        if (!node?.canPause || !isNonEmptyString(node?.nodeId)) continue;
+        const label = trimMenuLabel(nodeDisplayName(node));
+        rows.push([
+          cbButton(
+            node?.paused ? `${S.btn_resume_node} · ${label}` : `${S.btn_pause_node} · ${label}`,
+            { action: node?.paused ? "p:node_resume" : "p:node_pause", chatKey, nodeId: node.nodeId, reveal }
+          )
+        ]);
+      }
+
+      if (reveal) {
+        lines.push("");
+        lines.push(`<b>${escapeHtml(S.node_token_label)}</b>`);
+        lines.push(escapeHtml(S.node_warning));
+        try {
+          const tokenRes = await argusHttp.automationNodeToken(chatKey);
+          const token = isNonEmptyString(tokenRes?.token) ? tokenRes.token : null;
+          const pathName = isNonEmptyString(tokenRes?.path) ? tokenRes.path : "/nodes/ws";
+          const wsUrl = deriveNodeWsUrl({ httpBase: gatewayHttpUrl, pathName, token });
+          lines.push(`path: ${htmlCode(pathName)}`);
+          lines.push(`token:
+<pre><code>${escapeHtml(token || "(none)")}</code></pre>`);
+          if (wsUrl) {
+            lines.push(`wsUrl:
+<pre><code>${escapeHtml(wsUrl)}</code></pre>`);
+          }
+        } catch (e) {
+          lines.push(escapeHtml(formatGatewayErrorForUser(e, { locale })));
+        }
+      } else {
+        lines.push("");
+        lines.push(escapeHtml(S.node_press_reveal));
       }
     } catch (e) {
       lines.push(escapeHtml(formatGatewayErrorForUser(e, { locale })));
@@ -2614,13 +2725,11 @@ async function main() {
       lines.push(`<b>${escapeHtml(S.label_error)}:</b> ${escapeHtml(error)}`);
     }
 
-    const replyMarkup = kb([
-      [
-        cbButton(S.btn_refresh, { action: "p:node_reveal", chatKey }),
-        cbButton(S.btn_back, { action: "p:main", chatKey })
-      ]
-    ]);
-    return { text: lines.join("\n"), replyMarkup };
+    rows.push([cbButton(S.btn_refresh, { action: reveal ? "p:node_reveal" : "p:node", chatKey })]);
+    if (!reveal) rows.push([cbButton(S.btn_show_node_token, { action: "p:node_reveal", chatKey })]);
+    rows.push([cbButton(S.btn_back, { action: "p:main", chatKey })]);
+
+    return { text: lines.join("\n"), replyMarkup: kb(rows) };
   }
 
   async function renderGroupMainMenu(chatKey, { notice, locale } = {}) {
@@ -3277,6 +3386,39 @@ async function main() {
       if (action === "p:node_reveal") {
         await answerOnce();
         const view = await renderPrivateNodeMenu(chatKey, { reveal: true, locale });
+        await editMenuMessage({ chatId, messageId, view });
+        return;
+      }
+
+      if (action === "p:node_pause" || action === "p:node_resume") {
+        await answerOnce();
+        const nodeId = payload.nodeId;
+        const reveal = Boolean(payload.reveal);
+        if (!isNonEmptyString(nodeId)) {
+          const view = await renderPrivateNodeMenu(chatKey, { reveal, error: S.msg_unsupported_cb, locale });
+          await editMenuMessage({ chatId, messageId, view });
+          return;
+        }
+        try {
+          if (action === "p:node_pause") {
+            await argusHttp.automationNodePause(chatKey, nodeId);
+          } else {
+            await argusHttp.automationNodeResume(chatKey, nodeId);
+          }
+        } catch (e) {
+          const view = await renderPrivateNodeMenu(chatKey, {
+            reveal,
+            error: formatGatewayErrorForUser(e, { locale }),
+            locale
+          });
+          await editMenuMessage({ chatId, messageId, view });
+          return;
+        }
+        const notice = formatTemplate(
+          action === "p:node_pause" ? S.notice_node_paused : S.notice_node_resumed,
+          { nodeId }
+        );
+        const view = await renderPrivateNodeMenu(chatKey, { reveal, notice, locale });
         await editMenuMessage({ chatId, messageId, view });
         return;
       }
