@@ -55,6 +55,121 @@ Stop:
 docker compose down
 ```
 
+## Environment variables
+
+`docker compose` automatically reads `.env` from the repo root. Start from the example file:
+
+```bash
+cp .env.example .env
+```
+
+How changes take effect:
+
+- **Build-time**: `ARGUS_RUNTIME_INSTALL_CMD` and `NEXT_PUBLIC_ARGUS_WS_URL` are baked into images/build output; rebuild after changing them.
+- **Gateway restart**: most gateway / Telegram bot variables take effect after restarting the relevant container.
+- **New runtime sessions only**: variables injected into spawned runtime containers (`ARGUS_RUNTIME_CMD`, resource limits, gateway-internal host, per-session proxy wiring) apply only to newly created sessions.
+
+### Core gateway, auth, and persistence
+
+| Variable | Required? | Default | What it does / notes |
+| --- | --- | --- | --- |
+| `ARGUS_TOKEN` | Recommended; effectively required if you expose the gateway beyond localhost | unset | Shared bearer token for `/ws` and the HTTP management endpoints. Also acts as the fallback master secret for `ARGUS_NODE_TOKEN`, `ARGUS_MCP_TOKEN`, and `ARGUS_OPENAI_TOKEN`. This is **not** an OpenAI API key. |
+| `ARGUS_NODE_TOKEN` | Optional | falls back to `ARGUS_TOKEN` | Separate master secret for derived `/nodes/ws` session tokens. Set this if you want node access scoped separately from the main gateway token. |
+| `ARGUS_MCP_TOKEN` | Optional | falls back to `ARGUS_TOKEN` | Separate master secret for the gateway MCP endpoint. Runtime containers receive per-session derived tokens instead of the raw secret. |
+| `ARGUS_HOME_HOST_PATH` | Optional in Compose, but strongly recommended | Compose: `${HOME}/.argus`; direct gateway run: unset | Host directory used for persistent gateway state and per-user workspaces. If you run the gateway directly without this set, automation state falls back to `/tmp/argus-gateway-state.json`. Must be an **absolute host path** when set. |
+| `ARGUS_WORKSPACE_HOST_PATH` | Optional | unset | Base directory for generic `/ws` sessions. When unset, generic sessions use `${ARGUS_HOME_HOST_PATH}/workspaces/sess-<sessionId>`. Must be an **absolute host path** when set. |
+| `ARGUS_CORS_ORIGINS` | Optional | `*` | Comma-separated list of allowed HTTP origins, for example `https://app.example.com,https://admin.example.com`. Tighten this when exposing the HTTP APIs to browsers. |
+| `ARGUS_GC_DELETE_ORPHAN_RUNTIMES` | Optional | `delete` | Controls startup garbage collection for docker runtime containers not referenced by gateway state. Supported values: `off`, `dry-run`, `delete` (also `true` / `yes` / `on`). |
+| `ARGUS_STUCK_TURN_TIMEOUT_S` | Optional | `900` | Safety timeout for lanes stuck in `busy` state because an upstream turn never completed. Set `0` to disable the reset logic. |
+
+### Docker runtime provisioning
+
+| Variable | Required? | Default | What it does / notes |
+| --- | --- | --- | --- |
+| `ARGUS_PROVISION_MODE` | Only if you run the gateway outside the provided Compose setup | Compose sets `docker`; code default is `static` | `docker` means each `/ws` session can auto-create its own runtime container. `static` means the gateway proxies to pre-existing upstream app-servers instead. |
+| `ARGUS_RUNTIME_IMAGE` | Optional | `argus-runtime` | Docker image tag used for spawned runtime session containers. |
+| `ARGUS_DOCKER_NETWORK` | Optional | `argus-net` | Docker network that both the gateway and runtime containers join. |
+| `ARGUS_RUNTIME_INSTALL_CMD` | Optional | `npm i -g @openai/codex` | **Build-time** install command for the runtime image (`Dockerfile` build arg `APP_SERVER_INSTALL_CMD`). Change this when swapping the bundled runtime; rebuild afterward. |
+| `ARGUS_RUNTIME_CMD` | Optional in Compose, conceptually required in `docker` mode | `codex app-server` | Command executed inside each spawned runtime container. This is what `run_app_server.sh` launches through the TCP bridge. |
+| `ARGUS_CONNECT_TIMEOUT_S` | Optional | `30` | Timeout for runtime bootstrap and TCP connect checks. Also reused as a coarse upper bound for Docker API calls. |
+| `ARGUS_CONTAINER_PREFIX` | Optional | `argus-session` | Prefix for auto-created docker container names. Resulting names look like `argus-session-<sessionId>`. |
+| `ARGUS_RUNTIME_CPUS` | Optional | unset | CPU limit for newly created runtime containers. Use decimal CPU counts such as `0.8` or `2`. |
+| `ARGUS_RUNTIME_MEM_LIMIT` | Optional | unset | Memory limit for newly created runtime containers. Supports values like `512m`, `1g`, `2gb`. |
+| `ARGUS_RUNTIME_MEMSWAP_LIMIT` | Optional | unset | Memory+swap limit for newly created runtime containers. Requires `ARGUS_RUNTIME_MEM_LIMIT`, and must be `>=` that value. Set it equal to mem limit to effectively disable swap. |
+| `ARGUS_RUNTIME_PIDS_LIMIT` | Optional | unset | Process count limit for newly created runtime containers. Must be a positive integer. |
+| `ARGUS_JSONL_LINE_LIMIT_BYTES` | Optional | `134217728` (128 MiB) | Max JSONL line size accepted from upstream runtimes. Increase this if you hit `Separator is not found, and chunk exceed the limit` on large tool outputs. |
+| `DOCKER_SOCK` | Optional | `/var/run/docker.sock` | Host path mounted into the gateway container as the Docker socket. Useful on OrbStack or custom Docker setups. Mounting the socket is root-equivalent on the host. |
+
+### Model provider / OpenAI-compatible proxy
+
+| Variable | Required? | Default | What it does / notes |
+| --- | --- | --- | --- |
+| `OPENAI_API_KEY` | Optional, but recommended for the default Codex runtime | unset | Long-lived API key stored on the **gateway** only. The key is not injected directly into runtime containers. |
+| `ARGUS_OPENAI_API_KEY` | Optional | unset | Compatibility alias for `OPENAI_API_KEY`. The gateway checks `OPENAI_API_KEY` first, then this alias. |
+| `ARGUS_OPENAI_RESPONSES_UPSTREAM_URL` | Optional | `https://api.openai.com/v1/responses` | Upstream Responses API URL used by the gateway proxy. Point this at any OpenAI-compatible `/v1/responses` endpoint if you want to self-host against your own provider or company proxy. |
+| `ARGUS_OPENAI_TOKEN` | Optional | falls back to `ARGUS_TOKEN` | Master secret used by the gateway to derive per-session bearer tokens for `/openai/v1/responses`. On the gateway this is the master secret; inside each runtime container the gateway injects a **derived session token** with the same env name. |
+| `ARGUS_GATEWAY_INTERNAL_HOST` | Optional | auto-detect current gateway container name, then fall back to `gateway` | Hostname that spawned runtime containers should use when calling back into the gateway (`/mcp`, `/nodes/ws`, `/openai/v1`). Set this only if Docker DNS / service naming differs from the default assumptions. |
+
+### Web UI and Telegram bot
+
+| Variable | Required? | Default | What it does / notes |
+| --- | --- | --- | --- |
+| `NEXT_PUBLIC_ARGUS_WS_URL` | Optional | unset | **Build-time** preset WebSocket URL for the optional web UI. Rebuild `web` after changing it. Common example: `ws://127.0.0.1:8080/ws?token=...`. |
+| `TELEGRAM_BOT_TOKEN` | Required for `docker compose --profile tg ...` | unset | Telegram bot token from `@BotFather`. The Telegram bot service exits immediately if this is missing. |
+| `TELEGRAM_DRAFT_STREAMING` | Optional | `auto` | Controls gateway-side private-chat draft streaming. Accepted forms: `auto` / `on` / `true`, `force` / `always`, and `off`. |
+| `HOST` | Optional helper variable | `127.0.0.1` | Convenience host used by docs, examples, and Telegram bot URL derivation. It is **not** a security boundary and is not required by the gateway itself. In Docker, `gateway` is used automatically when appropriate. |
+| `ARGUS_GATEWAY_WS_URL` | Optional | derived from `HOST` or `NEXT_PUBLIC_ARGUS_WS_URL` | Explicit WebSocket URL for `apps/telegram-bot` when it is not running in the default Compose topology. |
+| `ARGUS_GATEWAY_HTTP_URL` | Optional | derived from `ARGUS_GATEWAY_WS_URL` or `HOST` | Explicit HTTP base URL for `apps/telegram-bot`. Useful when WS and HTTP are routed differently or when URL derivation is wrong for your deployment. |
+| `ARGUS_CWD` | Optional | `/workspace` | Default working directory passed by `apps/telegram-bot` when creating/resuming threads. |
+| `STATE_PATH` | Optional | In container: `/data/state.json`; outside container: `./state.json` | Persistent state path for `apps/telegram-bot`. Only relevant if you run the bot directly rather than through the provided volume setup. |
+| `TELEGRAM_ADMIN_CHAT_IDS` | Reserved / currently unused in this repo | unset | Present in `docker-compose.yml`, but the current codebase does not read it yet. Safe to leave unset for now. |
+
+### Standalone node-host (`apps/node-host`)
+
+You normally do **not** need these when using the built-in runtime node-host; the gateway injects that wiring automatically. These are for running `apps/node-host` manually on another machine (for example your Mac).
+
+| Variable | Required? | Default | What it does / notes |
+| --- | --- | --- | --- |
+| `ARGUS_NODE_WS_URL` | Yes, unless you pass `--url` | unset | WebSocket URL for `/nodes/ws`. Example: `ws://127.0.0.1:8080/nodes/ws?token=...`. |
+| `ARGUS_NODE_ID` | Optional | machine hostname | Logical node id shown to the gateway. |
+| `ARGUS_NODE_DISPLAY_NAME` | Optional | machine hostname | Human-friendly label shown in node listings / events. |
+| `ARGUS_NODE_STATE_DIR` | Optional | `$APP_HOME/node-host/<nodeId>` if `APP_HOME` exists, else `$HOME/.argus/node-host/<nodeId>` | Directory for local node-host state. |
+| `ARGUS_NODE_AUDIT` | Optional | `true` | Enables stderr audit logging for remote commands. Set `0` / `false` to disable. |
+| `ARGUS_NODE_AUDIT_MAX_BYTES` | Optional | `4096` | Max stdout/stderr bytes included in each audit log preview. |
+| `ARGUS_NODE_AUDIT_STDIN_PREVIEW_BYTES` | Optional | `256` | Max stdin bytes included in audit previews. Set `0` to suppress stdin previews. |
+| `ARGUS_NODE_HANDSHAKE_TIMEOUT_MS` | Optional | `15000` | WebSocket handshake timeout in milliseconds. |
+| `ARGUS_NODE_CONNECT_TIMEOUT_MS` | Optional | derived from handshake timeout, usually `17000` | Overall WebSocket connect timeout. If unset, it defaults to `ARGUS_NODE_HANDSHAKE_TIMEOUT_MS + 2000` when handshake timeout is enabled. |
+| `ARGUS_NODE_RECONNECT_DELAY_MS` | Optional | `1000` | Base reconnect delay in milliseconds. |
+| `ARGUS_NODE_RECONNECT_DELAY_MAX_MS` | Optional | `30000` | Max reconnect backoff in milliseconds. |
+| `ARGUS_NODE_RECONNECT_JITTER_PCT` | Optional | `0.2` | Reconnect jitter fraction (`0` to `0.5`). |
+| `ARGUS_NODE_PING_INTERVAL_MS` | Optional | `30000` | Ping interval in milliseconds. Set `0` to disable pings. |
+| `ARGUS_NODE_PONG_TIMEOUT_MS` | Optional | `10000` | Pong timeout in milliseconds. |
+
+### Advanced: static upstream mode
+
+If you do **not** want Argus to auto-create Docker runtime containers, you can run the gateway in `ARGUS_PROVISION_MODE=static` and point it at pre-existing app-servers.
+
+| Variable | Required? | Default | What it does / notes |
+| --- | --- | --- | --- |
+| `ARGUS_UPSTREAMS_JSON` | Optional advanced override | unset | JSON object describing one or more named upstreams. When set, it replaces `ARGUS_TCP_HOST` / `ARGUS_TCP_PORT`. Each entry can include `host`, `port`, and optional `token`. |
+| `ARGUS_TCP_HOST` | Optional in static mode | `127.0.0.1` | Default upstream host when `ARGUS_UPSTREAMS_JSON` is unset. |
+| `ARGUS_TCP_PORT` | Optional in static mode | `7777` | Default upstream port when `ARGUS_UPSTREAMS_JSON` is unset. |
+
+Example `ARGUS_UPSTREAMS_JSON`:
+
+```json
+{
+  "default": { "host": "127.0.0.1", "port": 7777, "token": "change-me" },
+  "staging": { "host": "10.0.0.25", "port": 7777 }
+}
+```
+
+### Variables you normally should **not** set manually
+
+When the gateway provisions a runtime container, it injects several internal env vars automatically, including `APP_SERVER_CMD`, `APP_HOME`, `APP_WORKSPACE`, `CODEX_HOME`, `ARGUS_SESSION_ID`, `ARGUS_CODEX_MODEL`, `ARGUS_CODEX_MCP_URL`, derived `ARGUS_MCP_TOKEN`, derived `ARGUS_OPENAI_TOKEN`, and `ARGUS_NODE_WS_URL`.
+
+These are implementation details of the runtime bridge; in normal deployments you should set the higher-level gateway vars above instead of pre-filling these manually.
+
 ## Data & workspace
 
 By default Argus persists data on the Docker host at:

@@ -55,6 +55,121 @@ docker compose --profile tg up --build
 docker compose down
 ```
 
+## 环境变量
+
+`docker compose` 会自动读取仓库根目录下的 `.env`。建议先从示例文件开始：
+
+```bash
+cp .env.example .env
+```
+
+环境变量改动的生效范围可以这样理解：
+
+- **构建期生效**：`ARGUS_RUNTIME_INSTALL_CMD`、`NEXT_PUBLIC_ARGUS_WS_URL` 会被写进镜像或构建产物，修改后需要重新 build。
+- **重启服务生效**：大多数 gateway / Telegram bot 环境变量，在重启对应容器后生效。
+- **仅对新建 runtime session 生效**：注入到 runtime 容器内的变量（如 `ARGUS_RUNTIME_CMD`、资源限制、gateway 内部回连地址、按 session 派生的代理配置）只会影响新创建的 session 容器。
+
+### Gateway 核心、鉴权与持久化
+
+| 变量 | 是否必需 | 默认值 | 作用 / 注意事项 |
+| --- | --- | --- | --- |
+| `ARGUS_TOKEN` | 推荐设置；如果要暴露到 localhost 之外，几乎等同必需 | 未设置 | `/ws` 与 HTTP 管理接口共用的 Bearer token。同时也是 `ARGUS_NODE_TOKEN`、`ARGUS_MCP_TOKEN`、`ARGUS_OPENAI_TOKEN` 的回退 master secret。它**不是** OpenAI API Key。 |
+| `ARGUS_NODE_TOKEN` | 可选 | 回退到 `ARGUS_TOKEN` | 用于派生 `/nodes/ws` 的 session 级 token。如果你希望 node 访问和主网关 token 分离，就单独设置它。 |
+| `ARGUS_MCP_TOKEN` | 可选 | 回退到 `ARGUS_TOKEN` | gateway MCP 端点使用的独立 master secret。runtime 容器里拿到的是按 session 派生后的 token，而不是原始 secret。 |
+| `ARGUS_HOME_HOST_PATH` | 在 Compose 中可选，但强烈推荐设置清楚 | Compose 下默认 `${HOME}/.argus`；直接运行 gateway 时默认未设置 | 用于存放 gateway 持久化状态和按用户隔离的 workspace。若直接运行 gateway 且未设置它，automation state 会落到 `/tmp/argus-gateway-state.json`。设置时必须是**宿主机绝对路径**。 |
+| `ARGUS_WORKSPACE_HOST_PATH` | 可选 | 未设置 | 通用 `/ws` session 的 workspace 基础目录。未设置时，通用 session 使用 `${ARGUS_HOME_HOST_PATH}/workspaces/sess-<sessionId>`。设置时必须是**宿主机绝对路径**。 |
+| `ARGUS_CORS_ORIGINS` | 可选 | `*` | 逗号分隔的 HTTP 允许来源，例如 `https://app.example.com,https://admin.example.com`。如果你要把 HTTP API 暴露给浏览器，建议收紧。 |
+| `ARGUS_GC_DELETE_ORPHAN_RUNTIMES` | 可选 | `delete` | 控制 gateway 启动时是否清理未被状态文件引用的 docker runtime 容器。支持：`off`、`dry-run`、`delete`（也接受 `true` / `yes` / `on`）。 |
+| `ARGUS_STUCK_TURN_TIMEOUT_S` | 可选 | `900` | 防止某个上游 turn 永远不返回 `turn/completed`，导致 lane 一直卡在 `busy`。设为 `0` 可关闭这层保护。 |
+
+### Docker runtime 创建与资源控制
+
+| 变量 | 是否必需 | 默认值 | 作用 / 注意事项 |
+| --- | --- | --- | --- |
+| `ARGUS_PROVISION_MODE` | 只有在你不走仓库自带 Compose 时才需要关心 | Compose 固定为 `docker`；代码默认 `static` | `docker` 表示 `/ws` 连接会自动创建 runtime 容器；`static` 表示 gateway 只代理到预先存在的 app-server。 |
+| `ARGUS_RUNTIME_IMAGE` | 可选 | `argus-runtime` | gateway 创建 runtime session 容器时使用的镜像 tag。 |
+| `ARGUS_DOCKER_NETWORK` | 可选 | `argus-net` | gateway 与 runtime 容器加入的 Docker 网络。 |
+| `ARGUS_RUNTIME_INSTALL_CMD` | 可选 | `npm i -g @openai/codex` | runtime 镜像的**构建期**安装命令（对应 `Dockerfile` 的 `APP_SERVER_INSTALL_CMD`）。如果你要切换 bundled runtime，就改这里并重新 build。 |
+| `ARGUS_RUNTIME_CMD` | Compose 下可选；在 `docker` 模式下本质上必须有 | `codex app-server` | 每个 runtime 容器内部真正执行的启动命令，`run_app_server.sh` 会通过 TCP bridge 启动它。 |
+| `ARGUS_CONNECT_TIMEOUT_S` | 可选 | `30` | runtime 启动探测和 TCP 建连的超时时间；Docker API 调用也会把它当作一个粗粒度上限。 |
+| `ARGUS_CONTAINER_PREFIX` | 可选 | `argus-session` | 自动创建的 docker 容器名前缀，最终名字类似 `argus-session-<sessionId>`。 |
+| `ARGUS_RUNTIME_CPUS` | 可选 | 未设置 | 新建 runtime 容器的 CPU 限制，例如 `0.8`、`2`。 |
+| `ARGUS_RUNTIME_MEM_LIMIT` | 可选 | 未设置 | 新建 runtime 容器的内存限制，支持 `512m`、`1g`、`2gb` 这类写法。 |
+| `ARGUS_RUNTIME_MEMSWAP_LIMIT` | 可选 | 未设置 | 新建 runtime 容器的 memory+swap 上限。要求同时设置 `ARGUS_RUNTIME_MEM_LIMIT`，且必须 `>=` 它。若与内存上限相同，效果上接近“禁用 swap”。 |
+| `ARGUS_RUNTIME_PIDS_LIMIT` | 可选 | 未设置 | 新建 runtime 容器的最大进程数限制，必须是正整数。 |
+| `ARGUS_JSONL_LINE_LIMIT_BYTES` | 可选 | `134217728`（128 MiB） | runtime 上游单条 JSONL 消息允许的最大字节数。如果你遇到 `Separator is not found, and chunk exceed the limit`，通常该调它。 |
+| `DOCKER_SOCK` | 可选 | `/var/run/docker.sock` | 挂进 gateway 容器的宿主机 Docker socket 路径。适用于 OrbStack 或自定义 Docker 安装。注意：挂载 docker.sock 基本等价宿主机 root 权限。 |
+
+### 模型提供方 / OpenAI 兼容代理
+
+| 变量 | 是否必需 | 默认值 | 作用 / 注意事项 |
+| --- | --- | --- | --- |
+| `OPENAI_API_KEY` | 对默认 Codex runtime 来说可选但强烈推荐 | 未设置 | 仅保存在 **gateway** 上的长期 API Key，不会直接注入 runtime 容器。 |
+| `ARGUS_OPENAI_API_KEY` | 可选 | 未设置 | `OPENAI_API_KEY` 的兼容别名。gateway 会先读 `OPENAI_API_KEY`，再回退到这个名字。 |
+| `ARGUS_OPENAI_RESPONSES_UPSTREAM_URL` | 可选 | `https://api.openai.com/v1/responses` | gateway 代理请求真正转发到的 Responses API 地址。若你想改成自己的 OpenAI-compatible 提供方、公司内网代理或自建网关，就改这里。 |
+| `ARGUS_OPENAI_TOKEN` | 可选 | 回退到 `ARGUS_TOKEN` | gateway 用来派生 `/openai/v1/responses` session 级 Bearer token 的 master secret。注意：在 gateway 进程里它表示 master secret；在 runtime 容器里同名变量表示**派生后的 session token**。 |
+| `ARGUS_GATEWAY_INTERNAL_HOST` | 可选 | 自动探测当前 gateway 容器名，失败后回退到 `gateway` | runtime 容器回连 gateway（`/mcp`、`/nodes/ws`、`/openai/v1`）时使用的主机名。只有当你的 Docker DNS / 服务名和默认假设不一致时才需要手动设。 |
+
+### Web UI 与 Telegram bot
+
+| 变量 | 是否必需 | 默认值 | 作用 / 注意事项 |
+| --- | --- | --- | --- |
+| `NEXT_PUBLIC_ARGUS_WS_URL` | 可选 | 未设置 | 可选 Web UI 的**构建期** WebSocket 预设地址。修改后需要重新 build `web`。常见示例：`ws://127.0.0.1:8080/ws?token=...`。 |
+| `TELEGRAM_BOT_TOKEN` | `docker compose --profile tg ...` 时必需 | 未设置 | 从 `@BotFather` 获取的 bot token；缺失时 Telegram bot 服务会直接退出。 |
+| `TELEGRAM_DRAFT_STREAMING` | 可选 | `auto` | 控制 gateway 在私聊里是否发送实时草稿。接受形式：`auto` / `on` / `true`、`force` / `always`、`off`。 |
+| `HOST` | 可选辅助变量 | `127.0.0.1` | 主要给文档示例、Web 预设和 Telegram bot 自动推导 gateway 地址使用。它**不是**安全配置项，gateway 自身也不依赖它做鉴权。Docker 场景下会在需要时自动改用 `gateway`。 |
+| `ARGUS_GATEWAY_WS_URL` | 可选 | 从 `HOST` 或 `NEXT_PUBLIC_ARGUS_WS_URL` 推导 | 当 `apps/telegram-bot` 不在默认 Compose 拓扑里运行时，用它显式指定 WebSocket 地址。 |
+| `ARGUS_GATEWAY_HTTP_URL` | 可选 | 从 `ARGUS_GATEWAY_WS_URL` 或 `HOST` 推导 | 给 `apps/telegram-bot` 显式指定 HTTP base URL。适合 WS / HTTP 分流，或者自动推导不正确的部署。 |
+| `ARGUS_CWD` | 可选 | `/workspace` | `apps/telegram-bot` 创建 / 恢复线程时默认使用的工作目录。 |
+| `STATE_PATH` | 可选 | 容器内默认 `/data/state.json`；容器外默认 `./state.json` | `apps/telegram-bot` 的本地状态文件路径。只有你直接运行 bot（而不是用当前 compose volume）时才需要关心。 |
+| `TELEGRAM_ADMIN_CHAT_IDS` | 预留 / 当前版本未使用 | 未设置 | `docker-compose.yml` 里保留了这个变量，但当前代码并没有读取它；现在可以安全忽略。 |
+
+### 独立 node-host（`apps/node-host`）
+
+如果你只使用 runtime 容器里内置的 node-host，通常**不需要**自己设置下面这些变量；gateway 会自动把连接参数注入进去。以下变量主要用于你在别的机器（例如自己的 Mac）上手动运行 `apps/node-host`。
+
+| 变量 | 是否必需 | 默认值 | 作用 / 注意事项 |
+| --- | --- | --- | --- |
+| `ARGUS_NODE_WS_URL` | 必需（除非你改用 `--url`） | 未设置 | `/nodes/ws` 的 WebSocket 地址，例如 `ws://127.0.0.1:8080/nodes/ws?token=...`。 |
+| `ARGUS_NODE_ID` | 可选 | 当前机器 hostname | 显示给 gateway 的逻辑 node id。 |
+| `ARGUS_NODE_DISPLAY_NAME` | 可选 | 当前机器 hostname | 给人看的节点名称，会出现在节点列表和 system event 中。 |
+| `ARGUS_NODE_STATE_DIR` | 可选 | 若有 `APP_HOME` 则为 `$APP_HOME/node-host/<nodeId>`，否则为 `$HOME/.argus/node-host/<nodeId>` | 本地 node-host 状态目录。 |
+| `ARGUS_NODE_AUDIT` | 可选 | `true` | 是否把远程命令审计日志输出到 stderr。设为 `0` / `false` 可关闭。 |
+| `ARGUS_NODE_AUDIT_MAX_BYTES` | 可选 | `4096` | 每条审计日志中保留的 stdout/stderr 预览最大字节数。 |
+| `ARGUS_NODE_AUDIT_STDIN_PREVIEW_BYTES` | 可选 | `256` | 审计日志中保留的 stdin 预览最大字节数。设为 `0` 可不记录 stdin 预览。 |
+| `ARGUS_NODE_HANDSHAKE_TIMEOUT_MS` | 可选 | `15000` | WebSocket 握手超时（毫秒）。 |
+| `ARGUS_NODE_CONNECT_TIMEOUT_MS` | 可选 | 跟随握手超时推导，通常为 `17000` | WebSocket 整体连接超时。未设置时，如果握手超时启用，则默认为 `ARGUS_NODE_HANDSHAKE_TIMEOUT_MS + 2000`。 |
+| `ARGUS_NODE_RECONNECT_DELAY_MS` | 可选 | `1000` | 重连基础退避时间（毫秒）。 |
+| `ARGUS_NODE_RECONNECT_DELAY_MAX_MS` | 可选 | `30000` | 重连最大退避时间（毫秒）。 |
+| `ARGUS_NODE_RECONNECT_JITTER_PCT` | 可选 | `0.2` | 重连抖动比例（`0` 到 `0.5`）。 |
+| `ARGUS_NODE_PING_INTERVAL_MS` | 可选 | `30000` | ping 间隔（毫秒）；设为 `0` 可关闭 ping。 |
+| `ARGUS_NODE_PONG_TIMEOUT_MS` | 可选 | `10000` | pong 超时（毫秒）。 |
+
+### 高级：static upstream 模式
+
+如果你**不想**让 Argus 自动创建 Docker runtime 容器，可以把 gateway 运行在 `ARGUS_PROVISION_MODE=static`，然后手动指向已经存在的 app-server。
+
+| 变量 | 是否必需 | 默认值 | 作用 / 注意事项 |
+| --- | --- | --- | --- |
+| `ARGUS_UPSTREAMS_JSON` | 可选高级项 | 未设置 | 用 JSON 对象描述一个或多个命名 upstream。设置后会覆盖 `ARGUS_TCP_HOST` / `ARGUS_TCP_PORT`。每个条目可包含 `host`、`port` 以及可选的 `token`。 |
+| `ARGUS_TCP_HOST` | static 模式下可选 | `127.0.0.1` | 当未设置 `ARGUS_UPSTREAMS_JSON` 时，默认上游主机名。 |
+| `ARGUS_TCP_PORT` | static 模式下可选 | `7777` | 当未设置 `ARGUS_UPSTREAMS_JSON` 时，默认上游端口。 |
+
+`ARGUS_UPSTREAMS_JSON` 示例：
+
+```json
+{
+  "default": { "host": "127.0.0.1", "port": 7777, "token": "change-me" },
+  "staging": { "host": "10.0.0.25", "port": 7777 }
+}
+```
+
+### 一般**不要手动设置**的内部变量
+
+当 gateway 创建 runtime 容器时，会自动注入一批内部环境变量，包括 `APP_SERVER_CMD`、`APP_HOME`、`APP_WORKSPACE`、`CODEX_HOME`、`ARGUS_SESSION_ID`、`ARGUS_CODEX_MODEL`、`ARGUS_CODEX_MCP_URL`、派生后的 `ARGUS_MCP_TOKEN`、派生后的 `ARGUS_OPENAI_TOKEN`、以及 `ARGUS_NODE_WS_URL`。
+
+这些都属于 runtime bridge 的内部实现细节。正常部署时，优先设置上面那些高层 gateway 变量，而不是自己在 `.env` 里预填这些内部变量。
+
 ## 数据目录与工作区（workspace）
 
 默认情况下，Argus 会把数据存到 Docker 宿主机上：
