@@ -157,6 +157,7 @@ Default runtime (Codex):
 
 - Build/install command: `ARGUS_RUNTIME_INSTALL_CMD` (defaults to installing `@openai/codex`)
 - Start command: `ARGUS_RUNTIME_CMD` (defaults to `codex app-server`)
+- The base runtime image includes a few common CLI tools by default, including `curl`, `git`, `rg`, and `strings`.
 
 ### OpenAI credentials (recommended)
 

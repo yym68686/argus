@@ -7,6 +7,7 @@ RUN CGO_ENABLED=0 go build -trimpath -ldflags "-s -w" -o /out/argus ./cmd/argus
 FROM node:22-trixie-slim
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
+  binutils \
   ca-certificates \
   curl \
   git \
