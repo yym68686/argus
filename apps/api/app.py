@@ -4112,7 +4112,7 @@ class AutomationManager:
                 return ""
 
             lines: list[str] = [
-                "## Skills (mandatory)",
+                "## Skills",
                 "",
                 "A skill is a set of local instructions stored in a `SKILL.md` file.",
                 "",
