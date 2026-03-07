@@ -9,6 +9,7 @@ import re
 import time
 import uuid
 import urllib.error
+import urllib.parse
 import urllib.request
 from collections import deque
 from dataclasses import dataclass, field, replace
@@ -1465,12 +1466,18 @@ class PersistedLastActiveTarget:
 
 
 AGENT_ID_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9_-]{0,63}$")
+CHANNEL_ID_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,63}$")
 TELEGRAM_PRIVATE_CHAT_ID_RE = re.compile(r"^[1-9]\d{0,19}$")
-AUTOMATION_STATE_VERSION = 4
+AUTOMATION_STATE_VERSION = 5
 ARGUS_AGENT_MODEL_DEFAULT = "gpt-5.4"
 ARGUS_AGENT_MODELS = ("gpt-5.2", "gpt-5.4")
 ARGUS_AGENT_MODELS_SET = frozenset(ARGUS_AGENT_MODELS)
 ARGUS_AGENT_MODEL_FILE = "argus-agent-model"
+CHANNEL_ID_GATEWAY = "gateway"
+CHANNEL_ID_ZERO_ZERO_PRO = "0-0.pro"
+CHANNEL_IDS_BUILTIN = frozenset((CHANNEL_ID_GATEWAY, CHANNEL_ID_ZERO_ZERO_PRO))
+CHANNEL_ZERO_ZERO_PRO_BASE_URL = "https://api.0-0.pro/v1"
+CHANNEL_ZERO_ZERO_PRO_PROMO_URL = "https://0-0.pro"
 
 
 def _normalize_runtime_session_id(raw: Any) -> str:
@@ -1531,6 +1538,89 @@ def _normalize_agent_short_name(raw: Any) -> str:
 
 def _user_agent_id(*, user_id: int, short_name: str) -> str:
     return f"u{user_id}-{short_name}"
+
+
+def _normalize_channel_id(raw: Any) -> str:
+    if not isinstance(raw, str):
+        return ""
+    channel_id = raw.strip().lower()
+    if not channel_id:
+        return ""
+    if not CHANNEL_ID_RE.match(channel_id):
+        return ""
+    return channel_id
+
+
+def _normalize_channel_name(raw: Any) -> str:
+    return _normalize_channel_id(raw)
+
+
+def _normalize_channel_api_key(raw: Any) -> Optional[str]:
+    if raw is None:
+        return None
+    value = str(raw).strip()
+    return value or None
+
+
+def _normalize_openai_base_url(raw: Any) -> str:
+    if not isinstance(raw, str):
+        return ""
+    value = raw.strip()
+    if not value:
+        return ""
+    try:
+        parsed = urllib.parse.urlparse(value)
+    except Exception:
+        return ""
+    if parsed.scheme not in {"http", "https"}:
+        return ""
+    if not parsed.netloc:
+        return ""
+    if parsed.query or parsed.fragment:
+        return ""
+    path = parsed.path.rstrip("/")
+    if path.lower().endswith("/responses"):
+        path = path[: -len("/responses")].rstrip("/")
+    normalized = urllib.parse.urlunparse((parsed.scheme, parsed.netloc, path, "", "", ""))
+    return normalized.rstrip("/")
+
+
+def _responses_url_from_base_url(base_url: Any) -> str:
+    normalized = _normalize_openai_base_url(base_url)
+    if not normalized:
+        return ""
+    return f"{normalized}/responses"
+
+
+def _base_url_from_responses_url(raw: Any) -> str:
+    value = str(raw or "").strip()
+    if not value:
+        return ""
+    value = value.rstrip("/")
+    if value.lower().endswith("/responses"):
+        value = value[: -len("/responses")]
+    return value.rstrip("/")
+
+
+def _gateway_openai_api_key() -> Optional[str]:
+    return _normalize_channel_api_key(os.getenv("OPENAI_API_KEY") or os.getenv("ARGUS_OPENAI_API_KEY"))
+
+
+def _gateway_openai_responses_upstream_url() -> str:
+    return (os.getenv("ARGUS_OPENAI_RESPONSES_UPSTREAM_URL") or "https://api.openai.com/v1/responses").strip()
+
+
+def _mask_secret(raw: Any) -> Optional[str]:
+    value = _normalize_channel_api_key(raw)
+    if not value:
+        return None
+    if len(value) <= 8:
+        return "*" * len(value)
+    return f"{value[:4]}***{value[-4:]}"
+
+
+def _new_custom_channel_id() -> str:
+    return f"ch-{uuid.uuid4().hex[:12]}"
 
 
 def _normalize_agent_model(raw: Any) -> str:
@@ -1728,18 +1818,140 @@ class PersistedSessionAutomation:
 
 
 @dataclass
+class PersistedUserChannel:
+    channel_id: str
+    name: str
+    base_url: str
+    api_key: Optional[str] = None
+    created_at_ms: int = field(default_factory=_now_ms)
+    updated_at_ms: int = field(default_factory=_now_ms)
+
+    def to_json(self, *, redact_secrets: bool = False) -> dict[str, Any]:
+        api_key = _normalize_channel_api_key(self.api_key)
+        return {
+            "channelId": self.channel_id,
+            "name": self.name,
+            "baseUrl": self.base_url,
+            "apiKey": _mask_secret(api_key) if redact_secrets else api_key,
+            "createdAtMs": int(self.created_at_ms),
+            "updatedAtMs": int(self.updated_at_ms),
+        }
+
+    @staticmethod
+    def from_json(obj: Any) -> Optional["PersistedUserChannel"]:
+        if not isinstance(obj, dict):
+            return None
+        channel_id = _normalize_channel_id(obj.get("channelId"))
+        if not channel_id or channel_id in CHANNEL_IDS_BUILTIN:
+            return None
+        name = _normalize_channel_name(obj.get("name")) or channel_id
+        base_url = _normalize_openai_base_url(obj.get("baseUrl"))
+        if not base_url:
+            return None
+        api_key = _normalize_channel_api_key(obj.get("apiKey"))
+        try:
+            created_at_ms = int(obj.get("createdAtMs")) if obj.get("createdAtMs") is not None else _now_ms()
+        except Exception:
+            created_at_ms = _now_ms()
+        try:
+            updated_at_ms = int(obj.get("updatedAtMs")) if obj.get("updatedAtMs") is not None else created_at_ms
+        except Exception:
+            updated_at_ms = created_at_ms
+        if created_at_ms <= 0:
+            created_at_ms = _now_ms()
+        if updated_at_ms <= 0:
+            updated_at_ms = created_at_ms
+        return PersistedUserChannel(
+            channel_id=channel_id,
+            name=name,
+            base_url=base_url,
+            api_key=api_key,
+            created_at_ms=created_at_ms,
+            updated_at_ms=updated_at_ms,
+        )
+
+
+@dataclass
+class PersistedUserChannelState:
+    current_channel_id: str = CHANNEL_ID_GATEWAY
+    custom_channels: dict[str, PersistedUserChannel] = field(default_factory=dict)
+    builtin_api_keys: dict[str, str] = field(default_factory=dict)
+
+    def to_json(self, *, redact_secrets: bool = False) -> dict[str, Any]:
+        custom_channels: dict[str, Any] = {}
+        for channel_id, channel in (self.custom_channels or {}).items():
+            if not isinstance(channel, PersistedUserChannel):
+                continue
+            custom_channels[channel_id] = channel.to_json(redact_secrets=redact_secrets)
+        builtin_api_keys: dict[str, Any] = {}
+        for channel_id, api_key in (self.builtin_api_keys or {}).items():
+            cid = _normalize_channel_id(channel_id)
+            if cid not in CHANNEL_IDS_BUILTIN or cid == CHANNEL_ID_GATEWAY:
+                continue
+            normalized_key = _normalize_channel_api_key(api_key)
+            if not normalized_key:
+                continue
+            builtin_api_keys[cid] = _mask_secret(normalized_key) if redact_secrets else normalized_key
+        return {
+            "currentChannelId": _normalize_channel_id(self.current_channel_id) or CHANNEL_ID_GATEWAY,
+            "customChannels": custom_channels,
+            "builtinApiKeys": builtin_api_keys,
+        }
+
+    @staticmethod
+    def from_json(obj: Any) -> "PersistedUserChannelState":
+        if not isinstance(obj, dict):
+            return PersistedUserChannelState()
+        current_channel_id = _normalize_channel_id(obj.get("currentChannelId")) or CHANNEL_ID_GATEWAY
+        custom_channels_raw = obj.get("customChannels")
+        custom_channels: dict[str, PersistedUserChannel] = {}
+        if isinstance(custom_channels_raw, dict):
+            for raw_channel_id, raw_channel in custom_channels_raw.items():
+                channel = PersistedUserChannel.from_json(raw_channel)
+                channel_id = _normalize_channel_id(raw_channel_id)
+                if channel is None:
+                    continue
+                key = channel_id or channel.channel_id
+                if not key or key in CHANNEL_IDS_BUILTIN:
+                    continue
+                custom_channels[key] = replace(channel, channel_id=key)
+        builtin_api_keys_raw = obj.get("builtinApiKeys")
+        builtin_api_keys: dict[str, str] = {}
+        if isinstance(builtin_api_keys_raw, dict):
+            for raw_channel_id, raw_api_key in builtin_api_keys_raw.items():
+                channel_id = _normalize_channel_id(raw_channel_id)
+                if channel_id not in CHANNEL_IDS_BUILTIN or channel_id == CHANNEL_ID_GATEWAY:
+                    continue
+                api_key = _normalize_channel_api_key(raw_api_key)
+                if not api_key:
+                    continue
+                builtin_api_keys[channel_id] = api_key
+        return PersistedUserChannelState(
+            current_channel_id=current_channel_id,
+            custom_channels=custom_channels,
+            builtin_api_keys=builtin_api_keys,
+        )
+
+
+@dataclass
 class PersistedGatewayAutomationState:
-    version: int = 3
+    version: int = AUTOMATION_STATE_VERSION
     sessions: dict[str, PersistedSessionAutomation] = field(default_factory=dict)
     agents: dict[str, PersistedAgentRuntime] = field(default_factory=dict)
     chat_bindings: dict[str, str] = field(default_factory=dict)
+    user_channels: dict[str, PersistedUserChannelState] = field(default_factory=dict)
 
-    def to_json(self) -> dict[str, Any]:
+    def to_json(self, *, redact_secrets: bool = False) -> dict[str, Any]:
         return {
             "version": int(self.version),
             "sessions": {sid: sess.to_json() for sid, sess in self.sessions.items()},
             "agents": {aid: a.to_json() for aid, a in self.agents.items()},
             "chatBindings": dict(self.chat_bindings),
+            "userChannels": {
+                user_id: channel_state.to_json(redact_secrets=redact_secrets)
+                for user_id, channel_state in (self.user_channels or {}).items()
+                if isinstance(user_id, str) and user_id.strip() and isinstance(channel_state, PersistedUserChannelState)
+            },
         }
 
     @staticmethod
@@ -1783,11 +1995,26 @@ class PersistedGatewayAutomationState:
                     continue
                 chat_bindings[ck.strip()] = agent_id
 
+        user_channels_raw = obj.get("userChannels")
+        user_channels: dict[str, PersistedUserChannelState] = {}
+        if isinstance(user_channels_raw, dict):
+            for raw_user_id, raw_state in user_channels_raw.items():
+                if not isinstance(raw_user_id, str) or not raw_user_id.strip():
+                    continue
+                try:
+                    user_id_int = int(raw_user_id)
+                except Exception:
+                    continue
+                if user_id_int <= 0:
+                    continue
+                user_channels[str(user_id_int)] = PersistedUserChannelState.from_json(raw_state)
+
         return PersistedGatewayAutomationState(
             version=version_int,
             sessions=sessions,
             agents=agents,
             chat_bindings=chat_bindings,
+            user_channels=user_channels,
         )
 
 
@@ -1987,6 +2214,504 @@ class AutomationManager:
     def _get_agent(self, agent_id: str) -> Optional[PersistedAgentRuntime]:
         agent = self._store.state.agents.get(agent_id)
         return agent if isinstance(agent, PersistedAgentRuntime) else None
+
+    def get_owner_user_id_for_session(self, session_id: str) -> Optional[int]:
+        sid = session_id.strip() if isinstance(session_id, str) else ""
+        if not sid:
+            return None
+        st = self._store.state
+        for agent in (st.agents or {}).values():
+            if not isinstance(agent, PersistedAgentRuntime):
+                continue
+            if agent.session_id != sid:
+                continue
+            owner_user_id = getattr(agent, "owner_user_id", None)
+            if isinstance(owner_user_id, int) and owner_user_id > 0:
+                return owner_user_id
+            return None
+        return None
+
+    def _get_user_channel_state_for_user(self, *, user_id: int) -> PersistedUserChannelState:
+        if not isinstance(user_id, int) or user_id <= 0:
+            return PersistedUserChannelState()
+        st = self._store.state
+        raw = st.user_channels.get(str(user_id)) if isinstance(getattr(st, "user_channels", None), dict) else None
+        return raw if isinstance(raw, PersistedUserChannelState) else PersistedUserChannelState()
+
+    def _resolve_user_channel_id(self, *, user_id: int, raw_channel: Any) -> str:
+        user_state = self._get_user_channel_state_for_user(user_id=user_id)
+        channel_id = _normalize_channel_id(raw_channel)
+        if channel_id in CHANNEL_IDS_BUILTIN:
+            return channel_id
+        if channel_id and channel_id in (user_state.custom_channels or {}):
+            return channel_id
+        channel_name = _normalize_channel_name(raw_channel)
+        if not channel_name:
+            return ""
+        if channel_name in CHANNEL_IDS_BUILTIN:
+            return channel_name
+        for channel in (user_state.custom_channels or {}).values():
+            if not isinstance(channel, PersistedUserChannel):
+                continue
+            if channel.name == channel_name:
+                return channel.channel_id
+        return ""
+
+    def _current_channel_id_for_user_state(self, *, user_state: PersistedUserChannelState) -> str:
+        channel_id = _normalize_channel_id(getattr(user_state, "current_channel_id", None))
+        if channel_id in CHANNEL_IDS_BUILTIN:
+            return channel_id
+        if channel_id and channel_id in (user_state.custom_channels or {}):
+            return channel_id
+        return CHANNEL_ID_GATEWAY
+
+    def _iter_custom_channels_for_user_state(self, *, user_state: PersistedUserChannelState) -> list[PersistedUserChannel]:
+        out: list[PersistedUserChannel] = []
+        for channel in (user_state.custom_channels or {}).values():
+            if isinstance(channel, PersistedUserChannel):
+                out.append(channel)
+        out.sort(key=lambda item: (str(item.name or item.channel_id), int(item.created_at_ms)))
+        return out
+
+    def _channel_entry_for_user_state(
+        self,
+        *,
+        user_state: PersistedUserChannelState,
+        channel_id: str,
+        current_channel_id: Optional[str],
+    ) -> dict[str, Any]:
+        current_id = _normalize_channel_id(current_channel_id)
+        normalized_channel_id = _normalize_channel_id(channel_id)
+        if normalized_channel_id == CHANNEL_ID_GATEWAY:
+            api_key = _gateway_openai_api_key()
+            ready = bool(api_key)
+            return {
+                "channelId": CHANNEL_ID_GATEWAY,
+                "name": CHANNEL_ID_GATEWAY,
+                "kind": "builtin",
+                "builtinKind": "gateway",
+                "isBuiltin": True,
+                "selected": current_id == CHANNEL_ID_GATEWAY,
+                "baseUrl": _base_url_from_responses_url(_gateway_openai_responses_upstream_url()),
+                "responsesUrl": _gateway_openai_responses_upstream_url(),
+                "hasApiKey": bool(api_key),
+                "apiKeyMasked": None,
+                "ready": ready,
+                "reason": None if ready else "Gateway OPENAI_API_KEY is not configured",
+                "canRename": False,
+                "canDelete": False,
+                "canSetKey": False,
+                "canClearKey": False,
+                "websiteUrl": None,
+            }
+        if normalized_channel_id == CHANNEL_ID_ZERO_ZERO_PRO:
+            api_key = _normalize_channel_api_key((user_state.builtin_api_keys or {}).get(CHANNEL_ID_ZERO_ZERO_PRO))
+            ready = bool(api_key)
+            return {
+                "channelId": CHANNEL_ID_ZERO_ZERO_PRO,
+                "name": CHANNEL_ID_ZERO_ZERO_PRO,
+                "kind": "builtin",
+                "builtinKind": "0-0.pro",
+                "isBuiltin": True,
+                "selected": current_id == CHANNEL_ID_ZERO_ZERO_PRO,
+                "baseUrl": CHANNEL_ZERO_ZERO_PRO_BASE_URL,
+                "responsesUrl": _responses_url_from_base_url(CHANNEL_ZERO_ZERO_PRO_BASE_URL),
+                "hasApiKey": bool(api_key),
+                "apiKeyMasked": _mask_secret(api_key),
+                "ready": ready,
+                "reason": None if ready else "Missing apiKey",
+                "canRename": False,
+                "canDelete": False,
+                "canSetKey": True,
+                "canClearKey": bool(api_key),
+                "websiteUrl": CHANNEL_ZERO_ZERO_PRO_PROMO_URL,
+            }
+        channel = (user_state.custom_channels or {}).get(normalized_channel_id)
+        if not isinstance(channel, PersistedUserChannel):
+            raise ValueError(f"Unknown channel: {channel_id}")
+        api_key = _normalize_channel_api_key(channel.api_key)
+        ready = bool(channel.base_url and api_key)
+        missing: list[str] = []
+        if not channel.base_url:
+            missing.append("baseUrl")
+        if not api_key:
+            missing.append("apiKey")
+        return {
+            "channelId": channel.channel_id,
+            "name": channel.name,
+            "kind": "custom",
+            "builtinKind": None,
+            "isBuiltin": False,
+            "selected": current_id == channel.channel_id,
+            "baseUrl": channel.base_url,
+            "responsesUrl": _responses_url_from_base_url(channel.base_url),
+            "hasApiKey": bool(api_key),
+            "apiKeyMasked": _mask_secret(api_key),
+            "ready": ready,
+            "reason": None if ready else f"Missing {'/'.join(missing)}",
+            "canRename": True,
+            "canDelete": True,
+            "canSetKey": True,
+            "canClearKey": bool(api_key),
+            "websiteUrl": None,
+        }
+
+    def _best_channel_fallback_id_for_user_state(self, *, user_state: PersistedUserChannelState) -> str:
+        if self._channel_entry_for_user_state(
+            user_state=user_state,
+            channel_id=CHANNEL_ID_GATEWAY,
+            current_channel_id=None,
+        ).get("ready"):
+            return CHANNEL_ID_GATEWAY
+        if self._channel_entry_for_user_state(
+            user_state=user_state,
+            channel_id=CHANNEL_ID_ZERO_ZERO_PRO,
+            current_channel_id=None,
+        ).get("ready"):
+            return CHANNEL_ID_ZERO_ZERO_PRO
+        for channel in self._iter_custom_channels_for_user_state(user_state=user_state):
+            if self._channel_entry_for_user_state(
+                user_state=user_state,
+                channel_id=channel.channel_id,
+                current_channel_id=None,
+            ).get("ready"):
+                return channel.channel_id
+        return CHANNEL_ID_GATEWAY
+
+    def list_channels_for_user(self, *, user_id: int) -> dict[str, Any]:
+        user_state = self._get_user_channel_state_for_user(user_id=user_id)
+        current_channel_id = self._current_channel_id_for_user_state(user_state=user_state)
+        channels: list[dict[str, Any]] = [
+            self._channel_entry_for_user_state(
+                user_state=user_state,
+                channel_id=CHANNEL_ID_GATEWAY,
+                current_channel_id=current_channel_id,
+            ),
+            self._channel_entry_for_user_state(
+                user_state=user_state,
+                channel_id=CHANNEL_ID_ZERO_ZERO_PRO,
+                current_channel_id=current_channel_id,
+            ),
+        ]
+        for channel in self._iter_custom_channels_for_user_state(user_state=user_state):
+            channels.append(
+                self._channel_entry_for_user_state(
+                    user_state=user_state,
+                    channel_id=channel.channel_id,
+                    current_channel_id=current_channel_id,
+                )
+            )
+        current_channel = next((dict(item) for item in channels if item.get("channelId") == current_channel_id), None)
+        return {
+            "ok": True,
+            "userId": user_id,
+            "currentChannelId": current_channel_id,
+            "currentChannel": current_channel,
+            "channels": channels,
+        }
+
+    def get_current_channel_for_user(self, *, user_id: int) -> Optional[dict[str, Any]]:
+        listed = self.list_channels_for_user(user_id=user_id)
+        current_channel = listed.get("currentChannel")
+        return dict(current_channel) if isinstance(current_channel, dict) else None
+
+    def resolve_openai_proxy_target_for_session(self, session_id: str) -> dict[str, Any]:
+        sid = session_id.strip() if isinstance(session_id, str) else ""
+        if not sid:
+            raise ValueError("Missing sessionId")
+        owner_user_id = self.get_owner_user_id_for_session(sid)
+        if owner_user_id is None:
+            api_key = _gateway_openai_api_key()
+            if not api_key:
+                raise RuntimeError("Gateway channel is not configured (missing OPENAI_API_KEY)")
+            return {
+                "ownerUserId": None,
+                "channelId": CHANNEL_ID_GATEWAY,
+                "name": CHANNEL_ID_GATEWAY,
+                "upstreamUrl": _gateway_openai_responses_upstream_url(),
+                "apiKey": api_key,
+            }
+
+        current_channel = self.get_current_channel_for_user(user_id=owner_user_id)
+        if not isinstance(current_channel, dict):
+            raise RuntimeError(f"Unable to resolve current channel for user {owner_user_id}")
+        channel_id = _normalize_channel_id(current_channel.get("channelId"))
+        if not channel_id:
+            raise RuntimeError(f"Unable to resolve current channel for user {owner_user_id}")
+
+        if channel_id == CHANNEL_ID_GATEWAY:
+            api_key = _gateway_openai_api_key()
+            if not api_key:
+                raise RuntimeError("Current channel 'gateway' is not ready (missing OPENAI_API_KEY)")
+            upstream_url = _gateway_openai_responses_upstream_url()
+        elif channel_id == CHANNEL_ID_ZERO_ZERO_PRO:
+            user_state = self._get_user_channel_state_for_user(user_id=owner_user_id)
+            api_key = _normalize_channel_api_key((user_state.builtin_api_keys or {}).get(CHANNEL_ID_ZERO_ZERO_PRO))
+            if not api_key:
+                raise RuntimeError("Current channel '0-0.pro' is not ready (missing apiKey)")
+            upstream_url = _responses_url_from_base_url(CHANNEL_ZERO_ZERO_PRO_BASE_URL)
+        else:
+            user_state = self._get_user_channel_state_for_user(user_id=owner_user_id)
+            channel = (user_state.custom_channels or {}).get(channel_id)
+            if not isinstance(channel, PersistedUserChannel):
+                raise RuntimeError(f"Unknown current channel: {channel_id}")
+            api_key = _normalize_channel_api_key(channel.api_key)
+            if not channel.base_url or not api_key:
+                raise RuntimeError(f"Current channel '{channel.name or channel_id}' is not ready")
+            upstream_url = _responses_url_from_base_url(channel.base_url)
+        if not upstream_url:
+            raise RuntimeError(f"Current channel '{channel_id}' has no usable upstream URL")
+        return {
+            "ownerUserId": owner_user_id,
+            "channelId": channel_id,
+            "name": str(current_channel.get("name") or channel_id),
+            "upstreamUrl": upstream_url,
+            "apiKey": api_key,
+        }
+
+    async def create_user_channel(self, *, user_id: int, name: str, base_url: str, api_key: str) -> PersistedUserChannel:
+        if not isinstance(user_id, int) or user_id <= 0:
+            raise ValueError("Invalid userId")
+        channel_name = _normalize_channel_name(name)
+        if not channel_name:
+            raise ValueError("Invalid channel name")
+        if channel_name in CHANNEL_IDS_BUILTIN:
+            raise ValueError(f"Channel already exists: {channel_name}")
+        normalized_base_url = _normalize_openai_base_url(base_url)
+        if not normalized_base_url:
+            raise ValueError("Invalid baseUrl")
+        normalized_api_key = _normalize_channel_api_key(api_key)
+        if not normalized_api_key:
+            raise ValueError("Missing apiKey")
+
+        created: Optional[PersistedUserChannel] = None
+
+        def _write(st: PersistedGatewayAutomationState) -> None:
+            nonlocal created
+            st.version = max(int(getattr(st, "version", 1) or 1), AUTOMATION_STATE_VERSION)
+            user_key = str(user_id)
+            user_state = st.user_channels.get(user_key)
+            if not isinstance(user_state, PersistedUserChannelState):
+                user_state = PersistedUserChannelState()
+                st.user_channels[user_key] = user_state
+            for existing in (user_state.custom_channels or {}).values():
+                if isinstance(existing, PersistedUserChannel) and existing.name == channel_name:
+                    raise ValueError(f"Channel already exists: {channel_name}")
+            channel_id = _new_custom_channel_id()
+            while channel_id in CHANNEL_IDS_BUILTIN or channel_id in (user_state.custom_channels or {}):
+                channel_id = _new_custom_channel_id()
+            now = _now_ms()
+            created = PersistedUserChannel(
+                channel_id=channel_id,
+                name=channel_name,
+                base_url=normalized_base_url,
+                api_key=normalized_api_key,
+                created_at_ms=now,
+                updated_at_ms=now,
+            )
+            user_state.custom_channels[channel_id] = created
+            if not _normalize_channel_id(getattr(user_state, "current_channel_id", None)):
+                user_state.current_channel_id = CHANNEL_ID_GATEWAY
+
+        await self._store.update(_write)
+        if created is None:
+            raise RuntimeError("Channel was not created")
+        return created
+
+    async def rename_user_channel(self, *, user_id: int, channel_id: str, new_name: str) -> PersistedUserChannel:
+        if not isinstance(user_id, int) or user_id <= 0:
+            raise ValueError("Invalid userId")
+        resolved_channel_id = self._resolve_user_channel_id(user_id=user_id, raw_channel=channel_id)
+        if not resolved_channel_id:
+            raise ValueError(f"Unknown channel: {channel_id}")
+        if resolved_channel_id in CHANNEL_IDS_BUILTIN:
+            raise ValueError("Builtin channel cannot be renamed")
+        normalized_name = _normalize_channel_name(new_name)
+        if not normalized_name:
+            raise ValueError("Invalid channel name")
+        if normalized_name in CHANNEL_IDS_BUILTIN:
+            raise ValueError(f"Channel already exists: {normalized_name}")
+
+        updated: Optional[PersistedUserChannel] = None
+
+        def _write(st: PersistedGatewayAutomationState) -> None:
+            nonlocal updated
+            st.version = max(int(getattr(st, "version", 1) or 1), AUTOMATION_STATE_VERSION)
+            user_state = st.user_channels.get(str(user_id))
+            if not isinstance(user_state, PersistedUserChannelState):
+                raise ValueError(f"Unknown channel: {channel_id}")
+            channel = (user_state.custom_channels or {}).get(resolved_channel_id)
+            if not isinstance(channel, PersistedUserChannel):
+                raise ValueError(f"Unknown channel: {channel_id}")
+            for existing in (user_state.custom_channels or {}).values():
+                if not isinstance(existing, PersistedUserChannel):
+                    continue
+                if existing.channel_id != resolved_channel_id and existing.name == normalized_name:
+                    raise ValueError(f"Channel already exists: {normalized_name}")
+            if channel.name == normalized_name:
+                updated = channel
+                return
+            updated = replace(channel, name=normalized_name, updated_at_ms=_now_ms())
+            user_state.custom_channels[resolved_channel_id] = updated
+
+        await self._store.update(_write)
+        if updated is None:
+            raise RuntimeError("Channel was not renamed")
+        return updated
+
+    async def delete_user_channel(self, *, user_id: int, channel_id: str) -> dict[str, Any]:
+        if not isinstance(user_id, int) or user_id <= 0:
+            raise ValueError("Invalid userId")
+        resolved_channel_id = self._resolve_user_channel_id(user_id=user_id, raw_channel=channel_id)
+        if not resolved_channel_id:
+            raise ValueError(f"Unknown channel: {channel_id}")
+        if resolved_channel_id in CHANNEL_IDS_BUILTIN:
+            raise ValueError("Builtin channel cannot be deleted")
+
+        deleted: Optional[PersistedUserChannel] = None
+
+        def _write(st: PersistedGatewayAutomationState) -> None:
+            nonlocal deleted
+            st.version = max(int(getattr(st, "version", 1) or 1), AUTOMATION_STATE_VERSION)
+            user_state = st.user_channels.get(str(user_id))
+            if not isinstance(user_state, PersistedUserChannelState):
+                raise ValueError(f"Unknown channel: {channel_id}")
+            selected_before = _normalize_channel_id(getattr(user_state, "current_channel_id", None)) == resolved_channel_id
+            deleted = (user_state.custom_channels or {}).pop(resolved_channel_id, None)
+            if not isinstance(deleted, PersistedUserChannel):
+                raise ValueError(f"Unknown channel: {channel_id}")
+            if selected_before:
+                user_state.current_channel_id = self._best_channel_fallback_id_for_user_state(user_state=user_state)
+
+        await self._store.update(_write)
+        listed = self.list_channels_for_user(user_id=user_id)
+        return {
+            "deletedChannelId": resolved_channel_id,
+            "deletedName": deleted.name if isinstance(deleted, PersistedUserChannel) else None,
+            "currentChannelId": listed.get("currentChannelId"),
+            "currentChannel": listed.get("currentChannel"),
+        }
+
+    async def select_user_channel(self, *, user_id: int, channel_id: str) -> dict[str, Any]:
+        if not isinstance(user_id, int) or user_id <= 0:
+            raise ValueError("Invalid userId")
+        resolved_channel_id = self._resolve_user_channel_id(user_id=user_id, raw_channel=channel_id)
+        if not resolved_channel_id:
+            raise ValueError(f"Unknown channel: {channel_id}")
+
+        def _write(st: PersistedGatewayAutomationState) -> None:
+            st.version = max(int(getattr(st, "version", 1) or 1), AUTOMATION_STATE_VERSION)
+            user_key = str(user_id)
+            user_state = st.user_channels.get(user_key)
+            if not isinstance(user_state, PersistedUserChannelState):
+                user_state = PersistedUserChannelState()
+                st.user_channels[user_key] = user_state
+            if resolved_channel_id not in CHANNEL_IDS_BUILTIN and resolved_channel_id not in (user_state.custom_channels or {}):
+                raise ValueError(f"Unknown channel: {channel_id}")
+            if not self._channel_entry_for_user_state(
+                user_state=user_state,
+                channel_id=resolved_channel_id,
+                current_channel_id=None,
+            ).get("ready"):
+                raise ValueError(f"Channel is not ready: {resolved_channel_id}")
+            user_state.current_channel_id = resolved_channel_id
+
+        await self._store.update(_write)
+        current_channel = self.get_current_channel_for_user(user_id=user_id)
+        return {
+            "currentChannelId": resolved_channel_id,
+            "currentChannel": current_channel,
+        }
+
+    async def set_user_channel_api_key(self, *, user_id: int, channel_id: str, api_key: str) -> dict[str, Any]:
+        if not isinstance(user_id, int) or user_id <= 0:
+            raise ValueError("Invalid userId")
+        resolved_channel_id = self._resolve_user_channel_id(user_id=user_id, raw_channel=channel_id)
+        if not resolved_channel_id:
+            raise ValueError(f"Unknown channel: {channel_id}")
+        normalized_api_key = _normalize_channel_api_key(api_key)
+        if not normalized_api_key:
+            raise ValueError("Missing apiKey")
+
+        def _write(st: PersistedGatewayAutomationState) -> None:
+            st.version = max(int(getattr(st, "version", 1) or 1), AUTOMATION_STATE_VERSION)
+            user_key = str(user_id)
+            user_state = st.user_channels.get(user_key)
+            if not isinstance(user_state, PersistedUserChannelState):
+                user_state = PersistedUserChannelState()
+                st.user_channels[user_key] = user_state
+            if resolved_channel_id == CHANNEL_ID_GATEWAY:
+                raise ValueError("Gateway channel key is managed by gateway env")
+            if resolved_channel_id == CHANNEL_ID_ZERO_ZERO_PRO:
+                user_state.builtin_api_keys[CHANNEL_ID_ZERO_ZERO_PRO] = normalized_api_key
+                return
+            channel = (user_state.custom_channels or {}).get(resolved_channel_id)
+            if not isinstance(channel, PersistedUserChannel):
+                raise ValueError(f"Unknown channel: {channel_id}")
+            user_state.custom_channels[resolved_channel_id] = replace(
+                channel,
+                api_key=normalized_api_key,
+                updated_at_ms=_now_ms(),
+            )
+
+        await self._store.update(_write)
+        listed = self.list_channels_for_user(user_id=user_id)
+        current_channel = listed.get("currentChannel")
+        selected_channel = next(
+            (dict(item) for item in listed.get("channels", []) if isinstance(item, dict) and item.get("channelId") == resolved_channel_id),
+            None,
+        )
+        return {
+            "channelId": resolved_channel_id,
+            "channel": selected_channel,
+            "currentChannel": current_channel,
+            "currentChannelId": listed.get("currentChannelId"),
+        }
+
+    async def clear_user_channel_api_key(self, *, user_id: int, channel_id: str) -> dict[str, Any]:
+        if not isinstance(user_id, int) or user_id <= 0:
+            raise ValueError("Invalid userId")
+        resolved_channel_id = self._resolve_user_channel_id(user_id=user_id, raw_channel=channel_id)
+        if not resolved_channel_id:
+            raise ValueError(f"Unknown channel: {channel_id}")
+        if resolved_channel_id == CHANNEL_ID_GATEWAY:
+            raise ValueError("Gateway channel key is managed by gateway env")
+
+        def _write(st: PersistedGatewayAutomationState) -> None:
+            st.version = max(int(getattr(st, "version", 1) or 1), AUTOMATION_STATE_VERSION)
+            user_state = st.user_channels.get(str(user_id))
+            if not isinstance(user_state, PersistedUserChannelState):
+                raise ValueError(f"Unknown channel: {channel_id}")
+            selected_before = _normalize_channel_id(getattr(user_state, "current_channel_id", None)) == resolved_channel_id
+            if resolved_channel_id == CHANNEL_ID_ZERO_ZERO_PRO:
+                if CHANNEL_ID_ZERO_ZERO_PRO not in (user_state.builtin_api_keys or {}):
+                    raise ValueError(f"Unknown channel: {channel_id}")
+                user_state.builtin_api_keys.pop(CHANNEL_ID_ZERO_ZERO_PRO, None)
+            else:
+                channel = (user_state.custom_channels or {}).get(resolved_channel_id)
+                if not isinstance(channel, PersistedUserChannel):
+                    raise ValueError(f"Unknown channel: {channel_id}")
+                user_state.custom_channels[resolved_channel_id] = replace(
+                    channel,
+                    api_key=None,
+                    updated_at_ms=_now_ms(),
+                )
+            if selected_before:
+                user_state.current_channel_id = self._best_channel_fallback_id_for_user_state(user_state=user_state)
+
+        await self._store.update(_write)
+        listed = self.list_channels_for_user(user_id=user_id)
+        current_channel = listed.get("currentChannel")
+        selected_channel = next(
+            (dict(item) for item in listed.get("channels", []) if isinstance(item, dict) and item.get("channelId") == resolved_channel_id),
+            None,
+        )
+        return {
+            "channelId": resolved_channel_id,
+            "channel": selected_channel,
+            "currentChannel": current_channel,
+            "currentChannelId": listed.get("currentChannelId"),
+        }
 
     async def _migrate_agent_models(self) -> None:
         changed = False
@@ -5222,11 +5947,19 @@ def openai_responses_proxy(request: Request, body: Any = Body(...)):
     if request.url.query:
         raise HTTPException(status_code=403, detail="Query strings are not allowed on this endpoint")
 
-    openai_api_key = (os.getenv("OPENAI_API_KEY") or os.getenv("ARGUS_OPENAI_API_KEY") or "").strip()
-    if not openai_api_key:
-        raise HTTPException(status_code=503, detail="OpenAI proxy is not configured (missing OPENAI_API_KEY)")
+    automation = _get_automation_or_500()
+    scoped_session_id = getattr(request.state, "openai_scoped_session_id", None)
+    try:
+        target = automation.resolve_openai_proxy_target_for_session(str(scoped_session_id or ""))
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    except RuntimeError as e:
+        raise HTTPException(status_code=503, detail=str(e)) from e
 
-    upstream_url = (os.getenv("ARGUS_OPENAI_RESPONSES_UPSTREAM_URL") or "https://api.openai.com/v1/responses").strip()
+    upstream_url = str(target.get("upstreamUrl") or "").strip()
+    openai_api_key = _normalize_channel_api_key(target.get("apiKey"))
+    if not upstream_url or not openai_api_key:
+        raise HTTPException(status_code=503, detail="OpenAI proxy target is not configured")
 
     hop_by_hop = {
         "connection",
@@ -7431,10 +8164,9 @@ def _docker_create_container_sync(cfg: DockerProvisionConfig, session_id: str):
     # Codex runtime (optional): configure gateway MCP URL for tool access.
     env["ARGUS_CODEX_MCP_URL"] = f"http://{gateway_internal_host}:8080/mcp"
 
-    # Optional: OpenAI Responses proxy (keeps OPENAI_API_KEY out of the runtime container).
-    openai_api_key = (os.getenv("OPENAI_API_KEY") or os.getenv("ARGUS_OPENAI_API_KEY") or "").strip() or None
-    openai_master = os.getenv("ARGUS_OPENAI_TOKEN") or gateway_token
-    if openai_api_key and openai_master:
+    # Optional: OpenAI Responses proxy (keeps per-user provider secrets on the gateway).
+    openai_master = (os.getenv("ARGUS_OPENAI_TOKEN") or gateway_token or "").strip() or None
+    if openai_master:
         env["ARGUS_OPENAI_TOKEN"] = _openai_proxy_derive_session_token(openai_master, session_id)
         env["ARGUS_CODEX_OPENAI_PROXY_BASE_URL"] = f"http://{gateway_internal_host}:8080/openai/v1"
 
@@ -7852,7 +8584,7 @@ async def automation_state(request: Request):
             }
         )
     lanes.sort(key=lambda x: (x["sessionId"], x["threadId"]))
-    return {"ok": True, "persisted": st.to_json(), "runtime": {"lanes": lanes}}
+    return {"ok": True, "persisted": st.to_json(redact_secrets=True), "runtime": {"lanes": lanes}}
 
 
 @app.post("/automation/user/bootstrap")
@@ -7888,6 +8620,7 @@ async def automation_user_bootstrap(request: Request):
         current_agent_id = agent.agent_id
     current_session_id = automation.resolve_agent_session_id(current_agent_id) if current_agent_id else None
     current_agent = automation._get_agent(current_agent_id) if current_agent_id else None
+    channel_info = automation.list_channels_for_user(user_id=user_id)
 
     return {
         "ok": True,
@@ -7898,6 +8631,8 @@ async def automation_user_bootstrap(request: Request):
         "currentSessionId": current_session_id,
         "currentModel": _effective_agent_model(current_agent),
         "availableModels": list(ARGUS_AGENT_MODELS),
+        "currentChannelId": channel_info.get("currentChannelId"),
+        "currentChannel": channel_info.get("currentChannel"),
         "agent": agent.to_json(),
     }
 
@@ -7935,6 +8670,7 @@ async def automation_agent_list(request: Request):
         current_agent_id = main_id
     current_session_id = automation.resolve_agent_session_id(current_agent_id) if current_agent_id else None
     current_agent = automation._get_agent(current_agent_id) if current_agent_id else None
+    channel_info = automation.list_channels_for_user(user_id=user_id)
 
     return {
         "ok": True,
@@ -7943,6 +8679,8 @@ async def automation_agent_list(request: Request):
         "currentSessionId": current_session_id,
         "currentModel": _effective_agent_model(current_agent),
         "availableModels": list(ARGUS_AGENT_MODELS),
+        "currentChannelId": channel_info.get("currentChannelId"),
+        "currentChannel": channel_info.get("currentChannel"),
     }
 
 
@@ -7995,6 +8733,7 @@ async def automation_agent_resolve(request: Request):
     if not sess_id:
         raise HTTPException(status_code=500, detail="Agent has no sessionId")
     agent = automation._get_agent(agent_id)
+    channel_info = automation.list_channels_for_user(user_id=user_id)
     return {
         "ok": True,
         "chatKey": chat_key,
@@ -8002,6 +8741,8 @@ async def automation_agent_resolve(request: Request):
         "sessionId": sess_id,
         "model": _effective_agent_model(agent),
         "availableModels": list(ARGUS_AGENT_MODELS),
+        "currentChannelId": channel_info.get("currentChannelId"),
+        "currentChannel": channel_info.get("currentChannel"),
     }
 
 
@@ -8216,6 +8957,236 @@ async def automation_agent_delete(request: Request):
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e)) from e
     return {"ok": True, "chatKey": chat_key, **(result or {})}
+
+
+@app.post("/automation/channel/list")
+async def automation_channel_list(request: Request):
+    _http_require_token(request)
+    automation = _get_automation_or_500()
+    try:
+        body = await request.json()
+    except Exception as e:
+        raise HTTPException(status_code=400, detail="Invalid JSON body") from e
+    if not isinstance(body, dict):
+        raise HTTPException(status_code=400, detail="Invalid JSON body")
+
+    raw_chat_key = body.get("chatKey")
+    if not isinstance(raw_chat_key, str) or not raw_chat_key.strip():
+        raise HTTPException(status_code=400, detail="Missing 'chatKey'")
+    chat_key = raw_chat_key.strip()
+
+    user_id = _parse_telegram_private_user_id(chat_key)
+    if user_id is None:
+        raise HTTPException(status_code=400, detail="Invalid 'chatKey'")
+
+    return {"chatKey": chat_key, **automation.list_channels_for_user(user_id=user_id)}
+
+
+@app.post("/automation/channel/select")
+async def automation_channel_select(request: Request):
+    _http_require_token(request)
+    automation = _get_automation_or_500()
+    try:
+        body = await request.json()
+    except Exception as e:
+        raise HTTPException(status_code=400, detail="Invalid JSON body") from e
+    if not isinstance(body, dict):
+        raise HTTPException(status_code=400, detail="Invalid JSON body")
+
+    raw_chat_key = body.get("chatKey")
+    raw_channel = body.get("channelId") or body.get("id") or body.get("name")
+    if not isinstance(raw_chat_key, str) or not raw_chat_key.strip():
+        raise HTTPException(status_code=400, detail="Missing 'chatKey'")
+    chat_key = raw_chat_key.strip()
+
+    user_id = _parse_telegram_private_user_id(chat_key)
+    if user_id is None:
+        raise HTTPException(status_code=400, detail="Invalid 'chatKey'")
+    if not isinstance(raw_channel, str) or not raw_channel.strip():
+        raise HTTPException(status_code=400, detail="Missing 'channelId'")
+
+    try:
+        await automation.select_user_channel(user_id=user_id, channel_id=raw_channel)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+
+    listed = automation.list_channels_for_user(user_id=user_id)
+    return {"chatKey": chat_key, **listed}
+
+
+@app.post("/automation/channel/create")
+async def automation_channel_create(request: Request):
+    _http_require_token(request)
+    automation = _get_automation_or_500()
+    try:
+        body = await request.json()
+    except Exception as e:
+        raise HTTPException(status_code=400, detail="Invalid JSON body") from e
+    if not isinstance(body, dict):
+        raise HTTPException(status_code=400, detail="Invalid JSON body")
+
+    raw_chat_key = body.get("chatKey")
+    raw_name = body.get("name") or body.get("channelName")
+    raw_base_url = body.get("baseUrl")
+    raw_api_key = body.get("apiKey")
+    if not isinstance(raw_chat_key, str) or not raw_chat_key.strip():
+        raise HTTPException(status_code=400, detail="Missing 'chatKey'")
+    chat_key = raw_chat_key.strip()
+
+    user_id = _parse_telegram_private_user_id(chat_key)
+    if user_id is None:
+        raise HTTPException(status_code=400, detail="Invalid 'chatKey'")
+
+    try:
+        created = await automation.create_user_channel(
+            user_id=user_id,
+            name=str(raw_name or ""),
+            base_url=str(raw_base_url or ""),
+            api_key=str(raw_api_key or ""),
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+
+    listed = automation.list_channels_for_user(user_id=user_id)
+    created_entry = next(
+        (dict(item) for item in listed.get("channels", []) if isinstance(item, dict) and item.get("channelId") == created.channel_id),
+        None,
+    )
+    return {"ok": True, "chatKey": chat_key, "channel": created_entry, **listed}
+
+
+@app.post("/automation/channel/rename")
+async def automation_channel_rename(request: Request):
+    _http_require_token(request)
+    automation = _get_automation_or_500()
+    try:
+        body = await request.json()
+    except Exception as e:
+        raise HTTPException(status_code=400, detail="Invalid JSON body") from e
+    if not isinstance(body, dict):
+        raise HTTPException(status_code=400, detail="Invalid JSON body")
+
+    raw_chat_key = body.get("chatKey")
+    raw_channel = body.get("channelId") or body.get("id") or body.get("name")
+    raw_new_name = body.get("newName") or body.get("channelName")
+    if not isinstance(raw_chat_key, str) or not raw_chat_key.strip():
+        raise HTTPException(status_code=400, detail="Missing 'chatKey'")
+    chat_key = raw_chat_key.strip()
+
+    user_id = _parse_telegram_private_user_id(chat_key)
+    if user_id is None:
+        raise HTTPException(status_code=400, detail="Invalid 'chatKey'")
+    if not isinstance(raw_channel, str) or not raw_channel.strip():
+        raise HTTPException(status_code=400, detail="Missing 'channelId'")
+
+    try:
+        updated = await automation.rename_user_channel(user_id=user_id, channel_id=raw_channel, new_name=str(raw_new_name or ""))
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+
+    listed = automation.list_channels_for_user(user_id=user_id)
+    updated_entry = next(
+        (dict(item) for item in listed.get("channels", []) if isinstance(item, dict) and item.get("channelId") == updated.channel_id),
+        None,
+    )
+    return {"ok": True, "chatKey": chat_key, "channel": updated_entry, **listed}
+
+
+@app.post("/automation/channel/delete")
+async def automation_channel_delete(request: Request):
+    _http_require_token(request)
+    automation = _get_automation_or_500()
+    try:
+        body = await request.json()
+    except Exception as e:
+        raise HTTPException(status_code=400, detail="Invalid JSON body") from e
+    if not isinstance(body, dict):
+        raise HTTPException(status_code=400, detail="Invalid JSON body")
+
+    raw_chat_key = body.get("chatKey")
+    raw_channel = body.get("channelId") or body.get("id") or body.get("name")
+    if not isinstance(raw_chat_key, str) or not raw_chat_key.strip():
+        raise HTTPException(status_code=400, detail="Missing 'chatKey'")
+    chat_key = raw_chat_key.strip()
+
+    user_id = _parse_telegram_private_user_id(chat_key)
+    if user_id is None:
+        raise HTTPException(status_code=400, detail="Invalid 'chatKey'")
+    if not isinstance(raw_channel, str) or not raw_channel.strip():
+        raise HTTPException(status_code=400, detail="Missing 'channelId'")
+
+    try:
+        deleted = await automation.delete_user_channel(user_id=user_id, channel_id=raw_channel)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+
+    listed = automation.list_channels_for_user(user_id=user_id)
+    return {"ok": True, "chatKey": chat_key, **deleted, **listed}
+
+
+@app.post("/automation/channel/key/set")
+async def automation_channel_key_set(request: Request):
+    _http_require_token(request)
+    automation = _get_automation_or_500()
+    try:
+        body = await request.json()
+    except Exception as e:
+        raise HTTPException(status_code=400, detail="Invalid JSON body") from e
+    if not isinstance(body, dict):
+        raise HTTPException(status_code=400, detail="Invalid JSON body")
+
+    raw_chat_key = body.get("chatKey")
+    raw_channel = body.get("channelId") or body.get("id") or body.get("name")
+    raw_api_key = body.get("apiKey")
+    if not isinstance(raw_chat_key, str) or not raw_chat_key.strip():
+        raise HTTPException(status_code=400, detail="Missing 'chatKey'")
+    chat_key = raw_chat_key.strip()
+
+    user_id = _parse_telegram_private_user_id(chat_key)
+    if user_id is None:
+        raise HTTPException(status_code=400, detail="Invalid 'chatKey'")
+    if not isinstance(raw_channel, str) or not raw_channel.strip():
+        raise HTTPException(status_code=400, detail="Missing 'channelId'")
+
+    try:
+        result = await automation.set_user_channel_api_key(user_id=user_id, channel_id=raw_channel, api_key=str(raw_api_key or ""))
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+
+    listed = automation.list_channels_for_user(user_id=user_id)
+    return {"ok": True, "chatKey": chat_key, **result, **listed}
+
+
+@app.post("/automation/channel/key/clear")
+async def automation_channel_key_clear(request: Request):
+    _http_require_token(request)
+    automation = _get_automation_or_500()
+    try:
+        body = await request.json()
+    except Exception as e:
+        raise HTTPException(status_code=400, detail="Invalid JSON body") from e
+    if not isinstance(body, dict):
+        raise HTTPException(status_code=400, detail="Invalid JSON body")
+
+    raw_chat_key = body.get("chatKey")
+    raw_channel = body.get("channelId") or body.get("id") or body.get("name")
+    if not isinstance(raw_chat_key, str) or not raw_chat_key.strip():
+        raise HTTPException(status_code=400, detail="Missing 'chatKey'")
+    chat_key = raw_chat_key.strip()
+
+    user_id = _parse_telegram_private_user_id(chat_key)
+    if user_id is None:
+        raise HTTPException(status_code=400, detail="Invalid 'chatKey'")
+    if not isinstance(raw_channel, str) or not raw_channel.strip():
+        raise HTTPException(status_code=400, detail="Missing 'channelId'")
+
+    try:
+        result = await automation.clear_user_channel_api_key(user_id=user_id, channel_id=raw_channel)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+
+    listed = automation.list_channels_for_user(user_id=user_id)
+    return {"ok": True, "chatKey": chat_key, **result, **listed}
 
 
 @app.post("/automation/chat/bind")

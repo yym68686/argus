@@ -104,11 +104,19 @@ How changes take effect:
 
 | Variable | Required? | Default | What it does / notes |
 | --- | --- | --- | --- |
-| `OPENAI_API_KEY` | Optional, but recommended for the default Codex runtime | unset | Long-lived API key stored on the **gateway** only. The key is not injected directly into runtime containers. |
-| `ARGUS_OPENAI_API_KEY` | Optional | unset | Compatibility alias for `OPENAI_API_KEY`. The gateway checks `OPENAI_API_KEY` first, then this alias. |
-| `ARGUS_OPENAI_RESPONSES_UPSTREAM_URL` | Optional | `https://api.openai.com/v1/responses` | Upstream Responses API URL used by the gateway proxy. Point this at any OpenAI-compatible `/v1/responses` endpoint if you want to self-host against your own provider or company proxy. |
-| `ARGUS_OPENAI_TOKEN` | Optional | falls back to `ARGUS_TOKEN` | Master secret used by the gateway to derive per-session bearer tokens for `/openai/v1/responses`. On the gateway this is the master secret; inside each runtime container the gateway injects a **derived session token** with the same env name. |
-| `ARGUS_GATEWAY_INTERNAL_HOST` | Optional | auto-detect current gateway container name, then fall back to `gateway` | Hostname that spawned runtime containers should use when calling back into the gateway (`/mcp`, `/nodes/ws`, `/openai/v1`). Set this only if Docker DNS / service naming differs from the default assumptions. |
+| `OPENAI_API_KEY` | Optional, but recommended for the default Codex runtime | unset | Long-lived API key for the built-in `gateway` channel only. The key stays on the **gateway** and is not injected directly into runtime containers. |
+| `ARGUS_OPENAI_API_KEY` | Optional | unset | Compatibility alias for `OPENAI_API_KEY`. The built-in `gateway` channel checks `OPENAI_API_KEY` first, then this alias. |
+| `ARGUS_OPENAI_RESPONSES_UPSTREAM_URL` | Optional | `https://api.openai.com/v1/responses` | Upstream Responses API URL used by the built-in `gateway` channel. Point this at any OpenAI-compatible `/v1/responses` endpoint if you want the shared gateway channel to target your own provider or company proxy. |
+| `ARGUS_OPENAI_TOKEN` | Optional | falls back to `ARGUS_TOKEN` | Master secret used by the gateway to derive per-session bearer tokens for `/openai/v1/responses`. On the gateway this is the master secret; inside each runtime container the gateway injects a **derived session token** with the same env name. This controls access to the proxy; the actual upstream is chosen from the selected channel. |
+| `ARGUS_GATEWAY_INTERNAL_HOST` | Optional | auto-detect current gateway container name, then fall back to `gateway` | Hostname that spawned runtime containers should use when calling back into the gateway (`/mcp`, `/nodes/ws`, `/openai/v1`). Runtime containers keep this fixed gateway URL even when users switch channels. Set this only if Docker DNS / service naming differs from the default assumptions. |
+
+Channel behavior:
+
+- Built-in `gateway`: selected by default; uses `OPENAI_API_KEY` + `ARGUS_OPENAI_RESPONSES_UPSTREAM_URL`.
+- Built-in `0-0.pro`: fixed base URL `https://api.0-0.pro/v1`; each user supplies their own API key from the Telegram menu.
+- Custom channels: each user can add/delete/rename their own OpenAI-compatible `baseUrl` + API key entries.
+- The channel list and user API keys are stored in `${ARGUS_HOME_HOST_PATH}/gateway/state.json`. Protect this file like any other secret store.
+- Switching the current channel is **user-global**: one switch affects that user's existing and future agents/containers.
 
 ### Web UI and Telegram bot
 
@@ -176,6 +184,7 @@ By default Argus persists data on the Docker host at:
 
 - `ARGUS_HOME_HOST_PATH` (default: `${HOME}/.argus`)
   - Gateway automation state: `${ARGUS_HOME_HOST_PATH}/gateway/state.json`
+  - Also stores per-user API channel definitions, the selected current channel, and user-supplied API keys. Treat it as a secret-bearing file.
 
 Each runtime session container mounts a **single host workspace directory** at `/workspace`.
 
@@ -204,6 +213,7 @@ When using `apps/telegram-bot`, the gateway can isolate runtime containers (agen
 - Use `/menu` to open the control panel:
   - **Switch Agent**: switch the current DM agent (workspace/session).
   - **Switch Model**: switch the current agent between `gpt-5.2` and `gpt-5.4`.
+  - **API Channels**: manage the per-user channel list (`gateway`, `0-0.pro`, and your own custom channels) and switch the current channel for all of your agents/containers.
   - **Create Agent**: create a new agent (workspace/session) and switch to it.
   - **Rename Agent**: rename the current agent (owner-only; non-`main`).
   - **Delete Agent**: delete the current agent (owner-only; includes `main`). If you delete `main`, you’ll be prompted to create a new `main`.
@@ -274,19 +284,23 @@ Default runtime (Codex):
 - Start command: `ARGUS_RUNTIME_CMD` (defaults to `codex app-server`)
 - The base runtime image includes a few common CLI tools by default, including `curl`, `git`, `rg`, and `strings`.
 
-### OpenAI credentials (recommended)
+### OpenAI proxy & API channels
 
-To avoid putting your long-lived OpenAI API key inside each runtime container, set `OPENAI_API_KEY` on the **gateway**.
-When `OPENAI_API_KEY` is set, the gateway exposes a narrow `/openai/v1/responses` proxy and each runtime is configured to use it automatically.
+Argus keeps runtime containers on a fixed gateway proxy URL (`/openai/v1/responses`). Users switch channels on the gateway side, so existing containers do **not** need their `.codex/config.toml` rewritten.
 
 Notes:
 
-- The key is **not** passed into runtime containers.
-- The runtime writes a generated `CODEX_HOME/config.toml` (no secrets) to point Codex at the gateway MCP server and optional OpenAI proxy.
+- The built-in `gateway` channel is selected by default and uses `OPENAI_API_KEY` / `ARGUS_OPENAI_API_KEY` plus `ARGUS_OPENAI_RESPONSES_UPSTREAM_URL`.
+- The built-in promo channel `0-0.pro` always points to `https://api.0-0.pro/v1`; each user provides their own API key before switching to it.
+- Users can add/delete/rename extra OpenAI-compatible channels from the Telegram **API Channels** menu.
+- The channel list, selected current channel, and user-supplied API keys are stored in `${ARGUS_HOME_HOST_PATH}/gateway/state.json`.
+- Switching the current channel is **user-global**: it affects that user's existing and future agents/containers.
+- Sessions without an owning Telegram user still fall back to the built-in `gateway` channel.
+- The proxy requires a per-session derived bearer token (master: `ARGUS_OPENAI_TOKEN`, fallback: `ARGUS_TOKEN`).
+- The runtime writes a generated `CODEX_HOME/config.toml` (no provider secrets) to point Codex at the gateway MCP server and proxy.
   - Default `CODEX_HOME`: `/workspace/.codex` (workspace-scoped)
   - Default model: `gpt-5.4` (Telegram agents can switch between `gpt-5.2` / `gpt-5.4` from `/menu`, and the selection is persisted per agent).
-- The proxy requires a per-session derived bearer token (master: `ARGUS_OPENAI_TOKEN`, fallback: `ARGUS_TOKEN`).
-- Optional: override the upstream URL with `ARGUS_OPENAI_RESPONSES_UPSTREAM_URL` (default: `https://api.openai.com/v1/responses`).
+- If you want the default `gateway` channel to work out of the box for every user, set `OPENAI_API_KEY` on the gateway. Otherwise users must select a ready personal channel first.
 
 To swap runtimes, set these before `docker compose up --build`.
 

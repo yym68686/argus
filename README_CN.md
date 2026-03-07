@@ -104,11 +104,19 @@ cp .env.example .env
 
 | 变量 | 是否必需 | 默认值 | 作用 / 注意事项 |
 | --- | --- | --- | --- |
-| `OPENAI_API_KEY` | 对默认 Codex runtime 来说可选但强烈推荐 | 未设置 | 仅保存在 **gateway** 上的长期 API Key，不会直接注入 runtime 容器。 |
-| `ARGUS_OPENAI_API_KEY` | 可选 | 未设置 | `OPENAI_API_KEY` 的兼容别名。gateway 会先读 `OPENAI_API_KEY`，再回退到这个名字。 |
-| `ARGUS_OPENAI_RESPONSES_UPSTREAM_URL` | 可选 | `https://api.openai.com/v1/responses` | gateway 代理请求真正转发到的 Responses API 地址。若你想改成自己的 OpenAI-compatible 提供方、公司内网代理或自建网关，就改这里。 |
-| `ARGUS_OPENAI_TOKEN` | 可选 | 回退到 `ARGUS_TOKEN` | gateway 用来派生 `/openai/v1/responses` session 级 Bearer token 的 master secret。注意：在 gateway 进程里它表示 master secret；在 runtime 容器里同名变量表示**派生后的 session token**。 |
-| `ARGUS_GATEWAY_INTERNAL_HOST` | 可选 | 自动探测当前 gateway 容器名，失败后回退到 `gateway` | runtime 容器回连 gateway（`/mcp`、`/nodes/ws`、`/openai/v1`）时使用的主机名。只有当你的 Docker DNS / 服务名和默认假设不一致时才需要手动设。 |
+| `OPENAI_API_KEY` | 对默认 Codex runtime 来说可选但强烈推荐 | 未设置 | 仅供内置 `gateway` 渠道使用的长期 API Key，只保存在 **gateway** 上，不会直接注入 runtime 容器。 |
+| `ARGUS_OPENAI_API_KEY` | 可选 | 未设置 | `OPENAI_API_KEY` 的兼容别名。内置 `gateway` 渠道会先读 `OPENAI_API_KEY`，再回退到这个名字。 |
+| `ARGUS_OPENAI_RESPONSES_UPSTREAM_URL` | 可选 | `https://api.openai.com/v1/responses` | 内置 `gateway` 渠道真正转发到的 Responses API 地址。若你想改成自己的 OpenAI-compatible 提供方、公司内网代理或自建网关，就改这里。 |
+| `ARGUS_OPENAI_TOKEN` | 可选 | 回退到 `ARGUS_TOKEN` | gateway 用来派生 `/openai/v1/responses` session 级 Bearer token 的 master secret。注意：在 gateway 进程里它表示 master secret；在 runtime 容器里同名变量表示**派生后的 session token**。它只控制代理访问权限，真正走哪个上游由当前渠道决定。 |
+| `ARGUS_GATEWAY_INTERNAL_HOST` | 可选 | 自动探测当前 gateway 容器名，失败后回退到 `gateway` | runtime 容器回连 gateway（`/mcp`、`/nodes/ws`、`/openai/v1`）时使用的主机名。即使用户切换渠道，runtime 里仍保持这个固定的 gateway 地址。只有当你的 Docker DNS / 服务名和默认假设不一致时才需要手动设。 |
+
+渠道行为：
+
+- 内置 `gateway`：默认选中；使用 `OPENAI_API_KEY` + `ARGUS_OPENAI_RESPONSES_UPSTREAM_URL`。
+- 内置 `0-0.pro`：固定 Base URL 为 `https://api.0-0.pro/v1`；每个用户自己在 Telegram 菜单里填 API Key。
+- 自定义渠道：每个用户都可以增删改自己的 OpenAI-compatible `baseUrl` + API Key。
+- 渠道列表和用户 API Key 都存放在 `${ARGUS_HOME_HOST_PATH}/gateway/state.json`；请把它当作带 secrets 的文件保护。
+- “当前渠道”是**用户级全局状态**：切换一次，会影响该用户现有和未来的所有 agent / 容器。
 
 ### Web UI 与 Telegram bot
 
@@ -176,6 +184,7 @@ cp .env.example .env
 
 - `ARGUS_HOME_HOST_PATH`（默认：`${HOME}/.argus`）
   - 网关自动化状态：`${ARGUS_HOME_HOST_PATH}/gateway/state.json`
+  - 同时保存每个用户的 API 渠道定义、当前选中的渠道，以及用户自行填写的 API Key；请按 secrets 文件对待。
 
 每个 runtime session 容器只会把**一个宿主机 workspace 目录**挂载到 `/workspace`。
 
@@ -204,6 +213,7 @@ cp .env.example .env
 - 使用 `/menu` 打开控制面板：
   - **Switch Agent**：切换当前私聊使用的 agent（workspace/session）。
   - **Switch Model**：在 `gpt-5.2` 和 `gpt-5.4` 之间切换当前 agent 的模型。
+  - **API Channels**：管理用户级渠道列表（`gateway`、`0-0.pro`、以及你自己添加的自定义渠道），并为你所有 agent / 容器切换当前渠道。
   - **Create Agent**：创建新的 agent 并切换过去（同名会报“已存在”）。
   - **Rename Agent**：重命名当前 agent（仅 owner；不包含 `main`）。
   - **Delete Agent**：删除当前 agent（仅 owner；包含 `main`）。删除 `main` 后，下次会提示创建新的 `main`。
@@ -273,19 +283,23 @@ open http://127.0.0.1:3000
 - 安装/构建命令：`ARGUS_RUNTIME_INSTALL_CMD`（默认安装 `@openai/codex`）
 - 启动命令：`ARGUS_RUNTIME_CMD`（默认 `codex app-server`）
 
-### OpenAI 凭据（推荐）
+### OpenAI 代理与 API 渠道
 
-为了避免把长期有效的 OpenAI API Key 放进每个 runtime 容器里，建议把 `OPENAI_API_KEY` 只配置在 **gateway** 上。
-当 `OPENAI_API_KEY` 存在时，gateway 会暴露一个范围很窄的 `/openai/v1/responses` 代理，并自动把 runtime 配置为走这个代理。
+Argus 会让 runtime 容器始终使用固定的 gateway 代理地址（`/openai/v1/responses`）。用户切换渠道是在 gateway 侧完成的，所以已有容器里的 `.codex/config.toml` **不需要**被重写。
 
 说明：
 
-- Key **不会**被传入 runtime 容器。
-- runtime 会写入一个生成的 `CODEX_HOME/config.toml`（不包含任何 secrets），用于把 Codex 指向 gateway 的 MCP 以及可选的 OpenAI 代理。
+- 内置 `gateway` 渠道默认选中，使用 `OPENAI_API_KEY` / `ARGUS_OPENAI_API_KEY` 加上 `ARGUS_OPENAI_RESPONSES_UPSTREAM_URL`。
+- 内置宣传渠道 `0-0.pro` 永远指向 `https://api.0-0.pro/v1`；每个用户需要先填自己的 API Key 才能切过去。
+- 用户可以在 Telegram 的 **API Channels** 菜单里增删改其他 OpenAI-compatible 渠道。
+- 渠道列表、当前选中的渠道、以及用户填写的 API Key 都存放在 `${ARGUS_HOME_HOST_PATH}/gateway/state.json`。
+- “当前渠道”是**用户级全局状态**：会影响该用户现有和未来的所有 agent / 容器。
+- 没有归属 Telegram 用户的通用 session，仍然回退到内置 `gateway` 渠道。
+- 代理要求每个 session 的派生 Bearer token（master：`ARGUS_OPENAI_TOKEN`；未设置则回退到 `ARGUS_TOKEN`）。
+- runtime 会写入一个生成的 `CODEX_HOME/config.toml`（不包含 provider secrets），用于把 Codex 指向 gateway 的 MCP 和代理。
   - 默认 `CODEX_HOME`：`/workspace/.codex`（按 workspace 隔离）
   - 默认模型：`gpt-5.4`（Telegram agent 可在 `/menu` 中切换 `gpt-5.2` / `gpt-5.4`，并按 agent 持久化）
-- 代理要求每个 session 的派生 Bearer token（master：`ARGUS_OPENAI_TOKEN`；未设置则回退到 `ARGUS_TOKEN`）。
-- 可选：用 `ARGUS_OPENAI_RESPONSES_UPSTREAM_URL` 覆盖上游地址（默认：`https://api.openai.com/v1/responses`）。
+- 如果你希望所有用户开箱即用，就在 gateway 上配置 `OPENAI_API_KEY`；否则用户需要先选中一个“已就绪”的个人渠道。
 
 要替换 runtime，在 `docker compose up --build` 之前设置这两个环境变量即可。
 

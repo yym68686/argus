@@ -492,6 +492,51 @@ class ArgusClient {
     return await this._httpJson("POST", "/automation/agent/delete", { chatKey, agentId });
   }
 
+  async automationChannelList(chatKey) {
+    if (!isNonEmptyString(chatKey)) throw new Error("Missing chatKey");
+    return await this._httpJson("POST", "/automation/channel/list", { chatKey });
+  }
+
+  async automationChannelSelect(chatKey, channelId) {
+    if (!isNonEmptyString(chatKey)) throw new Error("Missing chatKey");
+    if (!isNonEmptyString(channelId)) throw new Error("Missing channelId");
+    return await this._httpJson("POST", "/automation/channel/select", { chatKey, channelId });
+  }
+
+  async automationChannelCreate(chatKey, name, baseUrl, apiKey) {
+    if (!isNonEmptyString(chatKey)) throw new Error("Missing chatKey");
+    if (!isNonEmptyString(name)) throw new Error("Missing name");
+    if (!isNonEmptyString(baseUrl)) throw new Error("Missing baseUrl");
+    if (!isNonEmptyString(apiKey)) throw new Error("Missing apiKey");
+    return await this._httpJson("POST", "/automation/channel/create", { chatKey, name, baseUrl, apiKey });
+  }
+
+  async automationChannelRename(chatKey, channelId, newName) {
+    if (!isNonEmptyString(chatKey)) throw new Error("Missing chatKey");
+    if (!isNonEmptyString(channelId)) throw new Error("Missing channelId");
+    if (!isNonEmptyString(newName)) throw new Error("Missing newName");
+    return await this._httpJson("POST", "/automation/channel/rename", { chatKey, channelId, newName });
+  }
+
+  async automationChannelDelete(chatKey, channelId) {
+    if (!isNonEmptyString(chatKey)) throw new Error("Missing chatKey");
+    if (!isNonEmptyString(channelId)) throw new Error("Missing channelId");
+    return await this._httpJson("POST", "/automation/channel/delete", { chatKey, channelId });
+  }
+
+  async automationChannelKeySet(chatKey, channelId, apiKey) {
+    if (!isNonEmptyString(chatKey)) throw new Error("Missing chatKey");
+    if (!isNonEmptyString(channelId)) throw new Error("Missing channelId");
+    if (!isNonEmptyString(apiKey)) throw new Error("Missing apiKey");
+    return await this._httpJson("POST", "/automation/channel/key/set", { chatKey, channelId, apiKey });
+  }
+
+  async automationChannelKeyClear(chatKey, channelId) {
+    if (!isNonEmptyString(chatKey)) throw new Error("Missing chatKey");
+    if (!isNonEmptyString(channelId)) throw new Error("Missing channelId");
+    return await this._httpJson("POST", "/automation/channel/key/clear", { chatKey, channelId });
+  }
+
   async automationChatBind(chatKey, agentId, actorUserId) {
     if (!isNonEmptyString(chatKey)) throw new Error("Missing chatKey");
     if (!isNonEmptyString(agentId)) throw new Error("Missing agentId");
@@ -1136,7 +1181,59 @@ function normalizeAvailableModels(models) {
     help_line_start: "First time: run {start} in a DM to initialize your main agent.",
     help_line_private_more: "Switch Agent / Create Agent are available in the menu.",
     help_line_group_bind: "In groups/topics, bind the chat first ({bind}).",
-    help_line_group_new: "Then use {newThread} to reset the conversation for this chat/topic."
+    help_line_group_new: "Then use {newThread} to reset the conversation for this chat/topic.",
+
+    title_api_channels: "API Channels",
+    title_channel_detail: "API Channel",
+    title_create_channel: "Add Channel",
+    title_rename_channel: "Rename Channel",
+    title_delete_channel: "Delete Channel",
+    title_set_channel_key: "Set API Key",
+
+    btn_api_channels: "API Channels",
+    btn_add_channel: "Add Channel",
+    btn_select_channel: "Use This Channel",
+    btn_rename_channel: "Rename Channel",
+    btn_delete_channel: "Delete Channel",
+    btn_set_channel_key: "Set API Key",
+    btn_clear_channel_key: "Clear API Key",
+    btn_open_00pro: "Open 0-0.pro",
+
+    msg_invalid_channel: "Invalid channel.",
+    msg_invalid_base_url: "Invalid base URL.",
+
+    err_channel_exists: "error: already exists: {name}",
+
+    notice_channel_switched: "Channel: {name}",
+    notice_channel_created: "Channel created: {name}",
+    notice_channel_renamed: "Channel renamed: {old} -> {name}",
+    notice_channel_deleted: "Channel deleted: {name}",
+    notice_channel_key_saved: "API key saved: {name}",
+    notice_channel_key_cleared: "API key cleared: {name}",
+
+    label_channel: "channel",
+    label_base_url: "base_url",
+    label_api_key: "api_key",
+    label_scope: "scope",
+    value_ready: "ready",
+    value_not_ready: "not ready",
+    value_set: "set",
+    value_unset: "unset",
+
+    channel_scope_all_agents: "Switching here affects all your agents/containers.",
+    channel_gateway_hint: "Uses the gateway's shared OPENAI-compatible upstream.",
+    channel_promo_hint: "Set your own 0-0.pro API key, then switch to it.",
+    channel_delete_warning: "This deletes the saved channel. If it is current, all your agents switch to the fallback channel.",
+    channel_create_name_prompt: "Send the new channel name (a-z0-9._-), e.g.",
+    channel_create_name_missing: "Missing channel name.",
+    channel_create_base_url_prompt: "Send the base URL, e.g.",
+    channel_create_base_url_missing: "Missing base URL.",
+    channel_create_key_prompt: "Send the API key for {name}.",
+    channel_create_key_missing: "Missing API key.",
+    channel_rename_prompt_prefix: "Send the new channel name (a-z0-9._-), e.g.",
+    channel_rename_missing: "Missing channel name.",
+    channel_key_prompt_prefix: "Send the API key for {name}.",
+    channel_key_missing: "Missing API key."
   },
   zh: {
     menu_title: "Argus 菜单",
@@ -1226,7 +1323,59 @@ function normalizeAvailableModels(models) {
     help_line_start: "首次使用：先在私聊发送 {start} 完成初始化。",
     help_line_private_more: "切换/创建 agent 都在菜单里操作。",
     help_line_group_bind: "在群聊/话题里，先绑定（{bind}）。",
-    help_line_group_new: "之后用 {newThread} 重新开一个 thread。"
+    help_line_group_new: "之后用 {newThread} 重新开一个 thread。",
+
+    title_api_channels: "API 渠道",
+    title_channel_detail: "API 渠道",
+    title_create_channel: "添加渠道",
+    title_rename_channel: "重命名渠道",
+    title_delete_channel: "删除渠道",
+    title_set_channel_key: "设置 API Key",
+
+    btn_api_channels: "API 渠道",
+    btn_add_channel: "添加渠道",
+    btn_select_channel: "切换到此渠道",
+    btn_rename_channel: "重命名渠道",
+    btn_delete_channel: "删除渠道",
+    btn_set_channel_key: "设置 API Key",
+    btn_clear_channel_key: "清空 API Key",
+    btn_open_00pro: "打开 0-0.pro",
+
+    msg_invalid_channel: "无效的渠道。",
+    msg_invalid_base_url: "无效的 Base URL。",
+
+    err_channel_exists: "error: 已存在：{name}",
+
+    notice_channel_switched: "已切换渠道：{name}",
+    notice_channel_created: "已添加渠道：{name}",
+    notice_channel_renamed: "已重命名渠道：{old} -> {name}",
+    notice_channel_deleted: "已删除渠道：{name}",
+    notice_channel_key_saved: "已保存 API Key：{name}",
+    notice_channel_key_cleared: "已清空 API Key：{name}",
+
+    label_channel: "渠道",
+    label_base_url: "Base URL",
+    label_api_key: "API Key",
+    label_scope: "作用范围",
+    value_ready: "可用",
+    value_not_ready: "未就绪",
+    value_set: "已设置",
+    value_unset: "未设置",
+
+    channel_scope_all_agents: "这里的切换会影响你的所有 agent / 容器。",
+    channel_gateway_hint: "使用 gateway 自己配置的 OpenAI-compatible 上游。",
+    channel_promo_hint: "先设置你自己的 0-0.pro API Key，再切换到它。",
+    channel_delete_warning: "这会删除已保存的渠道；如果它当前正在使用，你的所有 agent 会切回回退渠道。",
+    channel_create_name_prompt: "发送新渠道名称（a-z0-9._-），例如",
+    channel_create_name_missing: "缺少渠道名称。",
+    channel_create_base_url_prompt: "发送 Base URL，例如",
+    channel_create_base_url_missing: "缺少 Base URL。",
+    channel_create_key_prompt: "发送 {name} 的 API Key。",
+    channel_create_key_missing: "缺少 API Key。",
+    channel_rename_prompt_prefix: "发送新的渠道名称（a-z0-9._-），例如",
+    channel_rename_missing: "缺少渠道名称。",
+    channel_key_prompt_prefix: "发送 {name} 的 API Key。",
+    channel_key_missing: "缺少 API Key。"
   }
 };
 
@@ -1247,8 +1396,12 @@ function formatGatewayErrorForUser(err, { locale } = {}) {
   if (msg.includes("/start") || /not initialized/i.test(msg)) return S.err_not_initialized;
   if (/forbidden/i.test(msg)) return S.err_forbidden;
   if (/invalid model/i.test(msg)) return S.msg_invalid_model;
+  if (/invalid channel|unknown channel|missing 'channelid'/i.test(msg)) return S.msg_invalid_channel;
+  if (/invalid baseurl/i.test(msg)) return S.msg_invalid_base_url;
   const already = /agent already exists:\s*([a-z0-9_-]+)/i.exec(msg);
   if (already) return formatTemplate(S.err_agent_exists, { name: already[1] });
+  const channelAlready = /channel already exists:\s*([a-z0-9._-]+)/i.exec(msg);
+  if (channelAlready) return formatTemplate(S.err_channel_exists, { name: channelAlready[1] });
   return `error: ${msg}`;
 }
 
@@ -1640,12 +1793,28 @@ async function main() {
     return { agentId, sessionId, model, availableModels };
   }
 
+  async function resolveChannelStateForChatKey(chatKey) {
+    const res = await argusHttp.automationChannelList(chatKey);
+    const channels = Array.isArray(res?.channels) ? res.channels : [];
+    const currentChannelId = isNonEmptyString(res?.currentChannelId) ? res.currentChannelId : null;
+    const currentChannel = (res?.currentChannel && typeof res.currentChannel === "object")
+      ? res.currentChannel
+      : (currentChannelId ? channels.find((channel) => isNonEmptyString(channel?.channelId) && channel.channelId === currentChannelId) || null : null);
+    return { channels, currentChannelId, currentChannel };
+  }
+
+  function findChannelById(channels, channelId) {
+    if (!Array.isArray(channels) || !isNonEmptyString(channelId)) return null;
+    return channels.find((channel) => channel && typeof channel === "object" && channel.channelId === channelId) || null;
+  }
+
   const callbacks = new CallbackStore();
-  const pendingAgentInputByChatKey = new Map(); // chatKey -> { kind, expiresAtMs, panelChatId, panelMessageId, agentId? }
+  const pendingAgentInputByChatKey = new Map(); // chatKey -> panel input state
   const unboundWarnedAtByChatKey = new Map(); // chatKey -> ms
   const localeByChatKey = new Map(); // chatKey -> "zh" | "en"
 
   const MENU_AGENT_PAGE_SIZE = 8;
+  const MENU_CHANNEL_PAGE_SIZE = 8;
   const MENU_AUTO_DELETE_MS = 30 * 60_000;
   const UNBOUND_WARN_COOLDOWN_MS = 5 * 60_000;
 
@@ -1666,6 +1835,10 @@ async function main() {
 
   function cbButton(text, payload) {
     return { text, callback_data: callbackData(payload) };
+  }
+
+  function urlButton(text, url) {
+    return { text, url };
   }
 
   function kb(rows) {
@@ -1802,22 +1975,74 @@ async function main() {
     pendingAgentInputByChatKey.delete(chatKey);
   }
 
-  function setPendingCreateAgent(chatKey, panelChatId, panelMessageId) {
+  function setPendingInput(chatKey, entry) {
     pendingAgentInputByChatKey.set(chatKey, {
-      kind: "create",
       expiresAtMs: nowMs() + 10 * 60_000,
+      ...entry
+    });
+  }
+
+  function setPendingCreateAgent(chatKey, panelChatId, panelMessageId) {
+    setPendingInput(chatKey, {
+      kind: "create",
       panelChatId,
       panelMessageId
     });
   }
 
   function setPendingRenameAgent(chatKey, panelChatId, panelMessageId, agentId) {
-    pendingAgentInputByChatKey.set(chatKey, {
+    setPendingInput(chatKey, {
       kind: "rename",
-      expiresAtMs: nowMs() + 10 * 60_000,
       panelChatId,
       panelMessageId,
       agentId
+    });
+  }
+
+  function setPendingCreateChannelName(chatKey, panelChatId, panelMessageId) {
+    setPendingInput(chatKey, {
+      kind: "channel_create_name",
+      panelChatId,
+      panelMessageId
+    });
+  }
+
+  function setPendingCreateChannelBaseUrl(chatKey, panelChatId, panelMessageId, channelName) {
+    setPendingInput(chatKey, {
+      kind: "channel_create_base_url",
+      panelChatId,
+      panelMessageId,
+      channelName
+    });
+  }
+
+  function setPendingCreateChannelApiKey(chatKey, panelChatId, panelMessageId, channelName, baseUrl) {
+    setPendingInput(chatKey, {
+      kind: "channel_create_api_key",
+      panelChatId,
+      panelMessageId,
+      channelName,
+      baseUrl
+    });
+  }
+
+  function setPendingRenameChannel(chatKey, panelChatId, panelMessageId, channelId, page = 0) {
+    setPendingInput(chatKey, {
+      kind: "channel_rename",
+      panelChatId,
+      panelMessageId,
+      channelId,
+      page
+    });
+  }
+
+  function setPendingChannelKey(chatKey, panelChatId, panelMessageId, channelId, page = 0) {
+    setPendingInput(chatKey, {
+      kind: "channel_key",
+      panelChatId,
+      panelMessageId,
+      channelId,
+      page
     });
   }
 
@@ -1833,6 +2058,34 @@ async function main() {
     if (isOwner && short) label = short;
     else label = locale === "zh" ? `${agentId}${S.shared_suffix}` : `${agentId} ${S.shared_suffix}`;
     return `${isCurrent ? "✅ " : ""}${label}`;
+  }
+
+  function channelDisplayName(channel) {
+    const c = channel && typeof channel === "object" ? channel : null;
+    if (isNonEmptyString(c?.name)) return c.name;
+    if (isNonEmptyString(c?.channelId)) return c.channelId;
+    return "(unknown)";
+  }
+
+  function channelStatusText(channel, { locale } = {}) {
+    const S = uiStrings(locale);
+    return channel?.ready ? S.value_ready : S.value_not_ready;
+  }
+
+  function channelApiKeyText(channel, { locale } = {}) {
+    const S = uiStrings(locale);
+    if (isNonEmptyString(channel?.apiKeyMasked)) return channel.apiKeyMasked;
+    return channel?.hasApiKey ? S.value_set : S.value_unset;
+  }
+
+  function formatChannelLabel(channel, { currentChannelId } = {}) {
+    const c = channel && typeof channel === "object" ? channel : null;
+    const channelId = isNonEmptyString(c?.channelId) ? c.channelId : "(unknown)";
+    const name = channelDisplayName(c);
+    const isCurrent = isNonEmptyString(currentChannelId) && channelId === currentChannelId;
+    const ready = Boolean(c?.ready);
+    const prefix = isCurrent ? "✅ " : ready ? "• " : "⚠️ ";
+    return `${prefix}${name}`;
   }
 
   function normalizePage(pageRaw) {
@@ -1871,6 +2124,13 @@ async function main() {
 
   async function renderPrivateMainMenu(chatKey, { notice, locale } = {}) {
     const S = uiStrings(locale);
+    let currentChannel = null;
+    try {
+      const channelState = await resolveChannelStateForChatKey(chatKey);
+      currentChannel = channelState?.currentChannel || null;
+    } catch {
+      currentChannel = null;
+    }
     try {
       const route = await resolveRouteForChatKey(chatKey);
       const lines = [];
@@ -1878,6 +2138,7 @@ async function main() {
       if (isNonEmptyString(notice)) lines.push(`<i>${escapeHtml(notice)}</i>`);
       lines.push(`agent: ${htmlCode(route.agentId)}`);
       lines.push(`${escapeHtml(S.label_model)}: ${htmlCode(route.model)}`);
+      if (currentChannel) lines.push(`${escapeHtml(S.label_channel)}: ${htmlCode(channelDisplayName(currentChannel))}`);
       lines.push(`session: ${htmlCode(route.sessionId)}`);
       const ownPrefix = isNonEmptyString(chatKey) ? `u${chatKey.trim()}-` : "";
       const canDelete = isNonEmptyString(ownPrefix)
@@ -1900,6 +2161,7 @@ async function main() {
       const rows = buildTwoColumnMenuRows(
         agentButtons,
         [
+          cbButton(S.btn_api_channels, { action: "p:channels", chatKey, page: 0 }),
           cbButton(S.btn_switch_model, { action: "p:model", chatKey }),
           cbButton(S.btn_new_main_thread, { action: "p:newmain", chatKey }),
           cbButton(S.btn_node_token, { action: "p:node", chatKey }),
@@ -1914,9 +2176,13 @@ async function main() {
       const lines = [];
       lines.push(`<b>${escapeHtml(S.menu_title)}</b>`);
       if (isNonEmptyString(notice)) lines.push(`<i>${escapeHtml(notice)}</i>`);
+      if (currentChannel) lines.push(`${escapeHtml(S.label_channel)}: ${htmlCode(channelDisplayName(currentChannel))}`);
       lines.push(escapeHtml(S.msg_not_initialized));
       const replyMarkup = kb(buildTwoColumnMenuRows(
-        [cbButton(S.btn_create_agent, { action: "p:create_begin", chatKey })],
+        [
+          cbButton(S.btn_create_agent, { action: "p:create_begin", chatKey }),
+          cbButton(S.btn_api_channels, { action: "p:channels", chatKey, page: 0 })
+        ],
         [cbButton(S.btn_help, { action: "help", chatKey })],
         cbButton(S.btn_close, { action: "close", chatKey })
       ));
@@ -2056,6 +2322,219 @@ async function main() {
     return { text: lines.join("\n"), replyMarkup };
   }
 
+  async function renderPrivateChannelListMenu(chatKey, pageRaw, { notice, error, locale } = {}) {
+    const S = uiStrings(locale);
+    const page = normalizePage(pageRaw);
+    try {
+      const { channels, currentChannelId, currentChannel } = await resolveChannelStateForChatKey(chatKey);
+      const totalPages = Math.max(1, Math.ceil(channels.length / MENU_CHANNEL_PAGE_SIZE));
+      const p = Math.min(page, totalPages - 1);
+      const slice = channels.slice(p * MENU_CHANNEL_PAGE_SIZE, (p + 1) * MENU_CHANNEL_PAGE_SIZE);
+
+      const lines = [];
+      lines.push(`<b>${escapeHtml(S.title_api_channels)}</b>`);
+      if (isNonEmptyString(notice)) lines.push(`<i>${escapeHtml(notice)}</i>`);
+      lines.push(`${escapeHtml(S.label_current)}: ${htmlCode(channelDisplayName(currentChannel || { channelId: currentChannelId || "gateway" }))}`);
+      lines.push(escapeHtml(S.channel_scope_all_agents));
+      if (isNonEmptyString(error)) {
+        lines.push("");
+        lines.push(`<b>${escapeHtml(S.label_error)}:</b> ${escapeHtml(error)}`);
+      }
+
+      const rows = [];
+      for (const channel of slice) {
+        rows.push([
+          cbButton(formatChannelLabel(channel, { currentChannelId }), {
+            action: "p:channel_view",
+            chatKey,
+            channelId: channel?.channelId,
+            page: p
+          })
+        ]);
+      }
+
+      const nav = [];
+      if (p > 0) nav.push(cbButton(S.btn_prev, { action: "p:channels", chatKey, page: p - 1 }));
+      if (p + 1 < totalPages) nav.push(cbButton(S.btn_next, { action: "p:channels", chatKey, page: p + 1 }));
+      if (nav.length > 0) rows.push(nav);
+
+      rows.push([
+        cbButton(S.btn_add_channel, { action: "p:channel_create_begin", chatKey }),
+        cbButton(S.btn_refresh, { action: "p:channels", chatKey, page: p })
+      ]);
+      rows.push([cbButton(S.btn_back, { action: "p:main", chatKey })]);
+      return { text: lines.join("\n"), replyMarkup: kb(rows) };
+    } catch (e) {
+      const lines = [];
+      lines.push(`<b>${escapeHtml(S.title_api_channels)}</b>`);
+      lines.push(escapeHtml(formatGatewayErrorForUser(e, { locale })));
+      return { text: lines.join("\n"), replyMarkup: kb([[cbButton(S.btn_back, { action: "p:main", chatKey })]]) };
+    }
+  }
+
+  async function renderPrivateChannelDetailMenu(chatKey, channelId, pageRaw, { notice, error, locale } = {}) {
+    const S = uiStrings(locale);
+    const page = normalizePage(pageRaw);
+    try {
+      const { channels } = await resolveChannelStateForChatKey(chatKey);
+      const channel = findChannelById(channels, channelId);
+      if (!channel) throw new Error(S.msg_invalid_channel);
+
+      const lines = [];
+      lines.push(`<b>${escapeHtml(S.title_channel_detail)}</b>`);
+      if (isNonEmptyString(notice)) lines.push(`<i>${escapeHtml(notice)}</i>`);
+      lines.push(`${escapeHtml(S.label_channel)}: ${htmlCode(channelDisplayName(channel))}`);
+      lines.push(`${escapeHtml(S.label_status)}: ${htmlCode(channelStatusText(channel, { locale }))}`);
+      lines.push(`${escapeHtml(S.label_base_url)}: ${htmlCode(channel?.baseUrl || "(none)")}`);
+      lines.push(`${escapeHtml(S.label_api_key)}: ${htmlCode(channelApiKeyText(channel, { locale }))}`);
+      lines.push(`${escapeHtml(S.label_scope)}: ${escapeHtml(S.channel_scope_all_agents)}`);
+      if (!channel?.ready && isNonEmptyString(channel?.reason)) {
+        lines.push(`${escapeHtml(S.label_error)}: ${escapeHtml(channel.reason)}`);
+      }
+      if (channel?.channelId === "gateway") {
+        lines.push(escapeHtml(S.channel_gateway_hint));
+      } else if (channel?.channelId === "0-0.pro") {
+        lines.push(escapeHtml(S.channel_promo_hint));
+      }
+      if (isNonEmptyString(error)) {
+        lines.push("");
+        lines.push(`<b>${escapeHtml(S.label_error)}:</b> ${escapeHtml(error)}`);
+      }
+
+      const rows = [];
+      if (!channel?.selected && channel?.ready) {
+        rows.push([cbButton(S.btn_select_channel, { action: "p:channel_select", chatKey, channelId: channel.channelId, page })]);
+      }
+      if (channel?.canSetKey) {
+        const keyRow = [cbButton(S.btn_set_channel_key, { action: "p:channel_key_begin", chatKey, channelId: channel.channelId, page })];
+        if (channel?.canClearKey) keyRow.push(cbButton(S.btn_clear_channel_key, { action: "p:channel_key_clear", chatKey, channelId: channel.channelId, page }));
+        rows.push(keyRow);
+      }
+      if (channel?.canRename || channel?.canDelete) {
+        const manageRow = [];
+        if (channel?.canRename) manageRow.push(cbButton(S.btn_rename_channel, { action: "p:channel_rename_begin", chatKey, channelId: channel.channelId, page }));
+        if (channel?.canDelete) manageRow.push(cbButton(S.btn_delete_channel, { action: "p:channel_delete_begin", chatKey, channelId: channel.channelId, page }));
+        if (manageRow.length > 0) rows.push(manageRow);
+      }
+      if (isNonEmptyString(channel?.websiteUrl)) {
+        rows.push([urlButton(S.btn_open_00pro, channel.websiteUrl)]);
+      }
+      rows.push([
+        cbButton(S.btn_refresh, { action: "p:channel_view", chatKey, channelId: channel.channelId, page }),
+        cbButton(S.btn_back, { action: "p:channels", chatKey, page })
+      ]);
+      return { text: lines.join("\n"), replyMarkup: kb(rows) };
+    } catch (e) {
+      return await renderPrivateChannelListMenu(chatKey, page, { error: formatGatewayErrorForUser(e, { locale }), locale });
+    }
+  }
+
+  async function renderPrivateChannelCreateNameMenu(chatKey, { error, locale } = {}) {
+    const S = uiStrings(locale);
+    const lines = [];
+    lines.push(`<b>${escapeHtml(S.title_create_channel)}</b>`);
+    lines.push(`${escapeHtml(S.channel_create_name_prompt)} ${htmlCode("foo")}${locale === "zh" ? "。" : "."}`);
+    if (isNonEmptyString(error)) {
+      lines.push("");
+      lines.push(`<b>${escapeHtml(S.label_error)}:</b> ${escapeHtml(error)}`);
+    }
+    return { text: lines.join("\n"), replyMarkup: kb([[cbButton(S.btn_cancel, { action: "p:channel_create_cancel", chatKey })]]) };
+  }
+
+  async function renderPrivateChannelCreateBaseUrlMenu(chatKey, channelName, { error, locale } = {}) {
+    const S = uiStrings(locale);
+    const lines = [];
+    lines.push(`<b>${escapeHtml(S.title_create_channel)}</b>`);
+    if (isNonEmptyString(channelName)) lines.push(`${escapeHtml(S.label_channel)}: ${htmlCode(channelName)}`);
+    lines.push(`${escapeHtml(S.channel_create_base_url_prompt)} ${htmlCode("https://api.example.com/v1")}${locale === "zh" ? "。" : "."}`);
+    if (isNonEmptyString(error)) {
+      lines.push("");
+      lines.push(`<b>${escapeHtml(S.label_error)}:</b> ${escapeHtml(error)}`);
+    }
+    return { text: lines.join("\n"), replyMarkup: kb([[cbButton(S.btn_cancel, { action: "p:channel_create_cancel", chatKey })]]) };
+  }
+
+  async function renderPrivateChannelCreateKeyMenu(chatKey, channelName, baseUrl, { error, locale } = {}) {
+    const S = uiStrings(locale);
+    const lines = [];
+    lines.push(`<b>${escapeHtml(S.title_create_channel)}</b>`);
+    if (isNonEmptyString(channelName)) lines.push(`${escapeHtml(S.label_channel)}: ${htmlCode(channelName)}`);
+    if (isNonEmptyString(baseUrl)) lines.push(`${escapeHtml(S.label_base_url)}: ${htmlCode(baseUrl)}`);
+    lines.push(escapeHtml(formatTemplate(S.channel_create_key_prompt, { name: channelName || "channel" })));
+    if (isNonEmptyString(error)) {
+      lines.push("");
+      lines.push(`<b>${escapeHtml(S.label_error)}:</b> ${escapeHtml(error)}`);
+    }
+    return { text: lines.join("\n"), replyMarkup: kb([[cbButton(S.btn_cancel, { action: "p:channel_create_cancel", chatKey })]]) };
+  }
+
+  async function renderPrivateChannelRenameMenu(chatKey, channelId, pageRaw, { error, locale } = {}) {
+    const S = uiStrings(locale);
+    const page = normalizePage(pageRaw);
+    const lines = [];
+    lines.push(`<b>${escapeHtml(S.title_rename_channel)}</b>`);
+    try {
+      const { channels } = await resolveChannelStateForChatKey(chatKey);
+      const channel = findChannelById(channels, channelId);
+      if (channel) lines.push(`${escapeHtml(S.label_current)}: ${htmlCode(channelDisplayName(channel))}`);
+    } catch {
+      if (isNonEmptyString(channelId)) lines.push(`${escapeHtml(S.label_current)}: ${htmlCode(channelId)}`);
+    }
+    lines.push(`${escapeHtml(S.channel_rename_prompt_prefix)} ${htmlCode("foo")}${locale === "zh" ? "。" : "."}`);
+    if (isNonEmptyString(error)) {
+      lines.push("");
+      lines.push(`<b>${escapeHtml(S.label_error)}:</b> ${escapeHtml(error)}`);
+    }
+    return { text: lines.join("\n"), replyMarkup: kb([[cbButton(S.btn_cancel, { action: "p:channel_rename_cancel", chatKey, channelId, page })]]) };
+  }
+
+  async function renderPrivateChannelDeleteMenu(chatKey, channelId, pageRaw, { error, locale } = {}) {
+    const S = uiStrings(locale);
+    const page = normalizePage(pageRaw);
+    const lines = [];
+    lines.push(`<b>${escapeHtml(S.title_delete_channel)}</b>`);
+    try {
+      const { channels } = await resolveChannelStateForChatKey(chatKey);
+      const channel = findChannelById(channels, channelId);
+      if (channel) lines.push(`${escapeHtml(S.label_current)}: ${htmlCode(channelDisplayName(channel))}`);
+    } catch {
+      if (isNonEmptyString(channelId)) lines.push(`${escapeHtml(S.label_current)}: ${htmlCode(channelId)}`);
+    }
+    lines.push(escapeHtml(S.channel_delete_warning));
+    if (isNonEmptyString(error)) {
+      lines.push("");
+      lines.push(`<b>${escapeHtml(S.label_error)}:</b> ${escapeHtml(error)}`);
+    }
+    return {
+      text: lines.join("\n"),
+      replyMarkup: kb([
+        [cbButton(S.btn_delete_confirm, { action: "p:channel_delete_confirm", chatKey, channelId, page })],
+        [cbButton(S.btn_cancel, { action: "p:channel_delete_cancel", chatKey, channelId, page })]
+      ])
+    };
+  }
+
+  async function renderPrivateChannelKeyMenu(chatKey, channelId, pageRaw, { error, locale } = {}) {
+    const S = uiStrings(locale);
+    const page = normalizePage(pageRaw);
+    const lines = [];
+    lines.push(`<b>${escapeHtml(S.title_set_channel_key)}</b>`);
+    try {
+      const { channels } = await resolveChannelStateForChatKey(chatKey);
+      const channel = findChannelById(channels, channelId);
+      if (channel) lines.push(`${escapeHtml(S.label_channel)}: ${htmlCode(channelDisplayName(channel))}`);
+      lines.push(escapeHtml(formatTemplate(S.channel_key_prompt_prefix, { name: channelDisplayName(channel) })));
+    } catch {
+      if (isNonEmptyString(channelId)) lines.push(`${escapeHtml(S.label_channel)}: ${htmlCode(channelId)}`);
+      lines.push(escapeHtml(formatTemplate(S.channel_key_prompt_prefix, { name: channelId || "channel" })));
+    }
+    if (isNonEmptyString(error)) {
+      lines.push("");
+      lines.push(`<b>${escapeHtml(S.label_error)}:</b> ${escapeHtml(error)}`);
+    }
+    return { text: lines.join("\n"), replyMarkup: kb([[cbButton(S.btn_cancel, { action: "p:channel_key_cancel", chatKey, channelId, page })]]) };
+  }
+
   async function renderPrivateStatusMenu(chatKey, { notice, error, locale } = {}) {
     const S = uiStrings(locale);
     const lines = [];
@@ -2064,14 +2543,22 @@ async function main() {
     try {
       const route = await resolveRouteForChatKey(chatKey);
       let tid = null;
+      let currentChannel = null;
       try {
         const client = await getClient(route.sessionId);
         tid = await client.ensureMainThread();
       } catch {
         tid = null;
       }
+      try {
+        const channelState = await resolveChannelStateForChatKey(chatKey);
+        currentChannel = channelState?.currentChannel || null;
+      } catch {
+        currentChannel = null;
+      }
       lines.push(`agentId: ${htmlCode(route.agentId)}`);
       lines.push(`${escapeHtml(S.label_model)}: ${htmlCode(route.model)}`);
+      if (currentChannel) lines.push(`${escapeHtml(S.label_channel)}: ${htmlCode(channelDisplayName(currentChannel))}`);
       lines.push(`sessionId: ${htmlCode(route.sessionId)}`);
       lines.push(`chatKey: ${htmlCode(chatKey)}`);
       lines.push(`mainThreadId: ${htmlCode(tid || "(none)")}`);
@@ -2435,6 +2922,199 @@ async function main() {
         const notice = formatTemplate(S.notice_model_switched, { model });
         const view = await renderPrivateMainMenu(chatKey, { notice, locale });
         await editMenuMessage({ chatId, messageId, view });
+        return;
+      }
+
+      if (action === "p:channels") {
+        await answerOnce();
+        clearPendingAgentInput(chatKey);
+        const view = await renderPrivateChannelListMenu(chatKey, payload.page, { locale });
+        await editMenuMessage({ chatId, messageId, view });
+        return;
+      }
+
+      if (action === "p:channel_view") {
+        await answerOnce();
+        clearPendingAgentInput(chatKey);
+        const channelId = payload.channelId;
+        if (!isNonEmptyString(channelId)) {
+          const view = await renderPrivateChannelListMenu(chatKey, payload.page, { error: S.msg_invalid_channel, locale });
+          await editMenuMessage({ chatId, messageId, view });
+          return;
+        }
+        const view = await renderPrivateChannelDetailMenu(chatKey, channelId, payload.page, { locale });
+        await editMenuMessage({ chatId, messageId, view });
+        return;
+      }
+
+      if (action === "p:channel_select") {
+        await answerOnce();
+        clearPendingAgentInput(chatKey);
+        const channelId = payload.channelId;
+        if (!isNonEmptyString(channelId)) {
+          const view = await renderPrivateChannelListMenu(chatKey, payload.page, { error: S.msg_invalid_channel, locale });
+          await editMenuMessage({ chatId, messageId, view });
+          return;
+        }
+        try {
+          const selected = await argusHttp.automationChannelSelect(chatKey, channelId);
+          const currentChannel = selected?.currentChannel && typeof selected.currentChannel === "object"
+            ? selected.currentChannel
+            : { channelId };
+          const notice = formatTemplate(S.notice_channel_switched, { name: channelDisplayName(currentChannel) });
+          const view = await renderPrivateMainMenu(chatKey, { notice, locale });
+          await editMenuMessage({ chatId, messageId, view });
+        } catch (e) {
+          const view = await renderPrivateChannelDetailMenu(chatKey, channelId, payload.page, { error: formatGatewayErrorForUser(e, { locale }), locale });
+          await editMenuMessage({ chatId, messageId, view });
+        }
+        return;
+      }
+
+      if (action === "p:channel_create_begin") {
+        await answerOnce();
+        clearPendingAgentInput(chatKey);
+        setPendingCreateChannelName(chatKey, chatId, messageId);
+        const view = await renderPrivateChannelCreateNameMenu(chatKey, { locale });
+        await editMenuMessage({ chatId, messageId, view });
+        return;
+      }
+
+      if (action === "p:channel_create_cancel") {
+        await answerOnce();
+        clearPendingAgentInput(chatKey);
+        const view = await renderPrivateChannelListMenu(chatKey, 0, { notice: S.notice_canceled, locale });
+        await editMenuMessage({ chatId, messageId, view });
+        return;
+      }
+
+      if (action === "p:channel_rename_begin") {
+        await answerOnce();
+        clearPendingAgentInput(chatKey);
+        const channelId = payload.channelId;
+        if (!isNonEmptyString(channelId)) {
+          const view = await renderPrivateChannelListMenu(chatKey, payload.page, { error: S.msg_invalid_channel, locale });
+          await editMenuMessage({ chatId, messageId, view });
+          return;
+        }
+        setPendingRenameChannel(chatKey, chatId, messageId, channelId, payload.page);
+        const view = await renderPrivateChannelRenameMenu(chatKey, channelId, payload.page, { locale });
+        await editMenuMessage({ chatId, messageId, view });
+        return;
+      }
+
+      if (action === "p:channel_rename_cancel") {
+        await answerOnce();
+        clearPendingAgentInput(chatKey);
+        const channelId = payload.channelId;
+        if (!isNonEmptyString(channelId)) {
+          const view = await renderPrivateChannelListMenu(chatKey, payload.page, { notice: S.notice_canceled, locale });
+          await editMenuMessage({ chatId, messageId, view });
+          return;
+        }
+        const view = await renderPrivateChannelDetailMenu(chatKey, channelId, payload.page, { notice: S.notice_canceled, locale });
+        await editMenuMessage({ chatId, messageId, view });
+        return;
+      }
+
+      if (action === "p:channel_delete_begin") {
+        await answerOnce();
+        clearPendingAgentInput(chatKey);
+        const channelId = payload.channelId;
+        if (!isNonEmptyString(channelId)) {
+          const view = await renderPrivateChannelListMenu(chatKey, payload.page, { error: S.msg_invalid_channel, locale });
+          await editMenuMessage({ chatId, messageId, view });
+          return;
+        }
+        const view = await renderPrivateChannelDeleteMenu(chatKey, channelId, payload.page, { locale });
+        await editMenuMessage({ chatId, messageId, view });
+        return;
+      }
+
+      if (action === "p:channel_delete_cancel") {
+        await answerOnce();
+        clearPendingAgentInput(chatKey);
+        const channelId = payload.channelId;
+        if (!isNonEmptyString(channelId)) {
+          const view = await renderPrivateChannelListMenu(chatKey, payload.page, { notice: S.notice_canceled, locale });
+          await editMenuMessage({ chatId, messageId, view });
+          return;
+        }
+        const view = await renderPrivateChannelDetailMenu(chatKey, channelId, payload.page, { notice: S.notice_canceled, locale });
+        await editMenuMessage({ chatId, messageId, view });
+        return;
+      }
+
+      if (action === "p:channel_delete_confirm") {
+        await answerOnce();
+        clearPendingAgentInput(chatKey);
+        const channelId = payload.channelId;
+        if (!isNonEmptyString(channelId)) {
+          const view = await renderPrivateChannelListMenu(chatKey, payload.page, { error: S.msg_invalid_channel, locale });
+          await editMenuMessage({ chatId, messageId, view });
+          return;
+        }
+        try {
+          const result = await argusHttp.automationChannelDelete(chatKey, channelId);
+          const deletedName = isNonEmptyString(result?.deletedName) ? result.deletedName : channelId;
+          const notice = formatTemplate(S.notice_channel_deleted, { name: deletedName });
+          const view = await renderPrivateChannelListMenu(chatKey, payload.page, { notice, locale });
+          await editMenuMessage({ chatId, messageId, view });
+        } catch (e) {
+          const view = await renderPrivateChannelDeleteMenu(chatKey, channelId, payload.page, { error: formatGatewayErrorForUser(e, { locale }), locale });
+          await editMenuMessage({ chatId, messageId, view });
+        }
+        return;
+      }
+
+      if (action === "p:channel_key_begin") {
+        await answerOnce();
+        clearPendingAgentInput(chatKey);
+        const channelId = payload.channelId;
+        if (!isNonEmptyString(channelId)) {
+          const view = await renderPrivateChannelListMenu(chatKey, payload.page, { error: S.msg_invalid_channel, locale });
+          await editMenuMessage({ chatId, messageId, view });
+          return;
+        }
+        setPendingChannelKey(chatKey, chatId, messageId, channelId, payload.page);
+        const view = await renderPrivateChannelKeyMenu(chatKey, channelId, payload.page, { locale });
+        await editMenuMessage({ chatId, messageId, view });
+        return;
+      }
+
+      if (action === "p:channel_key_cancel") {
+        await answerOnce();
+        clearPendingAgentInput(chatKey);
+        const channelId = payload.channelId;
+        if (!isNonEmptyString(channelId)) {
+          const view = await renderPrivateChannelListMenu(chatKey, payload.page, { notice: S.notice_canceled, locale });
+          await editMenuMessage({ chatId, messageId, view });
+          return;
+        }
+        const view = await renderPrivateChannelDetailMenu(chatKey, channelId, payload.page, { notice: S.notice_canceled, locale });
+        await editMenuMessage({ chatId, messageId, view });
+        return;
+      }
+
+      if (action === "p:channel_key_clear") {
+        await answerOnce();
+        clearPendingAgentInput(chatKey);
+        const channelId = payload.channelId;
+        if (!isNonEmptyString(channelId)) {
+          const view = await renderPrivateChannelListMenu(chatKey, payload.page, { error: S.msg_invalid_channel, locale });
+          await editMenuMessage({ chatId, messageId, view });
+          return;
+        }
+        try {
+          const result = await argusHttp.automationChannelKeyClear(chatKey, channelId);
+          const channel = result?.channel && typeof result.channel === "object" ? result.channel : { channelId };
+          const notice = formatTemplate(S.notice_channel_key_cleared, { name: channelDisplayName(channel) });
+          const view = await renderPrivateChannelDetailMenu(chatKey, channelId, payload.page, { notice, locale });
+          await editMenuMessage({ chatId, messageId, view });
+        } catch (e) {
+          const view = await renderPrivateChannelDetailMenu(chatKey, channelId, payload.page, { error: formatGatewayErrorForUser(e, { locale }), locale });
+          await editMenuMessage({ chatId, messageId, view });
+        }
         return;
       }
 
@@ -2867,6 +3547,100 @@ async function main() {
               await editMenuMessage({ chatId: pending.panelChatId, messageId: pending.panelMessageId, view });
             } catch (e) {
               const view = await renderPrivateRenameMenu(chatKey, pending.agentId, { error: formatGatewayErrorForUser(e, { locale }), locale });
+              await editMenuMessage({ chatId: pending.panelChatId, messageId: pending.panelMessageId, view });
+            }
+            return;
+          }
+          if (pending && pending.kind === "channel_create_name") {
+            const channelName = isNonEmptyString(text) ? text.trim().split(/\s+/, 1)[0]?.trim().toLowerCase() : "";
+            if (!isNonEmptyString(channelName)) {
+              const view = await renderPrivateChannelCreateNameMenu(chatKey, { error: S.channel_create_name_missing, locale });
+              await editMenuMessage({ chatId: pending.panelChatId, messageId: pending.panelMessageId, view });
+              return;
+            }
+            setPendingCreateChannelBaseUrl(chatKey, pending.panelChatId, pending.panelMessageId, channelName);
+            const view = await renderPrivateChannelCreateBaseUrlMenu(chatKey, channelName, { locale });
+            await editMenuMessage({ chatId: pending.panelChatId, messageId: pending.panelMessageId, view });
+            return;
+          }
+          if (pending && pending.kind === "channel_create_base_url") {
+            const baseUrl = isNonEmptyString(text) ? text.trim() : "";
+            if (!isNonEmptyString(baseUrl)) {
+              const view = await renderPrivateChannelCreateBaseUrlMenu(chatKey, pending.channelName, { error: S.channel_create_base_url_missing, locale });
+              await editMenuMessage({ chatId: pending.panelChatId, messageId: pending.panelMessageId, view });
+              return;
+            }
+            setPendingCreateChannelApiKey(chatKey, pending.panelChatId, pending.panelMessageId, pending.channelName, baseUrl);
+            const view = await renderPrivateChannelCreateKeyMenu(chatKey, pending.channelName, baseUrl, { locale });
+            await editMenuMessage({ chatId: pending.panelChatId, messageId: pending.panelMessageId, view });
+            return;
+          }
+          if (pending && pending.kind === "channel_create_api_key") {
+            const apiKey = isNonEmptyString(text) ? text.trim() : "";
+            if (!isNonEmptyString(apiKey)) {
+              const view = await renderPrivateChannelCreateKeyMenu(chatKey, pending.channelName, pending.baseUrl, { error: S.channel_create_key_missing, locale });
+              await editMenuMessage({ chatId: pending.panelChatId, messageId: pending.panelMessageId, view });
+              return;
+            }
+            try {
+              const created = await argusHttp.automationChannelCreate(chatKey, pending.channelName, pending.baseUrl, apiKey);
+              const createdChannel = created?.channel && typeof created.channel === "object" ? created.channel : null;
+              clearPendingAgentInput(chatKey);
+              const notice = formatTemplate(S.notice_channel_created, { name: channelDisplayName(createdChannel || { name: pending.channelName, channelId: pending.channelName }) });
+              if (isNonEmptyString(createdChannel?.channelId)) {
+                const view = await renderPrivateChannelDetailMenu(chatKey, createdChannel.channelId, 0, { notice, locale });
+                await editMenuMessage({ chatId: pending.panelChatId, messageId: pending.panelMessageId, view });
+              } else {
+                const view = await renderPrivateChannelListMenu(chatKey, 0, { notice, locale });
+                await editMenuMessage({ chatId: pending.panelChatId, messageId: pending.panelMessageId, view });
+              }
+            } catch (e) {
+              const view = await renderPrivateChannelCreateKeyMenu(chatKey, pending.channelName, pending.baseUrl, { error: formatGatewayErrorForUser(e, { locale }), locale });
+              await editMenuMessage({ chatId: pending.panelChatId, messageId: pending.panelMessageId, view });
+            }
+            return;
+          }
+          if (pending && pending.kind === "channel_rename") {
+            const name = isNonEmptyString(text) ? text.trim().split(/\s+/, 1)[0]?.trim().toLowerCase() : "";
+            if (!isNonEmptyString(name)) {
+              const view = await renderPrivateChannelRenameMenu(chatKey, pending.channelId, pending.page, { error: S.channel_rename_missing, locale });
+              await editMenuMessage({ chatId: pending.panelChatId, messageId: pending.panelMessageId, view });
+              return;
+            }
+            try {
+              let oldName = pending.channelId;
+              try {
+                const channelState = await resolveChannelStateForChatKey(chatKey);
+                const current = findChannelById(channelState?.channels, pending.channelId);
+                if (current) oldName = channelDisplayName(current);
+              } catch {}
+              await argusHttp.automationChannelRename(chatKey, pending.channelId, name);
+              clearPendingAgentInput(chatKey);
+              const notice = formatTemplate(S.notice_channel_renamed, { old: oldName, name });
+              const view = await renderPrivateChannelDetailMenu(chatKey, pending.channelId, pending.page, { notice, locale });
+              await editMenuMessage({ chatId: pending.panelChatId, messageId: pending.panelMessageId, view });
+            } catch (e) {
+              const view = await renderPrivateChannelRenameMenu(chatKey, pending.channelId, pending.page, { error: formatGatewayErrorForUser(e, { locale }), locale });
+              await editMenuMessage({ chatId: pending.panelChatId, messageId: pending.panelMessageId, view });
+            }
+            return;
+          }
+          if (pending && pending.kind === "channel_key") {
+            const apiKey = isNonEmptyString(text) ? text.trim() : "";
+            if (!isNonEmptyString(apiKey)) {
+              const view = await renderPrivateChannelKeyMenu(chatKey, pending.channelId, pending.page, { error: S.channel_key_missing, locale });
+              await editMenuMessage({ chatId: pending.panelChatId, messageId: pending.panelMessageId, view });
+              return;
+            }
+            try {
+              const updated = await argusHttp.automationChannelKeySet(chatKey, pending.channelId, apiKey);
+              const channel = updated?.channel && typeof updated.channel === "object" ? updated.channel : { channelId: pending.channelId };
+              clearPendingAgentInput(chatKey);
+              const notice = formatTemplate(S.notice_channel_key_saved, { name: channelDisplayName(channel) });
+              const view = await renderPrivateChannelDetailMenu(chatKey, pending.channelId, pending.page, { notice, locale });
+              await editMenuMessage({ chatId: pending.panelChatId, messageId: pending.panelMessageId, view });
+            } catch (e) {
+              const view = await renderPrivateChannelKeyMenu(chatKey, pending.channelId, pending.page, { error: formatGatewayErrorForUser(e, { locale }), locale });
               await editMenuMessage({ chatId: pending.panelChatId, messageId: pending.panelMessageId, view });
             }
             return;
