@@ -310,6 +310,33 @@ def _sanitize_path_part(raw: str, *, fallback: str = 'x', max_len: int = 64) -> 
     return s[:max_len]
 
 
+def _normalize_workspace_relative_path(raw: Any) -> Optional[str]:
+    if not isinstance(raw, str):
+        return None
+    s = raw.strip().replace("\\", "/")
+    if s.startswith("./"):
+        s = s[2:]
+    s = s.lstrip("/")
+    if not s:
+        return None
+    p = Path(s)
+    if p.is_absolute():
+        return None
+    parts = p.parts
+    if not parts:
+        return None
+    if any(part in ("", ".", "..") for part in parts):
+        return None
+    return p.as_posix()
+
+
+def _workspace_ref(raw: Any) -> Optional[str]:
+    rel = _normalize_workspace_relative_path(raw)
+    if not rel:
+        return None
+    return f"./{rel}"
+
+
 
 HEARTBEAT_FILENAME = "HEARTBEAT.md"
 HEARTBEAT_TASKS_INTERVAL_MS = 30 * 60 * 1000
@@ -1470,10 +1497,85 @@ class PersistedLastActiveTarget:
         return PersistedLastActiveTarget(channel=channel, chat_key=chat_key, at_ms=at_ms_int)
 
 
+@dataclass
+class PersistedStagedAttachment:
+    path: str
+    file_name: Optional[str] = None
+    mime_type: Optional[str] = None
+    file_size: Optional[int] = None
+    source: str = "message"
+    is_image: bool = False
+    file_unique_id: Optional[str] = None
+    staged_at_ms: int = 0
+
+    def to_json(self) -> dict[str, Any]:
+        out: dict[str, Any] = {
+            "path": self.path,
+            "source": self.source,
+            "isImage": bool(self.is_image),
+            "stagedAtMs": int(self.staged_at_ms or 0),
+        }
+        if isinstance(self.file_name, str) and self.file_name.strip():
+            out["fileName"] = self.file_name.strip()
+        if isinstance(self.mime_type, str) and self.mime_type.strip():
+            out["mimeType"] = self.mime_type.strip()
+        if isinstance(self.file_size, int) and self.file_size >= 0:
+            out["fileSize"] = int(self.file_size)
+        if isinstance(self.file_unique_id, str) and self.file_unique_id.strip():
+            out["fileUniqueId"] = self.file_unique_id.strip()
+        return out
+
+    @staticmethod
+    def from_json(obj: Any) -> Optional["PersistedStagedAttachment"]:
+        if not isinstance(obj, dict):
+            return None
+        path = _normalize_workspace_relative_path(obj.get("path"))
+        if not path:
+            return None
+        file_name = obj.get("fileName")
+        if not isinstance(file_name, str) or not file_name.strip():
+            file_name = None
+        else:
+            file_name = file_name.strip()
+        mime_type = obj.get("mimeType")
+        if not isinstance(mime_type, str) or not mime_type.strip():
+            mime_type = None
+        else:
+            mime_type = mime_type.strip()
+        file_size = obj.get("fileSize")
+        if file_size is not None:
+            try:
+                file_size = int(file_size)
+            except Exception:
+                file_size = None
+        source = str(obj.get("source") or "message").strip() or "message"
+        is_image = bool(obj.get("isImage", False))
+        file_unique_id = obj.get("fileUniqueId")
+        if not isinstance(file_unique_id, str) or not file_unique_id.strip():
+            file_unique_id = None
+        else:
+            file_unique_id = file_unique_id.strip()
+        staged_at_ms = obj.get("stagedAtMs")
+        try:
+            staged_at_ms_int = int(staged_at_ms) if staged_at_ms is not None else 0
+        except Exception:
+            staged_at_ms_int = 0
+        return PersistedStagedAttachment(
+            path=path,
+            file_name=file_name,
+            mime_type=mime_type,
+            file_size=file_size,
+            source=source,
+            is_image=is_image,
+            file_unique_id=file_unique_id,
+            staged_at_ms=staged_at_ms_int,
+        )
+
+
 AGENT_ID_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9_-]{0,63}$")
 CHANNEL_ID_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,63}$")
 TELEGRAM_PRIVATE_CHAT_ID_RE = re.compile(r"^[1-9]\d{0,19}$")
-AUTOMATION_STATE_VERSION = 6
+AUTOMATION_STATE_VERSION = 7
 ARGUS_AGENT_MODEL_DEFAULT = "gpt-5.4"
 ARGUS_AGENT_MODELS = ("gpt-5.2", "gpt-5.4")
 ARGUS_AGENT_MODELS_SET = frozenset(ARGUS_AGENT_MODELS)
@@ -1725,6 +1827,7 @@ class PersistedSessionAutomation:
     cron_runs_by_job: dict[str, list[PersistedCronRunMeta]] = field(default_factory=dict)
     system_event_queues: dict[str, list[PersistedSystemEvent]] = field(default_factory=dict)
     last_active_by_thread: dict[str, PersistedLastActiveTarget] = field(default_factory=dict)
+    pending_telegram_attachments_by_chat: dict[str, list[PersistedStagedAttachment]] = field(default_factory=dict)
     paused_node_ids: list[str] = field(default_factory=list)
 
     def to_json(self) -> dict[str, Any]:
@@ -1740,6 +1843,15 @@ class PersistedSessionAutomation:
             if not isinstance(tgt, PersistedLastActiveTarget):
                 continue
             last_active[tid] = tgt.to_json()
+        pending_attachments: dict[str, Any] = {}
+        for chat_key, attachments in self.pending_telegram_attachments_by_chat.items():
+            if not isinstance(chat_key, str) or not chat_key.strip():
+                continue
+            if not isinstance(attachments, list) or not attachments:
+                continue
+            out_attachments = [a.to_json() for a in attachments if isinstance(a, PersistedStagedAttachment)]
+            if out_attachments:
+                pending_attachments[chat_key.strip()] = out_attachments
         paused_node_ids: list[str] = []
         seen_node_ids: set[str] = set()
         for node_id in self.paused_node_ids:
@@ -1769,6 +1881,7 @@ class PersistedSessionAutomation:
             "cronRunsByJob": cron_runs,
             "systemEventQueues": queues,
             "lastActiveByThread": last_active,
+            "pendingTelegramAttachmentsByChat": pending_attachments,
             "pausedNodeIds": paused_node_ids,
         }
 
@@ -1825,6 +1938,21 @@ class PersistedSessionAutomation:
                 tgt = PersistedLastActiveTarget.from_json(raw_tgt)
                 if tgt is not None:
                     last_active_by_thread[tid.strip()] = tgt
+        pending_attachments_raw = obj.get("pendingTelegramAttachmentsByChat")
+        pending_telegram_attachments_by_chat: dict[str, list[PersistedStagedAttachment]] = {}
+        if isinstance(pending_attachments_raw, dict):
+            for chat_key, raw_attachments in pending_attachments_raw.items():
+                if not isinstance(chat_key, str) or not chat_key.strip():
+                    continue
+                if not isinstance(raw_attachments, list):
+                    continue
+                attachments: list[PersistedStagedAttachment] = []
+                for raw_attachment in raw_attachments:
+                    attachment = PersistedStagedAttachment.from_json(raw_attachment)
+                    if attachment is not None:
+                        attachments.append(attachment)
+                if attachments:
+                    pending_telegram_attachments_by_chat[chat_key.strip()] = attachments
         paused_node_ids_raw = obj.get("pausedNodeIds")
         paused_node_ids: list[str] = []
         if isinstance(paused_node_ids_raw, list):
@@ -1843,6 +1971,7 @@ class PersistedSessionAutomation:
             cron_runs_by_job=cron_runs_by_job,
             system_event_queues=queues,
             last_active_by_thread=last_active_by_thread,
+            pending_telegram_attachments_by_chat=pending_telegram_attachments_by_chat,
             paused_node_ids=paused_node_ids,
         )
 
@@ -3445,6 +3574,136 @@ class AutomationManager:
                 return Path(derived)
         return self._workspace_root()
 
+    def _staged_attachment_to_dict(self, attachment: PersistedStagedAttachment) -> dict[str, Any]:
+        return attachment.to_json()
+
+    def _normalize_staged_attachment_dict(self, raw: Any) -> Optional[dict[str, Any]]:
+        attachment = raw if isinstance(raw, PersistedStagedAttachment) else PersistedStagedAttachment.from_json(raw)
+        if attachment is None:
+            return None
+        return attachment.to_json()
+
+    def _merge_staged_attachment_dicts(self, attachments: list[Any]) -> list[dict[str, Any]]:
+        out: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        for raw in attachments:
+            item = self._normalize_staged_attachment_dict(raw)
+            if item is None:
+                continue
+            path_val = item.get("path")
+            key = None
+            unique_id = item.get("fileUniqueId")
+            if isinstance(unique_id, str) and unique_id.strip():
+                key = f"uid:{unique_id.strip()}"
+            else:
+                rel = _normalize_workspace_relative_path(path_val)
+                if rel:
+                    key = f"path:{rel}"
+            if not key:
+                continue
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append(item)
+        return out
+
+    def _attachment_input_items(self, attachments: list[Any]) -> list[dict[str, Any]]:
+        input_items: list[dict[str, Any]] = []
+        for item in self._merge_staged_attachment_dicts(attachments):
+            path_val = item.get("path")
+            rel = _normalize_workspace_relative_path(path_val)
+            if not rel:
+                continue
+            if bool(item.get("isImage", False)):
+                input_items.append({"type": "localImage", "path": rel})
+        return input_items
+
+    def _format_attachment_block(self, attachments: list[Any]) -> str:
+        items = self._merge_staged_attachment_dicts(attachments)
+        if not items:
+            return ""
+
+        lines = [
+            "[ATTACHMENTS]",
+            "The following files are already saved in the workspace for this turn:",
+        ]
+        for idx, item in enumerate(items, start=1):
+            rel = _workspace_ref(item.get("path"))
+            if not rel:
+                continue
+            parts = [f"path={rel}"]
+            file_name = item.get("fileName")
+            if isinstance(file_name, str) and file_name.strip():
+                parts.append(f"name={json.dumps(file_name.strip(), ensure_ascii=False)}")
+            mime_type = item.get("mimeType")
+            if isinstance(mime_type, str) and mime_type.strip():
+                parts.append(f"mime={mime_type.strip()}")
+            file_size = item.get("fileSize")
+            if isinstance(file_size, int) and file_size >= 0:
+                parts.append(f"bytes={file_size}")
+            if bool(item.get("isImage", False)):
+                parts.append("kind=image")
+            lines.append(f"{idx}. " + "; ".join(parts))
+        lines.append("[/ATTACHMENTS]")
+        return "\n".join(lines).strip()
+
+    async def _append_pending_telegram_attachments(
+        self,
+        *,
+        session_id: str,
+        chat_key: str,
+        attachments: list[Any],
+    ) -> list[dict[str, Any]]:
+        sid = session_id.strip() if isinstance(session_id, str) else ""
+        ck = chat_key.strip() if isinstance(chat_key, str) else ""
+        normalized = self._merge_staged_attachment_dicts(attachments)
+        if not sid or not ck or not normalized:
+            return normalized
+
+        merged_result: list[dict[str, Any]] = []
+
+        def _append(st: PersistedGatewayAutomationState) -> None:
+            nonlocal merged_result
+            sess = st.sessions.get(sid)
+            if sess is None:
+                sess = PersistedSessionAutomation()
+                st.sessions[sid] = sess
+            existing = sess.pending_telegram_attachments_by_chat.get(ck) or []
+            merged = self._merge_staged_attachment_dicts([*existing, *normalized])
+            stored: list[PersistedStagedAttachment] = []
+            for item in merged:
+                attachment = PersistedStagedAttachment.from_json(item)
+                if attachment is not None:
+                    stored.append(attachment)
+            sess.pending_telegram_attachments_by_chat[ck] = stored
+            merged_result = merged
+            st.version = max(int(getattr(st, "version", 1) or 1), AUTOMATION_STATE_VERSION)
+
+        await self._store.update(_append)
+        return merged_result
+
+    async def _consume_pending_telegram_attachments(self, *, session_id: str, chat_key: str) -> list[dict[str, Any]]:
+        sid = session_id.strip() if isinstance(session_id, str) else ""
+        ck = chat_key.strip() if isinstance(chat_key, str) else ""
+        if not sid or not ck:
+            return []
+
+        out: list[dict[str, Any]] = []
+
+        def _pop(st: PersistedGatewayAutomationState) -> None:
+            nonlocal out
+            sess = st.sessions.get(sid)
+            if sess is None:
+                return
+            raw_items = sess.pending_telegram_attachments_by_chat.pop(ck, None)
+            if not isinstance(raw_items, list) or not raw_items:
+                return
+            out = self._merge_staged_attachment_dicts(raw_items)
+            st.version = max(int(getattr(st, "version", 1) or 1), AUTOMATION_STATE_VERSION)
+
+        await self._store.update(_pop)
+        return out
+
     async def _ensure_workspace_files_at(self, root: Path) -> None:
         def _ensure() -> None:
             root.mkdir(parents=True, exist_ok=True)
@@ -4646,19 +4905,64 @@ class AutomationManager:
         text: str,
         source_channel: Optional[str] = None,
         source_chat_key: Optional[str] = None,
-        telegram_images: Optional[list[dict[str, Any]]] = None,
+        telegram_attachments: Optional[list[dict[str, Any]]] = None,
+        defer_if_no_text: bool = False,
     ) -> dict[str, Any]:
-        if telegram_images is not None and not isinstance(telegram_images, list):
-            telegram_images = None
-        if telegram_images:
-            telegram_images = [x for x in telegram_images if isinstance(x, dict)]
-            if not telegram_images:
-                telegram_images = None
+        if telegram_attachments is not None and not isinstance(telegram_attachments, list):
+            telegram_attachments = None
+        if telegram_attachments:
+            telegram_attachments = [x for x in telegram_attachments if isinstance(x, dict)]
+            if not telegram_attachments:
+                telegram_attachments = None
 
-        if not text.strip() and telegram_images:
-            text = "<media:image>"
-        if not text.strip():
-            raise ValueError("text must not be empty")
+        user_text = text if isinstance(text, str) else ""
+        text_has_content = bool(user_text.strip())
+
+        source_channel_norm = source_channel.strip() if isinstance(source_channel, str) and source_channel.strip() else None
+        source_chat_key_norm = source_chat_key.strip() if isinstance(source_chat_key, str) and source_chat_key.strip() else None
+        is_telegram_source = bool(source_channel_norm and source_channel_norm.lower() in ("telegram", "tg"))
+
+        local_attachments: list[dict[str, Any]] = []
+        if telegram_attachments and is_telegram_source:
+            staged = await self._stage_telegram_attachments(
+                session_id=session_id,
+                source_chat_key=source_chat_key_norm,
+                telegram_attachments=telegram_attachments,
+            )
+            local_attachments = self._merge_staged_attachment_dicts(staged)
+            if not local_attachments:
+                raise RuntimeError("Failed to save Telegram attachments")
+
+        if not text_has_content:
+            if not local_attachments:
+                raise ValueError("text must not be empty")
+            if defer_if_no_text:
+                pending_attachments = local_attachments
+                if is_telegram_source and source_chat_key_norm:
+                    pending_attachments = await self._append_pending_telegram_attachments(
+                        session_id=session_id,
+                        chat_key=source_chat_key_norm,
+                        attachments=local_attachments,
+                    )
+                return {
+                    "ok": True,
+                    "queued": False,
+                    "started": False,
+                    "staged": True,
+                    "stagedAttachmentCount": len(local_attachments),
+                    "pendingAttachmentCount": len(pending_attachments),
+                    "stagedAttachments": local_attachments,
+                    "attachments": pending_attachments or local_attachments,
+                }
+            user_text = "<media:image>" if any(bool(item.get("isImage", False)) for item in local_attachments) else "<attachment>"
+
+        pending_attachments: list[dict[str, Any]] = []
+        if is_telegram_source and source_chat_key_norm:
+            pending_attachments = await self._consume_pending_telegram_attachments(
+                session_id=session_id,
+                chat_key=source_chat_key_norm,
+            )
+        local_attachments = self._merge_staged_attachment_dicts([*pending_attachments, *local_attachments])
 
         live, _ = await _ensure_live_docker_session(session_id, allow_create=True)
         await self._ensure_initialized(live)
@@ -4668,73 +4972,72 @@ class AutomationManager:
         else:
             thread_id = thread_id.strip()
 
-        if isinstance(source_channel, str) and source_channel.strip() and isinstance(source_chat_key, str) and source_chat_key.strip():
-            ch = source_channel.strip()
-            ck = source_chat_key.strip()
+        if source_channel_norm and source_chat_key_norm:
 
             def _touch_last_active(st: PersistedGatewayAutomationState) -> None:
                 sess = st.sessions.get(session_id)
                 if sess is None:
                     sess = PersistedSessionAutomation()
                     st.sessions[session_id] = sess
-                sess.last_active_by_thread[thread_id] = PersistedLastActiveTarget(channel=ch, chat_key=ck, at_ms=_now_ms())
+                sess.last_active_by_thread[thread_id] = PersistedLastActiveTarget(
+                    channel=source_channel_norm,
+                    chat_key=source_chat_key_norm,
+                    at_ms=_now_ms(),
+                )
 
             await self._store.update(_touch_last_active)
 
         lane = self.lane(session_id, thread_id)
 
-        # If busy, enqueue follow-up (next turn).
         if lane.busy:
-            lane.followups.append({"text": text, "source_channel": source_channel, "source_chat_key": source_chat_key, "telegram_images": telegram_images})
+            lane.followups.append({
+                "text": user_text,
+                "source_channel": source_channel_norm,
+                "source_chat_key": source_chat_key_norm,
+                "local_attachments": local_attachments,
+            })
             return {
                 "ok": True,
                 "threadId": thread_id,
                 "queued": True,
                 "started": False,
                 "followupDepth": len(lane.followups),
+                "attachmentCount": len(local_attachments),
             }
 
         async with lane.lock:
             if lane.busy:
-                lane.followups.append({"text": text, "source_channel": source_channel, "source_chat_key": source_chat_key, "telegram_images": telegram_images})
+                lane.followups.append({
+                    "text": user_text,
+                    "source_channel": source_channel_norm,
+                    "source_chat_key": source_chat_key_norm,
+                    "local_attachments": local_attachments,
+                })
                 return {
                     "ok": True,
                     "threadId": thread_id,
                     "queued": True,
-                "started": False,
-                "followupDepth": len(lane.followups),
-            }
+                    "started": False,
+                    "followupDepth": len(lane.followups),
+                    "attachmentCount": len(local_attachments),
+                }
             self._prepare_lane_for_new_turn(lane, kind=TURN_KIND_USER)
             self._mark_lane_busy(lane)
 
             try:
-                # `turn/start` fails with "thread not found" if the app-server process hasn't loaded the thread yet
-                # (e.g. after reconnect/restart). Make `argus/input/enqueue` robust by resuming first.
                 await self._ensure_thread_loaded_or_resumed(live, thread_id)
                 assembled = await self._assemble_turn_input(
                     session_id,
                     thread_id,
-                    user_text=text,
+                    user_text=user_text,
                     heartbeat=False,
-                    source_channel=source_channel,
-                    source_chat_key=source_chat_key,
+                    source_channel=source_channel_norm,
+                    source_chat_key=source_chat_key_norm,
+                    local_attachments=local_attachments,
                 )
 
-                local_images: list[str] = []
-                if (
-                    telegram_images
-                    and isinstance(source_channel, str)
-                    and source_channel.strip().lower() in ("telegram", "tg")
-                ):
-                    local_images = await self._prepare_telegram_local_images(
-                        session_id=session_id,
-                        source_chat_key=source_chat_key,
-                        telegram_images=telegram_images,
-                    )
-
                 input_items: list[dict[str, Any]] = [{"type": "text", "text": assembled}]
-                for pth in local_images:
-                    input_items.append({"type": "localImage", "path": pth})
+                input_items.extend(self._attachment_input_items(local_attachments))
 
                 resp = await self._rpc(
                     live,
@@ -4751,49 +5054,26 @@ class AutomationManager:
                 if turn_id:
                     lane.active_turn_id = turn_id
                     self._note_lane_progress(lane)
-                return {"ok": True, "threadId": thread_id, "queued": False, "started": True, "turnId": turn_id}
-            except Exception as e:
+                return {
+                    "ok": True,
+                    "threadId": thread_id,
+                    "queued": False,
+                    "started": True,
+                    "turnId": turn_id,
+                    "attachmentCount": len(local_attachments),
+                }
+            except Exception:
                 self._mark_lane_idle(lane)
-                try:
-                    ended_at_ms = _now_ms()
-
-                    def _mark_failed(st: PersistedGatewayAutomationState) -> None:
-                        sess = st.sessions.get(sid)
-                        if sess is None:
-                            return
-                        runs = sess.cron_runs_by_job.get(job.job_id) or []
-                        for r in reversed(runs):
-                            if not isinstance(r, PersistedCronRunMeta):
-                                continue
-                            if r.run_id == run_id and r.thread_id == thread_id:
-                                r.status = "error"
-                                r.ended_at_ms = ended_at_ms
-                                msg = str(e).strip()
-                                r.error = msg or "turn/start failed"
-                                r.summary = r.error
-                                break
-
-                    await self._store.update(_mark_failed)
-                except Exception:
-                    pass
-                try:
-                    await self._enforce_cron_retention(
-                        session_id=sid,
-                        job_id=job.job_id,
-                        max_unarchived_threads=retention_max_unarchived,
-                    )
-                except Exception:
-                    pass
                 raise
 
-    async def _prepare_telegram_local_images(
+    async def _stage_telegram_attachments(
         self,
         *,
         session_id: str,
         source_chat_key: Optional[str],
-        telegram_images: list[dict[str, Any]],
-    ) -> list[str]:
-        if not telegram_images:
+        telegram_attachments: list[dict[str, Any]],
+    ) -> list[PersistedStagedAttachment]:
+        if not telegram_attachments:
             return []
 
         token = os.getenv("TELEGRAM_BOT_TOKEN") or ""
@@ -4819,10 +5099,29 @@ class AutomationManager:
             "image/bmp": ".bmp",
         }
 
-        out: list[str] = []
+        out: list[PersistedStagedAttachment] = []
         seen: set[str] = set()
 
-        for idx, ref in enumerate(telegram_images[:8], start=1):
+        mime_to_ext.update(
+            {
+                "application/pdf": ".pdf",
+                "text/plain": ".txt",
+                "text/markdown": ".md",
+                "application/json": ".json",
+                "text/csv": ".csv",
+                "application/zip": ".zip",
+                "application/x-zip-compressed": ".zip",
+                "application/gzip": ".gz",
+                "application/x-gzip": ".gz",
+                "audio/mpeg": ".mp3",
+                "audio/mp4": ".m4a",
+                "audio/ogg": ".ogg",
+                "video/mp4": ".mp4",
+                "video/webm": ".webm",
+            }
+        )
+
+        for idx, ref in enumerate(telegram_attachments[:8], start=1):
             if not isinstance(ref, dict):
                 continue
             file_id = ref.get("fileId") or ref.get("file_id")
@@ -4842,6 +5141,11 @@ class AutomationManager:
             if not isinstance(source, str) or not source.strip():
                 source = "message"
             source_part = _sanitize_path_part(source, fallback="message", max_len=16)
+
+            kind = ref.get("kind") or "file"
+            if not isinstance(kind, str) or not kind.strip():
+                kind = "file"
+            kind_part = _sanitize_path_part(kind, fallback="file", max_len=16)
 
             file_name = ref.get("fileName") or ref.get("file_name")
             mime_type = ref.get("mimeType") or ref.get("mime_type")
@@ -4867,15 +5171,24 @@ class AutomationManager:
                 ext = Path(file_name.strip()).suffix.lower()
             if not ext and isinstance(mime_type, str) and mime_type.strip():
                 ext = mime_to_ext.get(mime_type.strip().lower(), "")
+            mime_norm = mime_type.strip().lower() if isinstance(mime_type, str) and mime_type.strip() else None
+            is_image = bool(kind == "photo" or (mime_norm and mime_norm.startswith("image/")) or ext in TELEGRAM_IMAGE_EXTS)
             if not ext:
-                ext = ".jpg"
+                ext = ".jpg" if is_image else ".bin"
             if not ext.startswith(".") or len(ext) > 10:
-                ext = ".jpg"
+                ext = ".jpg" if is_image else ".bin"
+
+            if not isinstance(file_name, str) or not file_name.strip():
+                file_name = Path(file_path).name or f"{kind_part}{ext}"
+            else:
+                file_name = file_name.strip()
+
+            file_stem = _sanitize_path_part(Path(file_name).stem, fallback=kind_part, max_len=48)
 
             ts = _now_ms()
-            dest = base_dir / f"{ts}_{idx:02d}_{source_part}_{unique_part}{ext}"
+            dest = base_dir / f"{ts}_{idx:02d}_{source_part}_{file_stem}_{unique_part}{ext}"
             try:
-                await asyncio.to_thread(
+                downloaded_size = await asyncio.to_thread(
                     _telegram_download_file_to_path_sync,
                     token,
                     file_path,
@@ -4886,11 +5199,26 @@ class AutomationManager:
                 log.warning("Telegram download failed for fileId=%s: %s", file_id, str(e))
                 continue
 
+            rel = None
             try:
                 rel = dest.relative_to(root).as_posix()
             except Exception:
                 rel = str(dest)
-            out.append(rel)
+            rel_norm = _normalize_workspace_relative_path(rel)
+            if not rel_norm:
+                continue
+            out.append(
+                PersistedStagedAttachment(
+                    path=rel_norm,
+                    file_name=file_name,
+                    mime_type=mime_type.strip() if isinstance(mime_type, str) and mime_type.strip() else None,
+                    file_size=int(file_size) if isinstance(file_size, int) and file_size >= 0 else int(downloaded_size),
+                    source=source.strip(),
+                    is_image=is_image,
+                    file_unique_id=unique_id.strip() if isinstance(unique_id, str) and unique_id.strip() else None,
+                    staged_at_ms=ts,
+                )
+            )
 
         return out
 
@@ -4973,7 +5301,7 @@ class AutomationManager:
             if not lane.followups:
                 return
             followup_texts: list[str] = []
-            telegram_images: list[dict[str, Any]] = []
+            local_attachments: list[dict[str, Any]] = []
             telegram_channel: Optional[str] = None
             telegram_chat_key: Optional[str] = None
 
@@ -4993,10 +5321,11 @@ class AutomationManager:
                     telegram_channel = ch.strip()
                 if isinstance(ck, str) and ck.strip():
                     telegram_chat_key = ck.strip()
-                imgs = item.get("telegram_images")
-                if isinstance(imgs, list):
-                    telegram_images.extend([x for x in imgs if isinstance(x, dict)])
+                attachments = item.get("local_attachments")
+                if isinstance(attachments, list):
+                    local_attachments.extend([x for x in attachments if isinstance(x, (dict, PersistedStagedAttachment))])
             merged = self._format_followups(followup_texts)
+            local_attachments = self._merge_staged_attachment_dicts(local_attachments)
 
             live, _ = await _ensure_live_docker_session(session_id, allow_create=True)
             await self._ensure_initialized(live)
@@ -5012,23 +5341,11 @@ class AutomationManager:
                     heartbeat=False,
                     source_channel=telegram_channel,
                     source_chat_key=telegram_chat_key,
+                    local_attachments=local_attachments,
                 )
 
-                local_images: list[str] = []
-                if (
-                    telegram_images
-                    and isinstance(telegram_channel, str)
-                    and telegram_channel.strip().lower() in ("telegram", "tg")
-                ):
-                    local_images = await self._prepare_telegram_local_images(
-                        session_id=session_id,
-                        source_chat_key=telegram_chat_key,
-                        telegram_images=telegram_images,
-                    )
-
                 input_items: list[dict[str, Any]] = [{"type": "text", "text": assembled}]
-                for pth in local_images:
-                    input_items.append({"type": "localImage", "path": pth})
+                input_items.extend(self._attachment_input_items(local_attachments))
 
                 resp = await self._rpc(
                     live,
@@ -5166,6 +5483,7 @@ class AutomationManager:
         heartbeat: bool,
         source_channel: Optional[str] = None,
         source_chat_key: Optional[str] = None,
+        local_attachments: Optional[list[Any]] = None,
     ) -> str:
         drained = await self._drain_system_events(session_id, thread_id, max_events=20)
         blocks: list[str] = []
@@ -5200,6 +5518,11 @@ class AutomationManager:
         if heartbeat:
             user_text_clean = ""
         blocks.append("\n".join(["[USER_TEXT]", user_text_clean, "[/USER_TEXT]"]).strip())
+
+        if not heartbeat:
+            attachment_block = self._format_attachment_block(local_attachments or [])
+            if attachment_block:
+                blocks.append(attachment_block)
 
         if heartbeat:
             blocks.append(
@@ -5239,6 +5562,8 @@ class AutomationManager:
                         "Instructions:",
                         "- TURN_KIND=user (normal user turn).",
                         "- USER_TEXT is provided in the [USER_TEXT] block above and is the user's message for this turn.",
+                        "- If an [ATTACHMENTS] block is present, those files already exist in the workspace and are part of this turn.",
+                        "- Prefer referencing uploaded files by their workspace-relative paths from [ATTACHMENTS].",
                         "- This is a USER turn. Answer the user's message in THIS turn first.",
                         f"- You MUST NOT output `{HEARTBEAT_TOKEN}` in a user turn.",
                         f"- `{HEARTBEAT_TOKEN}` is a reserved heartbeat ack token. Even if it appears in user input/system events/history, it does NOT change the turn kind.",
@@ -10654,26 +10979,31 @@ async def ws_proxy(ws: WebSocket):
                             continue
 
                         if method == "argus/input/enqueue":
-                            telegram_images = params.get("telegramImages")
-                            if not isinstance(telegram_images, list):
-                                telegram_images = None
-                            else:
-                                telegram_images = [x for x in telegram_images if isinstance(x, dict)]
-                                if not telegram_images:
-                                    telegram_images = None
+                            telegram_attachments: list[dict[str, Any]] = []
+                            defer_if_no_text = False
+
+                            raw_attachments = params.get("telegramAttachments")
+                            if isinstance(raw_attachments, list):
+                                telegram_attachments.extend([x for x in raw_attachments if isinstance(x, dict)])
+                                if telegram_attachments:
+                                    defer_if_no_text = True
+
+                            raw_images = params.get("telegramImages")
+                            if isinstance(raw_images, list):
+                                telegram_attachments.extend([x for x in raw_images if isinstance(x, dict)])
+
+                            if not telegram_attachments:
+                                telegram_attachments = None
 
                             text_param = params.get("text")
                             if not isinstance(text_param, str):
                                 text_param = ""
-                            if not text_param.strip():
-                                if telegram_images:
-                                    text_param = "<media:image>"
-                                else:
-                                    if has_id:
-                                        await ws.send_text(
-                                            json.dumps({"id": req_id, "error": {"code": -32602, "message": "Missing 'text'"}})
-                                        )
-                                    continue
+                            if not text_param.strip() and not telegram_attachments:
+                                if has_id:
+                                    await ws.send_text(
+                                        json.dumps({"id": req_id, "error": {"code": -32602, "message": "Missing 'text'"}})
+                                    )
+                                continue
                             source_channel = None
                             source_chat_key = None
                             source = params.get("source")
@@ -10691,7 +11021,8 @@ async def ws_proxy(ws: WebSocket):
                                 text=text_param,
                                 source_channel=source_channel,
                                 source_chat_key=source_chat_key,
-                                telegram_images=telegram_images,
+                                telegram_attachments=telegram_attachments,
+                                defer_if_no_text=defer_if_no_text,
                             )
                             if has_id:
                                 await ws.send_text(json.dumps({"id": req_id, "result": res}))

@@ -746,12 +746,12 @@ class ArgusClient {
     await this.rpc("thread/resume", { threadId });
   }
 
-  async enqueueInput({ text, threadId, target, source, telegramImages }) {
-    const images = Array.isArray(telegramImages) ? telegramImages : [];
+  async enqueueInput({ text, threadId, target, source, telegramAttachments }) {
+    const attachments = Array.isArray(telegramAttachments) ? telegramAttachments : [];
     const hasText = isNonEmptyString(text);
-    if (!hasText && images.length === 0) throw new Error("Missing text");
+    if (!hasText && attachments.length === 0) throw new Error("Missing text");
     const params = { text: hasText ? text : "" };
-    if (images.length > 0) params.telegramImages = images;
+    if (attachments.length > 0) params.telegramAttachments = attachments;
     if (isNonEmptyString(threadId)) params.threadId = threadId;
     if (isNonEmptyString(target)) params.target = target;
     if (source && typeof source === "object" && !Array.isArray(source)) {
@@ -1013,41 +1013,79 @@ function extractReplyText(message) {
   return null;
 }
 
-function extractTelegramImagesFromMessage(message) {
+function appendTelegramAttachment(out, kind, file, { fileName = null, mimeType = null } = {}) {
+  if (!Array.isArray(out)) return;
+  if (!file || typeof file !== "object" || !isNonEmptyString(file.file_id)) return;
+  out.push({
+    kind,
+    fileId: file.file_id,
+    fileUniqueId: isNonEmptyString(file.file_unique_id) ? file.file_unique_id : null,
+    fileName: isNonEmptyString(fileName) ? fileName : isNonEmptyString(file.file_name) ? file.file_name : null,
+    mimeType: isNonEmptyString(mimeType) ? mimeType : isNonEmptyString(file.mime_type) ? file.mime_type : null,
+    fileSize: typeof file.file_size === "number" ? file.file_size : null,
+  });
+}
+
+function extractTelegramAttachmentsFromMessage(message) {
   const out = [];
   if (!message || typeof message !== "object") return out;
 
   const photos = Array.isArray(message.photo) ? message.photo : null;
   if (photos && photos.length > 0) {
     const best = photos[photos.length - 1];
-    if (best && typeof best === "object" && isNonEmptyString(best.file_id)) {
-      out.push({
-        kind: "photo",
-        fileId: best.file_id,
-        fileUniqueId: isNonEmptyString(best.file_unique_id) ? best.file_unique_id : null,
-        fileName: null,
-        mimeType: null,
-        fileSize: typeof best.file_size === "number" ? best.file_size : null,
-      });
-    }
+    appendTelegramAttachment(out, "photo", best);
   }
 
   const doc = message.document;
-  if (doc && typeof doc === "object" && isNonEmptyString(doc.file_id)) {
-    const mimeType = isNonEmptyString(doc.mime_type) ? doc.mime_type : null;
-    if (mimeType && mimeType.startsWith("image/")) {
-      out.push({
-        kind: "document",
-        fileId: doc.file_id,
-        fileUniqueId: isNonEmptyString(doc.file_unique_id) ? doc.file_unique_id : null,
-        fileName: isNonEmptyString(doc.file_name) ? doc.file_name : null,
-        mimeType,
-        fileSize: typeof doc.file_size === "number" ? doc.file_size : null,
-      });
-    }
-  }
+  appendTelegramAttachment(out, "document", doc);
+  appendTelegramAttachment(out, "audio", message.audio);
+  appendTelegramAttachment(out, "video", message.video);
+  appendTelegramAttachment(out, "voice", message.voice);
+  appendTelegramAttachment(out, "animation", message.animation);
+  appendTelegramAttachment(out, "video_note", message.video_note);
 
   return out;
+}
+
+function attachmentPlaceholder(attachments) {
+  if (!Array.isArray(attachments) || attachments.length === 0) return "<attachment>";
+  if (attachments.length === 1) {
+    const item = attachments[0] && typeof attachments[0] === "object" ? attachments[0] : null;
+    const fileName = isNonEmptyString(item?.fileName) ? item.fileName : null;
+    if (fileName) return `<attachment:${fileName}>`;
+    const kind = isNonEmptyString(item?.kind) ? item.kind : "attachment";
+    return kind === "photo" ? "<photo>" : `<${kind}>`;
+  }
+  return `<attachments:${attachments.length}>`;
+}
+
+function workspaceAttachmentRef(pathValue) {
+  if (!isNonEmptyString(pathValue)) return null;
+  let value = pathValue.trim().replace(/\\/g, "/");
+  if (value.startsWith("./")) return value;
+  value = value.replace(/^\/+/, "");
+  return value ? `./${value}` : null;
+}
+
+function formatStagedAttachmentsNotice(result, S) {
+  const staged = Array.isArray(result?.stagedAttachments) ? result.stagedAttachments : [];
+  const pending = Array.isArray(result?.attachments) ? result.attachments : staged;
+  const stagedCountRaw = Number(result?.stagedAttachmentCount);
+  const pendingCountRaw = Number(result?.pendingAttachmentCount);
+  const stagedCount = Number.isFinite(stagedCountRaw) ? Math.max(0, Math.floor(stagedCountRaw)) : staged.length;
+  const pendingCount = Number.isFinite(pendingCountRaw) ? Math.max(0, Math.floor(pendingCountRaw)) : pending.length;
+  const preview = staged.length > 0 ? staged : pending;
+
+  const lines = [formatTemplate(S.notice_attachments_staged, { stagedCount, pendingCount })];
+  for (const item of preview.slice(0, 5)) {
+    const ref = workspaceAttachmentRef(item?.path);
+    if (ref) lines.push(`- ${ref}`);
+  }
+  const remaining = Math.max(0, preview.length - Math.min(preview.length, 5));
+  if (remaining > 0) {
+    lines.push(formatTemplate(S.notice_attachments_staged_more, { count: remaining }));
+  }
+  return lines.join("\n");
 }
 
 const TELEGRAM_MAX_MESSAGE_CHARS = 4000;
@@ -1160,7 +1198,7 @@ function normalizeAvailableModels(models) {
 
     msg_not_initialized: "No agent yet. Press Create Agent to create main.",
     msg_use_start_in_dm: "Please use /start in a private chat.",
-    msg_unsupported_message: "Unsupported message type (text/images only for now).",
+    msg_unsupported_message: "Unsupported message type (text/files only for now).",
     msg_admins_only: "Admins only",
     msg_expired: "Expired. Send /menu.",
     msg_unsupported_cb: "Unsupported",
@@ -1193,6 +1231,8 @@ function normalizeAvailableModels(models) {
     notice_bound: "Bound: {agentId}",
     notice_node_paused: "Paused: {nodeId}",
     notice_node_resumed: "Resumed: {nodeId}",
+    notice_attachments_staged: "Saved {stagedCount} attachment(s) to the workspace. Pending for your next message: {pendingCount}.",
+    notice_attachments_staged_more: "... and {count} more.",
 
     label_current: "current",
     label_model: "model",
@@ -1324,7 +1364,7 @@ function normalizeAvailableModels(models) {
 
     msg_not_initialized: "尚未创建 agent：点击“创建 Agent”即可创建 main。",
     msg_use_start_in_dm: "请在私聊中使用 /start。",
-    msg_unsupported_message: "暂不支持该消息类型（目前仅支持文本/图片）。",
+    msg_unsupported_message: "暂不支持该消息类型（目前仅支持文本/文件）。",
     msg_admins_only: "仅群管理员可操作",
     msg_expired: "已过期，请发送 /menu。",
     msg_unsupported_cb: "不支持",
@@ -1357,6 +1397,8 @@ function normalizeAvailableModels(models) {
     notice_bound: "已绑定：{agentId}",
     notice_node_paused: "已暂停：{nodeId}",
     notice_node_resumed: "已恢复：{nodeId}",
+    notice_attachments_staged: "已将 {stagedCount} 个附件保存到工作区；下条消息会自动带上当前待处理的 {pendingCount} 个附件。",
+    notice_attachments_staged_more: "……其余 {count} 个未展开。",
 
     label_current: "当前",
     label_model: "模型",
@@ -3627,10 +3669,10 @@ async function main() {
       const slash = parseSlashCommand(trimmedText, botUsername);
       const looksSlash = trimmedText.startsWith("/");
 
-      const messageImages = extractTelegramImagesFromMessage(message).map((img) => ({ ...img, source: "message" }));
+      const messageAttachments = extractTelegramAttachmentsFromMessage(message).map((attachment) => ({ ...attachment, source: "message" }));
       const replyTextRaw = extractReplyText(message);
-      const replyImages = extractTelegramImagesFromMessage(message?.reply_to_message).map((img) => ({ ...img, source: "reply" }));
-      const replyText = replyTextRaw || (replyImages.length > 0 ? "<media:image>" : null);
+      const replyAttachments = extractTelegramAttachmentsFromMessage(message?.reply_to_message).map((attachment) => ({ ...attachment, source: "reply" }));
+      const replyText = replyTextRaw || (replyAttachments.length > 0 ? attachmentPlaceholder(replyAttachments) : null);
 
       queue.enqueue(async () => {
         const S = uiStrings(locale);
@@ -3884,7 +3926,7 @@ async function main() {
             return;
           }
 
-          if (!isNonEmptyString(text) && messageImages.length === 0 && replyImages.length === 0) {
+          if (!isNonEmptyString(text) && messageAttachments.length === 0 && replyAttachments.length === 0) {
             await safeSendMessage({ ...target, text: S.msg_unsupported_message });
             return;
           }
@@ -3913,45 +3955,54 @@ async function main() {
 
           const sessionId = route.sessionId;
           const client = await getClient(sessionId);
-
-          const userBody = isNonEmptyString(text) ? text : "<media:image>";
-          const userLines = [];
-          if (replyText) {
-            userLines.push("REPLY_TO:", replyText);
-            if (replyImages.length > 0) userLines.push(`[reply attachments: ${replyImages.length} image(s)]`);
-            userLines.push("");
-            userLines.push("USER:", userBody);
-          } else {
-            userLines.push(userBody);
+          const hasUserText = isNonEmptyString(text);
+          let userText = "";
+          if (hasUserText) {
+            const userLines = [];
+            if (replyText) {
+              userLines.push("REPLY_TO:", replyText);
+              if (replyAttachments.length > 0) userLines.push(`[reply attachments: ${replyAttachments.length} attachment(s)]`);
+              userLines.push("");
+              userLines.push("USER:", text);
+            } else {
+              userLines.push(text);
+            }
+            if (messageAttachments.length > 0) userLines.push(`[attachments: ${messageAttachments.length} attachment(s)]`);
+            userText = userLines.join("\n");
           }
-          if (messageImages.length > 0) userLines.push(`[attachments: ${messageImages.length} image(s)]`);
-
-          const userText = userLines.join("\n");
 
           let threadId = state.getThreadId(sessionId, chatKey);
           let enqueueTarget = null;
 
-          if (isPrivateChatType(chatType)) {
-            enqueueTarget = "main";
-            threadId = null;
-          } else if (isNonEmptyString(threadId)) {
-            // Use mapped thread.
-          } else {
-            threadId = await client.startThread(route.model);
-            await state.setThreadId(sessionId, chatKey, threadId);
+          if (hasUserText) {
+            if (isPrivateChatType(chatType)) {
+              enqueueTarget = "main";
+              threadId = null;
+            } else if (isNonEmptyString(threadId)) {
+              // Use mapped thread.
+            } else {
+              threadId = await client.startThread(route.model);
+              await state.setThreadId(sessionId, chatKey, threadId);
+            }
           }
 
-          // Show typing cue only for forwarded inputs; Telegram requires periodic refresh for long runs.
-          // Note: sendChatAction accepts message_thread_id=1 (General topic), while sendMessage may not.
-          typing.start(chatKey, typingTarget);
+          if (hasUserText) {
+            typing.start(chatKey, typingTarget);
+          }
 
           const res = await client.enqueueInput({
-            text: userText,
+            text: hasUserText ? userText : "",
             threadId,
             target: enqueueTarget,
             source: { channel: "telegram", chatKey },
-            telegramImages: [...replyImages, ...messageImages],
+            telegramAttachments: [...replyAttachments, ...messageAttachments],
           });
+
+          if (res?.staged === true && res?.started !== true && res?.queued !== true) {
+            await safeSendMessage({ ...target, text: formatStagedAttachmentsNotice(res, S) });
+            return;
+          }
+
           const effectiveThreadId = isNonEmptyString(res?.threadId) ? res.threadId : threadId;
           if (isNonEmptyString(effectiveThreadId)) {
             lastActiveBySessionThread.set(sessionThreadKey(sessionId, effectiveThreadId), chatKey);

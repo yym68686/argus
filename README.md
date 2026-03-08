@@ -210,6 +210,9 @@ When using `apps/telegram-bot`, the gateway can isolate runtime containers (agen
 - First `/start` in a private chat bootstraps a dedicated per-user `main` agent (one session container + one workspace).
   - Host workspace directory: `${ARGUS_HOME_HOST_PATH}/workspace-<tgid>-main`
 - Subsequent `/start` reuses the existing `main`.
+- Telegram uploads are staged into the active workspace under `/workspace/inbox/telegram/<chatKey>/...`.
+  - If the upload includes a caption, that caption starts the turn immediately.
+  - If the upload has no caption, the file is still saved immediately and will be attached to the next text message from that chat.
 - Use `/menu` to open the control panel:
   - **Switch Agent**: switch the current DM agent (workspace/session).
   - **Switch Model**: switch the current agent between `gpt-5.2` and `gpt-5.4`.
