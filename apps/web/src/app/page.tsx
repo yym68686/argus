@@ -743,6 +743,7 @@ export default function Page() {
   const connectPromisesRef = React.useRef<Map<string, Promise<void>>>(new Map());
   const autoExpandedRef = React.useRef<boolean>(false);
   const autoConnectAttemptedRef = React.useRef<boolean>(false);
+  const [cancelBusyByThreadKey, setCancelBusyByThreadKey] = React.useState<Record<string, boolean>>({});
 
   const chatScrollRef = React.useRef<HTMLDivElement | null>(null);
   const composingRef = React.useRef<boolean>(false);
@@ -1059,6 +1060,43 @@ export default function Page() {
       toast.error((e as Error)?.message || String(e));
     } finally {
       followupStartInFlightRef.current.delete(key);
+    }
+  }
+
+  async function cancelActiveTurn(sessionId: string, threadId: string): Promise<void> {
+    const key = threadKey(sessionId, threadId);
+    if (cancelBusyByThreadKey[key]) return;
+
+    setCancelBusyByThreadKey((prev) => ({ ...prev, [key]: true }));
+    try {
+      const result = await rpc(sessionId, "argus/turn/cancel", { threadId });
+      const payload = isRecord(result) ? result : {};
+      const cancelRequested = payload["cancelRequested"] === true;
+      const alreadyRequested = payload["alreadyRequested"] === true;
+      const reason = getTrimmedString(payload["reason"]);
+      const activeKind = getTrimmedString(payload["activeKind"]);
+
+      if (cancelRequested) {
+        toast.success(alreadyRequested ? "Stop already requested" : "Stopping current turn…");
+        return;
+      }
+      if (reason === "TURN_NOT_READY") {
+        toast.error("Current turn is still starting; try again in a moment");
+        return;
+      }
+      if (reason === "NON_USER_TURN") {
+        toast.error(
+          activeKind === "heartbeat"
+            ? "Heartbeat turns can't be stopped from chat"
+            : "Current run isn't a user turn"
+        );
+        return;
+      }
+      toast.error("No active user turn to stop");
+    } catch (e) {
+      toast.error((e as Error)?.message || String(e));
+    } finally {
+      setCancelBusyByThreadKey((prev) => ({ ...prev, [key]: false }));
     }
   }
 
@@ -2964,6 +3002,32 @@ export default function Page() {
 	                          }}
 	                        />
 	
+		                        {activeChat?.turnInProgress ? (
+		                          <Button
+		                            type="button"
+		                            variant="ghost"
+		                            onClick={() => {
+		                              if (!activeSessionId || !activeThreadId) return;
+		                              void cancelActiveTurn(activeSessionId, activeThreadId);
+		                            }}
+		                            disabled={
+		                              !activeSessionId ||
+		                              !activeThreadId ||
+		                              (activeThreadKey ? !!cancelBusyByThreadKey[activeThreadKey] : false)
+		                            }
+		                            className={cn(
+		                              "h-10 w-10 rounded-full p-0",
+		                              "bg-background/50 text-muted-foreground",
+		                              "hover:bg-red-500/10 hover:text-red-500",
+		                              "disabled:opacity-50"
+		                            )}
+		                            aria-label="Stop"
+		                            title="Stop"
+		                          >
+		                            <XCircle className="h-4 w-4" />
+		                          </Button>
+		                        ) : null}
+
 		                        <Button
 		                          type="button"
 		                          variant="ghost"

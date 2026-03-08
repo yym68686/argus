@@ -85,6 +85,7 @@ class LiveDockerSession:
 
     pending_server_requests: dict[str, str]
     outbox: deque[str]
+    pending_client_turn_starts: dict[str, str]
 
     turn_owners_by_thread: dict[str, WebSocket]
 
@@ -314,6 +315,10 @@ HEARTBEAT_FILENAME = "HEARTBEAT.md"
 HEARTBEAT_TASKS_INTERVAL_MS = 30 * 60 * 1000
 HEARTBEAT_TOKEN = "HEARTBEAT_OK"
 HEARTBEAT_ACK_MAX_CHARS = 300
+
+TURN_KIND_USER = "user"
+TURN_KIND_HEARTBEAT = "heartbeat"
+TURN_KIND_CRON = "cron"
 
 CRON_EVENT_KIND = "cron"
 CRON_WRITEBACK_EVENT_KIND = "cron_writeback"
@@ -2098,6 +2103,9 @@ class ThreadLane:
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     busy: bool = False
     active_turn_id: Optional[str] = None
+    active_turn_kind: Optional[str] = None
+    pending_client_turn_kind: Optional[str] = None
+    cancel_requested: bool = False
     followups: deque[Any] = field(default_factory=deque)
     busy_since_ms: Optional[int] = None
     last_progress_at_ms: Optional[int] = None
@@ -3472,18 +3480,193 @@ class AutomationManager:
             self._lanes[key] = lane
         return lane
 
+    def _normalize_turn_kind(self, kind: Any) -> Optional[str]:
+        if not isinstance(kind, str):
+            return None
+        normalized = kind.strip().lower()
+        if normalized in (TURN_KIND_USER, TURN_KIND_HEARTBEAT, TURN_KIND_CRON):
+            return normalized
+        return None
+
+    def _prepare_lane_for_new_turn(self, lane: ThreadLane, *, kind: str) -> None:
+        lane.active_turn_kind = self._normalize_turn_kind(kind)
+        lane.pending_client_turn_kind = None
+        lane.cancel_requested = False
+
+    def _queue_pending_client_turn(self, lane: ThreadLane, *, kind: str) -> None:
+        lane.pending_client_turn_kind = self._normalize_turn_kind(kind)
+        lane.cancel_requested = False
+
+    def _clear_pending_client_turn(self, lane: ThreadLane) -> None:
+        lane.pending_client_turn_kind = None
+
+    def note_client_turn_start_requested(self, session_id: str, thread_id: str) -> None:
+        sid = session_id.strip() if isinstance(session_id, str) else ""
+        tid = thread_id.strip() if isinstance(thread_id, str) else ""
+        if not sid or not tid:
+            return
+        lane = self.lane(sid, tid)
+        if lane.busy:
+            return
+        self._queue_pending_client_turn(lane, kind=TURN_KIND_USER)
+
+    async def on_client_turn_start_response(self, session_id: str, thread_id: str, msg: dict[str, Any]) -> None:
+        sid = session_id.strip() if isinstance(session_id, str) else ""
+        tid = thread_id.strip() if isinstance(thread_id, str) else ""
+        if not sid or not tid:
+            return
+        lane = self.lane(sid, tid)
+        async with lane.lock:
+            if not isinstance(msg, dict):
+                if not lane.busy:
+                    self._clear_pending_client_turn(lane)
+                return
+            if msg.get("error") is not None:
+                if not lane.busy:
+                    self._clear_pending_client_turn(lane)
+                return
+
+            turn_id: Optional[str] = None
+            result = msg.get("result")
+            if isinstance(result, dict):
+                turn = result.get("turn")
+                if isinstance(turn, dict):
+                    tid_val = turn.get("id")
+                    if isinstance(tid_val, str) and tid_val.strip():
+                        turn_id = tid_val.strip()
+            if not turn_id:
+                if not lane.busy:
+                    self._clear_pending_client_turn(lane)
+                return
+
+            if not lane.busy:
+                self._mark_lane_busy(lane, turn_id=turn_id)
+            elif not lane.active_turn_id:
+                lane.active_turn_id = turn_id
+            self._note_lane_progress(lane)
+
+    def _resolve_existing_thread_id(
+        self,
+        *,
+        session_id: str,
+        thread_id: Optional[str],
+        target: Optional[str],
+    ) -> Optional[str]:
+        if target == "main" or not (isinstance(thread_id, str) and thread_id.strip()):
+            sess = self._store.state.sessions.get(session_id)
+            if sess is None:
+                return None
+            main_tid = sess.main_thread_id
+            if isinstance(main_tid, str) and main_tid.strip():
+                return main_tid.strip()
+            return None
+        return thread_id.strip()
+
+    async def _interrupt_user_turn_background(self, *, session_id: str, thread_id: str, turn_id: str) -> None:
+        try:
+            live, _ = await _ensure_live_docker_session(session_id, allow_create=False)
+            await self._ensure_initialized(live)
+            await self._rpc(live, "turn/interrupt", {"threadId": thread_id, "turnId": turn_id})
+        except Exception as e:
+            lane = self._lanes.get((session_id, thread_id))
+            if lane is not None:
+                async with lane.lock:
+                    if lane.busy and lane.active_turn_id == turn_id and lane.active_turn_kind == TURN_KIND_USER:
+                        lane.cancel_requested = False
+            log.warning(
+                "Failed to interrupt user turn for session %s thread %s turn %s: %s",
+                session_id,
+                thread_id,
+                turn_id,
+                str(e),
+            )
+
+    async def cancel_active_user_turn(
+        self,
+        *,
+        session_id: str,
+        thread_id: Optional[str],
+        target: Optional[str],
+    ) -> dict[str, Any]:
+        sid = session_id.strip() if isinstance(session_id, str) else ""
+        resolved_thread_id = self._resolve_existing_thread_id(session_id=sid, thread_id=thread_id, target=target)
+        if not sid or not resolved_thread_id:
+            return {"ok": True, "cancelRequested": False, "reason": "NO_ACTIVE_USER_TURN", "threadId": resolved_thread_id}
+
+        lane = self._lanes.get((sid, resolved_thread_id))
+        if lane is None:
+            return {"ok": True, "cancelRequested": False, "reason": "NO_ACTIVE_USER_TURN", "threadId": resolved_thread_id}
+
+        turn_id: Optional[str] = None
+        already_requested = False
+        for _ in range(40):
+            async with lane.lock:
+                if not lane.busy:
+                    self._clear_pending_client_turn(lane)
+                    return {"ok": True, "cancelRequested": False, "reason": "NO_ACTIVE_USER_TURN", "threadId": resolved_thread_id}
+
+                active_kind = lane.active_turn_kind or lane.pending_client_turn_kind
+                if active_kind != TURN_KIND_USER:
+                    return {
+                        "ok": True,
+                        "cancelRequested": False,
+                        "reason": "NON_USER_TURN",
+                        "activeKind": active_kind,
+                        "threadId": resolved_thread_id,
+                        "turnId": lane.active_turn_id,
+                    }
+
+                if lane.cancel_requested:
+                    already_requested = True
+                    turn_id = lane.active_turn_id
+                    break
+
+                if isinstance(lane.active_turn_id, str) and lane.active_turn_id.strip():
+                    turn_id = lane.active_turn_id.strip()
+                    lane.cancel_requested = True
+                    break
+
+            await asyncio.sleep(0.05)
+
+        if not turn_id:
+            return {
+                "ok": True,
+                "cancelRequested": False,
+                "reason": "TURN_NOT_READY",
+                "activeKind": lane.active_turn_kind or lane.pending_client_turn_kind,
+                "threadId": resolved_thread_id,
+            }
+
+        if not already_requested:
+            asyncio.create_task(
+                self._interrupt_user_turn_background(session_id=sid, thread_id=resolved_thread_id, turn_id=turn_id)
+            )
+        return {
+            "ok": True,
+            "cancelRequested": True,
+            "alreadyRequested": already_requested,
+            "threadId": resolved_thread_id,
+            "turnId": turn_id,
+        }
+
     def _mark_lane_busy(self, lane: ThreadLane, *, turn_id: Optional[str] = None) -> None:
         now = _now_ms()
         lane.busy = True
         if lane.busy_since_ms is None:
             lane.busy_since_ms = now
         lane.last_progress_at_ms = now
+        if lane.active_turn_kind is None and lane.pending_client_turn_kind is not None:
+            lane.active_turn_kind = lane.pending_client_turn_kind
+            lane.pending_client_turn_kind = None
         if isinstance(turn_id, str) and turn_id.strip():
             lane.active_turn_id = turn_id.strip()
 
     def _mark_lane_idle(self, lane: ThreadLane) -> None:
         lane.busy = False
         lane.active_turn_id = None
+        lane.active_turn_kind = None
+        lane.pending_client_turn_kind = None
+        lane.cancel_requested = False
         lane.busy_since_ms = None
         lane.last_progress_at_ms = None
 
@@ -4040,7 +4223,7 @@ class AutomationManager:
                             turn_error_message=turn_error_message,
                         )
                     )
-                if final_text.strip():
+                if final_text.strip() and str(turn_status_raw or "").strip().lower() != "interrupted":
                     asyncio.create_task(self._deliver_turn_text(session_id, thread_id, final_text))
             return
 
@@ -4518,9 +4701,10 @@ class AutomationManager:
                     "ok": True,
                     "threadId": thread_id,
                     "queued": True,
-                    "started": False,
-                    "followupDepth": len(lane.followups),
-                }
+                "started": False,
+                "followupDepth": len(lane.followups),
+            }
+            self._prepare_lane_for_new_turn(lane, kind=TURN_KIND_USER)
             self._mark_lane_busy(lane)
 
             try:
@@ -4817,6 +5001,7 @@ class AutomationManager:
             live, _ = await _ensure_live_docker_session(session_id, allow_create=True)
             await self._ensure_initialized(live)
 
+            self._prepare_lane_for_new_turn(lane, kind=TURN_KIND_USER)
             self._mark_lane_busy(lane)
             try:
                 await self._ensure_thread_loaded_or_resumed(live, thread_id)
@@ -5327,6 +5512,7 @@ class AutomationManager:
         async with lane.lock:
             if lane.busy:
                 raise RuntimeError("isolated cron thread lane is unexpectedly busy")
+            self._prepare_lane_for_new_turn(lane, kind=TURN_KIND_CRON)
             self._mark_lane_busy(lane)
             try:
                 cron_block = "\n".join(
@@ -5617,6 +5803,7 @@ class AutomationManager:
                     self._note_session_failure(session_id, what="Heartbeat prepare", err=e)
                     continue
 
+                self._prepare_lane_for_new_turn(lane, kind=TURN_KIND_HEARTBEAT)
                 self._mark_lane_busy(lane)
                 try:
                     await self._ensure_thread_loaded_or_resumed(live, main_tid)
@@ -8529,6 +8716,7 @@ async def _ensure_live_docker_session(session_id: str, *, allow_create: bool) ->
         next_upstream_id=1_000_000_000,
         pending_server_requests={},
         outbox=deque(),
+        pending_client_turn_starts={},
         turn_owners_by_thread={},
     )
 
@@ -8566,14 +8754,23 @@ async def _ensure_live_docker_session(session_id: str, *, allow_create: bool) ->
                     if "id" in msg and "method" not in msg:
                         rid = str(msg.get("id"))
                         should_resolve = False
+                        client_turn_start_thread_id: Optional[str] = None
                         async with live.attach_lock:
                             if rid in live.pending_initialize_ids:
                                 live.pending_initialize_ids.discard(rid)
                                 if isinstance(msg.get("result"), dict):
                                     live.initialized_result = msg["result"]
                                     should_resolve = True
+                            client_turn_start_thread_id = live.pending_client_turn_starts.pop(rid, None)
                         if should_resolve:
                             await live.resolve_initialize_waiters()
+                        if client_turn_start_thread_id:
+                            automation: Optional[AutomationManager] = getattr(app.state, "automation", None)
+                            if automation is not None:
+                                try:
+                                    await automation.on_client_turn_start_response(session_id, client_turn_start_thread_id, msg)
+                                except Exception:
+                                    log.exception("Automation client turn-start response handler failed")
                         await live.resolve_internal_response(msg)
                         await live.deliver_response(msg)
                         continue
@@ -10500,6 +10697,16 @@ async def ws_proxy(ws: WebSocket):
                                 await ws.send_text(json.dumps({"id": req_id, "result": res}))
                             continue
 
+                        if method == "argus/turn/cancel":
+                            res = await automation.cancel_active_user_turn(
+                                session_id=session_id,
+                                thread_id=(params.get("threadId") if isinstance(params.get("threadId"), str) else None),
+                                target=(params.get("target") if isinstance(params.get("target"), str) else None),
+                            )
+                            if has_id:
+                                await ws.send_text(json.dumps({"id": req_id, "result": res}))
+                            continue
+
                         if method == "argus/systemEvent/enqueue":
                             text_param = params.get("text")
                             if not isinstance(text_param, str) or not text_param.strip():
@@ -10602,7 +10809,16 @@ async def ws_proxy(ws: WebSocket):
                         if isinstance(params, dict):
                             tid = params.get("threadId")
                             if isinstance(tid, str) and tid.strip():
-                                await live.set_turn_owner(thread_id=tid.strip(), ws=ws)
+                                tid_norm = tid.strip()
+                                await live.set_turn_owner(thread_id=tid_norm, ws=ws)
+                                automation: Optional[AutomationManager] = getattr(app.state, "automation", None)
+                                if automation is not None:
+                                    try:
+                                        automation.note_client_turn_start_requested(session_id, tid_norm)
+                                    except Exception:
+                                        log.exception("Automation client turn-start request handler failed")
+                                async with live.attach_lock:
+                                    live.pending_client_turn_starts[str(upstream_id)] = tid_norm
                     await live.write_upstream(json.dumps(rewritten))
                     continue
 

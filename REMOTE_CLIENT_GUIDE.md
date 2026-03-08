@@ -159,7 +159,7 @@ curl -sS -X DELETE -H "Authorization: Bearer $ARGUS_TOKEN" "http://$HOST:8080/se
 
 - `item/agentMessage/delta`：流式输出的增量文本（你需要拼接显示）
 - `item/completed`：某个 item 完成
-- `turn/completed`：本次 turn 完成（UI/客户端应在这里“解锁下一次发送”）
+- `turn/completed`：本次 turn 完成（UI/客户端应在这里“解锁下一次发送”；如果是取消，`turn.status` 会是 `interrupted`）
 
 #### 推荐：用网关的 `argus/input/enqueue`（支持 followup queue + 自动合并 systemEvent）
 
@@ -182,6 +182,39 @@ curl -sS -X DELETE -H "Authorization: Bearer $ARGUS_TOKEN" "http://$HOST:8080/se
 ```
 
 之后仍然是等 `turn/completed`（notification）来判断“这一轮结束”，并渲染最后的 agent message。
+
+#### 打断当前用户 turn：`argus/turn/cancel`
+
+如果你的客户端需要“立刻打断当前用户正在执行的 turn”，可以调用网关 helper：
+
+```json
+{"method":"argus/turn/cancel","id":4,"params":{"threadId":"thr_123"}}
+```
+
+私聊 / main thread 也可以直接写：
+
+```json
+{"method":"argus/turn/cancel","id":4,"params":{"target":"main"}}
+```
+
+响应示例（已接受取消请求）：
+
+```json
+{"id":4,"result":{"ok":true,"cancelRequested":true,"threadId":"thr_123","turnId":"turn_abc"}}
+```
+
+响应示例（当前没有可打断的用户 turn）：
+
+```json
+{"id":4,"result":{"ok":true,"cancelRequested":false,"reason":"NO_ACTIVE_USER_TURN","threadId":"thr_123"}}
+```
+
+注意：
+
+- 这个 helper **只会取消用户发起的 turn**
+- heartbeat / cron / 其他 system turn **不会**被这个 helper 打断
+- helper 返回 `cancelRequested=true` 只表示“已提交取消请求”；真正结束仍然以 `turn/completed` 通知为准
+- 被取消的 turn 会在 `turn/completed` 里带 `turn.status = "interrupted"`
 
 ### 4.4 Approvals（可能会出现的审批请求）
 

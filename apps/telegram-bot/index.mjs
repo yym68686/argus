@@ -25,6 +25,10 @@ function isNonEmptyString(value) {
   return typeof value === "string" && value.trim().length > 0;
 }
 
+function isObjectRecord(value) {
+  return !!value && typeof value === "object" && !Array.isArray(value);
+}
+
 function normalizeMessagePhase(value) {
   if (!isNonEmptyString(value)) return null;
   return value.trim().toLowerCase();
@@ -760,6 +764,13 @@ class ArgusClient {
     return await this.rpc("argus/input/enqueue", params, { timeoutMs: 120000 });
   }
 
+  async cancelTurn({ threadId, target } = {}) {
+    const params = {};
+    if (isNonEmptyString(threadId)) params.threadId = threadId;
+    if (isNonEmptyString(target)) params.target = target;
+    return await this.rpc("argus/turn/cancel", params, { timeoutMs: 15000 });
+  }
+
   _handleServerRequest(msg) {
     const id = msg.id;
     const method = msg.method;
@@ -974,7 +985,7 @@ function isServiceMessage(message) {
   return serviceKeys.some((k) => k in message);
 }
 
-const KNOWN_COMMANDS = new Set(["start", "menu", "help"]);
+const KNOWN_COMMANDS = new Set(["start", "menu", "help", "cancel"]);
 const LEGACY_COMMANDS = new Set(["new", "newmain", "where", "agents", "newagent", "useagent"]);
 
 function parseSlashCommand(text, botUsername) {
@@ -1163,6 +1174,12 @@ function normalizeAvailableModels(models) {
     notice_initialized_created: "Initialized: main created.",
     notice_initialized_exists: "Initialized: main exists.",
     notice_canceled: "Canceled.",
+    notice_cancel_requested: "Stopping the current turn…",
+    notice_stop_already_requested: "Stop already requested.",
+    notice_no_active_user_turn: "No active user turn to stop.",
+    notice_non_user_turn: "Current run isn't a user turn.",
+    notice_heartbeat_not_cancelable: "Heartbeat turns can't be stopped from chat.",
+    notice_turn_not_ready: "The current turn is still starting; try again in a moment.",
     notice_unbound_hint: "UNBOUND. Use Bind This Chat in /menu.",
     notice_legacy_moved: "/{cmd} has moved to /menu.",
     notice_unknown_command: "Unknown command: /{cmd}. Use /menu.",
@@ -1211,6 +1228,7 @@ function normalizeAvailableModels(models) {
 
     help_line_menu: "Use {menu} to open the control panel.",
     help_line_start: "First time: run {start} in a DM to initialize your main agent.",
+    help_line_cancel: "Use {cancel} to stop the current user turn.",
     help_line_private_more: "Switch Agent / Create Agent are available in the menu.",
     help_line_group_bind: "In groups/topics, bind the chat first ({bind}).",
     help_line_group_new: "Then use {newThread} to reset the conversation for this chat/topic.",
@@ -1320,6 +1338,12 @@ function normalizeAvailableModels(models) {
     notice_initialized_created: "已初始化：已创建 main。",
     notice_initialized_exists: "已初始化：main 已存在。",
     notice_canceled: "已取消。",
+    notice_cancel_requested: "正在停止当前任务……",
+    notice_stop_already_requested: "已经请求停止了。",
+    notice_no_active_user_turn: "当前没有可停止的用户任务。",
+    notice_non_user_turn: "当前运行的不是用户任务。",
+    notice_heartbeat_not_cancelable: "heartbeat 任务不能从聊天里停止。",
+    notice_turn_not_ready: "当前任务还在启动中，请稍后再试。",
     notice_unbound_hint: "未绑定：请用 /menu 里的“绑定当前群聊”。",
     notice_legacy_moved: "/{cmd} 已迁移到 /menu。",
     notice_unknown_command: "未知命令：/{cmd}。请用 /menu。",
@@ -1368,6 +1392,7 @@ function normalizeAvailableModels(models) {
 
     help_line_menu: "用 {menu} 打开控制面板。",
     help_line_start: "首次使用：先在私聊发送 {start} 完成初始化。",
+    help_line_cancel: "需要打断当前用户任务时，发送 {cancel}。",
     help_line_private_more: "切换/创建 agent 都在菜单里操作。",
     help_line_group_bind: "在群聊/话题里，先绑定（{bind}）。",
     help_line_group_new: "之后用 {newThread} 重新开一个 thread。",
@@ -1450,6 +1475,22 @@ function formatGatewayErrorForUser(err, { locale } = {}) {
   const channelAlready = /channel already exists:\s*([a-z0-9._-]+)/i.exec(msg);
   if (channelAlready) return formatTemplate(S.err_channel_exists, { name: channelAlready[1] });
   return `error: ${msg}`;
+}
+
+function formatCancelTurnResultForUser(result, { locale } = {}) {
+  const S = uiStrings(locale);
+  const payload = isObjectRecord(result) ? result : {};
+  if (payload.cancelRequested === true) {
+    return payload.alreadyRequested === true ? S.notice_stop_already_requested : S.notice_cancel_requested;
+  }
+  const reason = isNonEmptyString(payload.reason) ? payload.reason : "";
+  const activeKind = isNonEmptyString(payload.activeKind) ? payload.activeKind.toLowerCase() : "";
+  if (reason === "TURN_NOT_READY") return S.notice_turn_not_ready;
+  if (reason === "NON_USER_TURN") {
+    if (activeKind === "heartbeat") return S.notice_heartbeat_not_cancelable;
+    return S.notice_non_user_turn;
+  }
+  return S.notice_no_active_user_turn;
 }
 
 const TELEGRAM_HTML_PARSE_ERR_RE = /can't parse entities|parse entities|find end of the entity/i;
@@ -1708,20 +1749,24 @@ async function main() {
 
   const defaultCommands = [
     { command: "menu", description: "Open menu" },
+    { command: "cancel", description: "Stop current turn" },
     { command: "help", description: "Help" }
   ];
   const privateCommands = [
     { command: "start", description: "Initialize (private chat)" },
     { command: "menu", description: "Open menu" },
+    { command: "cancel", description: "Stop current turn" },
     { command: "help", description: "Help" }
   ];
   const defaultCommandsZh = [
     { command: "menu", description: "打开菜单" },
+    { command: "cancel", description: "停止当前任务" },
     { command: "help", description: "帮助" }
   ];
   const privateCommandsZh = [
     { command: "start", description: "初始化（私聊）" },
     { command: "menu", description: "打开菜单" },
+    { command: "cancel", description: "停止当前任务" },
     { command: "help", description: "帮助" }
   ];
   try {
@@ -2869,6 +2914,7 @@ async function main() {
     const lines = [];
     lines.push(`<b>${escapeHtml(S.title_help)}</b>`);
     lines.push(`- ${formatTemplate(S.help_line_menu, { menu: htmlCode("/menu") })}`);
+    lines.push(`- ${formatTemplate(S.help_line_cancel, { cancel: htmlCode("/cancel") })}`);
     if (forGroup) {
       lines.push(
         `- ${formatTemplate(S.help_line_group_bind, { bind: `<b>${escapeHtml(S.btn_bind_this_chat)}</b>` })}`
@@ -3591,6 +3637,8 @@ async function main() {
         try {
           if (slash?.forOtherBot) return;
           if (slash || looksSlash) {
+            const pendingBeforeSlash = isPrivateChatType(chatType) ? getPendingAgentInput(chatKey) : null;
+            const hadPendingBeforeSlash = !!pendingBeforeSlash;
             clearPendingAgentInput(chatKey);
             if (slash?.known && slash.cmd === "start") {
               if (!isPrivateChatType(chatType)) {
@@ -3617,6 +3665,54 @@ async function main() {
                 menuMessageId: sent?.message_id,
                 commandMessageId: message?.message_id
               });
+              return;
+            }
+
+            if (slash?.known && slash.cmd === "cancel") {
+              let notice = hadPendingBeforeSlash ? S.notice_canceled : S.notice_no_active_user_turn;
+              try {
+                const route = await resolveRouteForChatKey(chatKey);
+                const sessionId = route.sessionId;
+                const client = await getClient(sessionId);
+                let cancelThreadId = state.getThreadId(sessionId, chatKey);
+                let cancelTarget = null;
+
+                if (isPrivateChatType(chatType)) {
+                  cancelTarget = "main";
+                  cancelThreadId = null;
+                } else if (!isNonEmptyString(cancelThreadId)) {
+                  await safeSendMessage({ ...target, text: hadPendingBeforeSlash ? S.notice_canceled : S.notice_no_active_user_turn });
+                  return;
+                }
+
+                const res = await client.cancelTurn({ threadId: cancelThreadId, target: cancelTarget });
+                notice = formatCancelTurnResultForUser(res, { locale });
+                if (
+                  hadPendingBeforeSlash &&
+                  isObjectRecord(res) &&
+                  res.cancelRequested !== true &&
+                  res.reason === "NO_ACTIVE_USER_TURN"
+                ) {
+                  notice = S.notice_canceled;
+                }
+                if (isObjectRecord(res) && res.cancelRequested === true) {
+                  typing.stop(chatKey);
+                }
+              } catch (e) {
+                const rawMsg = e instanceof Error ? e.message : String(e);
+                const msg2 = formatGatewayErrorForUser(e, { locale });
+                if (hadPendingBeforeSlash) {
+                  notice = S.notice_canceled;
+                } else if (
+                  msg2 === S.err_not_initialized ||
+                  /no agent bound|unknown session|agent has no sessionid/i.test(rawMsg)
+                ) {
+                  notice = S.notice_no_active_user_turn;
+                } else {
+                  notice = msg2;
+                }
+              }
+              await safeSendMessage({ ...target, text: notice });
               return;
             }
 
