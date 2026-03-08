@@ -375,11 +375,11 @@ SKILLS_DIRNAME = "skills"
 SKILL_MD_FILENAME = "SKILL.md"
 
 PROJECT_CONTEXT_FILENAMES: list[str] = [AGENTS_FILENAME, SOUL_FILENAME, USER_FILENAME]
-WORKSPACE_BOOTSTRAP_TEMPLATES: list[tuple[str, str]] = [
-    (AGENTS_TEMPLATE_FILENAME, AGENTS_FILENAME),
-    (SOUL_FILENAME, SOUL_FILENAME),
-    (USER_FILENAME, USER_FILENAME),
-    (HEARTBEAT_FILENAME, HEARTBEAT_FILENAME),
+WORKSPACE_TEMPLATE_SYNC_RULES: list[tuple[str, str, bool]] = [
+    (AGENTS_TEMPLATE_FILENAME, AGENTS_FILENAME, True),
+    (SOUL_FILENAME, SOUL_FILENAME, False),
+    (USER_FILENAME, USER_FILENAME, False),
+    (HEARTBEAT_FILENAME, HEARTBEAT_FILENAME, False),
 ]
 
 def _strip_heartbeat_token_at_edges(raw: str, token: str) -> tuple[str, bool]:
@@ -1272,6 +1272,36 @@ def _load_template_text(template_filename: str) -> Optional[str]:
 
 def _load_heartbeat_template_text() -> str:
     return _load_template_text(HEARTBEAT_FILENAME) or "# HEARTBEAT.md\n\n"
+
+
+def _render_workspace_template_content(template_filename: str, target_filename: str) -> str:
+    template_raw = _load_template_text(template_filename) or f"# {target_filename}\n"
+    template_clean = _strip_yaml_front_matter(template_raw).strip()
+    if template_clean:
+        return template_clean + "\n"
+    return f"# {target_filename}\n"
+
+
+def _sync_workspace_template_file(
+    workspace_root: Path,
+    *,
+    template_filename: str,
+    target_filename: str,
+    overwrite_existing: bool,
+) -> None:
+    target_path = workspace_root / target_filename
+    if target_path.exists() and not overwrite_existing:
+        return
+
+    rendered = _render_workspace_template_content(template_filename, target_filename)
+    if target_path.exists():
+        try:
+            if target_path.read_text(encoding="utf-8") == rendered:
+                return
+        except Exception:
+            pass
+
+    _atomic_write_text(target_path, rendered)
 
 
 @dataclass
@@ -3707,20 +3737,26 @@ class AutomationManager:
     async def _ensure_workspace_files_at(self, root: Path) -> None:
         def _ensure() -> None:
             root.mkdir(parents=True, exist_ok=True)
-            for template_name, target_name in WORKSPACE_BOOTSTRAP_TEMPLATES:
-                target_path = root / target_name
-                if target_path.exists():
-                    continue
-
-                template_raw = _load_template_text(template_name) or f"# {target_name}\n"
-                template_clean = _strip_yaml_front_matter(template_raw).strip()
-                if template_clean:
-                    template_clean += "\n"
-                _atomic_write_text(target_path, template_clean or f"# {target_name}\n")
+            for template_name, target_name, overwrite_existing in WORKSPACE_TEMPLATE_SYNC_RULES:
+                _sync_workspace_template_file(
+                    root,
+                    template_filename=template_name,
+                    target_filename=target_name,
+                    overwrite_existing=overwrite_existing,
+                )
 
             _bootstrap_workspace_skill_templates(root)
 
         await asyncio.to_thread(_ensure)
+
+    async def _sync_workspace_agents_file_at(self, root: Path) -> None:
+        await asyncio.to_thread(
+            _sync_workspace_template_file,
+            root,
+            template_filename=AGENTS_TEMPLATE_FILENAME,
+            target_filename=AGENTS_FILENAME,
+            overwrite_existing=True,
+        )
 
     async def stop(self) -> None:
         for t in self._tasks:
@@ -5375,6 +5411,11 @@ class AutomationManager:
         root = self._workspace_root_for_session(session_id)
         if root is None:
             return ""
+
+        try:
+            await self._sync_workspace_agents_file_at(root)
+        except Exception:
+            log.exception("Failed to refresh AGENTS.md from template at %s", str(root))
 
         filenames = list(PROJECT_CONTEXT_FILENAMES)
         if include_heartbeat:

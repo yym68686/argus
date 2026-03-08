@@ -194,12 +194,14 @@ cp .env.example .env
   - 通用 `/ws` session：`${ARGUS_HOME_HOST_PATH}/workspaces/sess-<sessionId>`
     - 如果设置了 `ARGUS_WORKSPACE_HOST_PATH`，通用 session 会改用 `${ARGUS_WORKSPACE_HOST_PATH}/sess-<sessionId>`。
 
-首次运行时，runtime 会在 workspace 根目录初始化这些文件（**仅在缺失时创建，不会覆盖已有文件**）：
+runtime 会管理这些 workspace 文件：
 
-- `AGENTS.md`（来自 `docs/templates/AGENTS.default.md`）
-- `SOUL.md`
-- `USER.md`
-- `HEARTBEAT.md`
+- `AGENTS.md`（从 `docs/templates/AGENTS.default.md` 同步；模板更新后会自动刷新到 workspace 副本）
+- `SOUL.md`（缺失时创建）
+- `USER.md`（缺失时创建）
+- `HEARTBEAT.md`（缺失时创建）
+
+如果你希望 agent 指令有持久修改，请编辑 `docs/templates/AGENTS.default.md`，不要改某个 workspace 里的 `AGENTS.md` 副本。
 
 这些文件会组成“项目上下文”。每一轮 turn 都会注入 `AGENTS.md` / `SOUL.md` / `USER.md`；**只有 heartbeat turn 才会注入 `HEARTBEAT.md`**。
 

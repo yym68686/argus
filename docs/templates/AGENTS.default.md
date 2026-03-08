@@ -64,6 +64,10 @@ Example (Telegram progress update):
 - Long-term memory: `memory.md` for durable facts, preferences, and decisions.
 - On session start, read today + yesterday + `memory.md` if present.
 - Capture: decisions, preferences, constraints, open loops.
+- If the user repeats the same stable environment fact or workflow/output preference twice, add a concise bullet to `memory.md` in the same turn.
+- If the user explicitly says a workflow or preference should apply in future turns, write that rule into `memory.md` immediately instead of only acknowledging it in chat.
+- Before the final reply, check whether this turn introduced a durable fact, future-turn workflow, or output preference worth preserving; if yes, update `memory.md` first.
+- Do not store secrets, one-off task details, speculative assumptions, or transient corrections in `memory.md`.
 - Avoid secrets unless explicitly requested.
 
 ## Backup tip (recommended)

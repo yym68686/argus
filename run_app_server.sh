@@ -14,6 +14,26 @@ mkdir -p "$APP_HOME_DIR" "$APP_WORKSPACE_DIR"
 
 TEMPLATE_DIR="/app/docs/templates"
 
+write_workspace_file_from_template() {
+  src="$1"
+  dst="$2"
+  tmp="${dst}.tmp.$$"
+
+  if [ -f "$src" ]; then
+    # Strip YAML front matter if present (--- ... --- at top).
+    awk 'NR==1{if($0=="---"){fm=1; next}} fm==1{if($0=="---"){fm=0; next} next} {print}' "$src" > "$tmp"
+  else
+    printf '# %s\n' "$(basename "$dst")" > "$tmp"
+  fi
+
+  if [ -f "$dst" ] && cmp -s "$tmp" "$dst"; then
+    rm -f "$tmp"
+    return 0
+  fi
+
+  mv -f "$tmp" "$dst"
+}
+
 bootstrap_workspace_file() {
   src="$1"
   dst="$2"
@@ -22,18 +42,20 @@ bootstrap_workspace_file() {
     return 0
   fi
 
-  if [ -f "$src" ]; then
-    # Strip YAML front matter if present (--- ... --- at top).
-    awk 'NR==1{if($0=="---"){fm=1; next}} fm==1{if($0=="---"){fm=0; next} next} {print}' "$src" > "$dst"
-  else
-    printf '# %s\n' "$(basename "$dst")" > "$dst"
-  fi
+  write_workspace_file_from_template "$src" "$dst"
 }
 
-# Bootstrap "OpenClaw-style" workspace context files (do not overwrite if already present).
+sync_workspace_file() {
+  src="$1"
+  dst="$2"
+
+  write_workspace_file_from_template "$src" "$dst"
+}
+
+# Sync AGENTS.md from the template on every start; bootstrap the rest if missing.
+sync_workspace_file "$TEMPLATE_DIR/AGENTS.default.md" "$APP_WORKSPACE_DIR/AGENTS.md"
 bootstrap_workspace_file "$TEMPLATE_DIR/SOUL.md" "$APP_WORKSPACE_DIR/SOUL.md"
 bootstrap_workspace_file "$TEMPLATE_DIR/USER.md" "$APP_WORKSPACE_DIR/USER.md"
-bootstrap_workspace_file "$TEMPLATE_DIR/AGENTS.default.md" "$APP_WORKSPACE_DIR/AGENTS.md"
 bootstrap_workspace_file "$TEMPLATE_DIR/HEARTBEAT.md" "$APP_WORKSPACE_DIR/HEARTBEAT.md"
 
 # Scope Codex state (threads/history, config, etc.) to the workspace by default.

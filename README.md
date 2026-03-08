@@ -194,12 +194,14 @@ Each runtime session container mounts a **single host workspace directory** at `
   - Generic `/ws` sessions: `${ARGUS_HOME_HOST_PATH}/workspaces/sess-<sessionId>`
     - If `ARGUS_WORKSPACE_HOST_PATH` is set, generic sessions use `${ARGUS_WORKSPACE_HOST_PATH}/sess-<sessionId>` instead.
 
-On first run, the runtime bootstraps these workspace files **if missing** (it will not overwrite existing files):
+The runtime manages these workspace files:
 
-- `AGENTS.md` (from `docs/templates/AGENTS.default.md`)
-- `SOUL.md`
-- `USER.md`
-- `HEARTBEAT.md`
+- `AGENTS.md` (synced from `docs/templates/AGENTS.default.md`; template updates automatically refresh the workspace copy)
+- `SOUL.md` (created if missing)
+- `USER.md` (created if missing)
+- `HEARTBEAT.md` (created if missing)
+
+If you want a durable change to the managed agent instructions, edit `docs/templates/AGENTS.default.md` instead of a per-workspace `AGENTS.md` copy.
 
 These files are used to build the assistant’s “project context”. Every turn injects `AGENTS.md` / `SOUL.md` / `USER.md`; **`HEARTBEAT.md` is injected only for heartbeat turns**.
 
