@@ -32,6 +32,10 @@ RUNTIME_LAYOUT = "root_argus_v1"
 RUNTIME_SESSION_ID_RE = re.compile(r"^[a-f0-9]{12}$")
 
 
+class UpstreamSessionClosedError(RuntimeError):
+    pass
+
+
 @dataclass(frozen=True)
 class Upstream:
     host: str
@@ -260,11 +264,38 @@ class LiveDockerSession:
                 await self.detach(ws)
                 break
 
+    async def close_attached_websockets(self, *, code: int, reason: str) -> None:
+        async with self.attach_lock:
+            targets = list(self.attached_wss)
+        if targets:
+            log.info("Closing %s downstream websocket(s) for session %s: %s", len(targets), self.session_id, reason)
+        for ws in targets:
+            if ws.client_state == WebSocketState.CONNECTED:
+                try:
+                    await ws.close(code=code, reason=reason)
+                except Exception:
+                    pass
+            await self.detach(ws)
+
     async def write_upstream(self, text: str) -> None:
+        try:
+            writer_closing = self.writer.is_closing()
+        except Exception:
+            writer_closing = False
+        if self.closed or writer_closing:
+            raise UpstreamSessionClosedError(f"Upstream session {self.session_id} is closed")
         if not text.endswith("\n"):
             text += "\n"
-        self.writer.write(text.encode("utf-8"))
-        await self.writer.drain()
+        try:
+            self.writer.write(text.encode("utf-8"))
+            await self.writer.drain()
+        except Exception as e:
+            self.closed = True
+            try:
+                self.writer.close()
+            except Exception:
+                pass
+            raise UpstreamSessionClosedError(f"Upstream session {self.session_id} is closed") from e
 
 
 def _now_ms() -> int:
@@ -9020,8 +9051,14 @@ async def _read_jsonl_line(
 async def _ensure_live_docker_session(session_id: str, *, allow_create: bool) -> tuple[LiveDockerSession, bool]:
     async with app.state.sessions_lock:
         existing = app.state.sessions.get(session_id)
-    if existing is not None and not existing.closed:
-        return existing, False
+    if existing is not None:
+        try:
+            writer_closing = existing.writer.is_closing()
+        except Exception:
+            writer_closing = False
+        if not existing.closed and not writer_closing:
+            return existing, False
+        log.info("Ignoring stale live session for %s (closed=%s, writer_closing=%s)", session_id, existing.closed, writer_closing)
 
     cfg = _docker_cfg()
     # Resolve a per-session workspace host path (used as the *only* persistent mount for the runtime).
@@ -9092,6 +9129,7 @@ async def _ensure_live_docker_session(session_id: str, *, allow_create: bool) ->
             while True:
                 raw = await _read_jsonl_line(live.reader, buf, max_line_bytes=cfg.jsonl_line_limit_bytes)
                 if raw is None:
+                    log.info("Upstream TCP closed for session %s", session_id)
                     break
                 text = raw.decode("utf-8", errors="replace").rstrip("\r")
 
@@ -9175,6 +9213,7 @@ async def _ensure_live_docker_session(session_id: str, *, allow_create: bool) ->
                 current = app.state.sessions.get(session_id)
                 if current is live:
                     app.state.sessions.pop(session_id, None)
+            await live.close_attached_websockets(code=1011, reason="Upstream session closed")
             automation: Optional[AutomationManager] = getattr(app.state, "automation", None)
             if automation is not None:
                 try:
@@ -11195,6 +11234,13 @@ async def ws_proxy(ws: WebSocket):
                     continue
 
                 await live.write_upstream(text)
+        except UpstreamSessionClosedError:
+            log.info("Session %s upstream closed while proxying websocket traffic", session_id)
+            if ws.client_state == WebSocketState.CONNECTED:
+                try:
+                    await ws.close(code=1011, reason="Upstream session closed")
+                except Exception:
+                    pass
         finally:
             await live.detach(ws)
             log.info("Session %s detached (codex process retained)", session_id)
