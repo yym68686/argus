@@ -1279,15 +1279,15 @@ function normalizeAvailableModels(models) {
 
     group_bind_first: "Bind this group to an agent first. All topics will use it by default.",
 
-    bind_select_agent: "Select an agent for this group. All topics will use it by default.",
+    bind_select_agent: "Select an agent for this topic/group. If the group has no default binding yet, this becomes the default for all topics.",
     bind_hint_start: "Hint: DM the bot and create an agent (via /menu).",
 
     help_line_menu: "Use {menu} to open the control panel.",
     help_line_start: "First time: run {start} in a DM to initialize your main agent.",
     help_line_cancel: "Use {cancel} to stop the current user turn.",
     help_line_private_more: "Switch Agent / Create Agent are available in the menu.",
-    help_line_group_bind: "In groups/topics, bind the group once ({bind}).",
-    help_line_group_new: "Then use {newThread} to reset the whole group's conversation.",
+    help_line_group_bind: "In groups/topics, bind a default agent once ({bind}); topics can later switch independently.",
+    help_line_group_new: "Then use {newThread} to reset the current agent's conversation.",
 
     title_api_channels: "API Channels",
     title_channel_detail: "API Channel",
@@ -1446,15 +1446,15 @@ function normalizeAvailableModels(models) {
 
     group_bind_first: "请先把当前群聊绑定到某个 agent；绑定后所有 topic 默认共用它。",
 
-    bind_select_agent: "选择一个 agent 作为当前群聊的默认路由；所有 topic 默认共用它。",
+    bind_select_agent: "为当前话题/群选择 agent。若当前群还没有默认绑定，这次选择会成为所有 topic 的默认 agent。",
     bind_hint_start: "提示：先私聊 bot，用 /menu 创建一个 agent。",
 
     help_line_menu: "用 {menu} 打开控制面板。",
     help_line_start: "首次使用：先在私聊发送 {start} 完成初始化。",
     help_line_cancel: "需要打断当前用户任务时，发送 {cancel}。",
     help_line_private_more: "切换/创建 agent 都在菜单里操作。",
-    help_line_group_bind: "在群聊/话题里，先给整个群绑定一次（{bind}）。",
-    help_line_group_new: "之后用 {newThread} 重置整个群的对话。",
+    help_line_group_bind: "在群聊/话题里，先给整个群绑定一个默认 agent（{bind}）；之后各个 topic 也可以单独切换。",
+    help_line_group_new: "之后用 {newThread} 重置当前 agent 的对话。",
 
     title_api_channels: "API 渠道",
     title_channel_detail: "API 渠道",

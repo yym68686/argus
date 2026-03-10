@@ -848,6 +848,22 @@ def _telegram_group_binding_key_from_chat_key(chat_key: Any) -> Optional[str]:
     return str(chat_id)
 
 
+def _telegram_topic_id_from_chat_key(chat_key: Any) -> Optional[int]:
+    if not isinstance(chat_key, str) or not chat_key.strip():
+        return None
+    parts = chat_key.strip().split(":", 1)
+    if len(parts) != 2:
+        return None
+    topic_raw = parts[1].strip()
+    if not topic_raw:
+        return None
+    try:
+        topic_id = int(topic_raw)
+    except Exception:
+        return None
+    return topic_id if topic_id > 0 else None
+
+
 def _chat_binding_lookup_keys(chat_key: Any) -> list[str]:
     if not isinstance(chat_key, str):
         return []
@@ -856,12 +872,11 @@ def _chat_binding_lookup_keys(chat_key: Any) -> list[str]:
         return []
     out: list[str] = []
     group_key = _telegram_group_binding_key_from_chat_key(ck)
-    # Prefer the group-level binding so one bind covers all topics. Fall back to
-    # the exact topic key for compatibility with older persisted state.
-    if group_key:
+    # Topic-specific bindings override the group's default binding.
+    out.append(ck)
+    # Fall back to the group's default binding when a topic has no override.
+    if group_key and group_key not in out:
         out.append(group_key)
-    if ck not in out:
-        out.append(ck)
     return out
 
 
@@ -871,7 +886,7 @@ def _chat_binding_storage_key(chat_key: Any) -> str:
     ck = chat_key.strip()
     if not ck:
         return ""
-    return _telegram_group_binding_key_from_chat_key(ck) or ck
+    return ck
 
 
 def _telegram_private_chat_id_from_chat_key(chat_key: Any) -> Optional[int]:
@@ -10308,10 +10323,10 @@ async def automation_chat_bind(request: Request):
     if not isinstance(raw_chat_key, str) or not raw_chat_key.strip():
         raise HTTPException(status_code=400, detail="Missing 'chatKey'")
     chat_key = raw_chat_key.strip()
-    binding_chat_key = _chat_binding_storage_key(chat_key)
-    if not binding_chat_key:
-        raise HTTPException(status_code=400, detail="Invalid 'chatKey'")
     group_binding_key = _telegram_group_binding_key_from_chat_key(chat_key)
+    topic_id = _telegram_topic_id_from_chat_key(chat_key)
+    is_topic_chat = isinstance(group_binding_key, str) and group_binding_key and chat_key != group_binding_key
+    is_general_topic = topic_id == 1
 
     actor_user_id: Optional[int] = None
     if raw_actor is not None:
@@ -10341,17 +10356,55 @@ async def automation_chat_bind(request: Request):
     if not automation._can_user_access_agent(user_id=actor_user_id, agent=agent):
         raise HTTPException(status_code=403, detail="Forbidden")
 
+    st0 = automation._store.state
+    existing_bindings = getattr(st0, "chat_bindings", None)
+    group_default_agent_id = (
+        existing_bindings.get(group_binding_key)
+        if isinstance(existing_bindings, dict) and isinstance(group_binding_key, str) and group_binding_key
+        else None
+    )
+    group_has_any_binding = False
+    if isinstance(existing_bindings, dict) and isinstance(group_binding_key, str) and group_binding_key:
+        prefix = f"{group_binding_key}:"
+        for bound_ck in existing_bindings.keys():
+            if not isinstance(bound_ck, str) or not bound_ck.strip():
+                continue
+            ck_norm = bound_ck.strip()
+            if ck_norm == group_binding_key or ck_norm.startswith(prefix):
+                group_has_any_binding = True
+                break
+
+    binding_chat_key = _chat_binding_storage_key(chat_key)
+    if not binding_chat_key:
+        raise HTTPException(status_code=400, detail="Invalid 'chatKey'")
+    if is_topic_chat:
+        if is_general_topic or not group_has_any_binding:
+            binding_chat_key = group_binding_key or binding_chat_key
+        elif (
+            isinstance(group_binding_key, str)
+            and group_binding_key
+            and isinstance(group_default_agent_id, str)
+            and group_default_agent_id.strip() == agent_id
+        ):
+            binding_chat_key = group_binding_key
+        else:
+            binding_chat_key = chat_key
+
     def _write(st: PersistedGatewayAutomationState) -> None:
         st.version = max(int(getattr(st, "version", 1) or 1), AUTOMATION_STATE_VERSION)
-        if group_binding_key:
-            prefix = f"{group_binding_key}:"
-            for bound_ck in list(st.chat_bindings.keys()):
-                if not isinstance(bound_ck, str):
-                    continue
-                ck_norm = bound_ck.strip()
-                if ck_norm == group_binding_key or ck_norm.startswith(prefix):
-                    st.chat_bindings.pop(bound_ck, None)
-        st.chat_bindings[binding_chat_key] = agent_id
+        # Topic switches should not overwrite the group's default binding or
+        # other topics' overrides. Only the chosen binding key is updated.
+        if (
+            is_topic_chat
+            and not is_general_topic
+            and isinstance(group_binding_key, str)
+            and group_binding_key
+            and isinstance(group_default_agent_id, str)
+            and group_default_agent_id.strip() == agent_id
+        ):
+            st.chat_bindings.pop(chat_key, None)
+        else:
+            st.chat_bindings[binding_chat_key] = agent_id
 
     await automation._store.update(_write)
     return {
