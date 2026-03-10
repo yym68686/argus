@@ -828,6 +828,52 @@ def _telegram_target_from_chat_key(chat_key: str) -> Optional[dict[str, Any]]:
     return out
 
 
+def _telegram_chat_id_from_chat_key(chat_key: Any) -> Optional[int]:
+    if not isinstance(chat_key, str) or not chat_key.strip():
+        return None
+    chat_id_raw = chat_key.strip().split(":", 1)[0].strip()
+    if not chat_id_raw:
+        return None
+    try:
+        chat_id = int(chat_id_raw)
+    except Exception:
+        return None
+    return chat_id if chat_id != 0 else None
+
+
+def _telegram_group_binding_key_from_chat_key(chat_key: Any) -> Optional[str]:
+    chat_id = _telegram_chat_id_from_chat_key(chat_key)
+    if not isinstance(chat_id, int) or chat_id >= 0:
+        return None
+    return str(chat_id)
+
+
+def _chat_binding_lookup_keys(chat_key: Any) -> list[str]:
+    if not isinstance(chat_key, str):
+        return []
+    ck = chat_key.strip()
+    if not ck:
+        return []
+    out: list[str] = []
+    group_key = _telegram_group_binding_key_from_chat_key(ck)
+    # Prefer the group-level binding so one bind covers all topics. Fall back to
+    # the exact topic key for compatibility with older persisted state.
+    if group_key:
+        out.append(group_key)
+    if ck not in out:
+        out.append(ck)
+    return out
+
+
+def _chat_binding_storage_key(chat_key: Any) -> str:
+    if not isinstance(chat_key, str):
+        return ""
+    ck = chat_key.strip()
+    if not ck:
+        return ""
+    return _telegram_group_binding_key_from_chat_key(ck) or ck
+
+
 def _telegram_private_chat_id_from_chat_key(chat_key: Any) -> Optional[int]:
     if not isinstance(chat_key, str) or not chat_key.strip():
         return None
@@ -870,6 +916,8 @@ def _create_turn_text_entry() -> dict[str, Any]:
         "agentMessageTextByItemId": {},
         "activeAgentMessageItemId": None,
         "draft": None,
+        "sourceChannel": None,
+        "sourceChatKey": None,
     }
 
 
@@ -2295,6 +2343,8 @@ class ThreadLane:
     active_turn_id: Optional[str] = None
     active_turn_kind: Optional[str] = None
     pending_client_turn_kind: Optional[str] = None
+    pending_source_channel: Optional[str] = None
+    pending_source_chat_key: Optional[str] = None
     cancel_requested: bool = False
     followups: deque[Any] = field(default_factory=deque)
     busy_since_ms: Optional[int] = None
@@ -2378,13 +2428,15 @@ class AutomationManager:
         return ARGUS_AGENT_MODEL_DEFAULT
 
     def resolve_agent_for_chat_key(self, chat_key: str) -> str:
-        ck = chat_key.strip() if isinstance(chat_key, str) else ""
-        if not ck:
-            return ""
         st = self._store.state
-        agent_id = st.chat_bindings.get(ck) if isinstance(st.chat_bindings, dict) else None
-        agent_id = _normalize_agent_id(agent_id) if isinstance(agent_id, str) else ""
-        return agent_id
+        if not isinstance(st.chat_bindings, dict):
+            return ""
+        for lookup_key in _chat_binding_lookup_keys(chat_key):
+            agent_id = st.chat_bindings.get(lookup_key)
+            agent_id = _normalize_agent_id(agent_id) if isinstance(agent_id, str) else ""
+            if agent_id:
+                return agent_id
+        return ""
 
     def resolve_agent_session_id(self, agent_id: str) -> Optional[str]:
         aid = _normalize_agent_id(agent_id)
@@ -3817,6 +3869,8 @@ class AutomationManager:
     def _prepare_lane_for_new_turn(self, lane: ThreadLane, *, kind: str) -> None:
         lane.active_turn_kind = self._normalize_turn_kind(kind)
         lane.pending_client_turn_kind = None
+        lane.pending_source_channel = None
+        lane.pending_source_chat_key = None
         lane.cancel_requested = False
 
     def _queue_pending_client_turn(self, lane: ThreadLane, *, kind: str) -> None:
@@ -3825,6 +3879,23 @@ class AutomationManager:
 
     def _clear_pending_client_turn(self, lane: ThreadLane) -> None:
         lane.pending_client_turn_kind = None
+
+    def _set_pending_turn_source(
+        self,
+        lane: ThreadLane,
+        *,
+        source_channel: Optional[str],
+        source_chat_key: Optional[str],
+    ) -> None:
+        lane.pending_source_channel = source_channel.strip() if isinstance(source_channel, str) and source_channel.strip() else None
+        lane.pending_source_chat_key = source_chat_key.strip() if isinstance(source_chat_key, str) and source_chat_key.strip() else None
+
+    def _consume_pending_turn_source(self, lane: ThreadLane) -> tuple[Optional[str], Optional[str]]:
+        source_channel = lane.pending_source_channel
+        source_chat_key = lane.pending_source_chat_key
+        lane.pending_source_channel = None
+        lane.pending_source_chat_key = None
+        return source_channel, source_chat_key
 
     def note_client_turn_start_requested(self, session_id: str, thread_id: str) -> None:
         sid = session_id.strip() if isinstance(session_id, str) else ""
@@ -3992,6 +4063,8 @@ class AutomationManager:
         lane.active_turn_id = None
         lane.active_turn_kind = None
         lane.pending_client_turn_kind = None
+        lane.pending_source_channel = None
+        lane.pending_source_chat_key = None
         lane.cancel_requested = False
         lane.busy_since_ms = None
         lane.last_progress_at_ms = None
@@ -4051,11 +4124,124 @@ class AutomationManager:
         self._cancel_turn_draft_task(entry.get("draft"))
         return entry
 
+    def _remember_turn_source_context(
+        self,
+        *,
+        session_id: str,
+        thread_id: Optional[str],
+        turn_id: Optional[str],
+        source_channel: Optional[str],
+        source_chat_key: Optional[str],
+    ) -> None:
+        tid = thread_id.strip() if isinstance(thread_id, str) and thread_id.strip() else None
+        run_id = turn_id.strip() if isinstance(turn_id, str) and turn_id.strip() else None
+        channel = source_channel.strip() if isinstance(source_channel, str) and source_channel.strip() else None
+        chat_key = source_chat_key.strip() if isinstance(source_chat_key, str) and source_chat_key.strip() else None
+        if not tid or not run_id or not channel or not chat_key:
+            return
+        entry = self._get_turn_text_entry((session_id, tid, run_id))
+        entry["sourceChannel"] = channel
+        entry["sourceChatKey"] = chat_key
+
+    def _peek_turn_source_context(
+        self,
+        *,
+        session_id: str,
+        thread_id: Optional[str],
+        turn_id: Optional[str],
+    ) -> tuple[Optional[str], Optional[str]]:
+        tid = thread_id.strip() if isinstance(thread_id, str) and thread_id.strip() else None
+        run_id = turn_id.strip() if isinstance(turn_id, str) and turn_id.strip() else None
+        if not tid or not run_id:
+            return None, None
+        entry = self._turn_text_by_key.get((session_id, tid, run_id))
+        if not isinstance(entry, dict):
+            return None, None
+        source_channel = entry.get("sourceChannel")
+        source_chat_key = entry.get("sourceChatKey")
+        channel = source_channel.strip() if isinstance(source_channel, str) and source_channel.strip() else None
+        chat_key = source_chat_key.strip() if isinstance(source_chat_key, str) and source_chat_key.strip() else None
+        return channel, chat_key
+
+    def _inject_source_context_into_notification(
+        self,
+        params: dict[str, Any],
+        *,
+        source_channel: Optional[str],
+        source_chat_key: Optional[str],
+    ) -> None:
+        channel = source_channel.strip() if isinstance(source_channel, str) and source_channel.strip() else None
+        chat_key = source_chat_key.strip() if isinstance(source_chat_key, str) and source_chat_key.strip() else None
+        if not channel or not chat_key:
+            return
+        if channel.lower() not in ("telegram", "tg"):
+            return
+        params["sourceChannel"] = channel
+        params["sourceChatKey"] = chat_key
+        params["source"] = {"channel": channel, "chatKey": chat_key}
+
+    async def _touch_last_active_target(
+        self,
+        *,
+        session_id: str,
+        thread_id: Optional[str],
+        source_channel: Optional[str],
+        source_chat_key: Optional[str],
+    ) -> None:
+        tid = thread_id.strip() if isinstance(thread_id, str) and thread_id.strip() else None
+        channel = source_channel.strip() if isinstance(source_channel, str) and source_channel.strip() else None
+        chat_key = source_chat_key.strip() if isinstance(source_chat_key, str) and source_chat_key.strip() else None
+        if not tid or not channel or not chat_key:
+            return
+
+        def _touch(st: PersistedGatewayAutomationState) -> None:
+            sess = st.sessions.get(session_id)
+            if sess is None:
+                sess = PersistedSessionAutomation()
+                st.sessions[session_id] = sess
+            sess.last_active_by_thread[tid] = PersistedLastActiveTarget(
+                channel=channel,
+                chat_key=chat_key,
+                at_ms=_now_ms(),
+            )
+
+        await self._store.update(_touch)
+
+    def _resolve_telegram_target_for_source(
+        self,
+        *,
+        source_channel: Optional[str],
+        source_chat_key: Optional[str],
+    ) -> Optional[tuple[str, dict[str, Any], str]]:
+        channel = source_channel.strip().lower() if isinstance(source_channel, str) and source_channel.strip() else ""
+        if channel not in ("telegram", "tg"):
+            return None
+        token = os.getenv("TELEGRAM_BOT_TOKEN") or ""
+        if not token.strip():
+            return None
+        chat_key = source_chat_key.strip() if isinstance(source_chat_key, str) and source_chat_key.strip() else ""
+        if not chat_key:
+            return None
+        target = _telegram_target_from_chat_key(chat_key)
+        if target is None:
+            return None
+        return token, target, chat_key
+
     def _resolve_telegram_target_for_turn(
         self,
         session_id: str,
         thread_id: str,
+        turn_id: Optional[str] = None,
     ) -> Optional[tuple[str, dict[str, Any], str]]:
+        if isinstance(turn_id, str) and turn_id.strip():
+            entry = self._turn_text_by_key.get((session_id, thread_id, turn_id.strip()))
+            if isinstance(entry, dict):
+                resolved = self._resolve_telegram_target_for_source(
+                    source_channel=entry.get("sourceChannel"),
+                    source_chat_key=entry.get("sourceChatKey"),
+                )
+                if resolved is not None:
+                    return resolved
         st = self._store.state
         sess = st.sessions.get(session_id)
         if sess is None:
@@ -4063,19 +4249,10 @@ class AutomationManager:
         tgt = sess.last_active_by_thread.get(thread_id)
         if tgt is None or not isinstance(tgt, PersistedLastActiveTarget):
             return None
-        channel = (tgt.channel or "").strip().lower()
-        if channel not in ("telegram", "tg"):
-            return None
-        token = os.getenv("TELEGRAM_BOT_TOKEN") or ""
-        if not token.strip():
-            return None
-        chat_key = tgt.chat_key.strip() if isinstance(tgt.chat_key, str) else ""
-        if not chat_key:
-            return None
-        target = _telegram_target_from_chat_key(chat_key)
-        if target is None:
-            return None
-        return token, target, chat_key
+        return self._resolve_telegram_target_for_source(
+            source_channel=tgt.channel,
+            source_chat_key=tgt.chat_key,
+        )
 
     def _turn_draft_candidate_text(self, entry: dict[str, Any]) -> str:
         phases = entry.get("agentMessagePhasesByItemId")
@@ -4115,7 +4292,7 @@ class AutomationManager:
         mode = _telegram_draft_streaming_mode()
         if mode == "off":
             return
-        resolved = self._resolve_telegram_target_for_turn(session_id, thread_id)
+        resolved = self._resolve_telegram_target_for_turn(session_id, thread_id, turn_id)
         if resolved is None:
             return
         _token, _target, chat_key = resolved
@@ -4181,7 +4358,7 @@ class AutomationManager:
                 await asyncio.sleep((next_allowed_at_ms - _now_ms()) / 1000.0)
                 continue
 
-            resolved = self._resolve_telegram_target_for_turn(session_id, thread_id)
+            resolved = self._resolve_telegram_target_for_turn(session_id, thread_id, turn_id)
             if resolved is None:
                 draft["disabled"] = True
                 draft["flushTask"] = None
@@ -4369,6 +4546,7 @@ class AutomationManager:
         params = msg.get("params")
         if not isinstance(params, dict):
             params = {}
+            msg["params"] = params
 
         thread_id_raw = params.get("threadId")
         thread_id = thread_id_raw.strip() if isinstance(thread_id_raw, str) and thread_id_raw.strip() else None
@@ -4409,6 +4587,16 @@ class AutomationManager:
                 entry["agentMessageTextByItemId"] = item_texts
             item_texts.setdefault(item_id, "")
             entry["activeAgentMessageItemId"] = item_id
+            source_channel, source_chat_key = self._peek_turn_source_context(
+                session_id=session_id,
+                thread_id=thread_id,
+                turn_id=turn_id,
+            )
+            self._inject_source_context_into_notification(
+                params,
+                source_channel=source_channel,
+                source_chat_key=source_chat_key,
+            )
             if thread_id:
                 self._note_lane_progress(self.lane(session_id, thread_id))
             return
@@ -4453,6 +4641,16 @@ class AutomationManager:
 
             if draft_candidate.strip():
                 self._queue_telegram_turn_draft_flush(session_id, thread_id, turn_id, text=draft_candidate)
+            source_channel, source_chat_key = self._peek_turn_source_context(
+                session_id=session_id,
+                thread_id=thread_id,
+                turn_id=turn_id,
+            )
+            self._inject_source_context_into_notification(
+                params,
+                source_channel=source_channel,
+                source_chat_key=source_chat_key,
+            )
             if thread_id:
                 self._note_lane_progress(self.lane(session_id, thread_id))
             return
@@ -4492,6 +4690,16 @@ class AutomationManager:
                 if item_id:
                     entry["activeAgentMessageItemId"] = item_id
                 self._queue_telegram_turn_draft_flush(session_id, thread_id, turn_id, text=text)
+            source_channel, source_chat_key = self._peek_turn_source_context(
+                session_id=session_id,
+                thread_id=thread_id,
+                turn_id=turn_id,
+            )
+            self._inject_source_context_into_notification(
+                params,
+                source_channel=source_channel,
+                source_chat_key=source_chat_key,
+            )
             if thread_id:
                 self._note_lane_progress(self.lane(session_id, thread_id))
             return
@@ -4499,6 +4707,19 @@ class AutomationManager:
         if method == "turn/started":
             if thread_id:
                 lane = self.lane(session_id, thread_id)
+                source_channel, source_chat_key = self._consume_pending_turn_source(lane)
+                self._remember_turn_source_context(
+                    session_id=session_id,
+                    thread_id=thread_id,
+                    turn_id=turn_id,
+                    source_channel=source_channel,
+                    source_chat_key=source_chat_key,
+                )
+                self._inject_source_context_into_notification(
+                    params,
+                    source_channel=source_channel,
+                    source_chat_key=source_chat_key,
+                )
                 self._mark_lane_busy(lane, turn_id=turn_id)
             return
 
@@ -4521,9 +4742,13 @@ class AutomationManager:
                 asyncio.create_task(self._maybe_request_heartbeat(session_id, thread_id))
 
                 final_text = ""
+                source_channel = None
+                source_chat_key = None
                 if key:
                     entry = self._pop_turn_text_entry(key)
                     if isinstance(entry, dict):
+                        source_channel = entry.get("sourceChannel") if isinstance(entry.get("sourceChannel"), str) else None
+                        source_chat_key = entry.get("sourceChatKey") if isinstance(entry.get("sourceChatKey"), str) else None
                         full = entry.get("fullText")
                         delta = entry.get("delta")
                         commentary_prefix = ""
@@ -4538,6 +4763,11 @@ class AutomationManager:
                                 delta_candidate = delta_candidate[len(commentary_prefix):]
                             if delta_candidate.strip():
                                 final_text = delta_candidate
+                self._inject_source_context_into_notification(
+                    params,
+                    source_channel=source_channel,
+                    source_chat_key=source_chat_key,
+                )
                 if key:
                     asyncio.create_task(
                         self._handle_isolated_cron_turn_completed(
@@ -4550,7 +4780,16 @@ class AutomationManager:
                         )
                     )
                 if final_text.strip() and str(turn_status_raw or "").strip().lower() != "interrupted":
-                    asyncio.create_task(self._deliver_turn_text(session_id, thread_id, final_text))
+                    asyncio.create_task(
+                        self._deliver_turn_text(
+                            session_id,
+                            thread_id,
+                            final_text,
+                            turn_id=turn_id,
+                            source_channel=source_channel,
+                            source_chat_key=source_chat_key,
+                        )
+                    )
             return
 
     async def _handle_isolated_cron_turn_completed(
@@ -4778,11 +5017,25 @@ class AutomationManager:
 
         await self._store.update(_mark_archived)
 
-    async def _deliver_turn_text(self, session_id: str, thread_id: str, text: str) -> None:
+    async def _deliver_turn_text(
+        self,
+        session_id: str,
+        thread_id: str,
+        text: str,
+        *,
+        turn_id: Optional[str] = None,
+        source_channel: Optional[str] = None,
+        source_chat_key: Optional[str] = None,
+    ) -> None:
         # Gateway-owned delivery: send final text on turn/completed, splitting when needed.
         if not isinstance(text, str) or not text.strip():
             return
-        resolved = self._resolve_telegram_target_for_turn(session_id, thread_id)
+        resolved = self._resolve_telegram_target_for_source(
+            source_channel=source_channel,
+            source_chat_key=source_chat_key,
+        )
+        if resolved is None:
+            resolved = self._resolve_telegram_target_for_turn(session_id, thread_id, turn_id)
         if resolved is None:
             return
         token, target, _chat_key = resolved
@@ -5039,21 +5292,6 @@ class AutomationManager:
         else:
             thread_id = thread_id.strip()
 
-        if source_channel_norm and source_chat_key_norm:
-
-            def _touch_last_active(st: PersistedGatewayAutomationState) -> None:
-                sess = st.sessions.get(session_id)
-                if sess is None:
-                    sess = PersistedSessionAutomation()
-                    st.sessions[session_id] = sess
-                sess.last_active_by_thread[thread_id] = PersistedLastActiveTarget(
-                    channel=source_channel_norm,
-                    chat_key=source_chat_key_norm,
-                    at_ms=_now_ms(),
-                )
-
-            await self._store.update(_touch_last_active)
-
         lane = self.lane(session_id, thread_id)
 
         if lane.busy:
@@ -5089,6 +5327,11 @@ class AutomationManager:
                     "attachmentCount": len(local_attachments),
                 }
             self._prepare_lane_for_new_turn(lane, kind=TURN_KIND_USER)
+            self._set_pending_turn_source(
+                lane,
+                source_channel=source_channel_norm,
+                source_chat_key=source_chat_key_norm,
+            )
             self._mark_lane_busy(lane)
 
             try:
@@ -5121,6 +5364,19 @@ class AutomationManager:
                 if turn_id:
                     lane.active_turn_id = turn_id
                     self._note_lane_progress(lane)
+                    self._remember_turn_source_context(
+                        session_id=session_id,
+                        thread_id=thread_id,
+                        turn_id=turn_id,
+                        source_channel=source_channel_norm,
+                        source_chat_key=source_chat_key_norm,
+                    )
+                await self._touch_last_active_target(
+                    session_id=session_id,
+                    thread_id=thread_id,
+                    source_channel=source_channel_norm,
+                    source_chat_key=source_chat_key_norm,
+                )
                 return {
                     "ok": True,
                     "threadId": thread_id,
@@ -5358,6 +5614,51 @@ class AutomationManager:
         if self._queue_has_actionable_system_events(q):
             self.request_heartbeat_now()
 
+    def _pop_next_followup(self, lane: ThreadLane) -> Optional[dict[str, Any]]:
+        while lane.followups:
+            item = lane.followups.popleft()
+            if isinstance(item, str):
+                text = item.strip()
+                if text:
+                    return {
+                        "text": text,
+                        "source_channel": None,
+                        "source_chat_key": None,
+                        "local_attachments": [],
+                    }
+                continue
+            if not isinstance(item, dict):
+                continue
+
+            text_raw = item.get("text")
+            text = text_raw.strip() if isinstance(text_raw, str) and text_raw.strip() else ""
+            attachments_raw = item.get("local_attachments")
+            local_attachments: list[dict[str, Any]] = []
+            if isinstance(attachments_raw, list):
+                local_attachments = [x for x in attachments_raw if isinstance(x, (dict, PersistedStagedAttachment))]
+            if not text and not local_attachments:
+                continue
+
+            source_channel = item.get("source_channel")
+            if not isinstance(source_channel, str) or not source_channel.strip():
+                source_channel = None
+            else:
+                source_channel = source_channel.strip()
+
+            source_chat_key = item.get("source_chat_key")
+            if not isinstance(source_chat_key, str) or not source_chat_key.strip():
+                source_chat_key = None
+            else:
+                source_chat_key = source_chat_key.strip()
+
+            return {
+                "text": text,
+                "source_channel": source_channel,
+                "source_chat_key": source_chat_key,
+                "local_attachments": local_attachments,
+            }
+        return None
+
     async def _process_lane_after_turn(self, session_id: str, thread_id: str) -> None:
         lane = self.lane(session_id, thread_id)
         if lane.busy:
@@ -5365,39 +5666,28 @@ class AutomationManager:
         async with lane.lock:
             if lane.busy:
                 return
-            if not lane.followups:
+            next_followup = self._pop_next_followup(lane)
+            if next_followup is None:
                 return
-            followup_texts: list[str] = []
-            local_attachments: list[dict[str, Any]] = []
-            telegram_channel: Optional[str] = None
-            telegram_chat_key: Optional[str] = None
-
-            while lane.followups:
-                item = lane.followups.popleft()
-                if isinstance(item, str):
-                    followup_texts.append(item)
-                    continue
-                if not isinstance(item, dict):
-                    continue
-                t = item.get("text")
-                if isinstance(t, str) and t.strip():
-                    followup_texts.append(t)
-                ch = item.get("source_channel")
-                ck = item.get("source_chat_key")
-                if isinstance(ch, str) and ch.strip():
-                    telegram_channel = ch.strip()
-                if isinstance(ck, str) and ck.strip():
-                    telegram_chat_key = ck.strip()
-                attachments = item.get("local_attachments")
-                if isinstance(attachments, list):
-                    local_attachments.extend([x for x in attachments if isinstance(x, (dict, PersistedStagedAttachment))])
-            merged = self._format_followups(followup_texts)
-            local_attachments = self._merge_staged_attachment_dicts(local_attachments)
+            # Process queued user inputs strictly FIFO. Once groups share one main
+            # thread across topics, batching follow-ups would collapse distinct topic
+            # sources into a single turn and misroute replies.
+            merged = str(next_followup.get("text") or "").strip()
+            telegram_channel = next_followup.get("source_channel")
+            telegram_chat_key = next_followup.get("source_chat_key")
+            local_attachments = self._merge_staged_attachment_dicts(
+                next_followup.get("local_attachments") if isinstance(next_followup.get("local_attachments"), list) else []
+            )
 
             live, _ = await _ensure_live_docker_session(session_id, allow_create=True)
             await self._ensure_initialized(live)
 
             self._prepare_lane_for_new_turn(lane, kind=TURN_KIND_USER)
+            self._set_pending_turn_source(
+                lane,
+                source_channel=telegram_channel,
+                source_chat_key=telegram_chat_key,
+            )
             self._mark_lane_busy(lane)
             try:
                 await self._ensure_thread_loaded_or_resumed(live, thread_id)
@@ -5428,15 +5718,22 @@ class AutomationManager:
                             turn_id = tid_val.strip()
                 lane.active_turn_id = turn_id
                 self._note_lane_progress(lane)
+                self._remember_turn_source_context(
+                    session_id=session_id,
+                    thread_id=thread_id,
+                    turn_id=turn_id,
+                    source_channel=telegram_channel,
+                    source_chat_key=telegram_chat_key,
+                )
+                await self._touch_last_active_target(
+                    session_id=session_id,
+                    thread_id=thread_id,
+                    source_channel=telegram_channel,
+                    source_chat_key=telegram_chat_key,
+                )
             except Exception:
                 self._mark_lane_idle(lane)
                 log.exception("Failed to start follow-up turn for %s/%s", session_id, thread_id)
-
-    def _format_followups(self, texts: list[str]) -> str:
-        lines = ["Follow-ups (batched):"]
-        for i, t in enumerate(texts, start=1):
-            lines.append(f"{i}) {t.strip()}")
-        return "\n".join(lines).strip()
 
     async def _read_project_context_block(self, *, session_id: str, include_heartbeat: bool) -> str:
         root = self._workspace_root_for_session(session_id)
@@ -9185,6 +9482,7 @@ async def _ensure_live_docker_session(session_id: str, *, allow_create: bool) ->
                         if automation is not None:
                             try:
                                 automation.on_upstream_notification(session_id, msg)
+                                text = json.dumps(msg)
                             except Exception:
                                 log.exception("Automation notification handler failed")
 
@@ -10010,6 +10308,10 @@ async def automation_chat_bind(request: Request):
     if not isinstance(raw_chat_key, str) or not raw_chat_key.strip():
         raise HTTPException(status_code=400, detail="Missing 'chatKey'")
     chat_key = raw_chat_key.strip()
+    binding_chat_key = _chat_binding_storage_key(chat_key)
+    if not binding_chat_key:
+        raise HTTPException(status_code=400, detail="Invalid 'chatKey'")
+    group_binding_key = _telegram_group_binding_key_from_chat_key(chat_key)
 
     actor_user_id: Optional[int] = None
     if raw_actor is not None:
@@ -10041,10 +10343,25 @@ async def automation_chat_bind(request: Request):
 
     def _write(st: PersistedGatewayAutomationState) -> None:
         st.version = max(int(getattr(st, "version", 1) or 1), AUTOMATION_STATE_VERSION)
-        st.chat_bindings[chat_key] = agent_id
+        if group_binding_key:
+            prefix = f"{group_binding_key}:"
+            for bound_ck in list(st.chat_bindings.keys()):
+                if not isinstance(bound_ck, str):
+                    continue
+                ck_norm = bound_ck.strip()
+                if ck_norm == group_binding_key or ck_norm.startswith(prefix):
+                    st.chat_bindings.pop(bound_ck, None)
+        st.chat_bindings[binding_chat_key] = agent_id
 
     await automation._store.update(_write)
-    return {"ok": True, "chatKey": chat_key, "agentId": agent_id, "sessionId": agent.session_id, "agent": agent.to_json()}
+    return {
+        "ok": True,
+        "chatKey": chat_key,
+        "bindingChatKey": binding_chat_key,
+        "agentId": agent_id,
+        "sessionId": agent.session_id,
+        "agent": agent.to_json(),
+    }
 
 
 @app.post("/automation/node/list")

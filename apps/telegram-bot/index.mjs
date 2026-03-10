@@ -805,6 +805,12 @@ class ArgusClient {
       : isNonEmptyString(params.turn?.id)
         ? params.turn.id
         : null;
+    const source = params.source && typeof params.source === "object" ? params.source : null;
+    const sourceChatKey = isNonEmptyString(params.sourceChatKey)
+      ? params.sourceChatKey
+      : isNonEmptyString(source?.chatKey)
+        ? source.chatKey
+        : null;
     const key = threadId && turnId ? `${threadId}:${turnId}` : null;
 
     if (msg.method === "item/agentMessage/delta") {
@@ -838,6 +844,7 @@ class ArgusClient {
             sessionId: this.sessionId,
             threadId,
             turnId,
+            sourceChatKey,
             itemId: isNonEmptyString(item.id) ? item.id : null,
             text: item.text,
             phase
@@ -854,7 +861,7 @@ class ArgusClient {
       const cb = this.onTurnStarted;
       if (typeof cb === "function") {
         try {
-          const res = cb({ sessionId: this.sessionId, threadId, turnId });
+          const res = cb({ sessionId: this.sessionId, threadId, turnId, sourceChatKey });
           if (res && typeof res.then === "function") res.catch(() => {});
         } catch {
           // ignore
@@ -879,7 +886,7 @@ class ArgusClient {
       const cb = this.onTurnCompleted;
       if (typeof cb === "function") {
         try {
-          const res = cb({ sessionId: this.sessionId, threadId, turnId, text: finalText });
+          const res = cb({ sessionId: this.sessionId, threadId, turnId, sourceChatKey, text: finalText });
           if (res && typeof res.then === "function") res.catch(() => {});
         } catch {
           // ignore
@@ -1198,8 +1205,8 @@ function normalizeAvailableModels(models) {
     btn_next: "Next",
     btn_cancel: "Cancel",
     btn_reveal: "Reveal",
-    btn_bind_this_chat: "Bind This Chat",
-    btn_new_thread: "New Thread",
+    btn_bind_this_chat: "Bind This Group",
+    btn_new_thread: "New Conversation",
 
     shared_suffix: "(shared)",
     status_unbound: "UNBOUND",
@@ -1226,7 +1233,7 @@ function normalizeAvailableModels(models) {
     notice_non_user_turn: "Current run isn't a user turn.",
     notice_heartbeat_not_cancelable: "Heartbeat turns can't be stopped from chat.",
     notice_turn_not_ready: "The current turn is still starting; try again in a moment.",
-    notice_unbound_hint: "UNBOUND. Use Bind This Chat in /menu.",
+    notice_unbound_hint: "UNBOUND. Use Bind This Group in /menu.",
     notice_legacy_moved: "/{cmd} has moved to /menu.",
     notice_unknown_command: "Unknown command: /{cmd}. Use /menu.",
     notice_switched: "Switched: {agentId}",
@@ -1235,7 +1242,7 @@ function normalizeAvailableModels(models) {
     notice_deleted: "Deleted: {agentId}",
     notice_model_switched: "Model: {model}",
     notice_new_main_thread: "New conversation: {threadId}",
-    notice_new_thread: "New thread: {threadId}",
+    notice_new_thread: "New group conversation: {threadId}",
     notice_bound: "Bound: {agentId}",
     notice_node_paused: "Paused: {nodeId}",
     notice_node_resumed: "Resumed: {nodeId}",
@@ -1269,17 +1276,17 @@ function normalizeAvailableModels(models) {
     node_status_not_connected: "not connected",
     node_press_reveal: "Press Show Token to fetch the current session token.",
 
-    group_bind_first: "Bind this chat/topic to an agent first.",
+    group_bind_first: "Bind this group to an agent first. All topics will use it by default.",
 
-    bind_select_agent: "Select an agent to route this chat/topic to.",
+    bind_select_agent: "Select an agent for this group. All topics will use it by default.",
     bind_hint_start: "Hint: DM the bot and create an agent (via /menu).",
 
     help_line_menu: "Use {menu} to open the control panel.",
     help_line_start: "First time: run {start} in a DM to initialize your main agent.",
     help_line_cancel: "Use {cancel} to stop the current user turn.",
     help_line_private_more: "Switch Agent / Create Agent are available in the menu.",
-    help_line_group_bind: "In groups/topics, bind the chat first ({bind}).",
-    help_line_group_new: "Then use {newThread} to reset the conversation for this chat/topic.",
+    help_line_group_bind: "In groups/topics, bind the group once ({bind}).",
+    help_line_group_new: "Then use {newThread} to reset the whole group's conversation.",
 
     title_api_channels: "API Channels",
     title_channel_detail: "API Channel",
@@ -1365,7 +1372,7 @@ function normalizeAvailableModels(models) {
     btn_cancel: "取消",
     btn_reveal: "显示",
     btn_bind_this_chat: "绑定当前群聊",
-    btn_new_thread: "新建 Thread",
+    btn_new_thread: "新建对话",
 
     shared_suffix: "（共享）",
     status_unbound: "未绑定",
@@ -1392,7 +1399,7 @@ function normalizeAvailableModels(models) {
     notice_non_user_turn: "当前运行的不是用户任务。",
     notice_heartbeat_not_cancelable: "heartbeat 任务不能从聊天里停止。",
     notice_turn_not_ready: "当前任务还在启动中，请稍后再试。",
-    notice_unbound_hint: "未绑定：请用 /menu 里的“绑定当前群聊”。",
+    notice_unbound_hint: "未绑定：请用 /menu 里的“绑定当前群聊”。绑定后所有 topic 默认共用这个 agent。",
     notice_legacy_moved: "/{cmd} 已迁移到 /menu。",
     notice_unknown_command: "未知命令：/{cmd}。请用 /menu。",
     notice_switched: "已切换：{agentId}",
@@ -1401,7 +1408,7 @@ function normalizeAvailableModels(models) {
     notice_deleted: "已删除：{agentId}",
     notice_model_switched: "已切换模型：{model}",
     notice_new_main_thread: "已新建对话：{threadId}",
-    notice_new_thread: "已新建 Thread：{threadId}",
+    notice_new_thread: "已新建群组对话：{threadId}",
     notice_bound: "已绑定：{agentId}",
     notice_node_paused: "已暂停：{nodeId}",
     notice_node_resumed: "已恢复：{nodeId}",
@@ -1435,17 +1442,17 @@ function normalizeAvailableModels(models) {
     node_status_not_connected: "未连接",
     node_press_reveal: "点击“显示 Token”获取当前 session 的 token。",
 
-    group_bind_first: "请先把当前群聊/话题绑定到某个 agent。",
+    group_bind_first: "请先把当前群聊绑定到某个 agent；绑定后所有 topic 默认共用它。",
 
-    bind_select_agent: "选择一个 agent，把当前 chat/topic 路由到它。",
+    bind_select_agent: "选择一个 agent 作为当前群聊的默认路由；所有 topic 默认共用它。",
     bind_hint_start: "提示：先私聊 bot，用 /menu 创建一个 agent。",
 
     help_line_menu: "用 {menu} 打开控制面板。",
     help_line_start: "首次使用：先在私聊发送 {start} 完成初始化。",
     help_line_cancel: "需要打断当前用户任务时，发送 {cancel}。",
     help_line_private_more: "切换/创建 agent 都在菜单里操作。",
-    help_line_group_bind: "在群聊/话题里，先绑定（{bind}）。",
-    help_line_group_new: "之后用 {newThread} 重新开一个 thread。",
+    help_line_group_bind: "在群聊/话题里，先给整个群绑定一次（{bind}）。",
+    help_line_group_new: "之后用 {newThread} 重置整个群的对话。",
 
     title_api_channels: "API 渠道",
     title_channel_detail: "API 渠道",
@@ -1860,21 +1867,110 @@ async function main() {
   // Keep one WS per gateway sessionId to avoid reconnect churn when routing between agents.
   const clients = new Map(); // sessionId -> ArgusClient
   const lastActiveBySessionThread = new Map(); // `${sessionId}:${threadId}` -> chatKey
+  const pendingTurnTargetsBySessionThread = new Map(); // `${sessionId}:${threadId}` -> [chatKey]
+  const turnTargetBySessionThreadTurn = new Map(); // `${sessionId}:${threadId}:${turnId}` -> chatKey
   const sessionThreadKey = (sessionId, threadId) => `${sessionId}:${threadId}`;
+  const sessionThreadTurnKey = (sessionId, threadId, turnId) => `${sessionId}:${threadId}:${turnId}`;
+
+  function queuePendingTurnTarget(sessionId, threadId, chatKey) {
+    if (!isNonEmptyString(sessionId) || !isNonEmptyString(threadId) || !isNonEmptyString(chatKey)) return;
+    const key = sessionThreadKey(sessionId, threadId);
+    const queue0 = pendingTurnTargetsBySessionThread.get(key);
+    if (Array.isArray(queue0)) {
+      queue0.push(chatKey);
+      return;
+    }
+    pendingTurnTargetsBySessionThread.set(key, [chatKey]);
+  }
+
+  function shiftPendingTurnTarget(sessionId, threadId) {
+    const key = sessionThreadKey(sessionId, threadId);
+    const queue0 = pendingTurnTargetsBySessionThread.get(key);
+    if (!Array.isArray(queue0) || queue0.length === 0) return null;
+    const chatKey = queue0.shift();
+    if (queue0.length === 0) pendingTurnTargetsBySessionThread.delete(key);
+    return isNonEmptyString(chatKey) ? chatKey : null;
+  }
+
+  function removePendingTurnTarget(sessionId, threadId, chatKey) {
+    if (!isNonEmptyString(sessionId) || !isNonEmptyString(threadId) || !isNonEmptyString(chatKey)) return;
+    const key = sessionThreadKey(sessionId, threadId);
+    const queue0 = pendingTurnTargetsBySessionThread.get(key);
+    if (!Array.isArray(queue0) || queue0.length === 0) return;
+    const idx = queue0.findIndex((item) => item === chatKey);
+    if (idx === -1) return;
+    queue0.splice(idx, 1);
+    if (queue0.length === 0) pendingTurnTargetsBySessionThread.delete(key);
+  }
+
+  function clearPendingTurnTargets(sessionId, threadId) {
+    if (!isNonEmptyString(sessionId) || !isNonEmptyString(threadId)) return;
+    pendingTurnTargetsBySessionThread.delete(sessionThreadKey(sessionId, threadId));
+  }
+
+  function rememberTurnTarget(sessionId, threadId, turnId, chatKey) {
+    if (!isNonEmptyString(sessionId) || !isNonEmptyString(threadId) || !isNonEmptyString(turnId) || !isNonEmptyString(chatKey)) return;
+    turnTargetBySessionThreadTurn.set(sessionThreadTurnKey(sessionId, threadId, turnId), chatKey);
+  }
+
+  function resolveExactTurnChatKey(sessionId, threadId, turnId) {
+    if (!isNonEmptyString(sessionId) || !isNonEmptyString(threadId) || !isNonEmptyString(turnId)) return null;
+    const exact = turnTargetBySessionThreadTurn.get(sessionThreadTurnKey(sessionId, threadId, turnId));
+    return isNonEmptyString(exact) ? exact : null;
+  }
+
+  function resolveTurnChatKey(sessionId, threadId, turnId) {
+    const exact = resolveExactTurnChatKey(sessionId, threadId, turnId);
+    if (isNonEmptyString(exact)) return exact;
+    return lastActiveBySessionThread.get(sessionThreadKey(sessionId, threadId)) || null;
+  }
+
+  function clearSessionRoutingState(sessionId) {
+    if (!isNonEmptyString(sessionId)) return;
+    const prefix = `${sessionId}:`;
+    for (const [key, chatKey] of lastActiveBySessionThread.entries()) {
+      if (key.startsWith(prefix) && isNonEmptyString(chatKey)) {
+        typing.stop(chatKey);
+        lastActiveBySessionThread.delete(key);
+      }
+    }
+    for (const key of pendingTurnTargetsBySessionThread.keys()) {
+      if (key.startsWith(prefix)) pendingTurnTargetsBySessionThread.delete(key);
+    }
+    for (const key of turnTargetBySessionThreadTurn.keys()) {
+      if (key.startsWith(prefix)) turnTargetBySessionThreadTurn.delete(key);
+    }
+  }
 
   const attachClientHooks = (client) => {
-    client.onTurnStarted = async ({ sessionId, threadId }) => {
+    client.onTurnStarted = async ({ sessionId, threadId, turnId, sourceChatKey }) => {
       if (!isNonEmptyString(sessionId) || !isNonEmptyString(threadId)) return;
-      const chatKey = lastActiveBySessionThread.get(sessionThreadKey(sessionId, threadId));
+      if (isNonEmptyString(sourceChatKey)) {
+        removePendingTurnTarget(sessionId, threadId, sourceChatKey);
+      }
+      let chatKey = isNonEmptyString(sourceChatKey) ? sourceChatKey : resolveExactTurnChatKey(sessionId, threadId, turnId);
+      if (!isNonEmptyString(chatKey)) {
+        chatKey = shiftPendingTurnTarget(sessionId, threadId);
+        if (isNonEmptyString(chatKey) && isNonEmptyString(turnId)) {
+          rememberTurnTarget(sessionId, threadId, turnId, chatKey);
+        }
+      }
+      if (!isNonEmptyString(chatKey)) {
+        chatKey = lastActiveBySessionThread.get(sessionThreadKey(sessionId, threadId)) || null;
+      }
       if (!isNonEmptyString(chatKey)) return;
+      if (isNonEmptyString(turnId)) {
+        rememberTurnTarget(sessionId, threadId, turnId, chatKey);
+      }
+      lastActiveBySessionThread.set(sessionThreadKey(sessionId, threadId), chatKey);
       const target = typingTargetFromChatKey(chatKey);
       if (!target) return;
       typing.start(chatKey, target);
     };
-    client.onAgentMessageCompleted = async ({ sessionId, threadId, text, phase }) => {
+    client.onAgentMessageCompleted = async ({ sessionId, threadId, turnId, sourceChatKey, text, phase }) => {
       if (phase !== "commentary") return;
       if (!isNonEmptyString(sessionId) || !isNonEmptyString(threadId) || !isNonEmptyString(text)) return;
-      const chatKey = lastActiveBySessionThread.get(sessionThreadKey(sessionId, threadId));
+      const chatKey = isNonEmptyString(sourceChatKey) ? sourceChatKey : resolveTurnChatKey(sessionId, threadId, turnId);
       if (!isNonEmptyString(chatKey)) return;
 
       await queue.enqueue(async () => {
@@ -1889,11 +1985,14 @@ async function main() {
         }
       });
     };
-    client.onTurnCompleted = async ({ sessionId, threadId }) => {
+    client.onTurnCompleted = async ({ sessionId, threadId, turnId, sourceChatKey }) => {
       if (!isNonEmptyString(sessionId) || !isNonEmptyString(threadId)) return;
-      const chatKey = lastActiveBySessionThread.get(sessionThreadKey(sessionId, threadId));
+      const chatKey = isNonEmptyString(sourceChatKey) ? sourceChatKey : resolveTurnChatKey(sessionId, threadId, turnId);
       if (!isNonEmptyString(chatKey)) return;
       typing.stop(chatKey);
+      if (isNonEmptyString(turnId)) {
+        turnTargetBySessionThreadTurn.delete(sessionThreadTurnKey(sessionId, threadId, turnId));
+      }
     };
     client.onDisconnected = () => {
       const sid = client.sessionId;
@@ -1901,11 +2000,7 @@ async function main() {
         typing.stopAll();
         return;
       }
-      for (const [key, chatKey] of lastActiveBySessionThread.entries()) {
-        if (key.startsWith(`${sid}:`) && isNonEmptyString(chatKey)) {
-          typing.stop(chatKey);
-        }
-      }
+      clearSessionRoutingState(sid);
     };
   };
 
@@ -1920,6 +2015,11 @@ async function main() {
     }
     await client.connectToSession(sid);
     return client;
+  }
+
+  async function ensureSessionMainThread(sessionId) {
+    const client = await getClient(sessionId);
+    return await client.ensureMainThread();
   }
 
   const queue = new SerialQueue();
@@ -2844,10 +2944,15 @@ async function main() {
   async function renderGroupMainMenu(chatKey, { notice, locale } = {}) {
     const S = uiStrings(locale);
     let route = null;
+    let mainThreadId = null;
     try {
       route = await resolveRouteForChatKey(chatKey);
+      if (isNonEmptyString(route?.sessionId)) {
+        mainThreadId = await ensureSessionMainThread(route.sessionId);
+      }
     } catch {
       route = null;
+      mainThreadId = null;
     }
 
     const lines = [];
@@ -2865,11 +2970,10 @@ async function main() {
       return { text: lines.join("\n"), replyMarkup };
     }
 
-    const threadId = state.getThreadId(route.sessionId, chatKey);
     lines.push(`agent: ${htmlCode(route.agentId)}`);
     lines.push(`${escapeHtml(S.label_model)}: ${htmlCode(route.model)}`);
     lines.push(`session: ${htmlCode(route.sessionId)}`);
-    lines.push(`thread: ${htmlCode(threadId || "(none)")}`);
+    lines.push(`mainThread: ${htmlCode(mainThreadId || "(none)")}`);
 
     const replyMarkup = kb([
       [
@@ -2890,11 +2994,11 @@ async function main() {
     lines.push(`chatKey: ${htmlCode(chatKey)}`);
     try {
       const route = await resolveRouteForChatKey(chatKey);
-      const threadId = state.getThreadId(route.sessionId, chatKey);
+      const mainThreadId = await ensureSessionMainThread(route.sessionId);
       lines.push(`agentId: ${htmlCode(route.agentId)}`);
       lines.push(`${escapeHtml(S.label_model)}: ${htmlCode(route.model)}`);
       lines.push(`sessionId: ${htmlCode(route.sessionId)}`);
-      lines.push(`threadId: ${htmlCode(threadId || "(none)")}`);
+      lines.push(`mainThreadId: ${htmlCode(mainThreadId || "(none)")}`);
     } catch (e) {
       lines.push(`${escapeHtml(S.label_status)}: <b>${escapeHtml(S.status_unbound)}</b>`);
       lines.push(escapeHtml(formatGatewayErrorForUser(e, { locale })));
@@ -3560,7 +3664,7 @@ async function main() {
 
         const client = await getClient(route.sessionId);
         const tid = await client.startThread(route.model);
-        await state.setThreadId(route.sessionId, chatKey, tid);
+        await client.setMainThread(tid);
         const notice = formatTemplate(S.notice_new_thread, { threadId: tid });
         const view = await renderGroupMainMenu(chatKey, { notice, locale });
         await editMenuMessage({ chatId, messageId, view });
@@ -3738,12 +3842,11 @@ async function main() {
                 const route = await resolveRouteForChatKey(chatKey);
                 const sessionId = route.sessionId;
                 const client = await getClient(sessionId);
-                let cancelThreadId = state.getThreadId(sessionId, chatKey);
+                let cancelThreadId = null;
                 let cancelTarget = null;
 
-                if (isPrivateChatType(chatType)) {
+                if (isPrivateChatType(chatType) || isGroupChatType(chatType)) {
                   cancelTarget = "main";
-                  cancelThreadId = null;
                 } else if (!isNonEmptyString(cancelThreadId)) {
                   await safeSendMessage({ ...target, text: hadPendingBeforeSlash ? S.notice_canceled : S.notice_no_active_user_turn });
                   return;
@@ -3993,41 +4096,59 @@ async function main() {
             userText = userLines.join("\n");
           }
 
-          let threadId = state.getThreadId(sessionId, chatKey);
+          let threadId = null;
           let enqueueTarget = null;
+          const useSharedMainThread = isGroupChatType(chatType);
 
-          if (hasUserText) {
-            if (isPrivateChatType(chatType)) {
-              enqueueTarget = "main";
-              threadId = null;
-            } else if (isNonEmptyString(threadId)) {
-              // Use mapped thread.
-            } else {
-              threadId = await client.startThread(route.model);
-              await state.setThreadId(sessionId, chatKey, threadId);
-            }
+          if (isPrivateChatType(chatType)) {
+            enqueueTarget = "main";
+          } else if (useSharedMainThread) {
+            enqueueTarget = "main";
+            threadId = await ensureSessionMainThread(sessionId);
           }
 
-          if (hasUserText) {
+          if (hasUserText && !useSharedMainThread) {
             typing.start(chatKey, typingTarget);
           }
 
-          const res = await client.enqueueInput({
-            text: hasUserText ? userText : "",
-            threadId,
-            target: enqueueTarget,
-            source: { channel: "telegram", chatKey },
-            telegramAttachments: [...replyAttachments, ...messageAttachments],
-          });
+          const shouldTrackTurnTarget = useSharedMainThread && isNonEmptyString(threadId);
+          if (shouldTrackTurnTarget) queuePendingTurnTarget(sessionId, threadId, chatKey);
+
+          let res;
+          try {
+            res = await client.enqueueInput({
+              text: hasUserText ? userText : "",
+              threadId,
+              target: enqueueTarget,
+              source: { channel: "telegram", chatKey },
+              telegramAttachments: [...replyAttachments, ...messageAttachments],
+            });
+          } catch (e) {
+            if (shouldTrackTurnTarget) removePendingTurnTarget(sessionId, threadId, chatKey);
+            throw e;
+          }
 
           if (res?.staged === true && res?.started !== true && res?.queued !== true) {
+            if (shouldTrackTurnTarget) removePendingTurnTarget(sessionId, threadId, chatKey);
             await safeSendMessage({ ...target, text: formatStagedAttachmentsNotice(res, S) });
             return;
           }
 
           const effectiveThreadId = isNonEmptyString(res?.threadId) ? res.threadId : threadId;
-          if (isNonEmptyString(effectiveThreadId)) {
+          if (!useSharedMainThread && isNonEmptyString(effectiveThreadId)) {
             lastActiveBySessionThread.set(sessionThreadKey(sessionId, effectiveThreadId), chatKey);
+          }
+
+          if (shouldTrackTurnTarget && res?.started === true && isNonEmptyString(res?.turnId) && isNonEmptyString(effectiveThreadId)) {
+            // An immediately started turn implies the lane was idle, so any older
+            // pending topic targets on this thread are stale leftovers.
+            clearPendingTurnTargets(sessionId, threadId);
+            if (effectiveThreadId !== threadId) clearPendingTurnTargets(sessionId, effectiveThreadId);
+            rememberTurnTarget(sessionId, effectiveThreadId, res.turnId, chatKey);
+          } else if (shouldTrackTurnTarget && isNonEmptyString(res?.turnId) && isNonEmptyString(effectiveThreadId)) {
+            rememberTurnTarget(sessionId, effectiveThreadId, res.turnId, chatKey);
+            removePendingTurnTarget(sessionId, threadId, chatKey);
+            if (effectiveThreadId !== threadId) removePendingTurnTarget(sessionId, effectiveThreadId, chatKey);
           }
         } catch (e) {
           const msg = e instanceof Error ? e.message : String(e);
