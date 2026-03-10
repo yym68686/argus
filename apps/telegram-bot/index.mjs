@@ -978,6 +978,14 @@ function isServiceMessage(message) {
     "message_auto_delete_timer_changed",
     "migrate_to_chat_id",
     "migrate_from_chat_id",
+    // Forum/topic lifecycle messages are service events too; Telegram emits these
+    // when topics are created/edited/closed/reopened or when the General topic changes.
+    "forum_topic_created",
+    "forum_topic_edited",
+    "forum_topic_closed",
+    "forum_topic_reopened",
+    "general_forum_topic_hidden",
+    "general_forum_topic_unhidden",
     "pinned_message",
     "invoice",
     "successful_payment"
@@ -1537,6 +1545,12 @@ function formatCancelTurnResultForUser(result, { locale } = {}) {
 
 const TELEGRAM_HTML_PARSE_ERR_RE = /can't parse entities|parse entities|find end of the entity/i;
 const TELEGRAM_MESSAGE_TOO_LONG_RE = /message is too long/i;
+const TELEGRAM_TOPIC_UNAVAILABLE_RE = /TOPIC_CLOSED|topic is closed|message thread not found/i;
+
+function isIgnorableTelegramSendError(err) {
+  const msg = err instanceof Error ? err.message : String(err);
+  return TELEGRAM_TOPIC_UNAVAILABLE_RE.test(msg);
+}
 
 function escapeHtml(text) {
   return String(text).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
@@ -2019,6 +2033,7 @@ async function main() {
     try {
       return await tg.sendMessage(params);
     } catch (e) {
+      if (isIgnorableTelegramSendError(e)) return null;
       log("sendMessage failed:", e instanceof Error ? e.message : String(e));
       return null;
     }
@@ -2027,9 +2042,9 @@ async function main() {
   async function sendAssistantMessage(target, text) {
     if (!target || !isNonEmptyString(text)) return null;
     const chunks = splitTelegramMessage(text.trim());
+    let lastResult = null;
 
     try {
-      let lastResult = null;
       for (const chunk of chunks) {
         const html = markdownToTelegramHtml(chunk);
         if (isNonEmptyString(html)) {
@@ -2037,16 +2052,23 @@ async function main() {
             lastResult = await tg.sendMessage({ ...target, text: html, parse_mode: "HTML" });
             continue;
           } catch (e) {
+            if (isIgnorableTelegramSendError(e)) return lastResult;
             const msg = e instanceof Error ? e.message : String(e);
             if (!TELEGRAM_HTML_PARSE_ERR_RE.test(msg) && !TELEGRAM_MESSAGE_TOO_LONG_RE.test(msg)) {
               throw e;
             }
           }
         }
-        lastResult = await tg.sendMessage({ ...target, text: chunk });
+        try {
+          lastResult = await tg.sendMessage({ ...target, text: chunk });
+        } catch (e) {
+          if (isIgnorableTelegramSendError(e)) return lastResult;
+          throw e;
+        }
       }
       return lastResult;
     } catch (e) {
+      if (isIgnorableTelegramSendError(e)) return lastResult;
       log("assistant sendMessage failed:", e instanceof Error ? e.message : String(e));
       return null;
     }
