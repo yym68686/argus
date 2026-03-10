@@ -1219,6 +1219,7 @@ function normalizeAvailableModels(models) {
     msg_unsupported_cb: "Unsupported",
     msg_invalid_agent: "Invalid agent.",
     msg_invalid_model: "Invalid model.",
+    msg_group_owner_only: "This action is only available for the owner of the group's current agent.",
 
     err_not_initialized: "No agent yet. Open /menu and press Create Agent.",
     err_forbidden: "error: forbidden.",
@@ -1385,6 +1386,7 @@ function normalizeAvailableModels(models) {
     msg_unsupported_cb: "不支持",
     msg_invalid_agent: "无效的 agent。",
     msg_invalid_model: "无效的模型。",
+    msg_group_owner_only: "只有当前群组 Agent 的拥有者才能执行这个操作。",
 
     err_not_initialized: "尚未创建 agent：请发送 /menu 并点击“创建 Agent”。",
     err_forbidden: "error: 没有权限。",
@@ -2217,89 +2219,121 @@ async function main() {
     }
   }
 
-  function getPendingAgentInput(chatKey) {
-    const entry = pendingAgentInputByChatKey.get(chatKey);
+  function pendingInputKey(chatKey, actorUserId) {
+    if (!isNonEmptyString(chatKey)) return null;
+    const uid = Number(actorUserId);
+    if (Number.isFinite(uid) && uid > 0) return `${chatKey}::u:${Math.trunc(uid)}`;
+    return chatKey;
+  }
+
+  function privateChatKeyForUserId(userId) {
+    const uid = Number(userId);
+    if (!Number.isFinite(uid) || uid <= 0) return null;
+    return String(Math.trunc(uid));
+  }
+
+  function ownerUserIdFromAgentId(agentId) {
+    const match = /^u(\d+)-/.exec(String(agentId || "").trim());
+    if (!match) return null;
+    const uid = Number(match[1]);
+    return Number.isFinite(uid) && uid > 0 ? Math.trunc(uid) : null;
+  }
+
+  function canActorManageAgent(agentId, actorUserId) {
+    const ownerUserId = ownerUserIdFromAgentId(agentId);
+    const uid = Number(actorUserId);
+    return Number.isFinite(uid) && uid > 0 && ownerUserId === Math.trunc(uid);
+  }
+
+  function getPendingAgentInput(chatKey, actorUserId) {
+    const key = pendingInputKey(chatKey, actorUserId);
+    if (!isNonEmptyString(key)) return null;
+    const entry = pendingAgentInputByChatKey.get(key);
     if (!entry) return null;
     if (nowMs() >= entry.expiresAtMs) {
-      pendingAgentInputByChatKey.delete(chatKey);
+      pendingAgentInputByChatKey.delete(key);
       return null;
     }
     return entry;
   }
 
-  function clearPendingAgentInput(chatKey) {
-    pendingAgentInputByChatKey.delete(chatKey);
+  function clearPendingAgentInput(chatKey, actorUserId) {
+    const key = pendingInputKey(chatKey, actorUserId);
+    if (!isNonEmptyString(key)) return;
+    pendingAgentInputByChatKey.delete(key);
   }
 
-  function setPendingInput(chatKey, entry) {
-    pendingAgentInputByChatKey.set(chatKey, {
+  function setPendingInput(chatKey, entry, actorUserId) {
+    const key = pendingInputKey(chatKey, actorUserId);
+    if (!isNonEmptyString(key)) return;
+    pendingAgentInputByChatKey.set(key, {
       expiresAtMs: nowMs() + 10 * 60_000,
       ...entry
     });
   }
 
-  function setPendingCreateAgent(chatKey, panelChatId, panelMessageId) {
+  function setPendingCreateAgent(chatKey, panelChatId, panelMessageId, actorUserId) {
     setPendingInput(chatKey, {
       kind: "create",
       panelChatId,
       panelMessageId
-    });
+    }, actorUserId);
   }
 
-  function setPendingRenameAgent(chatKey, panelChatId, panelMessageId, agentId) {
+  function setPendingRenameAgent(chatKey, panelChatId, panelMessageId, agentId, actorUserId) {
     setPendingInput(chatKey, {
       kind: "rename",
       panelChatId,
       panelMessageId,
       agentId
-    });
+    }, actorUserId);
   }
 
-  function setPendingCreateChannelName(chatKey, panelChatId, panelMessageId) {
+  function setPendingCreateChannelName(chatKey, panelChatId, panelMessageId, actorUserId) {
     setPendingInput(chatKey, {
       kind: "channel_create_name",
       panelChatId,
       panelMessageId
-    });
+    }, actorUserId);
   }
 
-  function setPendingCreateChannelBaseUrl(chatKey, panelChatId, panelMessageId, channelName) {
+  function setPendingCreateChannelBaseUrl(chatKey, panelChatId, panelMessageId, channelName, actorUserId) {
     setPendingInput(chatKey, {
       kind: "channel_create_base_url",
       panelChatId,
       panelMessageId,
       channelName
-    });
+    }, actorUserId);
   }
 
-  function setPendingCreateChannelApiKey(chatKey, panelChatId, panelMessageId, channelName, baseUrl) {
+  function setPendingCreateChannelApiKey(chatKey, panelChatId, panelMessageId, channelName, baseUrl, actorUserId) {
     setPendingInput(chatKey, {
       kind: "channel_create_api_key",
       panelChatId,
       panelMessageId,
       channelName,
       baseUrl
-    });
+    }, actorUserId);
   }
 
-  function setPendingRenameChannel(chatKey, panelChatId, panelMessageId, channelId, page = 0) {
+  function setPendingRenameChannel(chatKey, panelChatId, panelMessageId, channelId, page = 0, actorUserId) {
     setPendingInput(chatKey, {
       kind: "channel_rename",
       panelChatId,
       panelMessageId,
       channelId,
       page
-    });
+    }, actorUserId);
   }
 
-  function setPendingChannelKey(chatKey, panelChatId, panelMessageId, channelId, page = 0) {
+  function setPendingChannelKey(chatKey, panelChatId, panelMessageId, channelId, page = 0, actorUserId) {
     setPendingInput(chatKey, {
       kind: "channel_key",
       panelChatId,
       panelMessageId,
       channelId,
       page
-    });
+    }, actorUserId);
   }
 
   function formatAgentLabel(agent, { currentAgentId, locale } = {}) {
@@ -2397,6 +2431,101 @@ async function main() {
 
     if (trailingButton) rows.push([trailingButton]);
     return rows;
+  }
+
+  const PRIVATE_TO_GROUP_ACTION = new Map([
+    ["p:main", "g:main"],
+    ["p:channels", "g:channels"],
+    ["p:channel_view", "g:channel_view"],
+    ["p:channel_select", "g:channel_select"],
+    ["p:channel_create_begin", "g:channel_create_begin"],
+    ["p:channel_create_cancel", "g:channel_create_cancel"],
+    ["p:channel_rename_begin", "g:channel_rename_begin"],
+    ["p:channel_rename_cancel", "g:channel_rename_cancel"],
+    ["p:channel_delete_begin", "g:channel_delete_begin"],
+    ["p:channel_delete_cancel", "g:channel_delete_cancel"],
+    ["p:channel_delete_confirm", "g:channel_delete_confirm"],
+    ["p:channel_key_begin", "g:channel_key_begin"],
+    ["p:channel_key_cancel", "g:channel_key_cancel"],
+    ["p:channel_key_clear", "g:channel_key_clear"],
+    ["p:rename_cancel", "g:rename_cancel"]
+  ]);
+
+  function remapViewCallbacks(view, transformPayload) {
+    if (!view || typeof view !== "object") return view;
+    const replyMarkup = view.replyMarkup;
+    const keyboard = replyMarkup?.inline_keyboard;
+    if (!Array.isArray(keyboard)) return view;
+
+    const remappedKeyboard = keyboard.map((row) => {
+      if (!Array.isArray(row)) return row;
+      return row.map((button) => {
+        if (!button || typeof button !== "object" || !isNonEmptyString(button.callback_data)) return button;
+        const token = button.callback_data.startsWith("cb:") ? button.callback_data.slice("cb:".length) : null;
+        if (!isNonEmptyString(token)) return button;
+        const payload = callbacks.get(token);
+        if (!payload || typeof payload !== "object") return button;
+        const nextPayload = transformPayload(payload);
+        if (!nextPayload || typeof nextPayload !== "object") return button;
+        return {
+          ...button,
+          callback_data: callbackData(nextPayload)
+        };
+      });
+    });
+
+    return {
+      ...view,
+      replyMarkup: {
+        ...replyMarkup,
+        inline_keyboard: remappedKeyboard
+      }
+    };
+  }
+
+  function remapPrivateViewToGroup(view, chatKey) {
+    return remapViewCallbacks(view, (payload) => {
+      const action = isNonEmptyString(payload?.action) ? payload.action : null;
+      const nextAction = action ? PRIVATE_TO_GROUP_ACTION.get(action) : null;
+      if (!isNonEmptyString(nextAction)) return null;
+      return {
+        ...payload,
+        action: nextAction,
+        chatKey
+      };
+    });
+  }
+
+  function renderGroupOwnerOnlyView(chatKey, { error, locale } = {}) {
+    const S = uiStrings(locale);
+    const lines = [];
+    lines.push(`<b>${escapeHtml(S.menu_title)}</b>`);
+    lines.push(`chatKey: ${htmlCode(chatKey)}`);
+    if (isNonEmptyString(error)) lines.push(escapeHtml(error));
+    const replyMarkup = kb([[cbButton(S.btn_back, { action: "g:main", chatKey })]]);
+    return { text: lines.join("\n"), replyMarkup };
+  }
+
+  async function resolveGroupActorContext(chatKey, actorUserId) {
+    const route = await resolveRouteForChatKey(chatKey);
+    const actorChatKey = privateChatKeyForUserId(actorUserId);
+    const ownsCurrentAgent = isNonEmptyString(route?.agentId) && canActorManageAgent(route.agentId, actorUserId);
+    let currentChannel = null;
+    if (ownsCurrentAgent && isNonEmptyString(actorChatKey)) {
+      try {
+        const channelState = await resolveChannelStateForChatKey(actorChatKey);
+        currentChannel = channelState?.currentChannel || null;
+      } catch {
+        currentChannel = null;
+      }
+    }
+    return {
+      actorChatKey,
+      canRenameCurrentAgent: ownsCurrentAgent && isNonEmptyString(route?.agentId) && !route.agentId.endsWith("-main"),
+      ownsCurrentAgent,
+      currentChannel,
+      route
+    };
   }
 
   async function renderPrivateMainMenu(chatKey, { notice, locale } = {}) {
@@ -2941,18 +3070,28 @@ async function main() {
     return { text: lines.join("\n"), replyMarkup: kb(rows) };
   }
 
-  async function renderGroupMainMenu(chatKey, { notice, locale } = {}) {
+  async function renderGroupMainMenu(chatKey, { notice, locale, actorUserId } = {}) {
     const S = uiStrings(locale);
     let route = null;
     let mainThreadId = null;
+    let ownsCurrentAgent = false;
+    let canRenameCurrentAgent = false;
+    let currentChannel = null;
     try {
-      route = await resolveRouteForChatKey(chatKey);
+      const ctx = await resolveGroupActorContext(chatKey, actorUserId);
+      route = ctx.route;
+      ownsCurrentAgent = Boolean(ctx.ownsCurrentAgent);
+      canRenameCurrentAgent = Boolean(ctx.canRenameCurrentAgent);
+      currentChannel = ctx.currentChannel || null;
       if (isNonEmptyString(route?.sessionId)) {
         mainThreadId = await ensureSessionMainThread(route.sessionId);
       }
     } catch {
       route = null;
       mainThreadId = null;
+      ownsCurrentAgent = false;
+      canRenameCurrentAgent = false;
+      currentChannel = null;
     }
 
     const lines = [];
@@ -2972,17 +3111,33 @@ async function main() {
 
     lines.push(`agent: ${htmlCode(route.agentId)}`);
     lines.push(`${escapeHtml(S.label_model)}: ${htmlCode(route.model)}`);
+    if (currentChannel) lines.push(`${escapeHtml(S.label_channel)}: ${htmlCode(channelDisplayName(currentChannel))}`);
     lines.push(`session: ${htmlCode(route.sessionId)}`);
     lines.push(`mainThread: ${htmlCode(mainThreadId || "(none)")}`);
 
-    const replyMarkup = kb([
-      [
-        cbButton(S.btn_new_thread, { action: "g:new", chatKey }),
-        cbButton(S.btn_bind_this_chat, { action: "g:bind", chatKey, page: 0 })
-      ],
-      [cbButton(S.btn_status, { action: "g:status", chatKey }), cbButton(S.btn_help, { action: "help", chatKey })],
-      [cbButton(S.btn_close, { action: "close", chatKey })]
-    ]);
+    const primaryButtons = [cbButton(S.btn_switch_agent, { action: "g:switch", chatKey, page: 0 })];
+    if (canRenameCurrentAgent) {
+      primaryButtons.push(cbButton(S.btn_rename_agent, { action: "g:rename_begin", chatKey }));
+    }
+
+    const secondaryButtons = [];
+    if (ownsCurrentAgent) {
+      secondaryButtons.push(
+        cbButton(S.btn_api_channels, { action: "g:channels", chatKey, page: 0 }),
+        cbButton(S.btn_switch_model, { action: "g:model", chatKey })
+      );
+    }
+    secondaryButtons.push(
+      cbButton(S.btn_new_thread, { action: "g:new", chatKey }),
+      cbButton(S.btn_status, { action: "g:status", chatKey }),
+      cbButton(S.btn_help, { action: "help", chatKey })
+    );
+
+    const replyMarkup = kb(buildTwoColumnMenuRows(
+      primaryButtons,
+      secondaryButtons,
+      cbButton(S.btn_close, { action: "close", chatKey })
+    ));
     return { text: lines.join("\n"), replyMarkup };
   }
 
@@ -3017,7 +3172,7 @@ async function main() {
     const S = uiStrings(locale);
     const page = normalizePage(pageRaw);
     const lines = [];
-    lines.push(`<b>${escapeHtml(S.btn_bind_this_chat)}</b>`);
+    lines.push(`<b>${escapeHtml(S.btn_switch_agent)}</b>`);
     lines.push(`chatKey: ${htmlCode(chatKey)}`);
 
     let boundAgentId = null;
@@ -3077,6 +3232,158 @@ async function main() {
     return { text: lines.join("\n"), replyMarkup: kb(rows) };
   }
 
+  async function renderGroupModelMenu(chatKey, actorUserId, { error, locale } = {}) {
+    const S = uiStrings(locale);
+    try {
+      const ctx = await resolveGroupActorContext(chatKey, actorUserId);
+      if (!ctx.ownsCurrentAgent || !isNonEmptyString(ctx.actorChatKey)) {
+        return renderGroupOwnerOnlyView(chatKey, { error: S.msg_group_owner_only, locale });
+      }
+      const data = await argusHttp.automationAgentList(ctx.actorChatKey);
+      const availableModels = normalizeAvailableModels(data?.availableModels);
+
+      const lines = [];
+      lines.push(`<b>${escapeHtml(S.title_switch_model)}</b>`);
+      lines.push(`${escapeHtml(S.label_current)}: ${htmlCode(ctx.route.agentId || "(none)")}`);
+      lines.push(`${escapeHtml(S.label_model)}: ${htmlCode(ctx.route.model || DEFAULT_AGENT_MODEL)}`);
+      if (isNonEmptyString(error)) {
+        lines.push("");
+        lines.push(`<b>${escapeHtml(S.label_error)}:</b> ${escapeHtml(error)}`);
+      }
+
+      const rows = availableModels.map((model) => [
+        cbButton(`${model === ctx.route.model ? "✅ " : ""}${model}`, { action: "g:model_set", chatKey, model })
+      ]);
+      rows.push([
+        cbButton(S.btn_refresh, { action: "g:model", chatKey }),
+        cbButton(S.btn_back, { action: "g:main", chatKey })
+      ]);
+      return { text: lines.join("\n"), replyMarkup: kb(rows) };
+    } catch (e) {
+      const lines = [];
+      lines.push(`<b>${escapeHtml(S.title_switch_model)}</b>`);
+      lines.push(escapeHtml(formatGatewayErrorForUser(e, { locale })));
+      return { text: lines.join("\n"), replyMarkup: kb([[cbButton(S.btn_back, { action: "g:main", chatKey })]]) };
+    }
+  }
+
+  async function renderGroupRenameMenu(chatKey, actorUserId, agentId, { error, locale } = {}) {
+    try {
+      const ctx = await resolveGroupActorContext(chatKey, actorUserId);
+      if (!ctx.canRenameCurrentAgent || !isNonEmptyString(ctx.actorChatKey) || ctx.route.agentId !== agentId) {
+        return renderGroupOwnerOnlyView(chatKey, { error: uiStrings(locale).msg_group_owner_only, locale });
+      }
+      const view = await renderPrivateRenameMenu(ctx.actorChatKey, agentId, { error, locale });
+      return remapPrivateViewToGroup(view, chatKey);
+    } catch (e) {
+      return renderGroupOwnerOnlyView(chatKey, { error: formatGatewayErrorForUser(e, { locale }), locale });
+    }
+  }
+
+  async function renderGroupChannelListMenu(chatKey, actorUserId, pageRaw, opts = {}) {
+    try {
+      const ctx = await resolveGroupActorContext(chatKey, actorUserId);
+      if (!ctx.ownsCurrentAgent || !isNonEmptyString(ctx.actorChatKey)) {
+        return renderGroupOwnerOnlyView(chatKey, { error: uiStrings(opts.locale).msg_group_owner_only, locale: opts.locale });
+      }
+      const view = await renderPrivateChannelListMenu(ctx.actorChatKey, pageRaw, opts);
+      return remapPrivateViewToGroup(view, chatKey);
+    } catch (e) {
+      return renderGroupOwnerOnlyView(chatKey, { error: formatGatewayErrorForUser(e, { locale: opts.locale }), locale: opts.locale });
+    }
+  }
+
+  async function renderGroupChannelDetailMenu(chatKey, actorUserId, channelId, pageRaw, opts = {}) {
+    try {
+      const ctx = await resolveGroupActorContext(chatKey, actorUserId);
+      if (!ctx.ownsCurrentAgent || !isNonEmptyString(ctx.actorChatKey)) {
+        return renderGroupOwnerOnlyView(chatKey, { error: uiStrings(opts.locale).msg_group_owner_only, locale: opts.locale });
+      }
+      const view = await renderPrivateChannelDetailMenu(ctx.actorChatKey, channelId, pageRaw, opts);
+      return remapPrivateViewToGroup(view, chatKey);
+    } catch (e) {
+      return renderGroupOwnerOnlyView(chatKey, { error: formatGatewayErrorForUser(e, { locale: opts.locale }), locale: opts.locale });
+    }
+  }
+
+  async function renderGroupChannelCreateNameMenu(chatKey, actorUserId, opts = {}) {
+    try {
+      const ctx = await resolveGroupActorContext(chatKey, actorUserId);
+      if (!ctx.ownsCurrentAgent || !isNonEmptyString(ctx.actorChatKey)) {
+        return renderGroupOwnerOnlyView(chatKey, { error: uiStrings(opts.locale).msg_group_owner_only, locale: opts.locale });
+      }
+      const view = await renderPrivateChannelCreateNameMenu(ctx.actorChatKey, opts);
+      return remapPrivateViewToGroup(view, chatKey);
+    } catch (e) {
+      return renderGroupOwnerOnlyView(chatKey, { error: formatGatewayErrorForUser(e, { locale: opts.locale }), locale: opts.locale });
+    }
+  }
+
+  async function renderGroupChannelCreateBaseUrlMenu(chatKey, actorUserId, channelName, opts = {}) {
+    try {
+      const ctx = await resolveGroupActorContext(chatKey, actorUserId);
+      if (!ctx.ownsCurrentAgent || !isNonEmptyString(ctx.actorChatKey)) {
+        return renderGroupOwnerOnlyView(chatKey, { error: uiStrings(opts.locale).msg_group_owner_only, locale: opts.locale });
+      }
+      const view = await renderPrivateChannelCreateBaseUrlMenu(ctx.actorChatKey, channelName, opts);
+      return remapPrivateViewToGroup(view, chatKey);
+    } catch (e) {
+      return renderGroupOwnerOnlyView(chatKey, { error: formatGatewayErrorForUser(e, { locale: opts.locale }), locale: opts.locale });
+    }
+  }
+
+  async function renderGroupChannelCreateKeyMenu(chatKey, actorUserId, channelName, baseUrl, opts = {}) {
+    try {
+      const ctx = await resolveGroupActorContext(chatKey, actorUserId);
+      if (!ctx.ownsCurrentAgent || !isNonEmptyString(ctx.actorChatKey)) {
+        return renderGroupOwnerOnlyView(chatKey, { error: uiStrings(opts.locale).msg_group_owner_only, locale: opts.locale });
+      }
+      const view = await renderPrivateChannelCreateKeyMenu(ctx.actorChatKey, channelName, baseUrl, opts);
+      return remapPrivateViewToGroup(view, chatKey);
+    } catch (e) {
+      return renderGroupOwnerOnlyView(chatKey, { error: formatGatewayErrorForUser(e, { locale: opts.locale }), locale: opts.locale });
+    }
+  }
+
+  async function renderGroupChannelRenameMenu(chatKey, actorUserId, channelId, pageRaw, opts = {}) {
+    try {
+      const ctx = await resolveGroupActorContext(chatKey, actorUserId);
+      if (!ctx.ownsCurrentAgent || !isNonEmptyString(ctx.actorChatKey)) {
+        return renderGroupOwnerOnlyView(chatKey, { error: uiStrings(opts.locale).msg_group_owner_only, locale: opts.locale });
+      }
+      const view = await renderPrivateChannelRenameMenu(ctx.actorChatKey, channelId, pageRaw, opts);
+      return remapPrivateViewToGroup(view, chatKey);
+    } catch (e) {
+      return renderGroupOwnerOnlyView(chatKey, { error: formatGatewayErrorForUser(e, { locale: opts.locale }), locale: opts.locale });
+    }
+  }
+
+  async function renderGroupChannelDeleteMenu(chatKey, actorUserId, channelId, pageRaw, opts = {}) {
+    try {
+      const ctx = await resolveGroupActorContext(chatKey, actorUserId);
+      if (!ctx.ownsCurrentAgent || !isNonEmptyString(ctx.actorChatKey)) {
+        return renderGroupOwnerOnlyView(chatKey, { error: uiStrings(opts.locale).msg_group_owner_only, locale: opts.locale });
+      }
+      const view = await renderPrivateChannelDeleteMenu(ctx.actorChatKey, channelId, pageRaw, opts);
+      return remapPrivateViewToGroup(view, chatKey);
+    } catch (e) {
+      return renderGroupOwnerOnlyView(chatKey, { error: formatGatewayErrorForUser(e, { locale: opts.locale }), locale: opts.locale });
+    }
+  }
+
+  async function renderGroupChannelKeyMenu(chatKey, actorUserId, channelId, pageRaw, opts = {}) {
+    try {
+      const ctx = await resolveGroupActorContext(chatKey, actorUserId);
+      if (!ctx.ownsCurrentAgent || !isNonEmptyString(ctx.actorChatKey)) {
+        return renderGroupOwnerOnlyView(chatKey, { error: uiStrings(opts.locale).msg_group_owner_only, locale: opts.locale });
+      }
+      const view = await renderPrivateChannelKeyMenu(ctx.actorChatKey, channelId, pageRaw, opts);
+      return remapPrivateViewToGroup(view, chatKey);
+    } catch (e) {
+      return renderGroupOwnerOnlyView(chatKey, { error: formatGatewayErrorForUser(e, { locale: opts.locale }), locale: opts.locale });
+    }
+  }
+
   async function renderHelpMenu(chatKey, { forGroup = false, locale } = {}) {
     const S = uiStrings(locale);
     const lines = [];
@@ -3099,12 +3406,12 @@ async function main() {
     return { text: lines.join("\n"), replyMarkup };
   }
 
-  async function sendMenuMessage({ target, chatKey, chatType, notice, locale } = {}) {
+  async function sendMenuMessage({ target, chatKey, chatType, notice, locale, actorUserId } = {}) {
     if (!target || !isNonEmptyString(chatKey)) return null;
-    clearPendingAgentInput(chatKey);
+    clearPendingAgentInput(chatKey, isGroupChatType(chatType) ? actorUserId : undefined);
     const view = isPrivateChatType(chatType)
       ? await renderPrivateMainMenu(chatKey, { notice, locale })
-      : await renderGroupMainMenu(chatKey, { notice, locale });
+      : await renderGroupMainMenu(chatKey, { notice, locale, actorUserId });
     return await safeSendMessage({
       ...target,
       text: view.text,
@@ -3149,6 +3456,8 @@ async function main() {
     const chatId = msg?.chat?.id;
     const chatType = msg?.chat?.type;
     const messageId = msg?.message_id;
+    const actorUserId = Number.isFinite(fromId) ? Math.trunc(fromId) : null;
+    const clearPendingForActor = () => clearPendingAgentInput(chatKey, isGroupChatType(chatType) ? actorUserId : undefined);
 
     if (!isNonEmptyString(chatKey) || !Number.isFinite(chatId) || !Number.isFinite(messageId)) {
       await safeAnswerCallbackQuery(cbId, S0.msg_unsupported_cb);
@@ -3157,6 +3466,17 @@ async function main() {
 
     const locale = localeForChatKey(chatKey, callbackQuery?.from?.language_code);
     const S = uiStrings(locale);
+    const getOwnedGroupActorContext = async ({ requireRenameable = false } = {}) => {
+      try {
+        const ctx = await resolveGroupActorContext(chatKey, actorUserId);
+        if (!ctx.ownsCurrentAgent || !isNonEmptyString(ctx.actorChatKey) || (requireRenameable && !ctx.canRenameCurrentAgent)) {
+          return { ok: false, error: S.msg_group_owner_only, ctx: null };
+        }
+        return { ok: true, error: null, ctx };
+      } catch (e) {
+        return { ok: false, error: formatGatewayErrorForUser(e, { locale }), ctx: null };
+      }
+    };
 
     const payload = callbacks.get(token);
     if (!payload || payload.chatKey !== chatKey) {
@@ -3175,7 +3495,7 @@ async function main() {
     try {
       if (action === "close") {
         await answerOnce();
-        clearPendingAgentInput(chatKey);
+        clearPendingForActor();
         await safeDeleteMessage({ chat_id: chatId, message_id: messageId });
         return;
       }
@@ -3639,7 +3959,7 @@ async function main() {
 
       if (action === "g:main") {
         await answerOnce();
-        const view = await renderGroupMainMenu(chatKey, { locale });
+        const view = await renderGroupMainMenu(chatKey, { locale, actorUserId });
         await editMenuMessage({ chatId, messageId, view });
         return;
       }
@@ -3651,13 +3971,297 @@ async function main() {
         return;
       }
 
+      if (action === "g:model") {
+        await answerOnce();
+        const view = await renderGroupModelMenu(chatKey, actorUserId, { locale });
+        await editMenuMessage({ chatId, messageId, view });
+        return;
+      }
+
+      if (action === "g:model_set") {
+        await answerOnce();
+        const model = payload.model;
+        if (!isNonEmptyString(model) || !AVAILABLE_AGENT_MODELS.includes(model)) {
+          const view = await renderGroupModelMenu(chatKey, actorUserId, { error: S.msg_invalid_model, locale });
+          await editMenuMessage({ chatId, messageId, view });
+          return;
+        }
+        const owned = await getOwnedGroupActorContext();
+        if (!owned.ok) {
+          const view = await renderGroupModelMenu(chatKey, actorUserId, { error: owned.error, locale });
+          await editMenuMessage({ chatId, messageId, view });
+          return;
+        }
+        try {
+          await argusHttp.automationAgentSetModel(owned.ctx.actorChatKey, owned.ctx.route.agentId, model);
+        } catch (e) {
+          const view = await renderGroupModelMenu(chatKey, actorUserId, { error: formatGatewayErrorForUser(e, { locale }), locale });
+          await editMenuMessage({ chatId, messageId, view });
+          return;
+        }
+        const notice = formatTemplate(S.notice_model_switched, { model });
+        const view = await renderGroupMainMenu(chatKey, { notice, locale, actorUserId });
+        await editMenuMessage({ chatId, messageId, view });
+        return;
+      }
+
+      if (action === "g:rename_begin") {
+        await answerOnce();
+        clearPendingForActor();
+        const owned = await getOwnedGroupActorContext({ requireRenameable: true });
+        if (!owned.ok) {
+          const view = await renderGroupMainMenu(chatKey, { notice: owned.error, locale, actorUserId });
+          await editMenuMessage({ chatId, messageId, view });
+          return;
+        }
+        setPendingRenameAgent(chatKey, chatId, messageId, owned.ctx.route.agentId, actorUserId);
+        const view = await renderGroupRenameMenu(chatKey, actorUserId, owned.ctx.route.agentId, { locale });
+        await editMenuMessage({ chatId, messageId, view });
+        return;
+      }
+
+      if (action === "g:rename_cancel") {
+        await answerOnce();
+        clearPendingForActor();
+        const view = await renderGroupMainMenu(chatKey, { notice: S.notice_canceled, locale, actorUserId });
+        await editMenuMessage({ chatId, messageId, view });
+        return;
+      }
+
+      if (action === "g:channels") {
+        await answerOnce();
+        clearPendingForActor();
+        const view = await renderGroupChannelListMenu(chatKey, actorUserId, payload.page, { locale });
+        await editMenuMessage({ chatId, messageId, view });
+        return;
+      }
+
+      if (action === "g:channel_view") {
+        await answerOnce();
+        clearPendingForActor();
+        const channelId = payload.channelId;
+        if (!isNonEmptyString(channelId)) {
+          const view = await renderGroupChannelListMenu(chatKey, actorUserId, payload.page, { error: S.msg_invalid_channel, locale });
+          await editMenuMessage({ chatId, messageId, view });
+          return;
+        }
+        const view = await renderGroupChannelDetailMenu(chatKey, actorUserId, channelId, payload.page, { locale });
+        await editMenuMessage({ chatId, messageId, view });
+        return;
+      }
+
+      if (action === "g:channel_select") {
+        await answerOnce();
+        clearPendingForActor();
+        const channelId = payload.channelId;
+        if (!isNonEmptyString(channelId)) {
+          const view = await renderGroupChannelListMenu(chatKey, actorUserId, payload.page, { error: S.msg_invalid_channel, locale });
+          await editMenuMessage({ chatId, messageId, view });
+          return;
+        }
+        const owned = await getOwnedGroupActorContext();
+        if (!owned.ok) {
+          const view = await renderGroupChannelDetailMenu(chatKey, actorUserId, channelId, payload.page, { error: owned.error, locale });
+          await editMenuMessage({ chatId, messageId, view });
+          return;
+        }
+        try {
+          const result = await argusHttp.automationChannelSelect(owned.ctx.actorChatKey, channelId);
+          const channel = result?.currentChannel && typeof result.currentChannel === "object" ? result.currentChannel : { channelId };
+          const notice = formatTemplate(S.notice_channel_switched, { name: channelDisplayName(channel) });
+          const view = await renderGroupMainMenu(chatKey, { notice, locale, actorUserId });
+          await editMenuMessage({ chatId, messageId, view });
+        } catch (e) {
+          const view = await renderGroupChannelDetailMenu(chatKey, actorUserId, channelId, payload.page, { error: formatGatewayErrorForUser(e, { locale }), locale });
+          await editMenuMessage({ chatId, messageId, view });
+        }
+        return;
+      }
+
+      if (action === "g:channel_create_begin") {
+        await answerOnce();
+        clearPendingForActor();
+        const owned = await getOwnedGroupActorContext();
+        if (!owned.ok) {
+          const view = await renderGroupChannelListMenu(chatKey, actorUserId, 0, { error: owned.error, locale });
+          await editMenuMessage({ chatId, messageId, view });
+          return;
+        }
+        setPendingCreateChannelName(chatKey, chatId, messageId, actorUserId);
+        const view = await renderGroupChannelCreateNameMenu(chatKey, actorUserId, { locale });
+        await editMenuMessage({ chatId, messageId, view });
+        return;
+      }
+
+      if (action === "g:channel_create_cancel") {
+        await answerOnce();
+        clearPendingForActor();
+        const view = await renderGroupChannelListMenu(chatKey, actorUserId, 0, { notice: S.notice_canceled, locale });
+        await editMenuMessage({ chatId, messageId, view });
+        return;
+      }
+
+      if (action === "g:channel_rename_begin") {
+        await answerOnce();
+        clearPendingForActor();
+        const channelId = payload.channelId;
+        if (!isNonEmptyString(channelId)) {
+          const view = await renderGroupChannelListMenu(chatKey, actorUserId, payload.page, { error: S.msg_invalid_channel, locale });
+          await editMenuMessage({ chatId, messageId, view });
+          return;
+        }
+        const owned = await getOwnedGroupActorContext();
+        if (!owned.ok) {
+          const view = await renderGroupChannelDetailMenu(chatKey, actorUserId, channelId, payload.page, { error: owned.error, locale });
+          await editMenuMessage({ chatId, messageId, view });
+          return;
+        }
+        setPendingRenameChannel(chatKey, chatId, messageId, channelId, payload.page, actorUserId);
+        const view = await renderGroupChannelRenameMenu(chatKey, actorUserId, channelId, payload.page, { locale });
+        await editMenuMessage({ chatId, messageId, view });
+        return;
+      }
+
+      if (action === "g:channel_rename_cancel") {
+        await answerOnce();
+        clearPendingForActor();
+        const channelId = payload.channelId;
+        if (!isNonEmptyString(channelId)) {
+          const view = await renderGroupChannelListMenu(chatKey, actorUserId, payload.page, { notice: S.notice_canceled, locale });
+          await editMenuMessage({ chatId, messageId, view });
+          return;
+        }
+        const view = await renderGroupChannelDetailMenu(chatKey, actorUserId, channelId, payload.page, { notice: S.notice_canceled, locale });
+        await editMenuMessage({ chatId, messageId, view });
+        return;
+      }
+
+      if (action === "g:channel_delete_begin") {
+        await answerOnce();
+        clearPendingForActor();
+        const channelId = payload.channelId;
+        if (!isNonEmptyString(channelId)) {
+          const view = await renderGroupChannelListMenu(chatKey, actorUserId, payload.page, { error: S.msg_invalid_channel, locale });
+          await editMenuMessage({ chatId, messageId, view });
+          return;
+        }
+        const view = await renderGroupChannelDeleteMenu(chatKey, actorUserId, channelId, payload.page, { locale });
+        await editMenuMessage({ chatId, messageId, view });
+        return;
+      }
+
+      if (action === "g:channel_delete_cancel") {
+        await answerOnce();
+        clearPendingForActor();
+        const channelId = payload.channelId;
+        if (!isNonEmptyString(channelId)) {
+          const view = await renderGroupChannelListMenu(chatKey, actorUserId, payload.page, { notice: S.notice_canceled, locale });
+          await editMenuMessage({ chatId, messageId, view });
+          return;
+        }
+        const view = await renderGroupChannelDetailMenu(chatKey, actorUserId, channelId, payload.page, { notice: S.notice_canceled, locale });
+        await editMenuMessage({ chatId, messageId, view });
+        return;
+      }
+
+      if (action === "g:channel_delete_confirm") {
+        await answerOnce();
+        clearPendingForActor();
+        const channelId = payload.channelId;
+        if (!isNonEmptyString(channelId)) {
+          const view = await renderGroupChannelListMenu(chatKey, actorUserId, payload.page, { error: S.msg_invalid_channel, locale });
+          await editMenuMessage({ chatId, messageId, view });
+          return;
+        }
+        const owned = await getOwnedGroupActorContext();
+        if (!owned.ok) {
+          const view = await renderGroupChannelDeleteMenu(chatKey, actorUserId, channelId, payload.page, { error: owned.error, locale });
+          await editMenuMessage({ chatId, messageId, view });
+          return;
+        }
+        try {
+          const result = await argusHttp.automationChannelDelete(owned.ctx.actorChatKey, channelId);
+          const deletedName = isNonEmptyString(result?.deletedName) ? result.deletedName : channelId;
+          const notice = formatTemplate(S.notice_channel_deleted, { name: deletedName });
+          const view = await renderGroupChannelListMenu(chatKey, actorUserId, payload.page, { notice, locale });
+          await editMenuMessage({ chatId, messageId, view });
+        } catch (e) {
+          const view = await renderGroupChannelDeleteMenu(chatKey, actorUserId, channelId, payload.page, { error: formatGatewayErrorForUser(e, { locale }), locale });
+          await editMenuMessage({ chatId, messageId, view });
+        }
+        return;
+      }
+
+      if (action === "g:channel_key_begin") {
+        await answerOnce();
+        clearPendingForActor();
+        const channelId = payload.channelId;
+        if (!isNonEmptyString(channelId)) {
+          const view = await renderGroupChannelListMenu(chatKey, actorUserId, payload.page, { error: S.msg_invalid_channel, locale });
+          await editMenuMessage({ chatId, messageId, view });
+          return;
+        }
+        const owned = await getOwnedGroupActorContext();
+        if (!owned.ok) {
+          const view = await renderGroupChannelDetailMenu(chatKey, actorUserId, channelId, payload.page, { error: owned.error, locale });
+          await editMenuMessage({ chatId, messageId, view });
+          return;
+        }
+        setPendingChannelKey(chatKey, chatId, messageId, channelId, payload.page, actorUserId);
+        const view = await renderGroupChannelKeyMenu(chatKey, actorUserId, channelId, payload.page, { locale });
+        await editMenuMessage({ chatId, messageId, view });
+        return;
+      }
+
+      if (action === "g:channel_key_cancel") {
+        await answerOnce();
+        clearPendingForActor();
+        const channelId = payload.channelId;
+        if (!isNonEmptyString(channelId)) {
+          const view = await renderGroupChannelListMenu(chatKey, actorUserId, payload.page, { notice: S.notice_canceled, locale });
+          await editMenuMessage({ chatId, messageId, view });
+          return;
+        }
+        const view = await renderGroupChannelDetailMenu(chatKey, actorUserId, channelId, payload.page, { notice: S.notice_canceled, locale });
+        await editMenuMessage({ chatId, messageId, view });
+        return;
+      }
+
+      if (action === "g:channel_key_clear") {
+        await answerOnce();
+        clearPendingForActor();
+        const channelId = payload.channelId;
+        if (!isNonEmptyString(channelId)) {
+          const view = await renderGroupChannelListMenu(chatKey, actorUserId, payload.page, { error: S.msg_invalid_channel, locale });
+          await editMenuMessage({ chatId, messageId, view });
+          return;
+        }
+        const owned = await getOwnedGroupActorContext();
+        if (!owned.ok) {
+          const view = await renderGroupChannelDetailMenu(chatKey, actorUserId, channelId, payload.page, { error: owned.error, locale });
+          await editMenuMessage({ chatId, messageId, view });
+          return;
+        }
+        try {
+          const result = await argusHttp.automationChannelKeyClear(owned.ctx.actorChatKey, channelId);
+          const channel = result?.channel && typeof result.channel === "object" ? result.channel : { channelId };
+          const notice = formatTemplate(S.notice_channel_key_cleared, { name: channelDisplayName(channel) });
+          const view = await renderGroupChannelDetailMenu(chatKey, actorUserId, channelId, payload.page, { notice, locale });
+          await editMenuMessage({ chatId, messageId, view });
+        } catch (e) {
+          const view = await renderGroupChannelDetailMenu(chatKey, actorUserId, channelId, payload.page, { error: formatGatewayErrorForUser(e, { locale }), locale });
+          await editMenuMessage({ chatId, messageId, view });
+        }
+        return;
+      }
+
       if (action === "g:new") {
         await answerOnce();
         let route = null;
         try {
           route = await resolveRouteForChatKey(chatKey);
         } catch (e) {
-          const view = await renderGroupMainMenu(chatKey, { notice: formatGatewayErrorForUser(e, { locale }), locale });
+          const view = await renderGroupMainMenu(chatKey, { notice: formatGatewayErrorForUser(e, { locale }), locale, actorUserId });
           await editMenuMessage({ chatId, messageId, view });
           return;
         }
@@ -3666,19 +4270,19 @@ async function main() {
         const tid = await client.startThread(route.model);
         await client.setMainThread(tid);
         const notice = formatTemplate(S.notice_new_thread, { threadId: tid });
-        const view = await renderGroupMainMenu(chatKey, { notice, locale });
+        const view = await renderGroupMainMenu(chatKey, { notice, locale, actorUserId });
         await editMenuMessage({ chatId, messageId, view });
         return;
       }
 
-      if (action === "g:bind") {
+      if (action === "g:switch" || action === "g:bind") {
         const ok = await isChatAdmin(chatId, fromId);
         if (!ok) {
           await answerOnce(S.msg_admins_only);
           return;
         }
         await answerOnce();
-        const view = await renderGroupBindMenu(chatKey, fromId, payload.page, { locale });
+        const view = await renderGroupBindMenu(chatKey, actorUserId, payload.page, { locale });
         await editMenuMessage({ chatId, messageId, view });
         return;
       }
@@ -3687,7 +4291,7 @@ async function main() {
         const agentId = payload.agentId;
         if (!isNonEmptyString(agentId)) {
           await answerOnce();
-          const view = await renderGroupMainMenu(chatKey, { notice: S.msg_invalid_agent, locale });
+          const view = await renderGroupMainMenu(chatKey, { notice: S.msg_invalid_agent, locale, actorUserId });
           await editMenuMessage({ chatId, messageId, view });
           return;
         }
@@ -3697,14 +4301,13 @@ async function main() {
           return;
         }
         await answerOnce();
-        const actorUserId = fromId;
         const bound = await argusHttp.automationChatBind(chatKey, agentId, actorUserId);
         const sid = bound?.sessionId;
         if (isNonEmptyString(sid)) {
           await getClient(sid);
         }
         const notice = formatTemplate(S.notice_bound, { agentId });
-        const view = await renderGroupMainMenu(chatKey, { notice, locale });
+        const view = await renderGroupMainMenu(chatKey, { notice, locale, actorUserId });
         await editMenuMessage({ chatId, messageId, view });
         return;
       }
@@ -3802,12 +4405,74 @@ async function main() {
 
       queue.enqueue(async () => {
         const S = uiStrings(locale);
+        const actorUserId = Number.isFinite(message?.from?.id) ? Math.trunc(message.from.id) : null;
+        const pendingActorUserId = isGroupChatType(chatType) ? actorUserId : undefined;
+        const clearPendingForActor = () => clearPendingAgentInput(chatKey, pendingActorUserId);
+        const renderMainMenuForActor = async ({ notice, locale: localeOverride } = {}) => (
+          isPrivateChatType(chatType)
+            ? await renderPrivateMainMenu(chatKey, { notice, locale: localeOverride })
+            : await renderGroupMainMenu(chatKey, { notice, locale: localeOverride, actorUserId })
+        );
+        const renderRenameMenuForActor = async (agentId, opts = {}) => (
+          isPrivateChatType(chatType)
+            ? await renderPrivateRenameMenu(chatKey, agentId, opts)
+            : await renderGroupRenameMenu(chatKey, actorUserId, agentId, opts)
+        );
+        const renderChannelListMenuForActor = async (pageRaw, opts = {}) => (
+          isPrivateChatType(chatType)
+            ? await renderPrivateChannelListMenu(chatKey, pageRaw, opts)
+            : await renderGroupChannelListMenu(chatKey, actorUserId, pageRaw, opts)
+        );
+        const renderChannelDetailMenuForActor = async (channelId, pageRaw, opts = {}) => (
+          isPrivateChatType(chatType)
+            ? await renderPrivateChannelDetailMenu(chatKey, channelId, pageRaw, opts)
+            : await renderGroupChannelDetailMenu(chatKey, actorUserId, channelId, pageRaw, opts)
+        );
+        const renderChannelCreateNameMenuForActor = async (opts = {}) => (
+          isPrivateChatType(chatType)
+            ? await renderPrivateChannelCreateNameMenu(chatKey, opts)
+            : await renderGroupChannelCreateNameMenu(chatKey, actorUserId, opts)
+        );
+        const renderChannelCreateBaseUrlMenuForActor = async (channelName, opts = {}) => (
+          isPrivateChatType(chatType)
+            ? await renderPrivateChannelCreateBaseUrlMenu(chatKey, channelName, opts)
+            : await renderGroupChannelCreateBaseUrlMenu(chatKey, actorUserId, channelName, opts)
+        );
+        const renderChannelCreateKeyMenuForActor = async (channelName, baseUrl, opts = {}) => (
+          isPrivateChatType(chatType)
+            ? await renderPrivateChannelCreateKeyMenu(chatKey, channelName, baseUrl, opts)
+            : await renderGroupChannelCreateKeyMenu(chatKey, actorUserId, channelName, baseUrl, opts)
+        );
+        const renderChannelRenameMenuForActor = async (channelId, pageRaw, opts = {}) => (
+          isPrivateChatType(chatType)
+            ? await renderPrivateChannelRenameMenu(chatKey, channelId, pageRaw, opts)
+            : await renderGroupChannelRenameMenu(chatKey, actorUserId, channelId, pageRaw, opts)
+        );
+        const renderChannelKeyMenuForActor = async (channelId, pageRaw, opts = {}) => (
+          isPrivateChatType(chatType)
+            ? await renderPrivateChannelKeyMenu(chatKey, channelId, pageRaw, opts)
+            : await renderGroupChannelKeyMenu(chatKey, actorUserId, channelId, pageRaw, opts)
+        );
+        const getOwnedGroupActorContext = async ({ requireRenameable = false } = {}) => {
+          if (!isGroupChatType(chatType)) {
+            return { ok: true, error: null, mutationChatKey: chatKey, ctx: null };
+          }
+          try {
+            const ctx = await resolveGroupActorContext(chatKey, actorUserId);
+            if (!ctx.ownsCurrentAgent || !isNonEmptyString(ctx.actorChatKey) || (requireRenameable && !ctx.canRenameCurrentAgent)) {
+              return { ok: false, error: S.msg_group_owner_only, mutationChatKey: null, ctx: null };
+            }
+            return { ok: true, error: null, mutationChatKey: ctx.actorChatKey, ctx };
+          } catch (e) {
+            return { ok: false, error: formatGatewayErrorForUser(e, { locale }), mutationChatKey: null, ctx: null };
+          }
+        };
         try {
           if (slash?.forOtherBot) return;
           if (slash || looksSlash) {
-            const pendingBeforeSlash = isPrivateChatType(chatType) ? getPendingAgentInput(chatKey) : null;
+            const pendingBeforeSlash = getPendingAgentInput(chatKey, pendingActorUserId);
             const hadPendingBeforeSlash = !!pendingBeforeSlash;
-            clearPendingAgentInput(chatKey);
+            clearPendingForActor();
             if (slash?.known && slash.cmd === "start") {
               if (!isPrivateChatType(chatType)) {
                 await safeSendMessage({ ...target, text: S.msg_use_start_in_dm });
@@ -3821,13 +4486,14 @@ async function main() {
                 chatKey,
                 chatType,
                 locale,
+                actorUserId: message?.from?.id,
                 notice: Boolean(boot?.createdMain) ? S.notice_initialized_created : S.notice_initialized_exists
               });
               return;
             }
 
             if (slash?.known && slash.cmd === "menu") {
-              const sent = await sendMenuMessage({ target, chatKey, chatType, locale });
+              const sent = await sendMenuMessage({ target, chatKey, chatType, locale, actorUserId: message?.from?.id });
               scheduleMenuAutoDelete({
                 chatId: target.chat_id,
                 menuMessageId: sent?.message_id,
@@ -3904,17 +4570,17 @@ async function main() {
                 .trim()
                 .toLowerCase();
             if (!isNonEmptyString(raw)) {
-              await sendMenuMessage({ target, chatKey, chatType, locale });
+              await sendMenuMessage({ target, chatKey, chatType, locale, actorUserId: message?.from?.id });
               return;
             }
             const notice = LEGACY_COMMANDS.has(raw)
               ? formatTemplate(S.notice_legacy_moved, { cmd: raw })
               : formatTemplate(S.notice_unknown_command, { cmd: raw });
-            await sendMenuMessage({ target, chatKey, chatType, notice, locale });
+            await sendMenuMessage({ target, chatKey, chatType, notice, locale, actorUserId: message?.from?.id });
             return;
           }
 
-          const pending = isPrivateChatType(chatType) ? getPendingAgentInput(chatKey) : null;
+          const pending = getPendingAgentInput(chatKey, pendingActorUserId);
           if (pending && pending.kind === "create") {
             const name = isNonEmptyString(text) ? text.trim().split(/\s+/, 1)[0]?.trim().toLowerCase() : "";
             if (!isNonEmptyString(name)) {
@@ -3927,7 +4593,7 @@ async function main() {
               await argusHttp.automationAgentUse(chatKey, name);
               const sid = created?.agent?.sessionId;
               if (isNonEmptyString(sid)) await getClient(sid);
-              clearPendingAgentInput(chatKey);
+              clearPendingForActor();
               const notice = formatTemplate(S.notice_created, { name });
               const view = await renderPrivateMainMenu(chatKey, { notice, locale });
               await editMenuMessage({ chatId: pending.panelChatId, messageId: pending.panelMessageId, view });
@@ -3940,18 +4606,31 @@ async function main() {
           if (pending && pending.kind === "rename") {
             const name = isNonEmptyString(text) ? text.trim().split(/\s+/, 1)[0]?.trim().toLowerCase() : "";
             if (!isNonEmptyString(name)) {
-              const view = await renderPrivateRenameMenu(chatKey, pending.agentId, { error: S.rename_missing, locale });
+              const view = await renderRenameMenuForActor(pending.agentId, { error: S.rename_missing, locale });
               await editMenuMessage({ chatId: pending.panelChatId, messageId: pending.panelMessageId, view });
               return;
             }
             try {
-              await argusHttp.automationAgentRename(chatKey, pending.agentId, name);
-              clearPendingAgentInput(chatKey);
+              const owned = await getOwnedGroupActorContext({ requireRenameable: true });
+              if (!owned.ok) {
+                clearPendingForActor();
+                const view = await renderMainMenuForActor({ notice: owned.error, locale });
+                await editMenuMessage({ chatId: pending.panelChatId, messageId: pending.panelMessageId, view });
+                return;
+              }
+              if (owned.ctx && owned.ctx.route.agentId !== pending.agentId) {
+                clearPendingForActor();
+                const view = await renderMainMenuForActor({ notice: S.msg_invalid_agent, locale });
+                await editMenuMessage({ chatId: pending.panelChatId, messageId: pending.panelMessageId, view });
+                return;
+              }
+              await argusHttp.automationAgentRename(owned.mutationChatKey, pending.agentId, name);
+              clearPendingForActor();
               const notice = formatTemplate(S.notice_renamed, { old: pending.agentId, name });
-              const view = await renderPrivateMainMenu(chatKey, { notice, locale });
+              const view = await renderMainMenuForActor({ notice, locale });
               await editMenuMessage({ chatId: pending.panelChatId, messageId: pending.panelMessageId, view });
             } catch (e) {
-              const view = await renderPrivateRenameMenu(chatKey, pending.agentId, { error: formatGatewayErrorForUser(e, { locale }), locale });
+              const view = await renderRenameMenuForActor(pending.agentId, { error: formatGatewayErrorForUser(e, { locale }), locale });
               await editMenuMessage({ chatId: pending.panelChatId, messageId: pending.panelMessageId, view });
             }
             return;
@@ -3959,48 +4638,69 @@ async function main() {
           if (pending && pending.kind === "channel_create_name") {
             const channelName = isNonEmptyString(text) ? text.trim().split(/\s+/, 1)[0]?.trim().toLowerCase() : "";
             if (!isNonEmptyString(channelName)) {
-              const view = await renderPrivateChannelCreateNameMenu(chatKey, { error: S.channel_create_name_missing, locale });
+              const view = await renderChannelCreateNameMenuForActor({ error: S.channel_create_name_missing, locale });
               await editMenuMessage({ chatId: pending.panelChatId, messageId: pending.panelMessageId, view });
               return;
             }
-            setPendingCreateChannelBaseUrl(chatKey, pending.panelChatId, pending.panelMessageId, channelName);
-            const view = await renderPrivateChannelCreateBaseUrlMenu(chatKey, channelName, { locale });
+            const owned = await getOwnedGroupActorContext();
+            if (!owned.ok) {
+              clearPendingForActor();
+              const view = await renderMainMenuForActor({ notice: owned.error, locale });
+              await editMenuMessage({ chatId: pending.panelChatId, messageId: pending.panelMessageId, view });
+              return;
+            }
+            setPendingCreateChannelBaseUrl(chatKey, pending.panelChatId, pending.panelMessageId, channelName, pendingActorUserId);
+            const view = await renderChannelCreateBaseUrlMenuForActor(channelName, { locale });
             await editMenuMessage({ chatId: pending.panelChatId, messageId: pending.panelMessageId, view });
             return;
           }
           if (pending && pending.kind === "channel_create_base_url") {
             const baseUrl = isNonEmptyString(text) ? text.trim() : "";
             if (!isNonEmptyString(baseUrl)) {
-              const view = await renderPrivateChannelCreateBaseUrlMenu(chatKey, pending.channelName, { error: S.channel_create_base_url_missing, locale });
+              const view = await renderChannelCreateBaseUrlMenuForActor(pending.channelName, { error: S.channel_create_base_url_missing, locale });
               await editMenuMessage({ chatId: pending.panelChatId, messageId: pending.panelMessageId, view });
               return;
             }
-            setPendingCreateChannelApiKey(chatKey, pending.panelChatId, pending.panelMessageId, pending.channelName, baseUrl);
-            const view = await renderPrivateChannelCreateKeyMenu(chatKey, pending.channelName, baseUrl, { locale });
+            const owned = await getOwnedGroupActorContext();
+            if (!owned.ok) {
+              clearPendingForActor();
+              const view = await renderMainMenuForActor({ notice: owned.error, locale });
+              await editMenuMessage({ chatId: pending.panelChatId, messageId: pending.panelMessageId, view });
+              return;
+            }
+            setPendingCreateChannelApiKey(chatKey, pending.panelChatId, pending.panelMessageId, pending.channelName, baseUrl, pendingActorUserId);
+            const view = await renderChannelCreateKeyMenuForActor(pending.channelName, baseUrl, { locale });
             await editMenuMessage({ chatId: pending.panelChatId, messageId: pending.panelMessageId, view });
             return;
           }
           if (pending && pending.kind === "channel_create_api_key") {
             const apiKey = isNonEmptyString(text) ? text.trim() : "";
             if (!isNonEmptyString(apiKey)) {
-              const view = await renderPrivateChannelCreateKeyMenu(chatKey, pending.channelName, pending.baseUrl, { error: S.channel_create_key_missing, locale });
+              const view = await renderChannelCreateKeyMenuForActor(pending.channelName, pending.baseUrl, { error: S.channel_create_key_missing, locale });
               await editMenuMessage({ chatId: pending.panelChatId, messageId: pending.panelMessageId, view });
               return;
             }
             try {
-              const created = await argusHttp.automationChannelCreate(chatKey, pending.channelName, pending.baseUrl, apiKey);
+              const owned = await getOwnedGroupActorContext();
+              if (!owned.ok) {
+                clearPendingForActor();
+                const view = await renderMainMenuForActor({ notice: owned.error, locale });
+                await editMenuMessage({ chatId: pending.panelChatId, messageId: pending.panelMessageId, view });
+                return;
+              }
+              const created = await argusHttp.automationChannelCreate(owned.mutationChatKey, pending.channelName, pending.baseUrl, apiKey);
               const createdChannel = created?.channel && typeof created.channel === "object" ? created.channel : null;
-              clearPendingAgentInput(chatKey);
+              clearPendingForActor();
               const notice = formatTemplate(S.notice_channel_created, { name: channelDisplayName(createdChannel || { name: pending.channelName, channelId: pending.channelName }) });
               if (isNonEmptyString(createdChannel?.channelId)) {
-                const view = await renderPrivateChannelDetailMenu(chatKey, createdChannel.channelId, 0, { notice, locale });
+                const view = await renderChannelDetailMenuForActor(createdChannel.channelId, 0, { notice, locale });
                 await editMenuMessage({ chatId: pending.panelChatId, messageId: pending.panelMessageId, view });
               } else {
-                const view = await renderPrivateChannelListMenu(chatKey, 0, { notice, locale });
+                const view = await renderChannelListMenuForActor(0, { notice, locale });
                 await editMenuMessage({ chatId: pending.panelChatId, messageId: pending.panelMessageId, view });
               }
             } catch (e) {
-              const view = await renderPrivateChannelCreateKeyMenu(chatKey, pending.channelName, pending.baseUrl, { error: formatGatewayErrorForUser(e, { locale }), locale });
+              const view = await renderChannelCreateKeyMenuForActor(pending.channelName, pending.baseUrl, { error: formatGatewayErrorForUser(e, { locale }), locale });
               await editMenuMessage({ chatId: pending.panelChatId, messageId: pending.panelMessageId, view });
             }
             return;
@@ -4008,24 +4708,31 @@ async function main() {
           if (pending && pending.kind === "channel_rename") {
             const name = isNonEmptyString(text) ? text.trim().split(/\s+/, 1)[0]?.trim().toLowerCase() : "";
             if (!isNonEmptyString(name)) {
-              const view = await renderPrivateChannelRenameMenu(chatKey, pending.channelId, pending.page, { error: S.channel_rename_missing, locale });
+              const view = await renderChannelRenameMenuForActor(pending.channelId, pending.page, { error: S.channel_rename_missing, locale });
               await editMenuMessage({ chatId: pending.panelChatId, messageId: pending.panelMessageId, view });
               return;
             }
             try {
+              const owned = await getOwnedGroupActorContext();
+              if (!owned.ok) {
+                clearPendingForActor();
+                const view = await renderMainMenuForActor({ notice: owned.error, locale });
+                await editMenuMessage({ chatId: pending.panelChatId, messageId: pending.panelMessageId, view });
+                return;
+              }
               let oldName = pending.channelId;
               try {
-                const channelState = await resolveChannelStateForChatKey(chatKey);
+                const channelState = await resolveChannelStateForChatKey(owned.mutationChatKey);
                 const current = findChannelById(channelState?.channels, pending.channelId);
                 if (current) oldName = channelDisplayName(current);
               } catch {}
-              await argusHttp.automationChannelRename(chatKey, pending.channelId, name);
-              clearPendingAgentInput(chatKey);
+              await argusHttp.automationChannelRename(owned.mutationChatKey, pending.channelId, name);
+              clearPendingForActor();
               const notice = formatTemplate(S.notice_channel_renamed, { old: oldName, name });
-              const view = await renderPrivateChannelDetailMenu(chatKey, pending.channelId, pending.page, { notice, locale });
+              const view = await renderChannelDetailMenuForActor(pending.channelId, pending.page, { notice, locale });
               await editMenuMessage({ chatId: pending.panelChatId, messageId: pending.panelMessageId, view });
             } catch (e) {
-              const view = await renderPrivateChannelRenameMenu(chatKey, pending.channelId, pending.page, { error: formatGatewayErrorForUser(e, { locale }), locale });
+              const view = await renderChannelRenameMenuForActor(pending.channelId, pending.page, { error: formatGatewayErrorForUser(e, { locale }), locale });
               await editMenuMessage({ chatId: pending.panelChatId, messageId: pending.panelMessageId, view });
             }
             return;
@@ -4033,19 +4740,26 @@ async function main() {
           if (pending && pending.kind === "channel_key") {
             const apiKey = isNonEmptyString(text) ? text.trim() : "";
             if (!isNonEmptyString(apiKey)) {
-              const view = await renderPrivateChannelKeyMenu(chatKey, pending.channelId, pending.page, { error: S.channel_key_missing, locale });
+              const view = await renderChannelKeyMenuForActor(pending.channelId, pending.page, { error: S.channel_key_missing, locale });
               await editMenuMessage({ chatId: pending.panelChatId, messageId: pending.panelMessageId, view });
               return;
             }
             try {
-              const updated = await argusHttp.automationChannelKeySet(chatKey, pending.channelId, apiKey);
+              const owned = await getOwnedGroupActorContext();
+              if (!owned.ok) {
+                clearPendingForActor();
+                const view = await renderMainMenuForActor({ notice: owned.error, locale });
+                await editMenuMessage({ chatId: pending.panelChatId, messageId: pending.panelMessageId, view });
+                return;
+              }
+              const updated = await argusHttp.automationChannelKeySet(owned.mutationChatKey, pending.channelId, apiKey);
               const channel = updated?.channel && typeof updated.channel === "object" ? updated.channel : { channelId: pending.channelId };
-              clearPendingAgentInput(chatKey);
+              clearPendingForActor();
               const notice = formatTemplate(S.notice_channel_key_saved, { name: channelDisplayName(channel) });
-              const view = await renderPrivateChannelDetailMenu(chatKey, pending.channelId, pending.page, { notice, locale });
+              const view = await renderChannelDetailMenuForActor(pending.channelId, pending.page, { notice, locale });
               await editMenuMessage({ chatId: pending.panelChatId, messageId: pending.panelMessageId, view });
             } catch (e) {
-              const view = await renderPrivateChannelKeyMenu(chatKey, pending.channelId, pending.page, { error: formatGatewayErrorForUser(e, { locale }), locale });
+              const view = await renderChannelKeyMenuForActor(pending.channelId, pending.page, { error: formatGatewayErrorForUser(e, { locale }), locale });
               await editMenuMessage({ chatId: pending.panelChatId, messageId: pending.panelMessageId, view });
             }
             return;
@@ -4065,13 +4779,13 @@ async function main() {
               const now = nowMs();
               if (now - lastWarnAt >= UNBOUND_WARN_COOLDOWN_MS) {
                 unboundWarnedAtByChatKey.set(chatKey, now);
-                await sendMenuMessage({ target, chatKey, chatType, notice: S.notice_unbound_hint, locale });
+                await sendMenuMessage({ target, chatKey, chatType, notice: S.notice_unbound_hint, locale, actorUserId: message?.from?.id });
               }
               return;
             }
             const msg2 = formatGatewayErrorForUser(e, { locale });
             if (msg2 === S.err_not_initialized) {
-              await sendMenuMessage({ target, chatKey, chatType, locale });
+              await sendMenuMessage({ target, chatKey, chatType, locale, actorUserId: message?.from?.id });
               return;
             }
             await safeSendMessage({ ...target, text: msg2 });
