@@ -2435,6 +2435,7 @@ async function main() {
 
   const PRIVATE_TO_GROUP_ACTION = new Map([
     ["p:main", "g:main"],
+    ["p:create_cancel", "g:create_cancel"],
     ["p:channels", "g:channels"],
     ["p:channel_view", "g:channel_view"],
     ["p:channel_select", "g:channel_select"],
@@ -2448,7 +2449,13 @@ async function main() {
     ["p:channel_key_begin", "g:channel_key_begin"],
     ["p:channel_key_cancel", "g:channel_key_cancel"],
     ["p:channel_key_clear", "g:channel_key_clear"],
-    ["p:rename_cancel", "g:rename_cancel"]
+    ["p:rename_cancel", "g:rename_cancel"],
+    ["p:delete_cancel", "g:delete_cancel"],
+    ["p:delete_confirm", "g:delete_confirm"],
+    ["p:node", "g:node"],
+    ["p:node_reveal", "g:node_reveal"],
+    ["p:node_pause", "g:node_pause"],
+    ["p:node_resume", "g:node_resume"]
   ]);
 
   function remapViewCallbacks(view, transformPayload) {
@@ -3076,12 +3083,14 @@ async function main() {
     let mainThreadId = null;
     let ownsCurrentAgent = false;
     let canRenameCurrentAgent = false;
+    let canDeleteCurrentAgent = false;
     let currentChannel = null;
     try {
       const ctx = await resolveGroupActorContext(chatKey, actorUserId);
       route = ctx.route;
       ownsCurrentAgent = Boolean(ctx.ownsCurrentAgent);
       canRenameCurrentAgent = Boolean(ctx.canRenameCurrentAgent);
+      canDeleteCurrentAgent = Boolean(ctx.ownsCurrentAgent);
       currentChannel = ctx.currentChannel || null;
       if (isNonEmptyString(route?.sessionId)) {
         mainThreadId = await ensureSessionMainThread(route.sessionId);
@@ -3091,6 +3100,7 @@ async function main() {
       mainThreadId = null;
       ownsCurrentAgent = false;
       canRenameCurrentAgent = false;
+      canDeleteCurrentAgent = false;
       currentChannel = null;
     }
 
@@ -3115,20 +3125,23 @@ async function main() {
     lines.push(`session: ${htmlCode(route.sessionId)}`);
     lines.push(`mainThread: ${htmlCode(mainThreadId || "(none)")}`);
 
-    const primaryButtons = [cbButton(S.btn_switch_agent, { action: "g:switch", chatKey, page: 0 })];
+    const primaryButtons = [
+      cbButton(S.btn_switch_agent, { action: "g:switch", chatKey, page: 0 }),
+      cbButton(S.btn_create_agent, { action: "g:create_begin", chatKey })
+    ];
     if (canRenameCurrentAgent) {
       primaryButtons.push(cbButton(S.btn_rename_agent, { action: "g:rename_begin", chatKey }));
     }
+    if (canDeleteCurrentAgent) {
+      primaryButtons.push(cbButton(S.btn_delete_agent, { action: "g:delete_begin", chatKey }));
+    }
 
     const secondaryButtons = [];
-    if (ownsCurrentAgent) {
-      secondaryButtons.push(
-        cbButton(S.btn_api_channels, { action: "g:channels", chatKey, page: 0 }),
-        cbButton(S.btn_switch_model, { action: "g:model", chatKey })
-      );
-    }
     secondaryButtons.push(
-      cbButton(S.btn_new_thread, { action: "g:new", chatKey }),
+      cbButton(S.btn_api_channels, { action: "g:channels", chatKey, page: 0 }),
+      cbButton(S.btn_switch_model, { action: "g:model", chatKey }),
+      cbButton(S.btn_new_main_thread, { action: "g:newmain", chatKey }),
+      cbButton(S.btn_node_token, { action: "g:node", chatKey }),
       cbButton(S.btn_status, { action: "g:status", chatKey }),
       cbButton(S.btn_help, { action: "help", chatKey })
     );
@@ -3267,6 +3280,12 @@ async function main() {
     }
   }
 
+  async function renderGroupCreateMenu(chatKey, actorUserId, { error, locale } = {}) {
+    const actorChatKey = privateChatKeyForUserId(actorUserId) || chatKey;
+    const view = await renderPrivateCreateMenu(actorChatKey, { error, locale });
+    return remapPrivateViewToGroup(view, chatKey);
+  }
+
   async function renderGroupRenameMenu(chatKey, actorUserId, agentId, { error, locale } = {}) {
     try {
       const ctx = await resolveGroupActorContext(chatKey, actorUserId);
@@ -3274,6 +3293,32 @@ async function main() {
         return renderGroupOwnerOnlyView(chatKey, { error: uiStrings(locale).msg_group_owner_only, locale });
       }
       const view = await renderPrivateRenameMenu(ctx.actorChatKey, agentId, { error, locale });
+      return remapPrivateViewToGroup(view, chatKey);
+    } catch (e) {
+      return renderGroupOwnerOnlyView(chatKey, { error: formatGatewayErrorForUser(e, { locale }), locale });
+    }
+  }
+
+  async function renderGroupDeleteMenu(chatKey, actorUserId, agentId, { error, locale } = {}) {
+    try {
+      const ctx = await resolveGroupActorContext(chatKey, actorUserId);
+      if (!ctx.ownsCurrentAgent || !isNonEmptyString(ctx.actorChatKey) || ctx.route.agentId !== agentId) {
+        return renderGroupOwnerOnlyView(chatKey, { error: uiStrings(locale).msg_group_owner_only, locale });
+      }
+      const view = await renderPrivateDeleteMenu(ctx.actorChatKey, agentId, { error, locale });
+      return remapPrivateViewToGroup(view, chatKey);
+    } catch (e) {
+      return renderGroupOwnerOnlyView(chatKey, { error: formatGatewayErrorForUser(e, { locale }), locale });
+    }
+  }
+
+  async function renderGroupNodeMenu(chatKey, actorUserId, { reveal = false, notice, error, locale } = {}) {
+    try {
+      const ctx = await resolveGroupActorContext(chatKey, actorUserId);
+      if (!ctx.ownsCurrentAgent) {
+        return renderGroupOwnerOnlyView(chatKey, { error: uiStrings(locale).msg_group_owner_only, locale });
+      }
+      const view = await renderPrivateNodeMenu(chatKey, { reveal, notice, error, locale });
       return remapPrivateViewToGroup(view, chatKey);
     } catch (e) {
       return renderGroupOwnerOnlyView(chatKey, { error: formatGatewayErrorForUser(e, { locale }), locale });
@@ -3971,6 +4016,43 @@ async function main() {
         return;
       }
 
+      if (action === "g:create_begin") {
+        const ok = await isChatAdmin(chatId, fromId);
+        if (!ok) {
+          await answerOnce(S.msg_admins_only);
+          return;
+        }
+        await answerOnce();
+        clearPendingForActor();
+        const actorPrivateChatKey = privateChatKeyForUserId(actorUserId);
+        if (!isNonEmptyString(actorPrivateChatKey)) {
+          const view = await renderGroupMainMenu(chatKey, { notice: S.msg_group_owner_only, locale, actorUserId });
+          await editMenuMessage({ chatId, messageId, view });
+          return;
+        }
+        try {
+          const boot = await argusHttp.automationUserBootstrap(actorPrivateChatKey);
+          const currentSessionId = isNonEmptyString(boot?.currentSessionId) ? boot.currentSessionId : null;
+          if (currentSessionId) await getClient(currentSessionId);
+        } catch (e) {
+          const view = await renderGroupMainMenu(chatKey, { notice: formatGatewayErrorForUser(e, { locale }), locale, actorUserId });
+          await editMenuMessage({ chatId, messageId, view });
+          return;
+        }
+        setPendingCreateAgent(chatKey, chatId, messageId, actorUserId);
+        const view = await renderGroupCreateMenu(chatKey, actorUserId, { locale });
+        await editMenuMessage({ chatId, messageId, view });
+        return;
+      }
+
+      if (action === "g:create_cancel") {
+        await answerOnce();
+        clearPendingForActor();
+        const view = await renderGroupMainMenu(chatKey, { notice: S.notice_canceled, locale, actorUserId });
+        await editMenuMessage({ chatId, messageId, view });
+        return;
+      }
+
       if (action === "g:model") {
         await answerOnce();
         const view = await renderGroupModelMenu(chatKey, actorUserId, { locale });
@@ -4024,6 +4106,66 @@ async function main() {
         await answerOnce();
         clearPendingForActor();
         const view = await renderGroupMainMenu(chatKey, { notice: S.notice_canceled, locale, actorUserId });
+        await editMenuMessage({ chatId, messageId, view });
+        return;
+      }
+
+      if (action === "g:delete_begin") {
+        const ok = await isChatAdmin(chatId, fromId);
+        if (!ok) {
+          await answerOnce(S.msg_admins_only);
+          return;
+        }
+        await answerOnce();
+        clearPendingForActor();
+        const owned = await getOwnedGroupActorContext();
+        if (!owned.ok) {
+          const view = await renderGroupMainMenu(chatKey, { notice: owned.error, locale, actorUserId });
+          await editMenuMessage({ chatId, messageId, view });
+          return;
+        }
+        const view = await renderGroupDeleteMenu(chatKey, actorUserId, owned.ctx.route.agentId, { locale });
+        await editMenuMessage({ chatId, messageId, view });
+        return;
+      }
+
+      if (action === "g:delete_cancel") {
+        await answerOnce();
+        clearPendingForActor();
+        const view = await renderGroupMainMenu(chatKey, { notice: S.notice_canceled, locale, actorUserId });
+        await editMenuMessage({ chatId, messageId, view });
+        return;
+      }
+
+      if (action === "g:delete_confirm") {
+        const ok = await isChatAdmin(chatId, fromId);
+        if (!ok) {
+          await answerOnce(S.msg_admins_only);
+          return;
+        }
+        await answerOnce();
+        clearPendingForActor();
+        const agentId = payload.agentId;
+        if (!isNonEmptyString(agentId)) {
+          const view = await renderGroupMainMenu(chatKey, { notice: S.msg_invalid_agent, locale, actorUserId });
+          await editMenuMessage({ chatId, messageId, view });
+          return;
+        }
+        const owned = await getOwnedGroupActorContext();
+        if (!owned.ok || owned.ctx.route.agentId !== agentId) {
+          const view = await renderGroupDeleteMenu(chatKey, actorUserId, agentId, { error: owned.ok ? S.msg_invalid_agent : owned.error, locale });
+          await editMenuMessage({ chatId, messageId, view });
+          return;
+        }
+        try {
+          await argusHttp.automationAgentDelete(owned.ctx.actorChatKey, agentId);
+        } catch (e) {
+          const view = await renderGroupDeleteMenu(chatKey, actorUserId, agentId, { error: formatGatewayErrorForUser(e, { locale }), locale });
+          await editMenuMessage({ chatId, messageId, view });
+          return;
+        }
+        const notice = formatTemplate(S.notice_deleted, { agentId });
+        const view = await renderGroupMainMenu(chatKey, { notice, locale, actorUserId });
         await editMenuMessage({ chatId, messageId, view });
         return;
       }
@@ -4255,7 +4397,7 @@ async function main() {
         return;
       }
 
-      if (action === "g:new") {
+      if (action === "g:new" || action === "g:newmain") {
         await answerOnce();
         let route = null;
         try {
@@ -4271,6 +4413,59 @@ async function main() {
         await client.setMainThread(tid);
         const notice = formatTemplate(S.notice_new_thread, { threadId: tid });
         const view = await renderGroupMainMenu(chatKey, { notice, locale, actorUserId });
+        await editMenuMessage({ chatId, messageId, view });
+        return;
+      }
+
+      if (action === "g:node") {
+        await answerOnce();
+        const view = await renderGroupNodeMenu(chatKey, actorUserId, { reveal: false, locale });
+        await editMenuMessage({ chatId, messageId, view });
+        return;
+      }
+
+      if (action === "g:node_reveal") {
+        await answerOnce();
+        const view = await renderGroupNodeMenu(chatKey, actorUserId, { reveal: true, locale });
+        await editMenuMessage({ chatId, messageId, view });
+        return;
+      }
+
+      if (action === "g:node_pause" || action === "g:node_resume") {
+        await answerOnce();
+        const nodeId = payload.nodeId;
+        const reveal = Boolean(payload.reveal);
+        if (!isNonEmptyString(nodeId)) {
+          const view = await renderGroupNodeMenu(chatKey, actorUserId, { reveal, error: S.msg_unsupported_cb, locale });
+          await editMenuMessage({ chatId, messageId, view });
+          return;
+        }
+        const owned = await getOwnedGroupActorContext();
+        if (!owned.ok) {
+          const view = await renderGroupNodeMenu(chatKey, actorUserId, { reveal, error: owned.error, locale });
+          await editMenuMessage({ chatId, messageId, view });
+          return;
+        }
+        try {
+          if (action === "g:node_pause") {
+            await argusHttp.automationNodePause(chatKey, nodeId);
+          } else {
+            await argusHttp.automationNodeResume(chatKey, nodeId);
+          }
+        } catch (e) {
+          const view = await renderGroupNodeMenu(chatKey, actorUserId, {
+            reveal,
+            error: formatGatewayErrorForUser(e, { locale }),
+            locale
+          });
+          await editMenuMessage({ chatId, messageId, view });
+          return;
+        }
+        const notice = formatTemplate(
+          action === "g:node_pause" ? S.notice_node_paused : S.notice_node_resumed,
+          { nodeId }
+        );
+        const view = await renderGroupNodeMenu(chatKey, actorUserId, { reveal, notice, locale });
         await editMenuMessage({ chatId, messageId, view });
         return;
       }
@@ -4406,12 +4601,18 @@ async function main() {
       queue.enqueue(async () => {
         const S = uiStrings(locale);
         const actorUserId = Number.isFinite(message?.from?.id) ? Math.trunc(message.from.id) : null;
+        const actorChatKey = privateChatKeyForUserId(actorUserId);
         const pendingActorUserId = isGroupChatType(chatType) ? actorUserId : undefined;
         const clearPendingForActor = () => clearPendingAgentInput(chatKey, pendingActorUserId);
         const renderMainMenuForActor = async ({ notice, locale: localeOverride } = {}) => (
           isPrivateChatType(chatType)
             ? await renderPrivateMainMenu(chatKey, { notice, locale: localeOverride })
             : await renderGroupMainMenu(chatKey, { notice, locale: localeOverride, actorUserId })
+        );
+        const renderCreateMenuForActor = async (opts = {}) => (
+          isPrivateChatType(chatType)
+            ? await renderPrivateCreateMenu(chatKey, opts)
+            : await renderGroupCreateMenu(chatKey, actorUserId, opts)
         );
         const renderRenameMenuForActor = async (agentId, opts = {}) => (
           isPrivateChatType(chatType)
@@ -4584,21 +4785,49 @@ async function main() {
           if (pending && pending.kind === "create") {
             const name = isNonEmptyString(text) ? text.trim().split(/\s+/, 1)[0]?.trim().toLowerCase() : "";
             if (!isNonEmptyString(name)) {
-              const view = await renderPrivateCreateMenu(chatKey, { error: S.create_missing, locale });
+              const view = await renderCreateMenuForActor({ error: S.create_missing, locale });
               await editMenuMessage({ chatId: pending.panelChatId, messageId: pending.panelMessageId, view });
               return;
             }
             try {
-              const created = await argusHttp.automationAgentCreate(chatKey, name);
-              await argusHttp.automationAgentUse(chatKey, name);
+              let mutationChatKey = chatKey;
+              let notice = formatTemplate(S.notice_created, { name });
+              if (isGroupChatType(chatType)) {
+                if (!Number.isFinite(target.chat_id) || !Number.isFinite(actorUserId)) {
+                  clearPendingForActor();
+                  const view = await renderMainMenuForActor({ notice: S.msg_admins_only, locale });
+                  await editMenuMessage({ chatId: pending.panelChatId, messageId: pending.panelMessageId, view });
+                  return;
+                }
+                const ok = await isChatAdmin(target.chat_id, actorUserId);
+                if (!ok) {
+                  clearPendingForActor();
+                  const view = await renderMainMenuForActor({ notice: S.msg_admins_only, locale });
+                  await editMenuMessage({ chatId: pending.panelChatId, messageId: pending.panelMessageId, view });
+                  return;
+                }
+                if (!isNonEmptyString(actorChatKey)) {
+                  clearPendingForActor();
+                  const view = await renderMainMenuForActor({ notice: S.msg_group_owner_only, locale });
+                  await editMenuMessage({ chatId: pending.panelChatId, messageId: pending.panelMessageId, view });
+                  return;
+                }
+                mutationChatKey = actorChatKey;
+              }
+              const created = await argusHttp.automationAgentCreate(mutationChatKey, name);
+              const createdAgentId = isNonEmptyString(created?.agent?.agentId) ? created.agent.agentId : name;
+              await argusHttp.automationAgentUse(mutationChatKey, createdAgentId);
+              if (isGroupChatType(chatType)) {
+                await argusHttp.automationChatBind(chatKey, createdAgentId, actorUserId);
+                notice = formatTemplate(S.notice_bound, { agentId: createdAgentId });
+              }
               const sid = created?.agent?.sessionId;
               if (isNonEmptyString(sid)) await getClient(sid);
               clearPendingForActor();
-              const notice = formatTemplate(S.notice_created, { name });
-              const view = await renderPrivateMainMenu(chatKey, { notice, locale });
+              const view = await renderMainMenuForActor({ notice, locale });
               await editMenuMessage({ chatId: pending.panelChatId, messageId: pending.panelMessageId, view });
             } catch (e) {
-              const view = await renderPrivateCreateMenu(chatKey, { error: formatGatewayErrorForUser(e, { locale }), locale });
+              const view = await renderCreateMenuForActor({ error: formatGatewayErrorForUser(e, { locale }), locale });
               await editMenuMessage({ chatId: pending.panelChatId, messageId: pending.panelMessageId, view });
             }
             return;
