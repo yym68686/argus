@@ -1,8 +1,16 @@
 import process from "node:process";
 import crypto from "node:crypto";
 import fs from "node:fs/promises";
+import { createRequire } from "node:module";
 import path from "node:path";
 import WebSocket from "ws";
+
+const require = createRequire(import.meta.url);
+const TELEGRAM_BOT_PACKAGE = require("./package.json");
+const BOT_VERSION =
+  typeof TELEGRAM_BOT_PACKAGE?.version === "string" && TELEGRAM_BOT_PACKAGE.version.trim()
+    ? TELEGRAM_BOT_PACKAGE.version.trim()
+    : "0.1.0";
 
 function log(...args) {
   // eslint-disable-next-line no-console
@@ -726,7 +734,7 @@ class ArgusClient {
 
   async initialize() {
     if (this.initialized) return;
-    await this.rpc("initialize", { clientInfo: { name: "argus_tg_bot", title: "Argus Telegram Bot", version: "0.1.0" } });
+    await this.rpc("initialize", { clientInfo: { name: "argus_tg_bot", title: "Argus Telegram Bot", version: BOT_VERSION } });
     this._send({ method: "initialized" });
     this.initialized = true;
   }
@@ -1254,6 +1262,7 @@ function normalizeAvailableModels(models) {
     label_model: "model",
     label_page: "page",
     label_status: "status",
+    label_version: "version",
     label_error: "error",
     label_node: "node",
 
@@ -1421,6 +1430,7 @@ function normalizeAvailableModels(models) {
     label_model: "模型",
     label_page: "页",
     label_status: "状态",
+    label_version: "版本",
     label_error: "错误",
     label_node: "节点",
 
@@ -2399,6 +2409,14 @@ async function main() {
     return `${value.slice(0, Math.max(1, maxLen - 1))}…`;
   }
 
+  function botVersionText() {
+    return `v${BOT_VERSION}`;
+  }
+
+  function statusButtonText(S) {
+    return `${S.btn_status} · ${botVersionText()}`;
+  }
+
   function normalizePage(pageRaw) {
     const n = Number(pageRaw);
     return Number.isFinite(n) && n >= 0 ? Math.floor(n) : 0;
@@ -2578,7 +2596,7 @@ async function main() {
           cbButton(S.btn_switch_model, { action: "p:model", chatKey }),
           cbButton(S.btn_new_main_thread, { action: "p:newmain", chatKey }),
           cbButton(S.btn_node_token, { action: "p:node", chatKey }),
-          cbButton(S.btn_status, { action: "p:status", chatKey }),
+          cbButton(statusButtonText(S), { action: "p:status", chatKey }),
           cbButton(S.btn_help, { action: "help", chatKey })
         ],
         cbButton(S.btn_close, { action: "close", chatKey })
@@ -2975,6 +2993,7 @@ async function main() {
       lines.push(`sessionId: ${htmlCode(route.sessionId)}`);
       lines.push(`chatKey: ${htmlCode(chatKey)}`);
       lines.push(`mainThreadId: ${htmlCode(tid || "(none)")}`);
+      lines.push(`${escapeHtml(S.label_version)}: ${htmlCode(botVersionText())}`);
     } catch (e) {
       lines.push(escapeHtml(formatGatewayErrorForUser(e, { locale })));
     }
@@ -3142,7 +3161,7 @@ async function main() {
       cbButton(S.btn_switch_model, { action: "g:model", chatKey }),
       cbButton(S.btn_new_main_thread, { action: "g:newmain", chatKey }),
       cbButton(S.btn_node_token, { action: "g:node", chatKey }),
-      cbButton(S.btn_status, { action: "g:status", chatKey }),
+      cbButton(statusButtonText(S), { action: "g:status", chatKey }),
       cbButton(S.btn_help, { action: "help", chatKey })
     );
 
@@ -3167,6 +3186,7 @@ async function main() {
       lines.push(`${escapeHtml(S.label_model)}: ${htmlCode(route.model)}`);
       lines.push(`sessionId: ${htmlCode(route.sessionId)}`);
       lines.push(`mainThreadId: ${htmlCode(mainThreadId || "(none)")}`);
+      lines.push(`${escapeHtml(S.label_version)}: ${htmlCode(botVersionText())}`);
     } catch (e) {
       lines.push(`${escapeHtml(S.label_status)}: <b>${escapeHtml(S.status_unbound)}</b>`);
       lines.push(escapeHtml(formatGatewayErrorForUser(e, { locale })));
