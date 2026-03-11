@@ -1,16 +1,25 @@
 import process from "node:process";
 import crypto from "node:crypto";
+import { readFileSync } from "node:fs";
 import fs from "node:fs/promises";
-import { createRequire } from "node:module";
 import path from "node:path";
 import WebSocket from "ws";
 
-const require = createRequire(import.meta.url);
-const TELEGRAM_BOT_PACKAGE = require("./package.json");
-const BOT_VERSION =
-  typeof TELEGRAM_BOT_PACKAGE?.version === "string" && TELEGRAM_BOT_PACKAGE.version.trim()
-    ? TELEGRAM_BOT_PACKAGE.version.trim()
-    : "0.1.0";
+const DEFAULT_BOT_VERSION = "0.1.0";
+
+function loadBotVersion() {
+  const override = typeof process.env.ARGUS_VERSION === "string" ? process.env.ARGUS_VERSION.trim() : "";
+  if (override) return override;
+  try {
+    const value = readFileSync(new URL("../../VERSION", import.meta.url), "utf8").trim();
+    if (value) return value;
+  } catch {
+    // ignore
+  }
+  return DEFAULT_BOT_VERSION;
+}
+
+const BOT_VERSION = loadBotVersion();
 
 function log(...args) {
   // eslint-disable-next-line no-console
@@ -1816,6 +1825,7 @@ async function main() {
     statePath = path.resolve(process.cwd(), "state.json");
   }
 
+  log("Argus Telegram bot starting:", `version=${BOT_VERSION}`);
   const tg = new TelegramApi(telegramToken);
   const typing = new TypingController(tg);
   const me = await tg.getMe();

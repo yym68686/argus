@@ -30,6 +30,7 @@ ENV APP_HOME=/root/.argus \
 
 RUN mkdir -p /root/.argus /workspace /app
 
+COPY VERSION /app/VERSION
 COPY docs/templates /app/docs/templates
 
 COPY run_app_server.sh /app/run_app_server.sh

@@ -14,11 +14,8 @@ import (
 
 	"github.com/yym68686/argus/apps/node-host/internal/proto"
 	"github.com/yym68686/argus/apps/node-host/internal/util"
+	"github.com/yym68686/argus/apps/node-host/internal/version"
 	"github.com/yym68686/argus/apps/node-host/internal/ws"
-)
-
-const (
-	nodeHostVersion = "0.1.0"
 )
 
 type Invoker interface {
@@ -131,7 +128,7 @@ func (h *Host) connectFrame() proto.ConnectFrame {
 		NodeID:      h.cfg.NodeID,
 		DisplayName: h.cfg.DisplayName,
 		Platform:    platform,
-		Version:     nodeHostVersion,
+		Version:     version.Current(),
 		Caps:        caps,
 		Commands:    commands,
 	}
@@ -144,6 +141,7 @@ type rawEventFrame struct {
 }
 
 func (h *Host) Run(ctx context.Context) error {
+	h.LogLine("INFO", fmt.Sprintf("Argus node-host starting (version=%s)", version.Current()))
 	h.LogLine("INFO", fmt.Sprintf("Node state dir: %s", h.cfg.StateDir))
 	h.LogLine("INFO", fmt.Sprintf("Connecting nodeId=%s displayName=%s url=%s",
 		util.SafeJSON(h.cfg.NodeID), util.SafeJSON(h.cfg.DisplayName), util.SafeJSON(util.RedactWSURL(h.cfg.URL)),

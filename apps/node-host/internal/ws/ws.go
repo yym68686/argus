@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/yym68686/argus/apps/node-host/internal/util"
+	"github.com/yym68686/argus/apps/node-host/internal/version"
 )
 
 type Conn struct {
@@ -128,7 +129,7 @@ func Dial(rawURL string, opt DialOptions) (*Conn, *http.Response, error) {
 	req.Header.Set("Connection", "Upgrade")
 	req.Header.Set("Sec-WebSocket-Version", "13")
 	req.Header.Set("Sec-WebSocket-Key", secKey)
-	req.Header.Set("User-Agent", "argus/0.1.0")
+	req.Header.Set("User-Agent", version.UserAgent())
 
 	if err := req.Write(nc); err != nil {
 		_ = nc.Close()

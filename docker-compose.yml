@@ -76,8 +76,8 @@ services:
   telegram-bot:
     profiles: ["tg"]
     build:
-      context: ./apps/telegram-bot
-      dockerfile: Dockerfile
+      context: .
+      dockerfile: apps/telegram-bot/Dockerfile
     image: argus-telegram-bot
     environment:
       TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:-}

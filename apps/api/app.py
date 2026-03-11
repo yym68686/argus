@@ -28,6 +28,37 @@ from croniter import croniter
 
 log = logging.getLogger("argus_gateway")
 
+DEFAULT_ARGUS_VERSION = "0.1.0"
+
+
+def _load_argus_version() -> str:
+    override = (os.getenv("ARGUS_VERSION") or "").strip()
+    if override:
+        return override
+
+    candidates = [
+        Path(__file__).resolve().parents[2] / "VERSION",
+        Path.cwd() / "VERSION",
+    ]
+    seen: set[Path] = set()
+    for candidate in candidates:
+        resolved = candidate.resolve()
+        if resolved in seen:
+            continue
+        seen.add(resolved)
+        try:
+            value = candidate.read_text(encoding="utf-8").strip()
+        except FileNotFoundError:
+            continue
+        except OSError:
+            continue
+        if value:
+            return value
+    return DEFAULT_ARGUS_VERSION
+
+
+ARGUS_VERSION = _load_argus_version()
+
 RUNTIME_LAYOUT = "root_argus_v1"
 RUNTIME_SESSION_ID_RE = re.compile(r"^[a-f0-9]{12}$")
 
@@ -6114,7 +6145,7 @@ class AutomationManager:
         if live.initialized_result is not None and live.handshake_done:
             return
         # Send initialize and cache result.
-        req = {"method": "initialize", "id": None, "params": {"clientInfo": {"name": "argus_gateway", "title": "Argus Gateway Automation", "version": "0.1.0"}}}
+        req = {"method": "initialize", "id": None, "params": {"clientInfo": {"name": "argus_gateway", "title": "Argus Gateway Automation", "version": ARGUS_VERSION}}}
         rid, fut = await live.reserve_internal_id()
         req["id"] = rid
         try:
@@ -7000,7 +7031,7 @@ def _is_token_valid(expected: Optional[str], provided: Optional[str]) -> bool:
     return provided == expected
 
 
-app = FastAPI(title="Argus gateway", version="0.1.0")
+app = FastAPI(title="Argus gateway", version=ARGUS_VERSION)
 
 origins_raw = os.getenv("ARGUS_CORS_ORIGINS") or ""
 cors_origins = [o.strip() for o in origins_raw.split(",") if o.strip()] or ["*"]
@@ -7021,6 +7052,7 @@ async def _startup():
     app.state.node_registry = NodeRegistry()
     app.state.mcp_lock = asyncio.Lock()
     app.state.mcp_sessions: dict[str, McpSessionState] = {}
+    log.info("Argus gateway starting (version=%s)", ARGUS_VERSION)
 
     home_host_path = os.getenv("ARGUS_HOME_HOST_PATH") or None
     workspace_host_path = os.getenv("ARGUS_WORKSPACE_HOST_PATH") or None
@@ -7275,7 +7307,7 @@ async def _mcp_handle_single_message(request: Request, body: dict[str, Any]) -> 
             "serverInfo": {
                 "name": "argus_gateway",
                 "title": "Argus Gateway MCP",
-                "version": "0.1.0",
+                "version": ARGUS_VERSION,
             },
             "instructions": "This MCP server exposes tools for managing gateway cron jobs, sending messages, and invoking connected nodes. Cron/heartbeat operations are scoped to the calling runtime session by default.",
         }
@@ -8648,7 +8680,7 @@ async def _mcp_handle_single_message(request: Request, body: dict[str, Any]) -> 
             "serverInfo": {
                 "name": "argus_gateway",
                 "title": "Argus Gateway MCP",
-                "version": "0.1.0",
+                "version": ARGUS_VERSION,
             },
             "instructions": "This MCP server exposes tools for listing and invoking connected nodes. Requests may be scoped to a runtime session.",
         }

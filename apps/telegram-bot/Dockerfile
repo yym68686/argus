@@ -1,11 +1,12 @@
 FROM node:22-trixie-slim
 
-WORKDIR /app
+WORKDIR /app/apps/telegram-bot
 
-COPY package.json /app/package.json
+COPY apps/telegram-bot/package.json /app/apps/telegram-bot/package.json
 RUN npm install --omit=dev
 
-COPY index.mjs /app/index.mjs
+COPY VERSION /app/VERSION
+COPY apps/telegram-bot/index.mjs /app/apps/telegram-bot/index.mjs
 
 ENV NODE_ENV=production
 

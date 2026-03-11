@@ -10,6 +10,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates
 COPY apps/api/requirements.txt /app/apps/api/requirements.txt
 RUN python -m pip install --no-cache-dir -r /app/apps/api/requirements.txt
 
+COPY VERSION /app/VERSION
 COPY apps/api/app.py /app/apps/api/app.py
 COPY docs/templates /app/docs/templates
 
