@@ -926,6 +926,7 @@ def _create_turn_text_entry() -> dict[str, Any]:
     return {
         "delta": "",
         "fullText": None,
+        "turnKind": None,
         "completedCommentaryTexts": [],
         "agentMessagePhasesByItemId": {},
         "agentMessageTextByItemId": {},
@@ -4556,6 +4557,103 @@ class AutomationManager:
         self._session_backoff_until_ms[session_id] = _now_ms() + int(delay_s * 1000)
         log.warning("%s failed for session %s; backing off %.0fs: %s", what, session_id, delay_s, str(err))
 
+    def _remember_turn_kind(
+        self,
+        *,
+        session_id: str,
+        thread_id: Optional[str],
+        turn_id: Optional[str],
+        kind: Any,
+    ) -> None:
+        tid = thread_id.strip() if isinstance(thread_id, str) and thread_id.strip() else None
+        run_id = turn_id.strip() if isinstance(turn_id, str) and turn_id.strip() else None
+        normalized = self._normalize_turn_kind(kind)
+        if not tid or not run_id or normalized is None:
+            return
+        entry = self._get_turn_text_entry((session_id, tid, run_id))
+        entry["turnKind"] = normalized
+
+    def _resolve_turn_kind_for_notification(
+        self,
+        *,
+        session_id: str,
+        thread_id: Optional[str],
+        turn_id: Optional[str],
+    ) -> Optional[str]:
+        tid = thread_id.strip() if isinstance(thread_id, str) and thread_id.strip() else None
+        run_id = turn_id.strip() if isinstance(turn_id, str) and turn_id.strip() else None
+        if tid and run_id:
+            entry = self._turn_text_by_key.get((session_id, tid, run_id))
+            if isinstance(entry, dict):
+                normalized = self._normalize_turn_kind(entry.get("turnKind"))
+                if normalized is not None:
+                    return normalized
+        if not tid:
+            return None
+        lane = self._lanes.get((session_id, tid))
+        if lane is None:
+            return None
+        return self._normalize_turn_kind(lane.active_turn_kind or lane.pending_client_turn_kind)
+
+    def _is_heartbeat_commentary_notification(self, session_id: str, msg: dict[str, Any]) -> bool:
+        # Heartbeat commentary is internal automation chatter; downstream clients
+        # should only receive the final ack/token or the final user-visible text.
+        if not isinstance(msg, dict):
+            return False
+        method = msg.get("method")
+        if method not in ("item/started", "item/agentMessage/delta", "item/completed"):
+            return False
+        params = msg.get("params")
+        if not isinstance(params, dict):
+            return False
+
+        thread_id_raw = params.get("threadId")
+        thread_id = thread_id_raw.strip() if isinstance(thread_id_raw, str) and thread_id_raw.strip() else None
+        if not thread_id:
+            return False
+
+        turn_id: Optional[str] = None
+        turn_id_raw = params.get("turnId")
+        if isinstance(turn_id_raw, str) and turn_id_raw.strip():
+            turn_id = turn_id_raw.strip()
+        else:
+            turn = params.get("turn")
+            if isinstance(turn, dict):
+                tid_val = turn.get("id")
+                if isinstance(tid_val, str) and tid_val.strip():
+                    turn_id = tid_val.strip()
+
+        if self._resolve_turn_kind_for_notification(
+            session_id=session_id,
+            thread_id=thread_id,
+            turn_id=turn_id,
+        ) != TURN_KIND_HEARTBEAT:
+            return False
+
+        if method in ("item/started", "item/completed"):
+            item = params.get("item")
+            if not isinstance(item, dict) or item.get("type") != "agentMessage":
+                return False
+            return _normalize_message_phase(item.get("phase")) == "commentary"
+
+        if not turn_id:
+            return False
+        entry = self._turn_text_by_key.get((session_id, thread_id, turn_id))
+        if not isinstance(entry, dict):
+            return False
+        phases = entry.get("agentMessagePhasesByItemId")
+        if not isinstance(phases, dict):
+            return False
+        item_id = params.get("itemId")
+        candidate_item_id = item_id.strip() if isinstance(item_id, str) and item_id.strip() else None
+        if candidate_item_id is None:
+            active_item_id = entry.get("activeAgentMessageItemId")
+            if isinstance(active_item_id, str) and active_item_id.strip():
+                candidate_item_id = active_item_id.strip()
+        if candidate_item_id is None:
+            return False
+        return phases.get(candidate_item_id) == "commentary"
+
     def on_upstream_notification(self, session_id: str, msg: dict[str, Any]) -> None:
         method = msg.get("method")
         params = msg.get("params")
@@ -4736,6 +4834,12 @@ class AutomationManager:
                     source_chat_key=source_chat_key,
                 )
                 self._mark_lane_busy(lane, turn_id=turn_id)
+                self._remember_turn_kind(
+                    session_id=session_id,
+                    thread_id=thread_id,
+                    turn_id=turn_id,
+                    kind=lane.active_turn_kind,
+                )
             return
 
         if method == "turn/completed":
@@ -9492,11 +9596,14 @@ async def _ensure_live_docker_session(session_id: str, *, allow_create: bool) ->
                         continue
 
                     # Notifications: feed automation.
+                    should_broadcast = True
                     if "method" in msg and "id" not in msg:
                         automation: Optional[AutomationManager] = getattr(app.state, "automation", None)
                         if automation is not None:
                             try:
                                 automation.on_upstream_notification(session_id, msg)
+                                if automation._is_heartbeat_commentary_notification(session_id, msg):
+                                    should_broadcast = False
                                 text = json.dumps(msg)
                             except Exception:
                                 log.exception("Automation notification handler failed")
@@ -9508,7 +9615,8 @@ async def _ensure_live_docker_session(session_id: str, *, allow_create: bool) ->
                             if isinstance(tid, str) and tid.strip():
                                 await live.clear_turn_owner(tid.strip())
 
-                await live.broadcast(text)
+                if should_broadcast:
+                    await live.broadcast(text)
         except Exception:
             log.exception("Upstream pump failed for session %s", session_id)
         finally:
