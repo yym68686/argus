@@ -28,7 +28,7 @@ from croniter import croniter
 
 log = logging.getLogger("argus_gateway")
 
-DEFAULT_ARGUS_VERSION = "0.1.0"
+DEFAULT_ARGUS_VERSION = "0.1.1"
 
 
 def _load_argus_version() -> str:
@@ -61,6 +61,56 @@ ARGUS_VERSION = _load_argus_version()
 
 RUNTIME_LAYOUT = "root_argus_v1"
 RUNTIME_SESSION_ID_RE = re.compile(r"^[a-f0-9]{12}$")
+
+
+def _event_iso_now() -> str:
+    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def _event_log_value(value: Any) -> Any:
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    if isinstance(value, dict):
+        out: dict[str, Any] = {}
+        for k, v in value.items():
+            key = str(k).strip()
+            if not key:
+                continue
+            out[key] = _event_log_value(v)
+        return out
+    if isinstance(value, (list, tuple, set)):
+        return [_event_log_value(v) for v in value]
+    return str(value)
+
+
+def _event_log(level: str, event: str, **fields: Any) -> None:
+    payload: dict[str, Any] = {
+        "ts": _event_iso_now(),
+        "lvl": str(level or "INFO").upper(),
+        "svc": "gateway",
+        "ev": str(event or "gateway.event"),
+    }
+    for key, value in fields.items():
+        if value is None:
+            continue
+        payload[str(key)] = _event_log_value(value)
+    line = json.dumps(payload, ensure_ascii=False, separators=(",", ":"), default=str)
+    level_name = str(level or "info").strip().lower()
+    if level_name == "debug":
+        log.debug(line)
+    elif level_name == "warning":
+        log.warning(line)
+    elif level_name == "error":
+        log.error(line)
+    else:
+        log.info(line)
+
+
+def _chat_key_hash(raw: Any) -> Optional[str]:
+    if not isinstance(raw, str) or not raw.strip():
+        return None
+    digest = hashlib.sha256(raw.strip().encode("utf-8")).hexdigest()[:12]
+    return f"tg:{digest}"
 
 
 class UpstreamSessionClosedError(RuntimeError):
@@ -965,6 +1015,9 @@ def _create_turn_text_entry() -> dict[str, Any]:
         "draft": None,
         "sourceChannel": None,
         "sourceChatKey": None,
+        "cancelId": None,
+        "cancelRequestedAtMs": None,
+        "cancelPostActivityLogged": False,
     }
 
 
@@ -4006,23 +4059,54 @@ class AutomationManager:
             return None
         return thread_id.strip()
 
-    async def _interrupt_user_turn_background(self, *, session_id: str, thread_id: str, turn_id: str) -> None:
+    async def _interrupt_user_turn_background(
+        self,
+        *,
+        session_id: str,
+        thread_id: str,
+        turn_id: str,
+        cancel_id: Optional[str],
+    ) -> None:
+        started_at_ms = _now_ms()
+        _event_log(
+            "info",
+            "gw.cancel.interrupt_sent",
+            cancel_id=cancel_id,
+            session_id=session_id,
+            thread_id=thread_id,
+            turn_id=turn_id,
+        )
         try:
             live, _ = await _ensure_live_docker_session(session_id, allow_create=False)
             await self._ensure_initialized(live)
             await self._rpc(live, "turn/interrupt", {"threadId": thread_id, "turnId": turn_id})
+            _event_log(
+                "info",
+                "gw.cancel.interrupt_result",
+                cancel_id=cancel_id,
+                session_id=session_id,
+                thread_id=thread_id,
+                turn_id=turn_id,
+                result="ok",
+                duration_ms=max(0, _now_ms() - started_at_ms),
+            )
         except Exception as e:
             lane = self._lanes.get((session_id, thread_id))
             if lane is not None:
                 async with lane.lock:
                     if lane.busy and lane.active_turn_id == turn_id and lane.active_turn_kind == TURN_KIND_USER:
                         lane.cancel_requested = False
-            log.warning(
-                "Failed to interrupt user turn for session %s thread %s turn %s: %s",
-                session_id,
-                thread_id,
-                turn_id,
-                str(e),
+            _event_log(
+                "warning",
+                "gw.cancel.interrupt_result",
+                cancel_id=cancel_id,
+                session_id=session_id,
+                thread_id=thread_id,
+                turn_id=turn_id,
+                result="error",
+                duration_ms=max(0, _now_ms() - started_at_ms),
+                err_kind=type(e).__name__,
+                err_msg=str(e),
             )
 
     async def cancel_active_user_turn(
@@ -4031,33 +4115,94 @@ class AutomationManager:
         session_id: str,
         thread_id: Optional[str],
         target: Optional[str],
+        cancel_id: Optional[str] = None,
+        rpc_id: Optional[Any] = None,
     ) -> dict[str, Any]:
         sid = session_id.strip() if isinstance(session_id, str) else ""
-        resolved_thread_id = self._resolve_existing_thread_id(session_id=sid, thread_id=thread_id, target=target)
+        target_norm = target.strip() if isinstance(target, str) and target.strip() else None
+        request_cancel_id = cancel_id.strip() if isinstance(cancel_id, str) and cancel_id.strip() else None
+        resolved_thread_id = self._resolve_existing_thread_id(session_id=sid, thread_id=thread_id, target=target_norm)
+        lane: Optional[ThreadLane] = None
+
+        def _entry_cancel_id(turn_id_value: Optional[str]) -> Optional[str]:
+            tid = turn_id_value.strip() if isinstance(turn_id_value, str) and turn_id_value.strip() else None
+            if not tid or not resolved_thread_id:
+                return None
+            entry = self._turn_text_by_key.get((sid, resolved_thread_id, tid))
+            if not isinstance(entry, dict):
+                return None
+            raw = entry.get("cancelId")
+            return raw.strip() if isinstance(raw, str) and raw.strip() else None
+
+        def _log_cancel_decision(
+            *,
+            result: str,
+            reason: Optional[str],
+            turn_id_value: Optional[str] = None,
+            active_kind_value: Optional[str] = None,
+            already_requested_value: Optional[bool] = None,
+            active_cancel_id: Optional[str] = None,
+        ) -> None:
+            lane_busy = bool(lane.busy) if lane is not None else False
+            active_kind_local = active_kind_value
+            if active_kind_local is None and lane is not None:
+                active_kind_local = lane.active_turn_kind or lane.pending_client_turn_kind
+            _event_log(
+                "info",
+                "gw.cancel.decide",
+                cancel_id=request_cancel_id,
+                rpc_id=rpc_id,
+                session_id=sid or session_id,
+                target=target_norm,
+                thread_id=resolved_thread_id,
+                turn_id=turn_id_value,
+                lane_busy=lane_busy,
+                active_kind=active_kind_local,
+                cancel_requested=bool(lane.cancel_requested) if lane is not None else False,
+                followup_depth=len(lane.followups) if lane is not None else 0,
+                result=result,
+                reason=reason,
+                already_requested=already_requested_value,
+                active_cancel_id=active_cancel_id,
+            )
+
         if not sid or not resolved_thread_id:
+            _log_cancel_decision(result="rejected", reason="NO_ACTIVE_USER_TURN")
             return {"ok": True, "cancelRequested": False, "reason": "NO_ACTIVE_USER_TURN", "threadId": resolved_thread_id}
 
         lane = self._lanes.get((sid, resolved_thread_id))
         if lane is None:
+            _log_cancel_decision(result="rejected", reason="NO_ACTIVE_USER_TURN")
             return {"ok": True, "cancelRequested": False, "reason": "NO_ACTIVE_USER_TURN", "threadId": resolved_thread_id}
 
         turn_id: Optional[str] = None
         already_requested = False
+        active_kind_snapshot: Optional[str] = None
         for _ in range(40):
             async with lane.lock:
                 if not lane.busy:
                     self._clear_pending_client_turn(lane)
+                    _log_cancel_decision(result="rejected", reason="NO_ACTIVE_USER_TURN")
                     return {"ok": True, "cancelRequested": False, "reason": "NO_ACTIVE_USER_TURN", "threadId": resolved_thread_id}
 
-                active_kind = lane.active_turn_kind or lane.pending_client_turn_kind
-                if active_kind != TURN_KIND_USER:
+                active_kind_snapshot = lane.active_turn_kind or lane.pending_client_turn_kind
+                if active_kind_snapshot != TURN_KIND_USER:
+                    active_cancel_id = _entry_cancel_id(lane.active_turn_id)
+                    _log_cancel_decision(
+                        result="rejected",
+                        reason="NON_USER_TURN",
+                        turn_id_value=lane.active_turn_id,
+                        active_kind_value=active_kind_snapshot,
+                        active_cancel_id=active_cancel_id,
+                    )
                     return {
                         "ok": True,
                         "cancelRequested": False,
                         "reason": "NON_USER_TURN",
-                        "activeKind": active_kind,
+                        "activeKind": active_kind_snapshot,
                         "threadId": resolved_thread_id,
                         "turnId": lane.active_turn_id,
+                        "activeCancelId": active_cancel_id,
                     }
 
                 if lane.cancel_requested:
@@ -4073,6 +4218,11 @@ class AutomationManager:
             await asyncio.sleep(0.05)
 
         if not turn_id:
+            _log_cancel_decision(
+                result="rejected",
+                reason="TURN_NOT_READY",
+                active_kind_value=active_kind_snapshot,
+            )
             return {
                 "ok": True,
                 "cancelRequested": False,
@@ -4081,9 +4231,45 @@ class AutomationManager:
                 "threadId": resolved_thread_id,
             }
 
+        active_cancel_id = _entry_cancel_id(turn_id)
+        effective_cancel_id = (active_cancel_id or request_cancel_id) if already_requested else request_cancel_id
+        if not effective_cancel_id:
+            effective_cancel_id = f"gwcan_{uuid.uuid4().hex[:12]}"
+        requested_at_ms = _now_ms()
+        if not already_requested:
+            self._remember_turn_cancel_context(
+                session_id=sid,
+                thread_id=resolved_thread_id,
+                turn_id=turn_id,
+                cancel_id=effective_cancel_id,
+                requested_at_ms=requested_at_ms,
+            )
+            _log_cancel_decision(
+                result="accepted",
+                reason=None,
+                turn_id_value=turn_id,
+                active_kind_value=TURN_KIND_USER,
+                already_requested_value=False,
+                active_cancel_id=effective_cancel_id,
+            )
+        else:
+            _log_cancel_decision(
+                result="already_requested",
+                reason=None,
+                turn_id_value=turn_id,
+                active_kind_value=TURN_KIND_USER,
+                already_requested_value=True,
+                active_cancel_id=effective_cancel_id,
+            )
+
         if not already_requested:
             asyncio.create_task(
-                self._interrupt_user_turn_background(session_id=sid, thread_id=resolved_thread_id, turn_id=turn_id)
+                self._interrupt_user_turn_background(
+                    session_id=sid,
+                    thread_id=resolved_thread_id,
+                    turn_id=turn_id,
+                    cancel_id=effective_cancel_id,
+                )
             )
         return {
             "ok": True,
@@ -4091,6 +4277,8 @@ class AutomationManager:
             "alreadyRequested": already_requested,
             "threadId": resolved_thread_id,
             "turnId": turn_id,
+            "cancelId": effective_cancel_id,
+            "activeCancelId": active_cancel_id,
         }
 
     def _mark_lane_busy(self, lane: ThreadLane, *, turn_id: Optional[str] = None) -> None:
@@ -4170,6 +4358,55 @@ class AutomationManager:
             return None
         self._cancel_turn_draft_task(entry.get("draft"))
         return entry
+
+    def _remember_turn_cancel_context(
+        self,
+        *,
+        session_id: str,
+        thread_id: Optional[str],
+        turn_id: Optional[str],
+        cancel_id: Optional[str],
+        requested_at_ms: Optional[int],
+    ) -> None:
+        tid = thread_id.strip() if isinstance(thread_id, str) and thread_id.strip() else None
+        run_id = turn_id.strip() if isinstance(turn_id, str) and turn_id.strip() else None
+        cid = cancel_id.strip() if isinstance(cancel_id, str) and cancel_id.strip() else None
+        if not tid or not run_id or not cid:
+            return
+        entry = self._get_turn_text_entry((session_id, tid, run_id))
+        entry["cancelId"] = cid
+        if isinstance(requested_at_ms, int) and requested_at_ms > 0:
+            entry["cancelRequestedAtMs"] = requested_at_ms
+
+    def _log_turn_post_cancel_activity(
+        self,
+        *,
+        session_id: str,
+        thread_id: Optional[str],
+        turn_id: Optional[str],
+        method: str,
+        entry: dict[str, Any],
+    ) -> None:
+        cancel_id = entry.get("cancelId")
+        if not isinstance(cancel_id, str) or not cancel_id.strip():
+            return
+        if bool(entry.get("cancelPostActivityLogged")):
+            return
+        entry["cancelPostActivityLogged"] = True
+        requested_at_ms = entry.get("cancelRequestedAtMs")
+        since_cancel_ms = None
+        if isinstance(requested_at_ms, int) and requested_at_ms > 0:
+            since_cancel_ms = max(0, _now_ms() - requested_at_ms)
+        _event_log(
+            "warning",
+            "gw.turn.post_cancel_activity",
+            cancel_id=cancel_id,
+            session_id=session_id,
+            thread_id=thread_id,
+            turn_id=turn_id,
+            method=method,
+            since_cancel_ms=since_cancel_ms,
+        )
 
     def _remember_turn_source_context(
         self,
@@ -4797,6 +5034,13 @@ class AutomationManager:
             )
             if thread_id:
                 self._note_lane_progress(self.lane(session_id, thread_id))
+            self._log_turn_post_cancel_activity(
+                session_id=session_id,
+                thread_id=thread_id,
+                turn_id=turn_id,
+                method=method,
+                entry=entry,
+            )
             return
 
         if method == "item/completed":
@@ -4846,6 +5090,13 @@ class AutomationManager:
             )
             if thread_id:
                 self._note_lane_progress(self.lane(session_id, thread_id))
+            self._log_turn_post_cancel_activity(
+                session_id=session_id,
+                thread_id=thread_id,
+                turn_id=turn_id,
+                method=method,
+                entry=entry,
+            )
             return
 
         if method == "turn/started":
@@ -4871,6 +5122,24 @@ class AutomationManager:
                     turn_id=turn_id,
                     kind=lane.active_turn_kind,
                 )
+                entry = self._turn_text_by_key.get(key) if key else None
+                cancel_id = None
+                if isinstance(entry, dict):
+                    raw_cancel_id = entry.get("cancelId")
+                    if isinstance(raw_cancel_id, str) and raw_cancel_id.strip():
+                        cancel_id = raw_cancel_id.strip()
+                _event_log(
+                    "info",
+                    "gw.turn.started",
+                    cancel_id=cancel_id,
+                    session_id=session_id,
+                    thread_id=thread_id,
+                    turn_id=turn_id,
+                    turn_kind=lane.active_turn_kind,
+                    source_channel=source_channel,
+                    chat_key_hash=_chat_key_hash(source_chat_key),
+                    followup_depth=len(lane.followups),
+                )
             return
 
         if method == "turn/completed":
@@ -4887,6 +5156,12 @@ class AutomationManager:
 
             if thread_id:
                 lane = self.lane(session_id, thread_id)
+                turn_kind = self._resolve_turn_kind_for_notification(
+                    session_id=session_id,
+                    thread_id=thread_id,
+                    turn_id=turn_id,
+                )
+                followup_depth_after = len(lane.followups)
                 self._mark_lane_idle(lane)
                 asyncio.create_task(self._process_lane_after_turn(session_id, thread_id))
                 asyncio.create_task(self._maybe_request_heartbeat(session_id, thread_id))
@@ -4894,11 +5169,19 @@ class AutomationManager:
                 final_text = ""
                 source_channel = None
                 source_chat_key = None
+                cancel_id = None
+                cancel_requested_at_ms = None
                 if key:
                     entry = self._pop_turn_text_entry(key)
                     if isinstance(entry, dict):
                         source_channel = entry.get("sourceChannel") if isinstance(entry.get("sourceChannel"), str) else None
                         source_chat_key = entry.get("sourceChatKey") if isinstance(entry.get("sourceChatKey"), str) else None
+                        raw_cancel_id = entry.get("cancelId")
+                        if isinstance(raw_cancel_id, str) and raw_cancel_id.strip():
+                            cancel_id = raw_cancel_id.strip()
+                        raw_cancel_requested_at_ms = entry.get("cancelRequestedAtMs")
+                        if isinstance(raw_cancel_requested_at_ms, int) and raw_cancel_requested_at_ms > 0:
+                            cancel_requested_at_ms = raw_cancel_requested_at_ms
                         full = entry.get("fullText")
                         delta = entry.get("delta")
                         commentary_prefix = ""
@@ -4917,6 +5200,26 @@ class AutomationManager:
                     params,
                     source_channel=source_channel,
                     source_chat_key=source_chat_key,
+                )
+                turn_status = str(turn_status_raw or "").strip().lower() or None
+                since_cancel_ms = None
+                if isinstance(cancel_requested_at_ms, int):
+                    since_cancel_ms = max(0, _now_ms() - cancel_requested_at_ms)
+                _event_log(
+                    "info",
+                    "gw.turn.completed",
+                    cancel_id=cancel_id,
+                    session_id=session_id,
+                    thread_id=thread_id,
+                    turn_id=turn_id,
+                    turn_status=turn_status,
+                    turn_kind=turn_kind,
+                    source_channel=source_channel,
+                    chat_key_hash=_chat_key_hash(source_chat_key),
+                    followup_depth_after=followup_depth_after,
+                    final_text_len=len(final_text) if isinstance(final_text, str) else 0,
+                    since_cancel_ms=since_cancel_ms,
+                    turn_error=turn_error_message,
                 )
                 if key:
                     asyncio.create_task(
@@ -5444,6 +5747,21 @@ class AutomationManager:
 
         lane = self.lane(session_id, thread_id)
 
+        def _log_followup_queued() -> None:
+            _event_log(
+                "info",
+                "gw.followup.queued",
+                session_id=session_id,
+                thread_id=thread_id,
+                active_turn_id=lane.active_turn_id,
+                active_kind=lane.active_turn_kind or lane.pending_client_turn_kind,
+                source_channel=source_channel_norm,
+                chat_key_hash=_chat_key_hash(source_chat_key_norm),
+                followup_depth=len(lane.followups),
+                text_len=len(user_text),
+                attachment_count=len(local_attachments),
+            )
+
         if lane.busy:
             lane.followups.append({
                 "text": user_text,
@@ -5451,6 +5769,7 @@ class AutomationManager:
                 "source_chat_key": source_chat_key_norm,
                 "local_attachments": local_attachments,
             })
+            _log_followup_queued()
             return {
                 "ok": True,
                 "threadId": thread_id,
@@ -5468,6 +5787,7 @@ class AutomationManager:
                     "source_chat_key": source_chat_key_norm,
                     "local_attachments": local_attachments,
                 })
+                _log_followup_queued()
                 return {
                     "ok": True,
                     "threadId": thread_id,
@@ -5827,6 +6147,18 @@ class AutomationManager:
             telegram_chat_key = next_followup.get("source_chat_key")
             local_attachments = self._merge_staged_attachment_dicts(
                 next_followup.get("local_attachments") if isinstance(next_followup.get("local_attachments"), list) else []
+            )
+            _event_log(
+                "info",
+                "gw.followup.dequeued",
+                session_id=session_id,
+                thread_id=thread_id,
+                source_channel=telegram_channel if isinstance(telegram_channel, str) and telegram_channel.strip() else None,
+                chat_key_hash=_chat_key_hash(telegram_chat_key),
+                followup_depth_before=len(lane.followups) + 1,
+                remaining_followup_depth=len(lane.followups),
+                text_len=len(merged),
+                attachment_count=len(local_attachments),
             )
 
             live, _ = await _ensure_live_docker_session(session_id, allow_create=True)
@@ -11619,10 +11951,22 @@ async def ws_proxy(ws: WebSocket):
                             continue
 
                         if method == "argus/turn/cancel":
+                            cancel_id = params.get("cancelId") if isinstance(params.get("cancelId"), str) else None
+                            _event_log(
+                                "info",
+                                "gw.cancel.request_received",
+                                cancel_id=cancel_id,
+                                rpc_id=req_id,
+                                session_id=session_id,
+                                thread_id=(params.get("threadId") if isinstance(params.get("threadId"), str) else None),
+                                target=(params.get("target") if isinstance(params.get("target"), str) else None),
+                            )
                             res = await automation.cancel_active_user_turn(
                                 session_id=session_id,
                                 thread_id=(params.get("threadId") if isinstance(params.get("threadId"), str) else None),
                                 target=(params.get("target") if isinstance(params.get("target"), str) else None),
+                                cancel_id=cancel_id,
+                                rpc_id=req_id,
                             )
                             if has_id:
                                 await ws.send_text(json.dumps({"id": req_id, "result": res}))
@@ -11669,6 +12013,18 @@ async def ws_proxy(ws: WebSocket):
                             )
                         continue
                     except Exception as e:
+                        if method == "argus/turn/cancel":
+                            _event_log(
+                                "warning",
+                                "gw.cancel.request_error",
+                                cancel_id=(params.get("cancelId") if isinstance(params.get("cancelId"), str) else None),
+                                rpc_id=req_id,
+                                session_id=session_id,
+                                thread_id=(params.get("threadId") if isinstance(params.get("threadId"), str) else None),
+                                target=(params.get("target") if isinstance(params.get("target"), str) else None),
+                                err_kind=type(e).__name__,
+                                err_msg=str(e),
+                            )
                         if has_id:
                             try:
                                 await ws.send_text(json.dumps({"id": req_id, "error": {"code": -32000, "message": str(e)}}))

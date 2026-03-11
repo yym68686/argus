@@ -1105,7 +1105,7 @@ export default function Page() {
     if (!rt) throw new Error("Not connected");
     if (rt.initialized) return;
     await rpc(sessionId, "initialize", {
-      clientInfo: { name: "argus_web", title: "Argus Web", version: "0.1.0" }
+      clientInfo: { name: "argus_web", title: "Argus Web", version: "0.1.1" }
     });
     sendWire(sessionId, { method: "initialized" });
     rt.initialized = true;

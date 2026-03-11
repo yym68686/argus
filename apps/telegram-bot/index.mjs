@@ -5,7 +5,7 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import WebSocket from "ws";
 
-const DEFAULT_BOT_VERSION = "0.1.0";
+const DEFAULT_BOT_VERSION = "0.1.1";
 
 function loadBotVersion() {
   const override = typeof process.env.ARGUS_VERSION === "string" ? process.env.ARGUS_VERSION.trim() : "";
@@ -24,6 +24,39 @@ const BOT_VERSION = loadBotVersion();
 function log(...args) {
   // eslint-disable-next-line no-console
   console.log(new Date().toISOString(), ...args);
+}
+
+function logValue(value) {
+  if (value === null || value === undefined) return value;
+  if (typeof value === "string" || typeof value === "number" || typeof value === "boolean") return value;
+  if (value instanceof Error) return value.message;
+  if (Array.isArray(value)) return value.map((item) => logValue(item));
+  if (typeof value === "object") {
+    const out = {};
+    for (const [key, entry] of Object.entries(value)) {
+      if (!isNonEmptyString(key)) continue;
+      out[key] = logValue(entry);
+    }
+    return out;
+  }
+  return String(value);
+}
+
+function logEvent(level, event, fields = {}) {
+  const payload = {
+    ts: new Date().toISOString(),
+    lvl: String(level || "INFO").toUpperCase(),
+    svc: "telegram-bot",
+    ev: String(event || "telegram-bot.event")
+  };
+  if (fields && typeof fields === "object" && !Array.isArray(fields)) {
+    for (const [key, value] of Object.entries(fields)) {
+      if (!isNonEmptyString(key) || value === null || value === undefined) continue;
+      payload[key] = logValue(value);
+    }
+  }
+  // eslint-disable-next-line no-console
+  console.log(JSON.stringify(payload));
 }
 
 function sleep(ms) {
@@ -77,6 +110,19 @@ function randomToken(bytes = 9) {
     return crypto.randomBytes(bytes).toString("base64url");
   } catch {
     return Math.random().toString(36).slice(2) + Math.random().toString(36).slice(2);
+  }
+}
+
+function newCancelId() {
+  return `can_${randomToken(6)}`;
+}
+
+function chatKeyHash(chatKey) {
+  if (!isNonEmptyString(chatKey)) return null;
+  try {
+    return `tg:${crypto.createHash("sha256").update(chatKey.trim(), "utf8").digest("hex").slice(0, 12)}`;
+  } catch {
+    return null;
   }
 }
 
@@ -717,10 +763,17 @@ class ArgusClient {
     ws.send(JSON.stringify(obj));
   }
 
-  rpc(method, params, { timeoutMs } = {}) {
+  rpc(method, params, { timeoutMs, onSent } = {}) {
     const id = this.nextId++;
     const req = { method, id, ...(params !== undefined ? { params } : {}) };
     this._send(req);
+    if (typeof onSent === "function") {
+      try {
+        onSent(id);
+      } catch {
+        // ignore
+      }
+    }
     const ms = clampNumber(timeoutMs, 120000);
     return new Promise((resolve, reject) => {
       const t = setTimeout(() => {
@@ -781,11 +834,12 @@ class ArgusClient {
     return await this.rpc("argus/input/enqueue", params, { timeoutMs: 120000 });
   }
 
-  async cancelTurn({ threadId, target } = {}) {
+  async cancelTurn({ threadId, target, cancelId, onSent } = {}) {
     const params = {};
     if (isNonEmptyString(threadId)) params.threadId = threadId;
     if (isNonEmptyString(target)) params.target = target;
-    return await this.rpc("argus/turn/cancel", params, { timeoutMs: 15000 });
+    if (isNonEmptyString(cancelId)) params.cancelId = cancelId;
+    return await this.rpc("argus/turn/cancel", params, { timeoutMs: 15000, onSent });
   }
 
   _handleServerRequest(msg) {
@@ -891,6 +945,8 @@ class ArgusClient {
       if (!key) return;
       const existing = this.turnsByKey.get(key) || createTurnTextEntry();
       this.turnsByKey.delete(key);
+      const turn = params.turn && typeof params.turn === "object" ? params.turn : null;
+      const turnStatus = isNonEmptyString(turn?.status) ? turn.status : null;
       let finalText = isNonEmptyString(existing.fullText) ? existing.fullText : existing.delta;
       if (!isNonEmptyString(existing.fullText) && isNonEmptyString(finalText)) {
         const commentaryPrefix = Array.isArray(existing.completedCommentaryTexts)
@@ -903,7 +959,7 @@ class ArgusClient {
       const cb = this.onTurnCompleted;
       if (typeof cb === "function") {
         try {
-          const res = cb({ sessionId: this.sessionId, threadId, turnId, sourceChatKey, text: finalText });
+          const res = cb({ sessionId: this.sessionId, threadId, turnId, sourceChatKey, text: finalText, turnStatus });
           if (res && typeof res.then === "function") res.catch(() => {});
         } catch {
           // ignore
@@ -1555,20 +1611,27 @@ function formatGatewayErrorForUser(err, { locale } = {}) {
   return `error: ${msg}`;
 }
 
-function formatCancelTurnResultForUser(result, { locale } = {}) {
+function resolveCancelTurnResultForUser(result, { locale } = {}) {
   const S = uiStrings(locale);
   const payload = isObjectRecord(result) ? result : {};
   if (payload.cancelRequested === true) {
-    return payload.alreadyRequested === true ? S.notice_stop_already_requested : S.notice_cancel_requested;
+    return {
+      noticeKey: payload.alreadyRequested === true ? "stop_already_requested" : "cancel_requested",
+      text: payload.alreadyRequested === true ? S.notice_stop_already_requested : S.notice_cancel_requested
+    };
   }
   const reason = isNonEmptyString(payload.reason) ? payload.reason : "";
   const activeKind = isNonEmptyString(payload.activeKind) ? payload.activeKind.toLowerCase() : "";
-  if (reason === "TURN_NOT_READY") return S.notice_turn_not_ready;
-  if (reason === "NON_USER_TURN") {
-    if (activeKind === "heartbeat") return S.notice_heartbeat_not_cancelable;
-    return S.notice_non_user_turn;
+  if (reason === "TURN_NOT_READY") {
+    return { noticeKey: "turn_not_ready", text: S.notice_turn_not_ready };
   }
-  return S.notice_no_active_user_turn;
+  if (reason === "NON_USER_TURN") {
+    if (activeKind === "heartbeat") {
+      return { noticeKey: "heartbeat_not_cancelable", text: S.notice_heartbeat_not_cancelable };
+    }
+    return { noticeKey: "non_user_turn", text: S.notice_non_user_turn };
+  }
+  return { noticeKey: "no_active_user_turn", text: S.notice_no_active_user_turn };
 }
 
 const TELEGRAM_HTML_PARSE_ERR_RE = /can't parse entities|parse entities|find end of the entity/i;
@@ -1980,6 +2043,12 @@ async function main() {
       if (!isNonEmptyString(chatKey)) {
         chatKey = lastActiveBySessionThread.get(sessionThreadKey(sessionId, threadId)) || null;
       }
+      logEvent("INFO", "tg.turn.started", {
+        session_id: sessionId,
+        thread_id: threadId,
+        turn_id: turnId,
+        chat_key_hash: chatKeyHash(chatKey || sourceChatKey)
+      });
       if (!isNonEmptyString(chatKey)) return;
       if (isNonEmptyString(turnId)) {
         rememberTurnTarget(sessionId, threadId, turnId, chatKey);
@@ -2007,9 +2076,16 @@ async function main() {
         }
       });
     };
-    client.onTurnCompleted = async ({ sessionId, threadId, turnId, sourceChatKey }) => {
+    client.onTurnCompleted = async ({ sessionId, threadId, turnId, sourceChatKey, turnStatus }) => {
       if (!isNonEmptyString(sessionId) || !isNonEmptyString(threadId)) return;
       const chatKey = isNonEmptyString(sourceChatKey) ? sourceChatKey : resolveTurnChatKey(sessionId, threadId, turnId);
+      logEvent("INFO", "tg.turn.completed", {
+        session_id: sessionId,
+        thread_id: threadId,
+        turn_id: turnId,
+        turn_status: turnStatus,
+        chat_key_hash: chatKeyHash(chatKey || sourceChatKey)
+      });
       if (!isNonEmptyString(chatKey)) return;
       typing.stop(chatKey);
       if (isNonEmptyString(turnId)) {
@@ -4734,49 +4810,141 @@ async function main() {
             }
 
             if (slash?.known && slash.cmd === "cancel") {
+              const cancelId = newCancelId();
+              const cancelStartMs = nowMs();
               let notice = hadPendingBeforeSlash ? S.notice_canceled : S.notice_no_active_user_turn;
+              let noticeKey = hadPendingBeforeSlash ? "canceled" : "no_active_user_turn";
+              let cancelSessionId = null;
+              let cancelThreadId = null;
+              let cancelTarget = null;
+              let cancelRpcId = null;
+              logEvent("INFO", "tg.cancel.command_received", {
+                cancel_id: cancelId,
+                chat_key_hash: chatKeyHash(chatKey),
+                chat_type: chatType,
+                update_id: Number.isFinite(updateId) ? updateId : undefined,
+                message_id: Number.isFinite(message?.message_id) ? message.message_id : undefined,
+                had_pending_input: hadPendingBeforeSlash
+              });
               try {
                 const route = await resolveRouteForChatKey(chatKey);
-                const sessionId = route.sessionId;
-                const client = await getClient(sessionId);
-                let cancelThreadId = null;
-                let cancelTarget = null;
+                cancelSessionId = route.sessionId;
+                const client = await getClient(cancelSessionId);
 
                 if (isPrivateChatType(chatType) || isGroupChatType(chatType)) {
                   cancelTarget = "main";
                 } else if (!isNonEmptyString(cancelThreadId)) {
+                  logEvent("INFO", "tg.cancel.route_resolved", {
+                    cancel_id: cancelId,
+                    session_id: cancelSessionId,
+                    target: cancelTarget,
+                    thread_id: cancelThreadId,
+                    chat_key_hash: chatKeyHash(chatKey)
+                  });
                   await safeSendMessage({ ...target, text: hadPendingBeforeSlash ? S.notice_canceled : S.notice_no_active_user_turn });
+                  logEvent("INFO", "tg.cancel.notice_sent", {
+                    cancel_id: cancelId,
+                    session_id: cancelSessionId,
+                    target: cancelTarget,
+                    thread_id: cancelThreadId,
+                    notice_key: noticeKey,
+                    chat_key_hash: chatKeyHash(chatKey)
+                  });
                   return;
                 }
 
-                const res = await client.cancelTurn({ threadId: cancelThreadId, target: cancelTarget });
-                notice = formatCancelTurnResultForUser(res, { locale });
+                logEvent("INFO", "tg.cancel.route_resolved", {
+                  cancel_id: cancelId,
+                  session_id: cancelSessionId,
+                  target: cancelTarget,
+                  thread_id: cancelThreadId,
+                  chat_key_hash: chatKeyHash(chatKey)
+                });
+
+                const res = await client.cancelTurn({
+                  threadId: cancelThreadId,
+                  target: cancelTarget,
+                  cancelId,
+                  onSent: (rpcId) => {
+                    cancelRpcId = rpcId;
+                    logEvent("INFO", "tg.cancel.rpc_sent", {
+                      cancel_id: cancelId,
+                      rpc_id: rpcId,
+                      session_id: cancelSessionId,
+                      target: cancelTarget,
+                      thread_id: cancelThreadId
+                    });
+                  }
+                });
+                const resolved = resolveCancelTurnResultForUser(res, { locale });
+                notice = resolved.text;
+                noticeKey = resolved.noticeKey;
+                const payload = isObjectRecord(res) ? res : {};
                 if (
                   hadPendingBeforeSlash &&
-                  isObjectRecord(res) &&
-                  res.cancelRequested !== true &&
-                  res.reason === "NO_ACTIVE_USER_TURN"
+                  payload.cancelRequested !== true &&
+                  payload.reason === "NO_ACTIVE_USER_TURN"
                 ) {
                   notice = S.notice_canceled;
+                  noticeKey = "canceled";
                 }
-                if (isObjectRecord(res) && res.cancelRequested === true) {
+                if (payload.cancelRequested === true) {
                   typing.stop(chatKey);
                 }
+                logEvent("INFO", "tg.cancel.rpc_result", {
+                  cancel_id: cancelId,
+                  rpc_id: cancelRpcId,
+                  session_id: cancelSessionId,
+                  target: cancelTarget,
+                  thread_id: isNonEmptyString(payload.threadId) ? payload.threadId : cancelThreadId,
+                  turn_id: isNonEmptyString(payload.turnId) ? payload.turnId : undefined,
+                  result: payload.cancelRequested === true
+                    ? (payload.alreadyRequested === true ? "already_requested" : "accepted")
+                    : "rejected",
+                  reason: isNonEmptyString(payload.reason) ? payload.reason : undefined,
+                  active_kind: isNonEmptyString(payload.activeKind) ? payload.activeKind : undefined,
+                  gateway_cancel_id: isNonEmptyString(payload.cancelId) ? payload.cancelId : undefined,
+                  active_cancel_id: isNonEmptyString(payload.activeCancelId) ? payload.activeCancelId : undefined,
+                  duration_ms: nowMs() - cancelStartMs
+                });
               } catch (e) {
                 const rawMsg = e instanceof Error ? e.message : String(e);
                 const msg2 = formatGatewayErrorForUser(e, { locale });
                 if (hadPendingBeforeSlash) {
                   notice = S.notice_canceled;
+                  noticeKey = "canceled";
                 } else if (
                   msg2 === S.err_not_initialized ||
                   /no agent bound|unknown session|agent has no sessionid/i.test(rawMsg)
                 ) {
                   notice = S.notice_no_active_user_turn;
+                  noticeKey = "no_active_user_turn";
                 } else {
                   notice = msg2;
+                  noticeKey = "gateway_error";
                 }
+                logEvent("WARNING", "tg.cancel.error", {
+                  cancel_id: cancelId,
+                  rpc_id: cancelRpcId,
+                  session_id: cancelSessionId,
+                  target: cancelTarget,
+                  thread_id: cancelThreadId,
+                  chat_key_hash: chatKeyHash(chatKey),
+                  stage: cancelRpcId === null ? (cancelSessionId ? "client" : "route") : "rpc",
+                  err_kind: e instanceof Error ? e.name : typeof e,
+                  err_msg: rawMsg,
+                  duration_ms: nowMs() - cancelStartMs
+                });
               }
               await safeSendMessage({ ...target, text: notice });
+              logEvent("INFO", "tg.cancel.notice_sent", {
+                cancel_id: cancelId,
+                session_id: cancelSessionId,
+                target: cancelTarget,
+                thread_id: cancelThreadId,
+                notice_key: noticeKey,
+                chat_key_hash: chatKeyHash(chatKey)
+              });
               return;
             }
 
