@@ -803,9 +803,7 @@ class ArgusClient {
 
   async startThread(model) {
     const params = { cwd: this.cwd, approvalPolicy: "never", sandbox: "danger-full-access" };
-    if (AVAILABLE_AGENT_MODELS.includes(model)) {
-      params.model = model;
-    }
+    params.model = normalizeAgentModel(model);
     const result = await this.rpc("thread/start", params);
     const tid = result?.thread?.id;
     if (!isNonEmptyString(tid)) throw new Error("Invalid thread/start response");
@@ -1234,16 +1232,27 @@ function detectLocaleFromLanguageCode(languageCode) {
 }
 
 const DEFAULT_AGENT_MODEL = "gpt-5.4";
-const AVAILABLE_AGENT_MODELS = ["gpt-5.2", "gpt-5.4"];
+const AGENT_MODEL_RE = /^[A-Za-z0-9][A-Za-z0-9._:/+-]{0,127}$/;
 
 function normalizeAgentModel(model) {
-  return AVAILABLE_AGENT_MODELS.includes(model) ? model : DEFAULT_AGENT_MODEL;
+  const raw = isNonEmptyString(model) ? String(model).trim() : "";
+  return AGENT_MODEL_RE.test(raw) ? raw : DEFAULT_AGENT_MODEL;
 }
 
-function normalizeAvailableModels(models) {
-  if (!Array.isArray(models)) return [...AVAILABLE_AGENT_MODELS];
-  const out = models.filter((model) => AVAILABLE_AGENT_MODELS.includes(model));
-  return out.length > 0 ? out : [...AVAILABLE_AGENT_MODELS];
+function normalizeAvailableModels(models, currentModel) {
+  const out = [];
+  const seen = new Set();
+  if (Array.isArray(models)) {
+    for (const raw of models) {
+      const model = isNonEmptyString(raw) ? String(raw).trim() : "";
+      if (!AGENT_MODEL_RE.test(model) || seen.has(model)) continue;
+      seen.add(model);
+      out.push(model);
+    }
+  }
+  const current = normalizeAgentModel(currentModel);
+  if (!seen.has(current)) out.push(current);
+  return out.length > 0 ? out : [DEFAULT_AGENT_MODEL];
 }
 
   const UI_STRINGS = {
@@ -2134,7 +2143,7 @@ async function main() {
     const sessionId = isNonEmptyString(res?.sessionId) ? res.sessionId : null;
     const agentId = isNonEmptyString(res?.agentId) ? res.agentId : "main";
     const model = normalizeAgentModel(res?.model);
-    const availableModels = normalizeAvailableModels(res?.availableModels);
+    const availableModels = normalizeAvailableModels(res?.availableModels, model);
     if (!sessionId) throw new Error("Missing sessionId");
     return { agentId, sessionId, model, availableModels };
   }
@@ -2760,17 +2769,22 @@ async function main() {
       const data = await argusHttp.automationAgentList(chatKey);
       const currentAgentId = isNonEmptyString(data?.currentAgentId) ? data.currentAgentId : null;
       const agents = Array.isArray(data?.agents) ? data.agents : [];
-      const availableModels = normalizeAvailableModels(data?.availableModels);
       const currentAgent = agents.find((agent) => isNonEmptyString(agent?.agentId) && agent.agentId === currentAgentId) || null;
       const currentModel = normalizeAgentModel(currentAgent?.model);
+      const availableModels = normalizeAvailableModels(data?.availableModels, currentModel);
+      const effectiveError = isNonEmptyString(error)
+        ? error
+        : isNonEmptyString(data?.modelError)
+          ? data.modelError
+          : null;
 
       const lines = [];
       lines.push(`<b>${escapeHtml(S.title_switch_model)}</b>`);
       lines.push(`${escapeHtml(S.label_current)}: ${htmlCode(currentAgentId || "(none)")}`);
       lines.push(`${escapeHtml(S.label_model)}: ${htmlCode(currentModel)}`);
-      if (isNonEmptyString(error)) {
+      if (isNonEmptyString(effectiveError)) {
         lines.push("");
-        lines.push(`<b>${escapeHtml(S.label_error)}:</b> ${escapeHtml(error)}`);
+        lines.push(`<b>${escapeHtml(S.label_error)}:</b> ${escapeHtml(effectiveError)}`);
       }
 
       const rows = availableModels.map((model) => [
@@ -3359,15 +3373,20 @@ async function main() {
         return renderGroupOwnerOnlyView(chatKey, { error: S.msg_group_owner_only, locale });
       }
       const data = await argusHttp.automationAgentList(ctx.actorChatKey);
-      const availableModels = normalizeAvailableModels(data?.availableModels);
+      const availableModels = normalizeAvailableModels(data?.availableModels, ctx.route.model);
+      const effectiveError = isNonEmptyString(error)
+        ? error
+        : isNonEmptyString(data?.modelError)
+          ? data.modelError
+          : null;
 
       const lines = [];
       lines.push(`<b>${escapeHtml(S.title_switch_model)}</b>`);
       lines.push(`${escapeHtml(S.label_current)}: ${htmlCode(ctx.route.agentId || "(none)")}`);
       lines.push(`${escapeHtml(S.label_model)}: ${htmlCode(ctx.route.model || DEFAULT_AGENT_MODEL)}`);
-      if (isNonEmptyString(error)) {
+      if (isNonEmptyString(effectiveError)) {
         lines.push("");
-        lines.push(`<b>${escapeHtml(S.label_error)}:</b> ${escapeHtml(error)}`);
+        lines.push(`<b>${escapeHtml(S.label_error)}:</b> ${escapeHtml(effectiveError)}`);
       }
 
       const rows = availableModels.map((model) => [
@@ -4169,7 +4188,7 @@ async function main() {
       if (action === "g:model_set") {
         await answerOnce();
         const model = payload.model;
-        if (!isNonEmptyString(model) || !AVAILABLE_AGENT_MODELS.includes(model)) {
+        if (!isNonEmptyString(model)) {
           const view = await renderGroupModelMenu(chatKey, actorUserId, { error: S.msg_invalid_model, locale });
           await editMenuMessage({ chatId, messageId, view });
           return;

@@ -115,6 +115,7 @@ Channel behavior:
 - Built-in `gateway`: selected by default; uses `OPENAI_API_KEY` + `ARGUS_OPENAI_RESPONSES_UPSTREAM_URL`.
 - Built-in `0-0.pro`: fixed base URL `https://api.0-0.pro/v1`; each user supplies their own API key from the Telegram menu.
 - Custom channels: each user can add/delete/rename their own OpenAI-compatible `baseUrl` + API key entries.
+- The model switch menu fetches the current channel's model list from `<baseUrl>/models` (OpenAI-compatible shape). If that request fails, Argus falls back to the agent's current model so the session still stays usable.
 - The channel list and user API keys are stored in `${ARGUS_HOME_HOST_PATH}/gateway/state.json`. Protect this file like any other secret store.
 - Switching the current channel is **user-global**: one switch affects that user's existing and future agents/containers.
 
@@ -217,7 +218,7 @@ When using `apps/telegram-bot`, the gateway can isolate runtime containers (agen
   - If the upload has no caption, the file is still saved immediately and will be attached to the next text message from that chat.
 - Use `/menu` to open the control panel:
   - **Switch Agent**: switch the current DM agent (workspace/session).
-  - **Switch Model**: switch the current agent between `gpt-5.2` and `gpt-5.4`.
+  - **Switch Model**: switch the current agent to any model exposed by the currently selected API channel's `/models` endpoint.
   - **API Channels**: manage the per-user channel list (`gateway`, `0-0.pro`, and your own custom channels) and switch the current channel for all of your agents/containers.
   - **Create Agent**: create a new agent (workspace/session) and switch to it.
   - **Rename Agent**: rename the current agent (owner-only; non-`main`).
@@ -304,7 +305,7 @@ Notes:
 - The proxy requires a per-session derived bearer token (master: `ARGUS_OPENAI_TOKEN`, fallback: `ARGUS_TOKEN`).
 - The runtime writes a generated `CODEX_HOME/config.toml` (no provider secrets) to point Codex at the gateway MCP server and proxy.
   - Default `CODEX_HOME`: `/workspace/.codex` (workspace-scoped)
-  - Default model: `gpt-5.4` (Telegram agents can switch between `gpt-5.2` / `gpt-5.4` from `/menu`, and the selection is persisted per agent).
+  - Default model: `gpt-5.4` (Telegram agents can switch to any valid model id returned by the selected channel, and the selection is persisted per agent).
 - If you want the default `gateway` channel to work out of the box for every user, set `OPENAI_API_KEY` on the gateway. Otherwise users must select a ready personal channel first.
 
 To swap runtimes, set these before `docker compose up --build`.

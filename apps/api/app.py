@@ -1786,8 +1786,8 @@ CHANNEL_ID_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,63}$")
 TELEGRAM_PRIVATE_CHAT_ID_RE = re.compile(r"^[1-9]\d{0,19}$")
 AUTOMATION_STATE_VERSION = 7
 ARGUS_AGENT_MODEL_DEFAULT = "gpt-5.4"
-ARGUS_AGENT_MODELS = ("gpt-5.2", "gpt-5.4")
-ARGUS_AGENT_MODELS_SET = frozenset(ARGUS_AGENT_MODELS)
+ARGUS_AGENT_MODEL_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/+-]{0,127}$")
+ARGUS_MODEL_CATALOG_CACHE_TTL_MS = 60_000
 ARGUS_AGENT_MODEL_FILE = "argus-agent-model"
 CHANNEL_ID_GATEWAY = "gateway"
 CHANNEL_ID_ZERO_ZERO_PRO = "0-0.pro"
@@ -1895,8 +1895,10 @@ def _normalize_openai_base_url(raw: Any) -> str:
     if parsed.query or parsed.fragment:
         return ""
     path = parsed.path.rstrip("/")
-    if path.lower().endswith("/responses"):
-        path = path[: -len("/responses")].rstrip("/")
+    for suffix in ("/responses", "/models"):
+        if path.lower().endswith(suffix):
+            path = path[: -len(suffix)].rstrip("/")
+            break
     normalized = urllib.parse.urlunparse((parsed.scheme, parsed.netloc, path, "", "", ""))
     return normalized.rstrip("/")
 
@@ -1906,6 +1908,13 @@ def _responses_url_from_base_url(base_url: Any) -> str:
     if not normalized:
         return ""
     return f"{normalized}/responses"
+
+
+def _models_url_from_base_url(base_url: Any) -> str:
+    normalized = _normalize_openai_base_url(base_url)
+    if not normalized:
+        return ""
+    return f"{normalized}/models"
 
 
 def _base_url_from_responses_url(raw: Any) -> str:
@@ -1940,12 +1949,156 @@ def _new_custom_channel_id() -> str:
 
 
 def _normalize_agent_model(raw: Any) -> str:
-    if not isinstance(raw, str):
+    if raw is None:
         return ""
-    model = raw.strip()
-    if model not in ARGUS_AGENT_MODELS_SET:
+    model = str(raw).strip()
+    if not model or len(model) > 128:
+        return ""
+    if not ARGUS_AGENT_MODEL_RE.match(model):
         return ""
     return model
+
+
+def _normalize_model_catalog_entry(raw: Any) -> Optional[dict[str, Any]]:
+    if isinstance(raw, dict):
+        model_id = _normalize_agent_model(raw.get("id") or raw.get("model") or raw.get("name"))
+        if not model_id:
+            return None
+        out: dict[str, Any] = {"id": model_id}
+        owned_by = str(raw.get("owned_by") or raw.get("ownedBy") or "").strip()
+        if owned_by:
+            out["ownedBy"] = owned_by
+        object_type = str(raw.get("object") or "").strip()
+        if object_type:
+            out["object"] = object_type
+        created = raw.get("created")
+        if isinstance(created, int):
+            out["created"] = created
+        return out
+    model_id = _normalize_agent_model(raw)
+    if not model_id:
+        return None
+    return {"id": model_id}
+
+
+def _parse_model_catalog_payload(raw: Any) -> list[dict[str, Any]]:
+    items: Any = None
+    if isinstance(raw, dict):
+        if isinstance(raw.get("data"), list):
+            items = raw.get("data")
+        elif isinstance(raw.get("models"), list):
+            items = raw.get("models")
+    elif isinstance(raw, list):
+        items = raw
+    if not isinstance(items, list):
+        return []
+    out: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for item in items:
+        entry = _normalize_model_catalog_entry(item)
+        if not isinstance(entry, dict):
+            continue
+        model_id = str(entry.get("id") or "").strip()
+        if not model_id or model_id in seen:
+            continue
+        seen.add(model_id)
+        out.append(entry)
+    return out
+
+
+def _model_catalog_error_detail(raw: Any) -> Optional[str]:
+    if isinstance(raw, dict):
+        err = raw.get("error")
+        if isinstance(err, dict):
+            msg = str(err.get("message") or "").strip()
+            if msg:
+                return msg
+        for key in ("detail", "message", "error"):
+            value = raw.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+    return None
+
+
+def _fallback_model_catalog(*, current_model: Optional[str], error: Optional[str], channel: Optional[dict[str, Any]] = None) -> dict[str, Any]:
+    model_id = _normalize_agent_model(current_model) or ARGUS_AGENT_MODEL_DEFAULT
+    return {
+        "availableModels": [model_id],
+        "models": [{"id": model_id}],
+        "source": "fallback",
+        "fetchedAtMs": _now_ms(),
+        "error": error,
+        "channel": dict(channel) if isinstance(channel, dict) else None,
+    }
+
+
+def _merge_current_model_into_catalog(catalog: dict[str, Any], current_model: Optional[str]) -> dict[str, Any]:
+    current = _normalize_agent_model(current_model)
+    available_raw = catalog.get("availableModels")
+    models_raw = catalog.get("models")
+    available: list[str] = []
+    seen: set[str] = set()
+    if isinstance(available_raw, list):
+        for raw in available_raw:
+            model_id = _normalize_agent_model(raw)
+            if not model_id or model_id in seen:
+                continue
+            seen.add(model_id)
+            available.append(model_id)
+    models: list[dict[str, Any]] = []
+    seen_models: set[str] = set()
+    if isinstance(models_raw, list):
+        for raw in models_raw:
+            entry = _normalize_model_catalog_entry(raw)
+            if not isinstance(entry, dict):
+                continue
+            model_id = str(entry.get("id") or "").strip()
+            if not model_id or model_id in seen_models:
+                continue
+            seen_models.add(model_id)
+            models.append(entry)
+    if current and current not in seen:
+        available.append(current)
+        seen.add(current)
+    if current and current not in seen_models:
+        models.append({"id": current})
+        seen_models.add(current)
+    out = dict(catalog)
+    out["availableModels"] = available or [_normalize_agent_model(current_model) or ARGUS_AGENT_MODEL_DEFAULT]
+    out["models"] = models or [{"id": out["availableModels"][0]}]
+    return out
+
+
+def _fetch_model_catalog_sync(*, models_url: str, api_key: str) -> list[dict[str, Any]]:
+    if not models_url or not api_key:
+        raise RuntimeError("Model catalog target is not configured")
+    try:
+        response = requests.get(
+            models_url,
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "Accept": "application/json",
+            },
+            timeout=(10, 30),
+        )
+    except requests.RequestException as e:
+        raise RuntimeError(f"Upstream model request failed: {e}") from e
+
+    try:
+        payload = response.json()
+    except ValueError as e:
+        raise RuntimeError(f"Upstream model response is not valid JSON ({response.status_code})") from e
+
+    if response.status_code >= 400:
+        detail = _model_catalog_error_detail(payload)
+        if detail:
+            raise RuntimeError(f"Upstream model request failed ({response.status_code}): {detail}")
+        raise RuntimeError(f"Upstream model request failed ({response.status_code})")
+
+    models = _parse_model_catalog_payload(payload)
+    if not models:
+        raise RuntimeError("Upstream returned no usable models")
+    return models
 
 
 def _effective_agent_model(agent: Optional["PersistedAgentRuntime"]) -> str:
@@ -2492,6 +2645,7 @@ class AutomationManager:
         self._turn_text_by_key: dict[tuple[str, str, str], dict[str, Any]] = {}
         self._isolated_cron_context_by_key: dict[tuple[str, str, str], IsolatedCronTurnContext] = {}
         self._session_restart_locks: dict[str, asyncio.Lock] = {}
+        self._model_catalog_cache: dict[tuple[int, str], dict[str, Any]] = {}
 
     async def start(self) -> None:
         await self._store.load()
@@ -2746,6 +2900,7 @@ class AutomationManager:
         if normalized_channel_id == CHANNEL_ID_GATEWAY:
             api_key = _gateway_openai_api_key()
             ready = bool(api_key)
+            base_url = _base_url_from_responses_url(_gateway_openai_responses_upstream_url())
             return {
                 "channelId": CHANNEL_ID_GATEWAY,
                 "name": CHANNEL_ID_GATEWAY,
@@ -2753,8 +2908,9 @@ class AutomationManager:
                 "builtinKind": "gateway",
                 "isBuiltin": True,
                 "selected": current_id == CHANNEL_ID_GATEWAY,
-                "baseUrl": _base_url_from_responses_url(_gateway_openai_responses_upstream_url()),
+                "baseUrl": base_url,
                 "responsesUrl": _gateway_openai_responses_upstream_url(),
+                "modelsUrl": _models_url_from_base_url(base_url),
                 "hasApiKey": bool(api_key),
                 "apiKeyMasked": None,
                 "ready": ready,
@@ -2768,6 +2924,7 @@ class AutomationManager:
         if normalized_channel_id == CHANNEL_ID_ZERO_ZERO_PRO:
             api_key = _normalize_channel_api_key((user_state.builtin_api_keys or {}).get(CHANNEL_ID_ZERO_ZERO_PRO))
             ready = bool(api_key)
+            responses_url = _responses_url_from_base_url(CHANNEL_ZERO_ZERO_PRO_BASE_URL)
             return {
                 "channelId": CHANNEL_ID_ZERO_ZERO_PRO,
                 "name": CHANNEL_ID_ZERO_ZERO_PRO,
@@ -2776,7 +2933,8 @@ class AutomationManager:
                 "isBuiltin": True,
                 "selected": current_id == CHANNEL_ID_ZERO_ZERO_PRO,
                 "baseUrl": CHANNEL_ZERO_ZERO_PRO_BASE_URL,
-                "responsesUrl": _responses_url_from_base_url(CHANNEL_ZERO_ZERO_PRO_BASE_URL),
+                "responsesUrl": responses_url,
+                "modelsUrl": _models_url_from_base_url(CHANNEL_ZERO_ZERO_PRO_BASE_URL),
                 "hasApiKey": bool(api_key),
                 "apiKeyMasked": _mask_secret(api_key),
                 "ready": ready,
@@ -2806,6 +2964,7 @@ class AutomationManager:
             "selected": current_id == channel.channel_id,
             "baseUrl": channel.base_url,
             "responsesUrl": _responses_url_from_base_url(channel.base_url),
+            "modelsUrl": _models_url_from_base_url(channel.base_url),
             "hasApiKey": bool(api_key),
             "apiKeyMasked": _mask_secret(api_key),
             "ready": ready,
@@ -2876,6 +3035,126 @@ class AutomationManager:
         current_channel = listed.get("currentChannel")
         return dict(current_channel) if isinstance(current_channel, dict) else None
 
+    def _invalidate_model_catalog_cache(self, *, user_id: Optional[int] = None, channel_id: Optional[str] = None) -> None:
+        if not self._model_catalog_cache:
+            return
+        normalized_channel_id = _normalize_channel_id(channel_id) if channel_id is not None else None
+        for key_user_id, key_channel_id in list(self._model_catalog_cache.keys()):
+            if user_id is not None and key_user_id != user_id:
+                continue
+            if normalized_channel_id is not None and key_channel_id != normalized_channel_id:
+                continue
+            self._model_catalog_cache.pop((key_user_id, key_channel_id), None)
+
+    def _resolve_model_catalog_target_for_user(
+        self,
+        *,
+        user_id: int,
+        channel_id: Optional[str] = None,
+    ) -> dict[str, Any]:
+        if not isinstance(user_id, int) or user_id <= 0:
+            raise ValueError("Invalid userId")
+        user_state = self._get_user_channel_state_for_user(user_id=user_id)
+        current_channel_id = self._current_channel_id_for_user_state(user_state=user_state)
+        resolved_channel_id = (
+            current_channel_id if channel_id is None else self._resolve_user_channel_id(user_id=user_id, raw_channel=channel_id)
+        )
+        if not resolved_channel_id:
+            raise ValueError(f"Unknown channel: {channel_id}")
+        channel_entry = self._channel_entry_for_user_state(
+            user_state=user_state,
+            channel_id=resolved_channel_id,
+            current_channel_id=current_channel_id,
+        )
+        if not bool(channel_entry.get("ready")):
+            raise RuntimeError(str(channel_entry.get("reason") or f"Channel is not ready: {resolved_channel_id}"))
+
+        if resolved_channel_id == CHANNEL_ID_GATEWAY:
+            api_key = _gateway_openai_api_key()
+            base_url = _base_url_from_responses_url(_gateway_openai_responses_upstream_url())
+            responses_url = _gateway_openai_responses_upstream_url()
+        elif resolved_channel_id == CHANNEL_ID_ZERO_ZERO_PRO:
+            api_key = _normalize_channel_api_key((user_state.builtin_api_keys or {}).get(CHANNEL_ID_ZERO_ZERO_PRO))
+            base_url = CHANNEL_ZERO_ZERO_PRO_BASE_URL
+            responses_url = _responses_url_from_base_url(base_url)
+        else:
+            channel = (user_state.custom_channels or {}).get(resolved_channel_id)
+            if not isinstance(channel, PersistedUserChannel):
+                raise RuntimeError(f"Unknown channel: {resolved_channel_id}")
+            api_key = _normalize_channel_api_key(channel.api_key)
+            base_url = channel.base_url
+            responses_url = _responses_url_from_base_url(base_url)
+
+        if not api_key:
+            raise RuntimeError(f"Channel '{channel_entry.get('name') or resolved_channel_id}' is missing apiKey")
+        models_url = _models_url_from_base_url(base_url)
+        if not models_url:
+            raise RuntimeError(f"Channel '{channel_entry.get('name') or resolved_channel_id}' has no usable models URL")
+        return {
+            "ownerUserId": user_id,
+            "channelId": resolved_channel_id,
+            "name": str(channel_entry.get("name") or resolved_channel_id),
+            "baseUrl": base_url,
+            "responsesUrl": responses_url,
+            "modelsUrl": models_url,
+            "apiKey": api_key,
+            "channel": dict(channel_entry),
+        }
+
+    async def get_available_models_for_user(
+        self,
+        *,
+        user_id: int,
+        current_model: Optional[str] = None,
+        channel_id: Optional[str] = None,
+        force_refresh: bool = False,
+    ) -> dict[str, Any]:
+        normalized_current_model = _normalize_agent_model(current_model)
+        try:
+            target = self._resolve_model_catalog_target_for_user(user_id=user_id, channel_id=channel_id)
+        except Exception as e:
+            channel = None
+            if channel_id is None:
+                channel = self.get_current_channel_for_user(user_id=user_id)
+            return _fallback_model_catalog(current_model=normalized_current_model, error=str(e), channel=channel)
+
+        cache_key = (user_id, str(target.get("channelId") or ""))
+        now_ms = _now_ms()
+        cached = None if force_refresh else self._model_catalog_cache.get(cache_key)
+        if isinstance(cached, dict):
+            try:
+                fetched_at_ms = int(cached.get("fetchedAtMs") or 0)
+            except Exception:
+                fetched_at_ms = 0
+            if fetched_at_ms > 0 and now_ms - fetched_at_ms <= ARGUS_MODEL_CATALOG_CACHE_TTL_MS:
+                return _merge_current_model_into_catalog(cached, normalized_current_model)
+
+        try:
+            models = await asyncio.to_thread(
+                _fetch_model_catalog_sync,
+                models_url=str(target.get("modelsUrl") or ""),
+                api_key=str(target.get("apiKey") or ""),
+            )
+        except Exception as e:
+            fallback = _fallback_model_catalog(
+                current_model=normalized_current_model,
+                error=str(e),
+                channel=target.get("channel") if isinstance(target.get("channel"), dict) else None,
+            )
+            self._model_catalog_cache[cache_key] = dict(fallback)
+            return fallback
+
+        catalog = {
+            "availableModels": [str(item.get("id") or "").strip() for item in models if isinstance(item, dict)],
+            "models": models,
+            "source": "upstream",
+            "fetchedAtMs": now_ms,
+            "error": None,
+            "channel": dict(target.get("channel")) if isinstance(target.get("channel"), dict) else None,
+        }
+        self._model_catalog_cache[cache_key] = dict(catalog)
+        return _merge_current_model_into_catalog(catalog, normalized_current_model)
+
     def resolve_openai_proxy_target_for_session(self, session_id: str) -> dict[str, Any]:
         sid = session_id.strip() if isinstance(session_id, str) else ""
         if not sid:
@@ -2885,49 +3164,28 @@ class AutomationManager:
             api_key = _gateway_openai_api_key()
             if not api_key:
                 raise RuntimeError("Gateway channel is not configured (missing OPENAI_API_KEY)")
+            base_url = _base_url_from_responses_url(_gateway_openai_responses_upstream_url())
             return {
                 "ownerUserId": None,
                 "channelId": CHANNEL_ID_GATEWAY,
                 "name": CHANNEL_ID_GATEWAY,
+                "baseUrl": base_url,
                 "upstreamUrl": _gateway_openai_responses_upstream_url(),
+                "modelsUrl": _models_url_from_base_url(base_url),
                 "apiKey": api_key,
             }
-
-        current_channel = self.get_current_channel_for_user(user_id=owner_user_id)
-        if not isinstance(current_channel, dict):
-            raise RuntimeError(f"Unable to resolve current channel for user {owner_user_id}")
-        channel_id = _normalize_channel_id(current_channel.get("channelId"))
-        if not channel_id:
-            raise RuntimeError(f"Unable to resolve current channel for user {owner_user_id}")
-
-        if channel_id == CHANNEL_ID_GATEWAY:
-            api_key = _gateway_openai_api_key()
-            if not api_key:
-                raise RuntimeError("Current channel 'gateway' is not ready (missing OPENAI_API_KEY)")
-            upstream_url = _gateway_openai_responses_upstream_url()
-        elif channel_id == CHANNEL_ID_ZERO_ZERO_PRO:
-            user_state = self._get_user_channel_state_for_user(user_id=owner_user_id)
-            api_key = _normalize_channel_api_key((user_state.builtin_api_keys or {}).get(CHANNEL_ID_ZERO_ZERO_PRO))
-            if not api_key:
-                raise RuntimeError("Current channel '0-0.pro' is not ready (missing apiKey)")
-            upstream_url = _responses_url_from_base_url(CHANNEL_ZERO_ZERO_PRO_BASE_URL)
-        else:
-            user_state = self._get_user_channel_state_for_user(user_id=owner_user_id)
-            channel = (user_state.custom_channels or {}).get(channel_id)
-            if not isinstance(channel, PersistedUserChannel):
-                raise RuntimeError(f"Unknown current channel: {channel_id}")
-            api_key = _normalize_channel_api_key(channel.api_key)
-            if not channel.base_url or not api_key:
-                raise RuntimeError(f"Current channel '{channel.name or channel_id}' is not ready")
-            upstream_url = _responses_url_from_base_url(channel.base_url)
+        target = self._resolve_model_catalog_target_for_user(user_id=owner_user_id)
+        upstream_url = str(target.get("responsesUrl") or "").strip()
         if not upstream_url:
-            raise RuntimeError(f"Current channel '{channel_id}' has no usable upstream URL")
+            raise RuntimeError(f"Current channel '{target.get('channelId')}' has no usable upstream URL")
         return {
             "ownerUserId": owner_user_id,
-            "channelId": channel_id,
-            "name": str(current_channel.get("name") or channel_id),
+            "channelId": str(target.get("channelId") or ""),
+            "name": str(target.get("name") or target.get("channelId") or ""),
+            "baseUrl": str(target.get("baseUrl") or ""),
             "upstreamUrl": upstream_url,
-            "apiKey": api_key,
+            "modelsUrl": str(target.get("modelsUrl") or ""),
+            "apiKey": target.get("apiKey"),
         }
 
     async def create_user_channel(self, *, user_id: int, name: str, base_url: str, api_key: str) -> PersistedUserChannel:
@@ -2977,6 +3235,7 @@ class AutomationManager:
         await self._store.update(_write)
         if created is None:
             raise RuntimeError("Channel was not created")
+        self._invalidate_model_catalog_cache(user_id=user_id)
         return created
 
     async def rename_user_channel(self, *, user_id: int, channel_id: str, new_name: str) -> PersistedUserChannel:
@@ -3018,6 +3277,7 @@ class AutomationManager:
         await self._store.update(_write)
         if updated is None:
             raise RuntimeError("Channel was not renamed")
+        self._invalidate_model_catalog_cache(user_id=user_id, channel_id=resolved_channel_id)
         return updated
 
     async def delete_user_channel(self, *, user_id: int, channel_id: str) -> dict[str, Any]:
@@ -3045,6 +3305,7 @@ class AutomationManager:
                 user_state.current_channel_id = self._best_channel_fallback_id_for_user_state(user_state=user_state)
 
         await self._store.update(_write)
+        self._invalidate_model_catalog_cache(user_id=user_id, channel_id=resolved_channel_id)
         listed = self.list_channels_for_user(user_id=user_id)
         return {
             "deletedChannelId": resolved_channel_id,
@@ -3078,6 +3339,7 @@ class AutomationManager:
             user_state.current_channel_id = resolved_channel_id
 
         await self._store.update(_write)
+        self._invalidate_model_catalog_cache(user_id=user_id)
         current_channel = self.get_current_channel_for_user(user_id=user_id)
         return {
             "currentChannelId": resolved_channel_id,
@@ -3116,6 +3378,7 @@ class AutomationManager:
             )
 
         await self._store.update(_write)
+        self._invalidate_model_catalog_cache(user_id=user_id, channel_id=resolved_channel_id)
         listed = self.list_channels_for_user(user_id=user_id)
         current_channel = listed.get("currentChannel")
         selected_channel = next(
@@ -3161,6 +3424,7 @@ class AutomationManager:
                 user_state.current_channel_id = self._best_channel_fallback_id_for_user_state(user_state=user_state)
 
         await self._store.update(_write)
+        self._invalidate_model_catalog_cache(user_id=user_id, channel_id=resolved_channel_id)
         listed = self.list_channels_for_user(user_id=user_id)
         current_channel = listed.get("currentChannel")
         selected_channel = next(
@@ -10078,6 +10342,26 @@ def _get_automation_or_500() -> AutomationManager:
     return automation
 
 
+async def _automation_model_payload(
+    automation: AutomationManager,
+    *,
+    agent: Optional[PersistedAgentRuntime] = None,
+    user_id: Optional[int] = None,
+) -> dict[str, Any]:
+    current_model = _effective_agent_model(agent)
+    resolved_user_id = user_id if isinstance(user_id, int) and user_id > 0 else None
+    if resolved_user_id is None and isinstance(getattr(agent, "owner_user_id", None), int):
+        owner_user_id = int(getattr(agent, "owner_user_id"))
+        if owner_user_id > 0:
+            resolved_user_id = owner_user_id
+    if resolved_user_id is not None:
+        return await automation.get_available_models_for_user(
+            user_id=resolved_user_id,
+            current_model=current_model,
+        )
+    return _fallback_model_catalog(current_model=current_model, error=None)
+
+
 def _automation_require_chat_key(body: Any) -> str:
     if not isinstance(body, dict):
         raise HTTPException(status_code=400, detail="Invalid JSON body")
@@ -10210,6 +10494,7 @@ async def automation_user_bootstrap(request: Request):
     current_session_id = automation.resolve_agent_session_id(current_agent_id) if current_agent_id else None
     current_agent = automation._get_agent(current_agent_id) if current_agent_id else None
     channel_info = automation.list_channels_for_user(user_id=user_id)
+    model_info = await _automation_model_payload(automation, agent=current_agent, user_id=user_id)
 
     return {
         "ok": True,
@@ -10219,7 +10504,10 @@ async def automation_user_bootstrap(request: Request):
         "currentAgentId": current_agent_id,
         "currentSessionId": current_session_id,
         "currentModel": _effective_agent_model(current_agent),
-        "availableModels": list(ARGUS_AGENT_MODELS),
+        "availableModels": model_info.get("availableModels"),
+        "models": model_info.get("models"),
+        "modelSource": model_info.get("source"),
+        "modelError": model_info.get("error"),
         "currentChannelId": channel_info.get("currentChannelId"),
         "currentChannel": channel_info.get("currentChannel"),
         "agent": agent.to_json(),
@@ -10260,6 +10548,7 @@ async def automation_agent_list(request: Request):
     current_session_id = automation.resolve_agent_session_id(current_agent_id) if current_agent_id else None
     current_agent = automation._get_agent(current_agent_id) if current_agent_id else None
     channel_info = automation.list_channels_for_user(user_id=user_id)
+    model_info = await _automation_model_payload(automation, agent=current_agent, user_id=user_id)
 
     return {
         "ok": True,
@@ -10267,7 +10556,10 @@ async def automation_agent_list(request: Request):
         "currentAgentId": current_agent_id,
         "currentSessionId": current_session_id,
         "currentModel": _effective_agent_model(current_agent),
-        "availableModels": list(ARGUS_AGENT_MODELS),
+        "availableModels": model_info.get("availableModels"),
+        "models": model_info.get("models"),
+        "modelSource": model_info.get("source"),
+        "modelError": model_info.get("error"),
         "currentChannelId": channel_info.get("currentChannelId"),
         "currentChannel": channel_info.get("currentChannel"),
     }
@@ -10298,13 +10590,17 @@ async def automation_agent_resolve(request: Request):
         sess_id = automation.resolve_agent_session_id(agent_id)
         if not sess_id:
             raise HTTPException(status_code=404, detail="Unknown agent")
+        model_info = await _automation_model_payload(automation, agent=agent)
         return {
             "ok": True,
             "chatKey": chat_key,
             "agentId": agent_id,
             "sessionId": sess_id,
             "model": _effective_agent_model(agent),
-            "availableModels": list(ARGUS_AGENT_MODELS),
+            "availableModels": model_info.get("availableModels"),
+            "models": model_info.get("models"),
+            "modelSource": model_info.get("source"),
+            "modelError": model_info.get("error"),
         }
 
     st = automation._store.state
@@ -10323,13 +10619,17 @@ async def automation_agent_resolve(request: Request):
         raise HTTPException(status_code=500, detail="Agent has no sessionId")
     agent = automation._get_agent(agent_id)
     channel_info = automation.list_channels_for_user(user_id=user_id)
+    model_info = await _automation_model_payload(automation, agent=agent, user_id=user_id)
     return {
         "ok": True,
         "chatKey": chat_key,
         "agentId": agent_id,
         "sessionId": sess_id,
         "model": _effective_agent_model(agent),
-        "availableModels": list(ARGUS_AGENT_MODELS),
+        "availableModels": model_info.get("availableModels"),
+        "models": model_info.get("models"),
+        "modelSource": model_info.get("source"),
+        "modelError": model_info.get("error"),
         "currentChannelId": channel_info.get("currentChannelId"),
         "currentChannel": channel_info.get("currentChannel"),
     }
@@ -10366,7 +10666,15 @@ async def automation_agent_create(request: Request):
         raise HTTPException(status_code=403, detail=str(e)) from e
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e)) from e
-    return {"ok": True, "agent": agent.to_json(), "availableModels": list(ARGUS_AGENT_MODELS)}
+    model_info = await _automation_model_payload(automation, agent=agent, user_id=user_id)
+    return {
+        "ok": True,
+        "agent": agent.to_json(),
+        "availableModels": model_info.get("availableModels"),
+        "models": model_info.get("models"),
+        "modelSource": model_info.get("source"),
+        "modelError": model_info.get("error"),
+    }
 
 
 @app.post("/automation/agent/use")
@@ -10408,7 +10716,16 @@ async def automation_agent_use(request: Request):
         raise HTTPException(status_code=403, detail=str(e)) from e
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e)) from e
-    return {"ok": True, "chatKey": chat_key, "agent": agent.to_json(), "availableModels": list(ARGUS_AGENT_MODELS)}
+    model_info = await _automation_model_payload(automation, agent=agent, user_id=user_id)
+    return {
+        "ok": True,
+        "chatKey": chat_key,
+        "agent": agent.to_json(),
+        "availableModels": model_info.get("availableModels"),
+        "models": model_info.get("models"),
+        "modelSource": model_info.get("source"),
+        "modelError": model_info.get("error"),
+    }
 
 
 @app.post("/automation/agent/model/set")
@@ -10451,13 +10768,17 @@ async def automation_agent_model_set(request: Request):
         raise HTTPException(status_code=403, detail=str(e)) from e
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e)) from e
+    model_info = await _automation_model_payload(automation, agent=agent, user_id=user_id)
 
     return {
         "ok": True,
         "chatKey": chat_key,
         "agent": agent.to_json(),
         "liveModelSynced": synced,
-        "availableModels": list(ARGUS_AGENT_MODELS),
+        "availableModels": model_info.get("availableModels"),
+        "models": model_info.get("models"),
+        "modelSource": model_info.get("source"),
+        "modelError": model_info.get("error"),
     }
 
 

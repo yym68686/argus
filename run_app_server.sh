@@ -67,12 +67,21 @@ ARGUS_CODEX_MODEL_FILE="${ARGUS_CODEX_MODEL_FILE:-$CODEX_HOME_DIR/argus-agent-mo
 export HOME="$APP_HOME_DIR"
 
 normalize_argus_codex_model() {
-  case "$(printf '%s' "$1" | tr -d '\r\n')" in
-    gpt-5.2|gpt-5.4)
-      printf '%s' "$(printf '%s' "$1" | tr -d '\r\n')"
+  value="$(printf '%s' "$1" | tr -d '\r\n' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+  if [ -z "$value" ]; then
+    printf '%s' "gpt-5.4"
+    return 0
+  fi
+  if [ "${#value}" -gt 128 ]; then
+    printf '%s' "gpt-5.4"
+    return 0
+  fi
+  case "$value" in
+    *[!A-Za-z0-9._:/+-]*)
+      printf '%s' "gpt-5.4"
       ;;
     *)
-      printf '%s' "gpt-5.4"
+      printf '%s' "$value"
       ;;
   esac
 }
