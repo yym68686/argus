@@ -1786,6 +1786,8 @@ CHANNEL_ID_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,63}$")
 TELEGRAM_PRIVATE_CHAT_ID_RE = re.compile(r"^[1-9]\d{0,19}$")
 AUTOMATION_STATE_VERSION = 7
 ARGUS_AGENT_MODEL_DEFAULT = "gpt-5.4"
+ARGUS_GATEWAY_AGENT_MODELS = ("gpt-5.2", "gpt-5.4")
+ARGUS_GATEWAY_AGENT_MODELS_SET = frozenset(ARGUS_GATEWAY_AGENT_MODELS)
 ARGUS_AGENT_MODEL_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/+-]{0,127}$")
 ARGUS_MODEL_CATALOG_CACHE_TTL_MS = 60_000
 ARGUS_AGENT_MODEL_FILE = "argus-agent-model"
@@ -2026,6 +2028,33 @@ def _fallback_model_catalog(*, current_model: Optional[str], error: Optional[str
         "availableModels": [model_id],
         "models": [{"id": model_id}],
         "source": "fallback",
+        "fetchedAtMs": _now_ms(),
+        "error": error,
+        "channel": dict(channel) if isinstance(channel, dict) else None,
+    }
+
+
+def _static_model_catalog(
+    *,
+    models: tuple[str, ...],
+    source: str,
+    error: Optional[str] = None,
+    channel: Optional[dict[str, Any]] = None,
+) -> dict[str, Any]:
+    available = []
+    seen: set[str] = set()
+    for raw in models:
+        model_id = _normalize_agent_model(raw)
+        if not model_id or model_id in seen:
+            continue
+        seen.add(model_id)
+        available.append(model_id)
+    if not available:
+        available = [ARGUS_AGENT_MODEL_DEFAULT]
+    return {
+        "availableModels": available,
+        "models": [{"id": model_id} for model_id in available],
+        "source": source,
         "fetchedAtMs": _now_ms(),
         "error": error,
         "channel": dict(channel) if isinstance(channel, dict) else None,
@@ -2669,6 +2698,19 @@ class AutomationManager:
                 return agent.workspace_host_path
         return None
 
+    def _channel_adjusted_agent_model(self, agent: Optional[PersistedAgentRuntime]) -> str:
+        model = _effective_agent_model(agent)
+        if not isinstance(agent, PersistedAgentRuntime):
+            return model
+        owner_user_id = getattr(agent, "owner_user_id", None)
+        if not isinstance(owner_user_id, int) or owner_user_id <= 0:
+            return model
+        user_state = self._get_user_channel_state_for_user(user_id=owner_user_id)
+        current_channel_id = self._current_channel_id_for_user_state(user_state=user_state)
+        if current_channel_id != CHANNEL_ID_GATEWAY:
+            return model
+        return model if model in ARGUS_GATEWAY_AGENT_MODELS_SET else ARGUS_AGENT_MODEL_DEFAULT
+
     def get_effective_model_for_session(self, session_id: str) -> str:
         sid = session_id.strip() if isinstance(session_id, str) else ""
         if not sid:
@@ -2678,7 +2720,7 @@ class AutomationManager:
             if not isinstance(agent, PersistedAgentRuntime):
                 continue
             if agent.session_id == sid:
-                return _effective_agent_model(agent)
+                return self._channel_adjusted_agent_model(agent)
         return ARGUS_AGENT_MODEL_DEFAULT
 
     def resolve_agent_for_chat_key(self, chat_key: str) -> str:
@@ -2818,6 +2860,7 @@ class AutomationManager:
                 if isinstance(agent.agent_id, str) and agent.agent_id.startswith(prefix):
                     short = agent.agent_id[len(prefix) :].strip() or None
             entry = agent.to_json()
+            entry["model"] = self._channel_adjusted_agent_model(agent)
             entry["isOwner"] = bool(isinstance(agent.owner_user_id, int) and agent.owner_user_id == user_id)
             entry["isDefault"] = bool(aid == main_id)
             if short:
@@ -3110,13 +3153,42 @@ class AutomationManager:
         force_refresh: bool = False,
     ) -> dict[str, Any]:
         normalized_current_model = _normalize_agent_model(current_model)
+        if not isinstance(user_id, int) or user_id <= 0:
+            return _fallback_model_catalog(current_model=normalized_current_model, error="Invalid userId")
+
+        user_state = self._get_user_channel_state_for_user(user_id=user_id)
+        current_channel_id = self._current_channel_id_for_user_state(user_state=user_state)
+        resolved_channel_id = (
+            current_channel_id if channel_id is None else self._resolve_user_channel_id(user_id=user_id, raw_channel=channel_id)
+        )
+        if not resolved_channel_id:
+            channel = self.get_current_channel_for_user(user_id=user_id) if channel_id is None else None
+            return _fallback_model_catalog(
+                current_model=normalized_current_model,
+                error=f"Unknown channel: {channel_id}",
+                channel=channel,
+            )
+
+        channel_entry = self._channel_entry_for_user_state(
+            user_state=user_state,
+            channel_id=resolved_channel_id,
+            current_channel_id=current_channel_id,
+        )
+        if resolved_channel_id == CHANNEL_ID_GATEWAY:
+            return _static_model_catalog(
+                models=ARGUS_GATEWAY_AGENT_MODELS,
+                source="static",
+                channel=channel_entry,
+            )
+
         try:
             target = self._resolve_model_catalog_target_for_user(user_id=user_id, channel_id=channel_id)
         except Exception as e:
-            channel = None
-            if channel_id is None:
-                channel = self.get_current_channel_for_user(user_id=user_id)
-            return _fallback_model_catalog(current_model=normalized_current_model, error=str(e), channel=channel)
+            return _fallback_model_catalog(
+                current_model=normalized_current_model,
+                error=str(e),
+                channel=channel_entry,
+            )
 
         cache_key = (user_id, str(target.get("channelId") or ""))
         now_ms = _now_ms()
@@ -3306,6 +3378,7 @@ class AutomationManager:
 
         await self._store.update(_write)
         self._invalidate_model_catalog_cache(user_id=user_id, channel_id=resolved_channel_id)
+        await self._sync_user_agent_models_for_current_channel(user_id=user_id)
         listed = self.list_channels_for_user(user_id=user_id)
         return {
             "deletedChannelId": resolved_channel_id,
@@ -3340,6 +3413,7 @@ class AutomationManager:
 
         await self._store.update(_write)
         self._invalidate_model_catalog_cache(user_id=user_id)
+        await self._sync_user_agent_models_for_current_channel(user_id=user_id)
         current_channel = self.get_current_channel_for_user(user_id=user_id)
         return {
             "currentChannelId": resolved_channel_id,
@@ -3379,6 +3453,7 @@ class AutomationManager:
 
         await self._store.update(_write)
         self._invalidate_model_catalog_cache(user_id=user_id, channel_id=resolved_channel_id)
+        await self._sync_user_agent_models_for_current_channel(user_id=user_id)
         listed = self.list_channels_for_user(user_id=user_id)
         current_channel = listed.get("currentChannel")
         selected_channel = next(
@@ -3425,6 +3500,7 @@ class AutomationManager:
 
         await self._store.update(_write)
         self._invalidate_model_catalog_cache(user_id=user_id, channel_id=resolved_channel_id)
+        await self._sync_user_agent_models_for_current_channel(user_id=user_id)
         listed = self.list_channels_for_user(user_id=user_id)
         current_channel = listed.get("currentChannel")
         selected_channel = next(
@@ -3472,6 +3548,32 @@ class AutomationManager:
 
         await asyncio.to_thread(_write)
 
+    async def _sync_user_agent_models_for_current_channel(self, *, user_id: int) -> None:
+        if not isinstance(user_id, int) or user_id <= 0:
+            return
+        for agent in (self._store.state.agents or {}).values():
+            if not isinstance(agent, PersistedAgentRuntime):
+                continue
+            if not (isinstance(agent.owner_user_id, int) and agent.owner_user_id == user_id):
+                continue
+            workspace_host_path = str(agent.workspace_host_path or "").strip()
+            if not workspace_host_path:
+                continue
+            model = self._channel_adjusted_agent_model(agent)
+            try:
+                root = Path(workspace_host_path)
+                await self._ensure_workspace_files_at(root)
+                await self._write_agent_model_file(root, model)
+                await self._sync_live_session_default_model(session_id=agent.session_id, model=model)
+            except Exception as e:
+                log.warning(
+                    "Failed to sync effective model for agent %s (user=%s, session=%s): %s",
+                    agent.agent_id,
+                    user_id,
+                    str(agent.session_id or ""),
+                    str(e),
+                )
+
     async def _ensure_agent_model_files(self) -> None:
         for agent in (self._store.state.agents or {}).values():
             if not isinstance(agent, PersistedAgentRuntime):
@@ -3482,7 +3584,7 @@ class AutomationManager:
             root = Path(workspace_host_path)
             try:
                 await self._ensure_workspace_files_at(root)
-                await self._write_agent_model_file(root, _effective_agent_model(agent))
+                await self._write_agent_model_file(root, self._channel_adjusted_agent_model(agent))
             except Exception as e:
                 log.warning("Failed to persist model file for agent %s at %s: %s", agent.agent_id, str(root), str(e))
 
@@ -3528,7 +3630,7 @@ class AutomationManager:
         if agent is None:
             raise RuntimeError("Failed to persist user main agent")
         await self._ensure_workspace_files_at(Path(agent.workspace_host_path))
-        await self._write_agent_model_file(Path(agent.workspace_host_path), _effective_agent_model(agent))
+        await self._write_agent_model_file(Path(agent.workspace_host_path), self._channel_adjusted_agent_model(agent))
         await _ensure_live_docker_session(agent.session_id, allow_create=True)
         return agent, created
 
@@ -3575,7 +3677,7 @@ class AutomationManager:
         if agent is None:
             raise RuntimeError("Failed to persist user agent")
         await self._ensure_workspace_files_at(Path(agent.workspace_host_path))
-        await self._write_agent_model_file(Path(agent.workspace_host_path), _effective_agent_model(agent))
+        await self._write_agent_model_file(Path(agent.workspace_host_path), self._channel_adjusted_agent_model(agent))
         await _ensure_live_docker_session(agent.session_id, allow_create=True)
         return agent
 
@@ -3665,7 +3767,7 @@ class AutomationManager:
             agent2 = self._get_agent(new_aid)
             if agent2 is None:
                 raise RuntimeError("Agent not found after rename")
-            await self._write_agent_model_file(Path(agent2.workspace_host_path), _effective_agent_model(agent2))
+            await self._write_agent_model_file(Path(agent2.workspace_host_path), self._channel_adjusted_agent_model(agent2))
 
             # Ensure the runtime container is recreated with the new workspace bind mount.
             try:
@@ -3847,6 +3949,10 @@ class AutomationManager:
             raise ValueError(f"Unknown agent: {aid}")
         if not (isinstance(current.owner_user_id, int) and current.owner_user_id == user_id):
             raise PermissionError("Forbidden")
+        user_state = self._get_user_channel_state_for_user(user_id=user_id)
+        current_channel_id = self._current_channel_id_for_user_state(user_state=user_state)
+        if current_channel_id == CHANNEL_ID_GATEWAY and normalized_model not in ARGUS_GATEWAY_AGENT_MODELS_SET:
+            raise ValueError("Invalid model for gateway channel")
 
         if _effective_agent_model(current) != normalized_model:
             def _write(st: PersistedGatewayAutomationState) -> None:
@@ -3863,9 +3969,10 @@ class AutomationManager:
         updated = self._get_agent(aid)
         if updated is None:
             raise RuntimeError("Agent not found after model update")
+        effective_model = self._channel_adjusted_agent_model(updated)
         await self._ensure_workspace_files_at(Path(updated.workspace_host_path))
-        await self._write_agent_model_file(Path(updated.workspace_host_path), normalized_model)
-        synced = await self._sync_live_session_default_model(session_id=updated.session_id, model=normalized_model)
+        await self._write_agent_model_file(Path(updated.workspace_host_path), effective_model)
+        synced = await self._sync_live_session_default_model(session_id=updated.session_id, model=effective_model)
         return updated, synced
 
     async def bind_private_user_to_agent(self, *, user_id: int, chat_key: str, agent_id: str) -> PersistedAgentRuntime:
@@ -10348,7 +10455,7 @@ async def _automation_model_payload(
     agent: Optional[PersistedAgentRuntime] = None,
     user_id: Optional[int] = None,
 ) -> dict[str, Any]:
-    current_model = _effective_agent_model(agent)
+    current_model = automation._channel_adjusted_agent_model(agent)
     resolved_user_id = user_id if isinstance(user_id, int) and user_id > 0 else None
     if resolved_user_id is None and isinstance(getattr(agent, "owner_user_id", None), int):
         owner_user_id = int(getattr(agent, "owner_user_id"))
@@ -10503,7 +10610,7 @@ async def automation_user_bootstrap(request: Request):
         "createdMain": created_main,
         "currentAgentId": current_agent_id,
         "currentSessionId": current_session_id,
-        "currentModel": _effective_agent_model(current_agent),
+        "currentModel": automation._channel_adjusted_agent_model(current_agent),
         "availableModels": model_info.get("availableModels"),
         "models": model_info.get("models"),
         "modelSource": model_info.get("source"),
@@ -10555,7 +10662,7 @@ async def automation_agent_list(request: Request):
         "agents": automation.list_agents_for_user(user_id=user_id),
         "currentAgentId": current_agent_id,
         "currentSessionId": current_session_id,
-        "currentModel": _effective_agent_model(current_agent),
+        "currentModel": automation._channel_adjusted_agent_model(current_agent),
         "availableModels": model_info.get("availableModels"),
         "models": model_info.get("models"),
         "modelSource": model_info.get("source"),
@@ -10596,7 +10703,7 @@ async def automation_agent_resolve(request: Request):
             "chatKey": chat_key,
             "agentId": agent_id,
             "sessionId": sess_id,
-            "model": _effective_agent_model(agent),
+            "model": automation._channel_adjusted_agent_model(agent),
             "availableModels": model_info.get("availableModels"),
             "models": model_info.get("models"),
             "modelSource": model_info.get("source"),
@@ -10625,7 +10732,7 @@ async def automation_agent_resolve(request: Request):
         "chatKey": chat_key,
         "agentId": agent_id,
         "sessionId": sess_id,
-        "model": _effective_agent_model(agent),
+        "model": automation._channel_adjusted_agent_model(agent),
         "availableModels": model_info.get("availableModels"),
         "models": model_info.get("models"),
         "modelSource": model_info.get("source"),
