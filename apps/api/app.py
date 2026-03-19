@@ -28,7 +28,7 @@ from croniter import croniter
 
 log = logging.getLogger("argus_gateway")
 
-DEFAULT_ARGUS_VERSION = "0.1.1"
+DEFAULT_ARGUS_VERSION = "0.0.0"
 
 
 def _load_argus_version() -> str:
@@ -111,6 +111,15 @@ def _chat_key_hash(raw: Any) -> Optional[str]:
         return None
     digest = hashlib.sha256(raw.strip().encode("utf-8")).hexdigest()[:12]
     return f"tg:{digest}"
+
+
+def _text_hash(raw: Any) -> Optional[str]:
+    if not isinstance(raw, str):
+        return None
+    text = raw.strip()
+    if not text:
+        return None
+    return f"sha256:{hashlib.sha256(text.encode('utf-8')).hexdigest()[:12]}"
 
 
 class UpstreamSessionClosedError(RuntimeError):
@@ -1008,10 +1017,16 @@ def _create_turn_text_entry() -> dict[str, Any]:
         "delta": "",
         "fullText": None,
         "turnKind": None,
+        "turnStartedAtMs": None,
         "completedCommentaryTexts": [],
         "agentMessagePhasesByItemId": {},
         "agentMessageTextByItemId": {},
         "activeAgentMessageItemId": None,
+        "firstFinalItemCompletedAtMs": None,
+        "lastFinalItemCompletedAtMs": None,
+        "lastFinalItemId": None,
+        "lastFinalTextHash": None,
+        "lastFinalTextLen": None,
         "draft": None,
         "sourceChannel": None,
         "sourceChatKey": None,
@@ -4941,6 +4956,7 @@ class AutomationManager:
         turn_id: str,
         *,
         text: str,
+        source: str = "unknown",
     ) -> None:
         if not isinstance(text, str) or not text.strip():
             return
@@ -4963,7 +4979,13 @@ class AutomationManager:
             draft = {
                 "draftId": _new_telegram_draft_id(),
                 "latestText": "",
+                "latestSource": "unknown",
+                "latestQueuedAtMs": 0,
                 "sentPayloadKey": None,
+                "lastSentAtMs": None,
+                "lastSentSource": None,
+                "lastSentTextHash": None,
+                "lastSentTextLen": None,
                 "nextAllowedAtMs": 0,
                 "flushTask": None,
                 "disabled": False,
@@ -4972,6 +4994,8 @@ class AutomationManager:
         if bool(draft.get("disabled")):
             return
         draft["latestText"] = text
+        draft["latestSource"] = source.strip() if isinstance(source, str) and source.strip() else "unknown"
+        draft["latestQueuedAtMs"] = _now_ms()
         task = draft.get("flushTask")
         if isinstance(task, asyncio.Task) and not task.done():
             return
@@ -5032,6 +5056,15 @@ class AutomationManager:
 
             draft_id = int(draft.get("draftId") or 0) or _new_telegram_draft_id()
             draft["draftId"] = draft_id
+            draft_source = draft.get("latestSource") if isinstance(draft.get("latestSource"), str) else None
+            queued_at_ms = draft.get("latestQueuedAtMs")
+            queue_lag_ms = None
+            if isinstance(queued_at_ms, int) and queued_at_ms > 0:
+                queue_lag_ms = max(0, _now_ms() - queued_at_ms)
+            source_text = draft.get("latestText") if isinstance(draft.get("latestText"), str) else ""
+            source_text = source_text.strip()
+            source_text_hash = _text_hash(source_text)
+            send_started_at_ms = _now_ms()
             try:
                 await _telegram_send_message_draft(
                     token=token,
@@ -5047,10 +5080,49 @@ class AutomationManager:
                 draft["disabled"] = True
                 draft["flushTask"] = None
                 log.info("Telegram draft streaming disabled for %s/%s: %s", session_id, thread_id, str(e))
+                _event_log(
+                    "warning",
+                    "gw.tg.draft_flush",
+                    session_id=session_id,
+                    thread_id=thread_id,
+                    turn_id=turn_id,
+                    draft_id=draft_id,
+                    draft_source=draft_source,
+                    chat_key_hash=_chat_key_hash(chat_key),
+                    text_len=len(source_text),
+                    text_hash=source_text_hash,
+                    queue_lag_ms=queue_lag_ms,
+                    send_duration_ms=max(0, _now_ms() - send_started_at_ms),
+                    result="error",
+                    err_kind=type(e).__name__,
+                    err_msg=str(e),
+                )
                 return
 
             draft["sentPayloadKey"] = payload_key
-            draft["nextAllowedAtMs"] = _now_ms() + TELEGRAM_DRAFT_FLUSH_INTERVAL_MS
+            sent_at_ms = _now_ms()
+            draft["lastSentAtMs"] = sent_at_ms
+            draft["lastSentSource"] = draft_source
+            draft["lastSentTextHash"] = source_text_hash
+            draft["lastSentTextLen"] = len(source_text)
+            draft["nextAllowedAtMs"] = sent_at_ms + TELEGRAM_DRAFT_FLUSH_INTERVAL_MS
+
+            if draft_source != "delta":
+                _event_log(
+                    "info",
+                    "gw.tg.draft_flush",
+                    session_id=session_id,
+                    thread_id=thread_id,
+                    turn_id=turn_id,
+                    draft_id=draft_id,
+                    draft_source=draft_source,
+                    chat_key_hash=_chat_key_hash(chat_key),
+                    text_len=len(source_text),
+                    text_hash=source_text_hash,
+                    queue_lag_ms=queue_lag_ms,
+                    send_duration_ms=max(0, sent_at_ms - send_started_at_ms),
+                    result="ok",
+                )
 
             prepared_after = _telegram_prepare_draft_payload(draft.get("latestText"))
             latest_after_key = prepared_after.get("payloadKey") if isinstance(prepared_after.get("payloadKey"), str) else None
@@ -5392,7 +5464,13 @@ class AutomationManager:
                 draft_candidate = self._turn_draft_candidate_text(entry)
 
             if draft_candidate.strip():
-                self._queue_telegram_turn_draft_flush(session_id, thread_id, turn_id, text=draft_candidate)
+                self._queue_telegram_turn_draft_flush(
+                    session_id,
+                    thread_id,
+                    turn_id,
+                    text=draft_candidate,
+                    source="delta",
+                )
             source_channel, source_chat_key = self._peek_turn_source_context(
                 session_id=session_id,
                 thread_id=thread_id,
@@ -5445,10 +5523,23 @@ class AutomationManager:
                     entry["completedCommentaryTexts"] = commentary_texts
                 commentary_texts.append(text)
             else:
+                item_completed_at_ms = _now_ms()
+                if not isinstance(entry.get("firstFinalItemCompletedAtMs"), int):
+                    entry["firstFinalItemCompletedAtMs"] = item_completed_at_ms
+                entry["lastFinalItemCompletedAtMs"] = item_completed_at_ms
+                entry["lastFinalItemId"] = item_id
+                entry["lastFinalTextHash"] = _text_hash(text)
+                entry["lastFinalTextLen"] = len(text.strip())
                 entry["fullText"] = text
                 if item_id:
                     entry["activeAgentMessageItemId"] = item_id
-                self._queue_telegram_turn_draft_flush(session_id, thread_id, turn_id, text=text)
+                self._queue_telegram_turn_draft_flush(
+                    session_id,
+                    thread_id,
+                    turn_id,
+                    text=text,
+                    source="item_completed",
+                )
             source_channel, source_chat_key = self._peek_turn_source_context(
                 session_id=session_id,
                 thread_id=thread_id,
@@ -5459,6 +5550,25 @@ class AutomationManager:
                 source_channel=source_channel,
                 source_chat_key=source_chat_key,
             )
+            if phase != "commentary":
+                turn_started_at_ms = entry.get("turnStartedAtMs")
+                since_turn_started_ms = None
+                if isinstance(turn_started_at_ms, int) and turn_started_at_ms > 0:
+                    since_turn_started_ms = max(0, _now_ms() - turn_started_at_ms)
+                _event_log(
+                    "info",
+                    "gw.turn.final_item_completed",
+                    session_id=session_id,
+                    thread_id=thread_id,
+                    turn_id=turn_id,
+                    item_id=item_id,
+                    phase=phase,
+                    source_channel=source_channel,
+                    chat_key_hash=_chat_key_hash(source_chat_key),
+                    text_len=len(text.strip()),
+                    text_hash=_text_hash(text),
+                    since_turn_started_ms=since_turn_started_ms,
+                )
             if thread_id:
                 self._note_lane_progress(self.lane(session_id, thread_id))
             self._log_turn_post_cancel_activity(
@@ -5493,9 +5603,11 @@ class AutomationManager:
                     turn_id=turn_id,
                     kind=lane.active_turn_kind,
                 )
-                entry = self._turn_text_by_key.get(key) if key else None
+                entry = self._get_turn_text_entry(key) if key else None
                 cancel_id = None
                 if isinstance(entry, dict):
+                    if not isinstance(entry.get("turnStartedAtMs"), int):
+                        entry["turnStartedAtMs"] = _now_ms()
                     raw_cancel_id = entry.get("cancelId")
                     if isinstance(raw_cancel_id, str) and raw_cancel_id.strip():
                         cancel_id = raw_cancel_id.strip()
@@ -5542,6 +5654,16 @@ class AutomationManager:
                 source_chat_key = None
                 cancel_id = None
                 cancel_requested_at_ms = None
+                turn_started_at_ms = None
+                first_final_item_completed_at_ms = None
+                last_final_item_completed_at_ms = None
+                last_final_item_id = None
+                last_final_item_text_hash = None
+                last_final_item_text_len = None
+                last_draft_sent_at_ms = None
+                last_draft_source = None
+                last_draft_text_hash = None
+                last_draft_text_len = None
                 if key:
                     entry = self._pop_turn_text_entry(key)
                     if isinstance(entry, dict):
@@ -5553,6 +5675,38 @@ class AutomationManager:
                         raw_cancel_requested_at_ms = entry.get("cancelRequestedAtMs")
                         if isinstance(raw_cancel_requested_at_ms, int) and raw_cancel_requested_at_ms > 0:
                             cancel_requested_at_ms = raw_cancel_requested_at_ms
+                        raw_turn_started_at_ms = entry.get("turnStartedAtMs")
+                        if isinstance(raw_turn_started_at_ms, int) and raw_turn_started_at_ms > 0:
+                            turn_started_at_ms = raw_turn_started_at_ms
+                        raw_first_final_item_completed_at_ms = entry.get("firstFinalItemCompletedAtMs")
+                        if isinstance(raw_first_final_item_completed_at_ms, int) and raw_first_final_item_completed_at_ms > 0:
+                            first_final_item_completed_at_ms = raw_first_final_item_completed_at_ms
+                        raw_last_final_item_completed_at_ms = entry.get("lastFinalItemCompletedAtMs")
+                        if isinstance(raw_last_final_item_completed_at_ms, int) and raw_last_final_item_completed_at_ms > 0:
+                            last_final_item_completed_at_ms = raw_last_final_item_completed_at_ms
+                        raw_last_final_item_id = entry.get("lastFinalItemId")
+                        if isinstance(raw_last_final_item_id, str) and raw_last_final_item_id.strip():
+                            last_final_item_id = raw_last_final_item_id.strip()
+                        raw_last_final_item_text_hash = entry.get("lastFinalTextHash")
+                        if isinstance(raw_last_final_item_text_hash, str) and raw_last_final_item_text_hash.strip():
+                            last_final_item_text_hash = raw_last_final_item_text_hash.strip()
+                        raw_last_final_item_text_len = entry.get("lastFinalTextLen")
+                        if isinstance(raw_last_final_item_text_len, int) and raw_last_final_item_text_len >= 0:
+                            last_final_item_text_len = raw_last_final_item_text_len
+                        draft_state = entry.get("draft")
+                        if isinstance(draft_state, dict):
+                            raw_last_draft_sent_at_ms = draft_state.get("lastSentAtMs")
+                            if isinstance(raw_last_draft_sent_at_ms, int) and raw_last_draft_sent_at_ms > 0:
+                                last_draft_sent_at_ms = raw_last_draft_sent_at_ms
+                            raw_last_draft_source = draft_state.get("lastSentSource")
+                            if isinstance(raw_last_draft_source, str) and raw_last_draft_source.strip():
+                                last_draft_source = raw_last_draft_source.strip()
+                            raw_last_draft_text_hash = draft_state.get("lastSentTextHash")
+                            if isinstance(raw_last_draft_text_hash, str) and raw_last_draft_text_hash.strip():
+                                last_draft_text_hash = raw_last_draft_text_hash.strip()
+                            raw_last_draft_text_len = draft_state.get("lastSentTextLen")
+                            if isinstance(raw_last_draft_text_len, int) and raw_last_draft_text_len >= 0:
+                                last_draft_text_len = raw_last_draft_text_len
                         full = entry.get("fullText")
                         delta = entry.get("delta")
                         commentary_prefix = ""
@@ -5573,9 +5727,22 @@ class AutomationManager:
                     source_chat_key=source_chat_key,
                 )
                 turn_status = str(turn_status_raw or "").strip().lower() or None
+                now_ms = _now_ms()
                 since_cancel_ms = None
                 if isinstance(cancel_requested_at_ms, int):
-                    since_cancel_ms = max(0, _now_ms() - cancel_requested_at_ms)
+                    since_cancel_ms = max(0, now_ms - cancel_requested_at_ms)
+                turn_duration_ms = None
+                if isinstance(turn_started_at_ms, int):
+                    turn_duration_ms = max(0, now_ms - turn_started_at_ms)
+                since_first_final_item_completed_ms = None
+                if isinstance(first_final_item_completed_at_ms, int):
+                    since_first_final_item_completed_ms = max(0, now_ms - first_final_item_completed_at_ms)
+                since_last_final_item_completed_ms = None
+                if isinstance(last_final_item_completed_at_ms, int):
+                    since_last_final_item_completed_ms = max(0, now_ms - last_final_item_completed_at_ms)
+                since_last_draft_sent_ms = None
+                if isinstance(last_draft_sent_at_ms, int):
+                    since_last_draft_sent_ms = max(0, now_ms - last_draft_sent_at_ms)
                 _event_log(
                     "info",
                     "gw.turn.completed",
@@ -5589,6 +5756,17 @@ class AutomationManager:
                     chat_key_hash=_chat_key_hash(source_chat_key),
                     followup_depth_after=followup_depth_after,
                     final_text_len=len(final_text) if isinstance(final_text, str) else 0,
+                    final_text_hash=_text_hash(final_text),
+                    turn_duration_ms=turn_duration_ms,
+                    last_final_item_id=last_final_item_id,
+                    last_final_item_text_len=last_final_item_text_len,
+                    last_final_item_text_hash=last_final_item_text_hash,
+                    since_first_final_item_completed_ms=since_first_final_item_completed_ms,
+                    since_last_final_item_completed_ms=since_last_final_item_completed_ms,
+                    last_draft_source=last_draft_source,
+                    last_draft_text_len=last_draft_text_len,
+                    last_draft_text_hash=last_draft_text_hash,
+                    since_last_draft_sent_ms=since_last_draft_sent_ms,
                     since_cancel_ms=since_cancel_ms,
                     turn_error=turn_error_message,
                 )
@@ -5854,6 +6032,7 @@ class AutomationManager:
         # Gateway-owned delivery: send final text on turn/completed, splitting when needed.
         if not isinstance(text, str) or not text.strip():
             return
+        delivery_started_at_ms = _now_ms()
         resolved = self._resolve_telegram_target_for_source(
             source_channel=source_channel,
             source_chat_key=source_chat_key,
@@ -5861,28 +6040,118 @@ class AutomationManager:
         if resolved is None:
             resolved = self._resolve_telegram_target_for_turn(session_id, thread_id, turn_id)
         if resolved is None:
+            _event_log(
+                "warning",
+                "gw.tg.final_delivery.skip",
+                session_id=session_id,
+                thread_id=thread_id,
+                turn_id=turn_id,
+                source_channel=source_channel,
+                chat_key_hash=_chat_key_hash(source_chat_key),
+                reason="missing_target",
+                text_len=len(text.strip()),
+                text_hash=_text_hash(text),
+            )
             return
-        token, target, _chat_key = resolved
+        token, target, resolved_chat_key = resolved
 
         stripped = _strip_heartbeat_token(text)
         if stripped.get("shouldSkip"):
+            _event_log(
+                "info",
+                "gw.tg.final_delivery.skip",
+                session_id=session_id,
+                thread_id=thread_id,
+                turn_id=turn_id,
+                source_channel=source_channel,
+                chat_key_hash=_chat_key_hash(resolved_chat_key),
+                reason="heartbeat_filtered",
+                text_len=len(text.strip()),
+                text_hash=_text_hash(text),
+            )
             return
         final_raw = stripped.get("text") if isinstance(stripped.get("text"), str) else text
         final_raw = final_raw.strip()
         if not final_raw:
+            _event_log(
+                "info",
+                "gw.tg.final_delivery.skip",
+                session_id=session_id,
+                thread_id=thread_id,
+                turn_id=turn_id,
+                source_channel=source_channel,
+                chat_key_hash=_chat_key_hash(resolved_chat_key),
+                reason="empty_after_strip",
+                text_len=len(text.strip()),
+                text_hash=_text_hash(text),
+            )
             return
 
         clean_text, media_refs = _split_media_from_output(final_raw)
         delivered_any = False
+        text_send_failed = False
+        text_part_count = 0
+        attachment_attempt_count = 0
+        attachment_delivered_count = 0
+        attachment_failed_count = 0
 
         clean_text = clean_text.strip()
+        clean_text_hash = _text_hash(clean_text)
         if clean_text:
+            text_part_count = len(_telegram_split_text(clean_text))
+        _event_log(
+            "info",
+            "gw.tg.final_delivery.start",
+            session_id=session_id,
+            thread_id=thread_id,
+            turn_id=turn_id,
+            source_channel=source_channel,
+            chat_key_hash=_chat_key_hash(resolved_chat_key),
+            final_text_len=len(final_raw),
+            final_text_hash=_text_hash(final_raw),
+            clean_text_len=len(clean_text),
+            clean_text_hash=clean_text_hash,
+            text_part_count=text_part_count,
+            media_ref_count=len(media_refs),
+        )
+        if clean_text:
+            text_send_started_at_ms = _now_ms()
             try:
                 results = await _telegram_send_markdown_message_parts(token=token, target=target, text=clean_text)
                 if results:
                     delivered_any = True
+                _event_log(
+                    "info",
+                    "gw.tg.final_delivery.text_result",
+                    session_id=session_id,
+                    thread_id=thread_id,
+                    turn_id=turn_id,
+                    chat_key_hash=_chat_key_hash(resolved_chat_key),
+                    result="ok",
+                    clean_text_len=len(clean_text),
+                    clean_text_hash=clean_text_hash,
+                    text_part_count=text_part_count,
+                    sent_part_count=len(results),
+                    send_duration_ms=max(0, _now_ms() - text_send_started_at_ms),
+                )
             except Exception as e:
+                text_send_failed = True
                 log.warning("Failed to deliver to telegram for %s/%s: %s", session_id, thread_id, str(e))
+                _event_log(
+                    "warning",
+                    "gw.tg.final_delivery.text_result",
+                    session_id=session_id,
+                    thread_id=thread_id,
+                    turn_id=turn_id,
+                    chat_key_hash=_chat_key_hash(resolved_chat_key),
+                    result="error",
+                    clean_text_len=len(clean_text),
+                    clean_text_hash=clean_text_hash,
+                    text_part_count=text_part_count,
+                    send_duration_ms=max(0, _now_ms() - text_send_started_at_ms),
+                    err_kind=type(e).__name__,
+                    err_msg=str(e),
+                )
 
         if media_refs:
             workspace_root = self._workspace_root_for_session(session_id)
@@ -5894,6 +6163,7 @@ class AutomationManager:
                     root_resolved = workspace_root
 
             for ref in media_refs[:5]:
+                attachment_attempt_count += 1
                 try:
                     if ref.startswith("http://") or ref.startswith("https://"):
                         if _is_image_media_ref(ref):
@@ -5904,6 +6174,7 @@ class AutomationManager:
                         else:
                             await _telegram_send_document_url(token=token, target=target, url=ref)
                         delivered_any = True
+                        attachment_delivered_count += 1
                         continue
 
                     if not ref.startswith("./"):
@@ -5929,7 +6200,9 @@ class AutomationManager:
                     else:
                         await _telegram_send_document_file(token=token, target=target, file_path=cand)
                     delivered_any = True
+                    attachment_delivered_count += 1
                 except Exception as e:
+                    attachment_failed_count += 1
                     log.warning(
                         "Failed to deliver telegram attachment for %s/%s (ref=%s): %s",
                         session_id,
@@ -5938,6 +6211,32 @@ class AutomationManager:
                         str(e),
                     )
 
+        overall_result = "ok"
+        if text_send_failed and delivered_any:
+            overall_result = "partial"
+        elif text_send_failed and not delivered_any:
+            overall_result = "error"
+        elif not delivered_any:
+            overall_result = "no_delivery"
+        _event_log(
+            "info" if overall_result in ("ok", "no_delivery") else "warning",
+            "gw.tg.final_delivery.result",
+            session_id=session_id,
+            thread_id=thread_id,
+            turn_id=turn_id,
+            source_channel=source_channel,
+            chat_key_hash=_chat_key_hash(resolved_chat_key),
+            result=overall_result,
+            delivered_any=delivered_any,
+            clean_text_len=len(clean_text),
+            clean_text_hash=clean_text_hash,
+            text_part_count=text_part_count,
+            media_ref_count=len(media_refs),
+            attachment_attempt_count=attachment_attempt_count,
+            attachment_delivered_count=attachment_delivered_count,
+            attachment_failed_count=attachment_failed_count,
+            duration_ms=max(0, _now_ms() - delivery_started_at_ms),
+        )
         if not delivered_any:
             return
 

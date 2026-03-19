@@ -5,7 +5,7 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import WebSocket from "ws";
 
-const DEFAULT_BOT_VERSION = "0.1.1";
+const DEFAULT_BOT_VERSION = "0.0.0";
 
 function loadBotVersion() {
   const override = typeof process.env.ARGUS_VERSION === "string" ? process.env.ARGUS_VERSION.trim() : "";

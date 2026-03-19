@@ -26,6 +26,8 @@ import { cn } from "@/lib/utils";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 
+const ARGUS_WEB_VERSION = process.env.NEXT_PUBLIC_ARGUS_VERSION || "0.0.0";
+
 type JsonValue =
   | null
   | boolean
@@ -1105,7 +1107,7 @@ export default function Page() {
     if (!rt) throw new Error("Not connected");
     if (rt.initialized) return;
     await rpc(sessionId, "initialize", {
-      clientInfo: { name: "argus_web", title: "Argus Web", version: "0.1.1" }
+      clientInfo: { name: "argus_web", title: "Argus Web", version: ARGUS_WEB_VERSION }
     });
     sendWire(sessionId, { method: "initialized" });
     rt.initialized = true;

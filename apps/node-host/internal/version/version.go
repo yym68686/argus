@@ -7,7 +7,7 @@ import (
 	"sync"
 )
 
-const fallbackVersion = "0.1.1"
+const fallbackVersion = "0.0.0"
 
 var (
 	currentVersion string
