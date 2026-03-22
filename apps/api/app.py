@@ -4850,6 +4850,17 @@ class AutomationManager:
         params["sourceChatKey"] = chat_key
         params["source"] = {"channel": channel, "chatKey": chat_key}
 
+    def _inject_turn_kind_into_notification(
+        self,
+        params: dict[str, Any],
+        *,
+        turn_kind: Optional[str],
+    ) -> None:
+        normalized = self._normalize_turn_kind(turn_kind)
+        if normalized is None:
+            return
+        params["turnKind"] = normalized
+
     async def _touch_last_active_target(
         self,
         *,
@@ -5421,6 +5432,14 @@ class AutomationManager:
                 source_channel=source_channel,
                 source_chat_key=source_chat_key,
             )
+            self._inject_turn_kind_into_notification(
+                params,
+                turn_kind=self._resolve_turn_kind_for_notification(
+                    session_id=session_id,
+                    thread_id=thread_id,
+                    turn_id=turn_id,
+                ),
+            )
             if thread_id:
                 self._note_lane_progress(self.lane(session_id, thread_id))
             return
@@ -5480,6 +5499,14 @@ class AutomationManager:
                 params,
                 source_channel=source_channel,
                 source_chat_key=source_chat_key,
+            )
+            self._inject_turn_kind_into_notification(
+                params,
+                turn_kind=self._resolve_turn_kind_for_notification(
+                    session_id=session_id,
+                    thread_id=thread_id,
+                    turn_id=turn_id,
+                ),
             )
             if thread_id:
                 self._note_lane_progress(self.lane(session_id, thread_id))
@@ -5550,6 +5577,14 @@ class AutomationManager:
                 source_channel=source_channel,
                 source_chat_key=source_chat_key,
             )
+            self._inject_turn_kind_into_notification(
+                params,
+                turn_kind=self._resolve_turn_kind_for_notification(
+                    session_id=session_id,
+                    thread_id=thread_id,
+                    turn_id=turn_id,
+                ),
+            )
             if phase != "commentary":
                 turn_started_at_ms = entry.get("turnStartedAtMs")
                 since_turn_started_ms = None
@@ -5595,6 +5630,10 @@ class AutomationManager:
                     params,
                     source_channel=source_channel,
                     source_chat_key=source_chat_key,
+                )
+                self._inject_turn_kind_into_notification(
+                    params,
+                    turn_kind=lane.active_turn_kind,
                 )
                 self._mark_lane_busy(lane, turn_id=turn_id)
                 self._remember_turn_kind(
@@ -5725,6 +5764,10 @@ class AutomationManager:
                     params,
                     source_channel=source_channel,
                     source_chat_key=source_chat_key,
+                )
+                self._inject_turn_kind_into_notification(
+                    params,
+                    turn_kind=turn_kind,
                 )
                 turn_status = str(turn_status_raw or "").strip().lower() or None
                 now_ms = _now_ms()

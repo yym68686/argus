@@ -44,7 +44,8 @@ Example (Telegram progress update):
 
 ## Session start (required)
 
-- Read `SOUL.md`, `USER.md`, `memory.md`, and today+yesterday in `memory/`.
+- Read `SOUL.md`, `USER.md`, and today+yesterday in `memory/`.
+- Read `MEMORY.md` when present; only fall back to lowercase `memory.md` when `MEMORY.md` is absent.
 - Do it before responding.
 
 ## Soul (required)

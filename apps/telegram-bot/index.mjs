@@ -84,6 +84,14 @@ function normalizeMessagePhase(value) {
   return value.trim().toLowerCase();
 }
 
+function normalizeTurnKind(value) {
+  if (!isNonEmptyString(value)) return null;
+  const normalized = value.trim().toLowerCase();
+  return normalized === "user" || normalized === "heartbeat" || normalized === "cron"
+    ? normalized
+    : null;
+}
+
 function stripOuterQuotes(value) {
   if (!isNonEmptyString(value)) return null;
   const trimmed = value.trim();
@@ -880,6 +888,7 @@ class ArgusClient {
       : isNonEmptyString(source?.chatKey)
         ? source.chatKey
         : null;
+    const turnKind = normalizeTurnKind(params.turnKind);
     const key = threadId && turnId ? `${threadId}:${turnId}` : null;
 
     if (msg.method === "item/agentMessage/delta") {
@@ -930,7 +939,7 @@ class ArgusClient {
       const cb = this.onTurnStarted;
       if (typeof cb === "function") {
         try {
-          const res = cb({ sessionId: this.sessionId, threadId, turnId, sourceChatKey });
+          const res = cb({ sessionId: this.sessionId, threadId, turnId, sourceChatKey, turnKind });
           if (res && typeof res.then === "function") res.catch(() => {});
         } catch {
           // ignore
@@ -957,7 +966,7 @@ class ArgusClient {
       const cb = this.onTurnCompleted;
       if (typeof cb === "function") {
         try {
-          const res = cb({ sessionId: this.sessionId, threadId, turnId, sourceChatKey, text: finalText, turnStatus });
+          const res = cb({ sessionId: this.sessionId, threadId, turnId, sourceChatKey, text: finalText, turnStatus, turnKind });
           if (res && typeof res.then === "function") res.catch(() => {});
         } catch {
           // ignore
@@ -2037,8 +2046,9 @@ async function main() {
   }
 
   const attachClientHooks = (client) => {
-    client.onTurnStarted = async ({ sessionId, threadId, turnId, sourceChatKey }) => {
+    client.onTurnStarted = async ({ sessionId, threadId, turnId, sourceChatKey, turnKind }) => {
       if (!isNonEmptyString(sessionId) || !isNonEmptyString(threadId)) return;
+      if (turnKind !== "user") return;
       if (isNonEmptyString(sourceChatKey)) {
         removePendingTurnTarget(sessionId, threadId, sourceChatKey);
       }
