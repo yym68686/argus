@@ -10632,6 +10632,7 @@ async def _ensure_live_docker_session(session_id: str, *, allow_create: bool) ->
                 except Exception:
                     msg = None
 
+                should_broadcast = True
                 if isinstance(msg, dict):
                     # Server requests (approvals, etc).
                     if "id" in msg and "method" in msg:
@@ -10673,7 +10674,6 @@ async def _ensure_live_docker_session(session_id: str, *, allow_create: bool) ->
                         continue
 
                     # Notifications: feed automation.
-                    should_broadcast = True
                     if "method" in msg and "id" not in msg:
                         automation: Optional[AutomationManager] = getattr(app.state, "automation", None)
                         if automation is not None:
