@@ -1,5 +1,6 @@
 import asyncio
 import base64
+import functools
 import hashlib
 import hmac
 import json
@@ -61,6 +62,7 @@ ARGUS_VERSION = _load_argus_version()
 
 RUNTIME_LAYOUT = "root_argus_v1"
 RUNTIME_SESSION_ID_RE = re.compile(r"^[a-f0-9]{12}$")
+KUBERNETES_SERVICEACCOUNT_TOKEN_PATH = "/var/run/secrets/kubernetes.io/serviceaccount/token"
 
 
 def _event_iso_now() -> str:
@@ -134,6 +136,14 @@ class Upstream:
 
 
 @dataclass(frozen=True)
+class ProvisionModeResolution:
+    raw_mode: str
+    resolved_mode: str
+    reason: str
+    warnings: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
 class DockerProvisionConfig:
     image: str
     network: str
@@ -152,16 +162,37 @@ class DockerProvisionConfig:
     runtime_pids_limit: Optional[int] = None
 
 
+@dataclass(frozen=True)
+class FugueProvisionConfig:
+    base_url: str
+    token: str
+    project_id: str
+    image: str
+    runtime_id: str
+    gateway_internal_host: str
+    workspace_mount_path: str = "/workspace"
+    home_container_path: str = "/root/.argus"
+    runtime_cmd: Optional[str] = None
+    connect_timeout_s: float = 30.0
+    jsonl_line_limit_bytes: int = 8 * 1024 * 1024
+    workspace_storage_size: str = "10Gi"
+    workspace_storage_class_name: Optional[str] = None
+    service_port: int = 7777
+    app_name_prefix: str = "argus-session"
+
+
 @dataclass
-class LiveDockerSession:
+class LiveRuntimeSession:
     session_id: str
-    container_id: str
-    container_name: str
+    provider: str
+    runtime_id: str
+    runtime_name: str
+    workspace_runtime_path: str
+    jsonl_line_limit_bytes: int
     upstream_host: str
     upstream_port: int
     reader: asyncio.StreamReader
     writer: asyncio.StreamWriter
-    cfg: DockerProvisionConfig
     pump_task: Optional[asyncio.Task[None]]
 
     attach_lock: asyncio.Lock
@@ -184,6 +215,14 @@ class LiveDockerSession:
     turn_owners_by_thread: dict[str, WebSocket]
 
     closed: bool = False
+
+    @property
+    def container_id(self) -> str:
+        return self.runtime_id
+
+    @property
+    def container_name(self) -> str:
+        return self.runtime_name
 
     async def attach(self, ws: WebSocket) -> None:
         async with self.attach_lock:
@@ -386,6 +425,10 @@ class LiveDockerSession:
             except Exception:
                 pass
             raise UpstreamSessionClosedError(f"Upstream session {self.session_id} is closed") from e
+
+
+# Backwards-compatible alias while the rest of the module migrates away from docker-specific naming.
+LiveDockerSession = LiveRuntimeSession
 
 
 def _now_ms() -> int:
@@ -3579,6 +3622,11 @@ class AutomationManager:
                 root = Path(workspace_host_path)
                 await self._ensure_workspace_files_at(root)
                 await self._write_agent_model_file(root, model)
+                await _sync_session_workspace_file(
+                    agent.session_id,
+                    root,
+                    self._agent_model_file_for_workspace(root),
+                )
                 await self._sync_live_session_default_model(session_id=agent.session_id, model=model)
             except Exception as e:
                 log.warning(
@@ -3600,6 +3648,7 @@ class AutomationManager:
             try:
                 await self._ensure_workspace_files_at(root)
                 await self._write_agent_model_file(root, self._channel_adjusted_agent_model(agent))
+                await _sync_session_workspace_snapshot(agent.session_id, root)
             except Exception as e:
                 log.warning("Failed to persist model file for agent %s at %s: %s", agent.agent_id, str(root), str(e))
 
@@ -3607,8 +3656,7 @@ class AutomationManager:
         return False
 
     async def ensure_user_main_agent(self, *, user_id: int) -> tuple[PersistedAgentRuntime, bool]:
-        if _provision_mode() != "docker":
-            raise RuntimeError("User agents are only supported in docker provision mode")
+        _require_user_agent_support()
         if not self._home_host_path:
             raise RuntimeError("ARGUS_HOME_HOST_PATH is required to create user agents")
         if not isinstance(user_id, int) or user_id <= 0:
@@ -3644,14 +3692,15 @@ class AutomationManager:
         agent = self._get_agent(aid)
         if agent is None:
             raise RuntimeError("Failed to persist user main agent")
-        await self._ensure_workspace_files_at(Path(agent.workspace_host_path))
-        await self._write_agent_model_file(Path(agent.workspace_host_path), self._channel_adjusted_agent_model(agent))
-        await _ensure_live_docker_session(agent.session_id, allow_create=True)
+        root = Path(agent.workspace_host_path)
+        await self._ensure_workspace_files_at(root)
+        await self._write_agent_model_file(root, self._channel_adjusted_agent_model(agent))
+        await _sync_session_workspace_snapshot(agent.session_id, root)
+        await _ensure_live_session(agent.session_id, allow_create=True)
         return agent, created
 
     async def create_user_agent(self, *, user_id: int, short_name: str) -> PersistedAgentRuntime:
-        if _provision_mode() != "docker":
-            raise RuntimeError("User agents are only supported in docker provision mode")
+        _require_user_agent_support()
         if not self._home_host_path:
             raise RuntimeError("ARGUS_HOME_HOST_PATH is required to create user agents")
         if not isinstance(user_id, int) or user_id <= 0:
@@ -3691,14 +3740,15 @@ class AutomationManager:
         agent = self._get_agent(aid)
         if agent is None:
             raise RuntimeError("Failed to persist user agent")
-        await self._ensure_workspace_files_at(Path(agent.workspace_host_path))
-        await self._write_agent_model_file(Path(agent.workspace_host_path), self._channel_adjusted_agent_model(agent))
-        await _ensure_live_docker_session(agent.session_id, allow_create=True)
+        root = Path(agent.workspace_host_path)
+        await self._ensure_workspace_files_at(root)
+        await self._write_agent_model_file(root, self._channel_adjusted_agent_model(agent))
+        await _sync_session_workspace_snapshot(agent.session_id, root)
+        await _ensure_live_session(agent.session_id, allow_create=True)
         return agent
 
     async def rename_user_agent(self, *, user_id: int, agent_id: str, new_short_name: str) -> PersistedAgentRuntime:
-        if _provision_mode() != "docker":
-            raise RuntimeError("User agents are only supported in docker provision mode")
+        _require_user_agent_support()
         if not self._home_host_path:
             raise RuntimeError("ARGUS_HOME_HOST_PATH is required to rename user agents")
         if not isinstance(user_id, int) or user_id <= 0:
@@ -3782,27 +3832,26 @@ class AutomationManager:
             agent2 = self._get_agent(new_aid)
             if agent2 is None:
                 raise RuntimeError("Agent not found after rename")
-            await self._write_agent_model_file(Path(agent2.workspace_host_path), self._channel_adjusted_agent_model(agent2))
+            root = Path(agent2.workspace_host_path)
+            await self._write_agent_model_file(root, self._channel_adjusted_agent_model(agent2))
+            await _sync_session_workspace_snapshot(agent2.session_id, root)
 
-            # Ensure the runtime container is recreated with the new workspace bind mount.
-            try:
-                await self._force_close_live_session(session_id)
-            except Exception:
-                pass
-            if _provision_mode() == "docker":
+            if _provisioner_requires_runtime_recreation_on_workspace_change():
                 try:
-                    container = await asyncio.to_thread(_docker_get_container_by_session_sync, session_id)
-                    if container is not None:
-                        await asyncio.to_thread(_docker_remove_container_sync, container)
-                except Exception as e:
-                    log.warning("Failed to remove runtime container for session %s after rename: %s", session_id, str(e))
+                    await self._force_close_live_session(session_id)
+                except Exception:
+                    pass
+                if _provisioner_manages_runtime_sessions():
+                    try:
+                        await _remove_managed_runtime(session_id)
+                    except Exception as e:
+                        log.warning("Failed to remove runtime for session %s after rename: %s", session_id, str(e))
             self._clear_session_backoff(session_id)
 
             return agent2
 
     async def delete_user_agent(self, *, user_id: int, chat_key: str, agent_id: str) -> dict[str, Any]:
-        if _provision_mode() != "docker":
-            raise RuntimeError("User agents are only supported in docker provision mode")
+        _require_user_agent_support()
         if not self._home_host_path:
             raise RuntimeError("ARGUS_HOME_HOST_PATH is required to delete user agents")
         if not isinstance(user_id, int) or user_id <= 0:
@@ -3897,14 +3946,11 @@ class AutomationManager:
             except Exception:
                 pass
 
-            if _provision_mode() == "docker":
+            if _provisioner_manages_runtime_sessions():
                 try:
-                    container = await asyncio.to_thread(_docker_get_container_by_session_sync, session_id)
-                    if container is not None:
-                        await asyncio.to_thread(_docker_remove_container_sync, container)
-                        deleted_container = True
+                    deleted_container = await _remove_managed_runtime(session_id)
                 except Exception as e:
-                    log.warning("Failed to remove runtime container for deleted agent %s (session=%s): %s", aid, session_id, str(e))
+                    log.warning("Failed to remove runtime for deleted agent %s (session=%s): %s", aid, session_id, str(e))
 
             self._clear_session_backoff(session_id)
 
@@ -3930,6 +3976,7 @@ class AutomationManager:
             "deletedAgentId": aid,
             "deletedSessionId": session_id,
             "archivedWorkspaceHostPath": archived_workspace_host_path,
+            "deletedRuntime": deleted_container,
             "deletedContainer": deleted_container,
             "currentAgentId": current_agent_id,
             "currentSessionId": current_session_id,
@@ -3945,8 +3992,7 @@ class AutomationManager:
         return self._can_user_access_agent(user_id=user_id, agent=agent)
 
     async def set_user_agent_model(self, *, user_id: int, agent_id: str, model: str) -> tuple[PersistedAgentRuntime, bool]:
-        if _provision_mode() != "docker":
-            raise RuntimeError("User agents are only supported in docker provision mode")
+        _require_user_agent_support()
         if not self._home_host_path:
             raise RuntimeError("ARGUS_HOME_HOST_PATH is required to update user agents")
         if not isinstance(user_id, int) or user_id <= 0:
@@ -3985,8 +4031,10 @@ class AutomationManager:
         if updated is None:
             raise RuntimeError("Agent not found after model update")
         effective_model = self._channel_adjusted_agent_model(updated)
-        await self._ensure_workspace_files_at(Path(updated.workspace_host_path))
-        await self._write_agent_model_file(Path(updated.workspace_host_path), effective_model)
+        root = Path(updated.workspace_host_path)
+        await self._ensure_workspace_files_at(root)
+        await self._write_agent_model_file(root, effective_model)
+        await _sync_session_workspace_file(updated.session_id, root, self._agent_model_file_for_workspace(root))
         synced = await self._sync_live_session_default_model(session_id=updated.session_id, model=effective_model)
         return updated, synced
 
@@ -4017,8 +4065,12 @@ class AutomationManager:
         mode = _gc_delete_orphan_runtimes_mode()
         if mode == "off":
             return
-        if _provision_mode() != "docker":
-            log.info("Orphan runtime GC is enabled (%s) but provision mode is not docker; skipping", mode)
+        if not _provisioner_manages_runtime_sessions():
+            log.info(
+                "Orphan runtime GC is enabled (%s) but provision mode %s does not manage runtimes; skipping",
+                mode,
+                _provisioner_mode_name(),
+            )
             return
         if not self._store.loaded_from_disk_ok:
             log.info("Orphan runtime GC is enabled (%s) but automation state did not load cleanly; skipping", mode)
@@ -4037,9 +4089,9 @@ class AutomationManager:
             return
 
         try:
-            containers = await asyncio.to_thread(_docker_list_argus_containers_sync)
+            containers = await _list_managed_sessions()
         except Exception as e:
-            log.warning("Failed to list docker sessions for orphan GC: %s", str(e))
+            log.warning("Failed to list managed sessions for orphan GC: %s", str(e))
             return
 
         orphans: list[dict[str, Any]] = []
@@ -4092,26 +4144,25 @@ class AutomationManager:
             except Exception:
                 pass
             try:
-                container = await asyncio.to_thread(_docker_get_container_by_session_sync, sid)
-                if container is None:
+                deleted_runtime = await _remove_managed_runtime(sid)
+                if not deleted_runtime:
                     continue
-                await asyncio.to_thread(_docker_remove_container_sync, container)
                 deleted += 1
             except Exception as e:
-                log.warning("Failed to delete orphan runtime container for session %s: %s", sid, str(e))
+                log.warning("Failed to delete orphan runtime for session %s: %s", sid, str(e))
 
         log.info("Orphan runtime GC complete: deleted=%d", deleted)
 
     async def _prune_persisted_sessions(self) -> None:
-        # Keep persisted automation state in sync with existing docker runtime containers.
+        # Keep persisted automation state in sync with existing managed runtimes.
         # Users often delete old session containers manually; without pruning, stale sessions can
         # confuse UIs/bots that expect a single "current" session.
-        if _provision_mode() != "docker":
+        if not _provisioner_manages_runtime_sessions():
             return
         try:
-            sessions = await asyncio.to_thread(_docker_list_argus_containers_sync)
+            sessions = await _list_managed_sessions()
         except Exception as e:
-            log.warning("Failed to list docker sessions for pruning: %s", str(e))
+            log.warning("Failed to list managed sessions for pruning: %s", str(e))
             return
 
         live_session_ids: list[str] = []
@@ -4123,10 +4174,10 @@ class AutomationManager:
             if isinstance(sid, str) and sid.strip() and layout == RUNTIME_LAYOUT:
                 live_session_ids.append(sid.strip())
         if not live_session_ids:
-            # Safety: if Docker returns no live session containers (common right after a clean rebuild, or during
-            # transient Docker API issues), pruning would wipe persisted automation state including cron jobs.
+            # Safety: if the current provisioner reports no managed runtimes (common right after a clean rebuild, or
+            # during transient provider API issues), pruning would wipe persisted automation state including cron jobs.
             # Keep state; a session can be recreated later from persisted automation state.
-            log.info("No live docker sessions found; skipping automation-state pruning")
+            log.info("No live managed sessions found; skipping automation-state pruning")
             return
         live_set = set(live_session_ids)
 
@@ -4463,7 +4514,7 @@ class AutomationManager:
             turn_id=turn_id,
         )
         try:
-            live, _ = await _ensure_live_docker_session(session_id, allow_create=False)
+            live, _ = await _ensure_live_session(session_id, allow_create=False)
             await self._ensure_initialized(live)
             await self._rpc(live, "turn/interrupt", {"threadId": thread_id, "turnId": turn_id})
             _event_log(
@@ -5144,42 +5195,18 @@ class AutomationManager:
             return
 
     async def _force_close_live_session(self, session_id: str) -> None:
-        live: Optional[LiveDockerSession] = None
-        try:
-            async with app.state.sessions_lock:
-                live = app.state.sessions.pop(session_id, None)
-        except Exception:
-            live = None
-        if live is None:
-            return
-        try:
-            live.closed = True
-        except Exception:
-            pass
-        try:
-            live.writer.close()
-        except Exception:
-            pass
-        try:
-            if live.pump_task is not None:
-                live.pump_task.cancel()
-        except Exception:
-            pass
+        await _close_live_session(session_id)
 
     async def _restart_runtime_container(self, session_id: str) -> None:
-        if _provision_mode() != "docker":
+        if not _provisioner_manages_runtime_sessions():
             return
         try:
-            container = await asyncio.to_thread(_docker_get_container_by_session_sync, session_id)
+            restarted = await _restart_managed_runtime(session_id)
         except Exception as e:
-            log.warning("Failed to locate runtime container for session %s: %s", session_id, str(e))
+            log.warning("Failed to restart runtime for session %s: %s", session_id, str(e))
             return
-        if container is None:
+        if not restarted:
             return
-        try:
-            await asyncio.to_thread(container.restart, timeout=10)
-        except Exception as e:
-            log.warning("Failed to restart runtime container for session %s: %s", session_id, str(e))
 
     async def _unstick_session(self, session_id: str, *, reason: str) -> None:
         lock = self._session_restart_locks.get(session_id)
@@ -5990,7 +6017,7 @@ class AutomationManager:
         if not to_archive:
             return
 
-        live, _ = await _ensure_live_docker_session(sid, allow_create=True)
+        live, _ = await _ensure_live_session(sid, allow_create=True)
         await self._ensure_initialized(live)
 
         archived_ids: set[str] = set()
@@ -6230,6 +6257,15 @@ class AutomationManager:
                     if not cand.is_relative_to(root_resolved):
                         raise RuntimeError("media path escapes workspace root")
                     if not cand.is_file():
+                        pulled = await _pull_session_workspace_file_to_local(
+                            session_id,
+                            relative_path=rel,
+                            dest_path=cand,
+                            max_bytes=TELEGRAM_MAX_UPLOAD_BYTES,
+                        )
+                        if not pulled:
+                            raise RuntimeError("media file not found")
+                    if not cand.is_file():
                         raise RuntimeError("media file not found")
                     size = cand.stat().st_size
                     if size > TELEGRAM_MAX_UPLOAD_BYTES:
@@ -6295,7 +6331,7 @@ class AutomationManager:
                 return sess.main_thread_id if sess else None
 
             existing = get_existing(self._store.state)
-            live, _ = await _ensure_live_docker_session(session_id, allow_create=True)
+            live, _ = await _ensure_live_session(session_id, allow_create=True)
             await self._ensure_initialized(live)
 
             if isinstance(existing, str) and existing.strip():
@@ -6309,7 +6345,7 @@ class AutomationManager:
                 live,
                 "thread/start",
                 {
-                    "cwd": live.cfg.workspace_container_path,
+                    "cwd": live.workspace_runtime_path,
                     "approvalPolicy": "never",
                     "sandbox": "danger-full-access",
                     "model": self.get_effective_model_for_session(session_id),
@@ -6356,7 +6392,7 @@ class AutomationManager:
             self._main_thread_locks[session_id] = lock
 
         async with lock:
-            live, _ = await _ensure_live_docker_session(session_id, allow_create=True)
+            live, _ = await _ensure_live_session(session_id, allow_create=True)
             await self._ensure_initialized(live)
 
             # Ensure the thread exists/is loadable in the upstream app-server.
@@ -6450,7 +6486,7 @@ class AutomationManager:
             )
         local_attachments = self._merge_staged_attachment_dicts([*pending_attachments, *local_attachments])
 
-        live, _ = await _ensure_live_docker_session(session_id, allow_create=True)
+        live, _ = await _ensure_live_session(session_id, allow_create=True)
         await self._ensure_initialized(live)
 
         if target == "main" or not (isinstance(thread_id, str) and thread_id.strip()):
@@ -6713,6 +6749,7 @@ class AutomationManager:
             rel_norm = _normalize_workspace_relative_path(rel)
             if not rel_norm:
                 continue
+            await _sync_session_workspace_file(session_id, root, dest)
             out.append(
                 PersistedStagedAttachment(
                     path=rel_norm,
@@ -6874,7 +6911,7 @@ class AutomationManager:
                 attachment_count=len(local_attachments),
             )
 
-            live, _ = await _ensure_live_docker_session(session_id, allow_create=True)
+            live, _ = await _ensure_live_session(session_id, allow_create=True)
             await self._ensure_initialized(live)
 
             self._prepare_lane_for_new_turn(lane, kind=TURN_KIND_USER)
@@ -6936,7 +6973,13 @@ class AutomationManager:
             return ""
 
         try:
+            await _sync_session_prompt_context_to_local(session_id, root, include_heartbeat=include_heartbeat)
+        except Exception:
+            log.exception("Failed to sync remote prompt context for session %s", session_id)
+
+        try:
             await self._sync_workspace_agents_file_at(root)
+            await _sync_session_workspace_file(session_id, root, root / AGENTS_FILENAME)
         except Exception:
             log.exception("Failed to refresh AGENTS.md from template at %s", str(root))
 
@@ -7186,7 +7229,7 @@ class AutomationManager:
             content = f"(failed to read HEARTBEAT.md: {e})"
         return "[HEARTBEAT.md]\n" + content.strip() + "\n[/HEARTBEAT.md]"
 
-    async def _ensure_initialized(self, live: LiveDockerSession) -> None:
+    async def _ensure_initialized(self, live: LiveRuntimeSession) -> None:
         if live.initialized_result is not None and live.handshake_done:
             return
         # Send initialize and cache result.
@@ -7207,7 +7250,7 @@ class AutomationManager:
             await live.write_upstream(json.dumps({"method": "initialized"}))
             live.handshake_done = True
 
-    async def _rpc(self, live: LiveDockerSession, method: str, params: Any) -> Any:
+    async def _rpc(self, live: LiveRuntimeSession, method: str, params: Any) -> Any:
         rid, fut = await live.reserve_internal_id()
         try:
             await live.write_upstream(json.dumps({"method": method, "id": rid, "params": params}))
@@ -7224,17 +7267,17 @@ class AutomationManager:
             raise RuntimeError(msg or "RPC error")
         return resp.get("result")
 
-    def _turn_start_params(self, *, session_id: str, thread_id: str, input_items: list[dict[str, Any]], live: LiveDockerSession) -> dict[str, Any]:
+    def _turn_start_params(self, *, session_id: str, thread_id: str, input_items: list[dict[str, Any]], live: LiveRuntimeSession) -> dict[str, Any]:
         return {
             "threadId": thread_id,
             "input": input_items,
-            "cwd": live.cfg.workspace_container_path,
+            "cwd": live.workspace_runtime_path,
             "approvalPolicy": "never",
             "sandboxPolicy": {"type": "dangerFullAccess"},
             "model": self.get_effective_model_for_session(session_id),
         }
 
-    async def _is_thread_loaded(self, live: LiveDockerSession, thread_id: str) -> bool:
+    async def _is_thread_loaded(self, live: LiveRuntimeSession, thread_id: str) -> bool:
         tid = str(thread_id or "").strip()
         if not tid:
             return False
@@ -7259,7 +7302,7 @@ class AutomationManager:
             break
         return False
 
-    async def _ensure_thread_loaded_or_resumed(self, live: LiveDockerSession, thread_id: str) -> None:
+    async def _ensure_thread_loaded_or_resumed(self, live: LiveRuntimeSession, thread_id: str) -> None:
         tid = str(thread_id or "").strip()
         if not tid:
             raise ValueError("thread_id must not be empty")
@@ -7312,8 +7355,7 @@ class AutomationManager:
         manual: bool,
         writeback_requested: bool,
     ) -> tuple[str, Optional[str], str]:
-        if _provision_mode() != "docker":
-            raise RuntimeError("Cron automation is only supported in docker provision mode")
+        _require_runtime_automation_support(feature="Cron automation")
 
         sid = session_id.strip() if isinstance(session_id, str) else ""
         if not sid:
@@ -7321,7 +7363,7 @@ class AutomationManager:
 
         run_id = uuid.uuid4().hex[:12]
 
-        live, _ = await _ensure_live_docker_session(sid, allow_create=True)
+        live, _ = await _ensure_live_session(sid, allow_create=True)
         await self._ensure_initialized(live)
 
         # Ensure a main thread exists for writeback pointers.
@@ -7340,7 +7382,7 @@ class AutomationManager:
             live,
             "thread/start",
             {
-                "cwd": live.cfg.workspace_container_path,
+                "cwd": live.workspace_runtime_path,
                 "approvalPolicy": "never",
                 "sandbox": "danger-full-access",
                 "model": self.get_effective_model_for_session(sid),
@@ -7599,6 +7641,15 @@ class AutomationManager:
             return False
         p = root / HEARTBEAT_FILENAME
         try:
+            await _pull_session_workspace_file_to_local(
+                session_id,
+                relative_path=HEARTBEAT_FILENAME,
+                dest_path=p,
+                max_bytes=512 * 1024,
+            )
+        except Exception:
+            log.exception("Failed to sync HEARTBEAT.md for session %s", session_id)
+        try:
             raw = await asyncio.to_thread(p.read_text, "utf-8")
         except FileNotFoundError:
             # Back-compat: older setups stored HEARTBEAT.md under `$ARGUS_HOME_HOST_PATH/HEARTBEAT.md`.
@@ -7623,7 +7674,7 @@ class AutomationManager:
         return not _is_heartbeat_content_effectively_empty(raw)
 
     async def _heartbeat_tick(self, *, forced: bool) -> None:
-        if _provision_mode() != "docker":
+        if not _provisioner_supports_runtime_automation():
             return
         st = self._store.state
         session_ids = [sid for sid in st.sessions.keys() if isinstance(sid, str) and sid.strip()]
@@ -7686,7 +7737,7 @@ class AutomationManager:
                         continue
 
                 try:
-                    live, _ = await _ensure_live_docker_session(session_id, allow_create=True)
+                    live, _ = await _ensure_live_session(session_id, allow_create=True)
                     await self._ensure_initialized(live)
                 except Exception as e:
                     self._note_session_failure(session_id, what="Heartbeat prepare", err=e)
@@ -8000,8 +8051,114 @@ class McpSessionState:
     last_seen_ms: int
     scoped_session_id: Optional[str] = None
 
+def _configured_provision_mode() -> str:
+    return (os.getenv("ARGUS_PROVISION_MODE") or "").strip().lower()
+
+
+def _running_in_kubernetes() -> bool:
+    host = (os.getenv("KUBERNETES_SERVICE_HOST") or "").strip()
+    return bool(host and os.path.exists(KUBERNETES_SERVICEACCOUNT_TOKEN_PATH))
+
+
+def _docker_endpoint_hint() -> Optional[str]:
+    docker_host = (os.getenv("DOCKER_HOST") or "").strip()
+    if docker_host:
+        return f"DOCKER_HOST={docker_host}"
+    docker_sock = (os.getenv("DOCKER_SOCK") or "/var/run/docker.sock").strip() or "/var/run/docker.sock"
+    if os.path.exists(docker_sock):
+        return docker_sock
+    return None
+
+
+def _fugue_detection_values() -> dict[str, str]:
+    return {
+        "base_url": (os.getenv("ARGUS_FUGUE_BASE_URL") or os.getenv("FUGUE_BASE_URL") or "").strip().rstrip("/"),
+        "token": (os.getenv("ARGUS_FUGUE_TOKEN") or os.getenv("FUGUE_TOKEN") or "").strip(),
+        "project_id": (os.getenv("ARGUS_FUGUE_PROJECT_ID") or "").strip(),
+        "image": (os.getenv("ARGUS_FUGUE_RUNTIME_IMAGE") or os.getenv("ARGUS_RUNTIME_IMAGE") or "").strip(),
+        "gateway_internal_host": (
+            os.getenv("ARGUS_GATEWAY_INTERNAL_HOST") or os.getenv("ARGUS_FUGUE_GATEWAY_INTERNAL_HOST") or ""
+        ).strip(),
+    }
+
+
+def _fugue_detection_missing_fields() -> list[str]:
+    values = _fugue_detection_values()
+    required_fields = {
+        "base_url": "ARGUS_FUGUE_BASE_URL/FUGUE_BASE_URL",
+        "token": "ARGUS_FUGUE_TOKEN/FUGUE_TOKEN",
+        "project_id": "ARGUS_FUGUE_PROJECT_ID",
+        "image": "ARGUS_FUGUE_RUNTIME_IMAGE/ARGUS_RUNTIME_IMAGE",
+        "gateway_internal_host": "ARGUS_GATEWAY_INTERNAL_HOST/ARGUS_FUGUE_GATEWAY_INTERNAL_HOST",
+    }
+    return [env_name for field, env_name in required_fields.items() if not values.get(field)]
+
+
+def _has_any_fugue_detection_env() -> bool:
+    values = _fugue_detection_values()
+    return any(bool(value) for value in values.values())
+
+
+@functools.lru_cache(maxsize=1)
+def _resolve_provision_mode() -> ProvisionModeResolution:
+    raw_mode = _configured_provision_mode()
+    explicit_mode = raw_mode or "auto"
+
+    if explicit_mode in ("static", "docker", "fugue"):
+        return ProvisionModeResolution(
+            raw_mode=explicit_mode,
+            resolved_mode=explicit_mode,
+            reason=f"explicit ARGUS_PROVISION_MODE={explicit_mode}",
+        )
+
+    if explicit_mode not in ("", "auto"):
+        raise RuntimeError(
+            f"Unsupported ARGUS_PROVISION_MODE={raw_mode!r}; supported modes are: 'auto', 'static', 'docker', 'fugue'"
+        )
+
+    warnings: list[str] = []
+    fugue_missing = _fugue_detection_missing_fields()
+    if not fugue_missing:
+        reason = "auto-detected fugue from configured Fugue API settings"
+        if _running_in_kubernetes():
+            reason += " inside Kubernetes"
+        return ProvisionModeResolution(
+            raw_mode="auto",
+            resolved_mode="fugue",
+            reason=reason,
+        )
+
+    if _has_any_fugue_detection_env():
+        warnings.append(
+            "Fugue environment detected but incomplete; missing "
+            + ", ".join(fugue_missing)
+            + ". Falling back to another provisioner."
+        )
+
+    docker_hint = _docker_endpoint_hint()
+    if docker_hint:
+        return ProvisionModeResolution(
+            raw_mode="auto",
+            resolved_mode="docker",
+            reason=f"auto-detected docker from {docker_hint}",
+            warnings=tuple(warnings),
+        )
+
+    if _running_in_kubernetes():
+        warnings.append(
+            "Kubernetes runtime detected but Fugue configuration is incomplete and no Docker endpoint is available; falling back to static mode."
+        )
+
+    return ProvisionModeResolution(
+        raw_mode="auto",
+        resolved_mode="static",
+        reason="auto-fell back to static because no complete Fugue configuration or Docker endpoint was detected",
+        warnings=tuple(warnings),
+    )
+
+
 def _provision_mode() -> str:
-    return os.getenv("ARGUS_PROVISION_MODE", "static").strip().lower()
+    return _resolve_provision_mode().resolved_mode
 
 
 def _gc_delete_orphan_runtimes_mode() -> str:
@@ -8050,6 +8207,321 @@ def _load_upstreams() -> dict[str, Upstream]:
 UPSTREAMS = _load_upstreams()
 
 
+class ProvisionerOperationUnsupportedError(RuntimeError):
+    pass
+
+
+class RuntimeProvisioner:
+    name = "static"
+
+    @property
+    def supports_user_agents(self) -> bool:
+        return False
+
+    @property
+    def supports_runtime_automation(self) -> bool:
+        return False
+
+    @property
+    def manages_runtime_sessions(self) -> bool:
+        return False
+
+    @property
+    def requires_runtime_recreation_on_workspace_change(self) -> bool:
+        return False
+
+    async def ensure_live_session(self, session_id: str, *, allow_create: bool) -> tuple[LiveRuntimeSession, bool]:
+        raise ProvisionerOperationUnsupportedError(
+            f"Provision mode '{self.name}' does not manage runtime sessions"
+        )
+
+    async def list_sessions(self) -> list[dict[str, Any]]:
+        raise ProvisionerOperationUnsupportedError(
+            f"Provision mode '{self.name}' does not expose managed sessions"
+        )
+
+    async def delete_session(self, session_id: str) -> None:
+        raise ProvisionerOperationUnsupportedError(
+            f"Provision mode '{self.name}' does not support deleting managed sessions"
+        )
+
+    async def remove_runtime(self, session_id: str) -> bool:
+        raise ProvisionerOperationUnsupportedError(
+            f"Provision mode '{self.name}' does not support runtime removal"
+        )
+
+    async def restart_runtime(self, session_id: str) -> bool:
+        raise ProvisionerOperationUnsupportedError(
+            f"Provision mode '{self.name}' does not support runtime restart"
+        )
+
+
+class StaticRuntimeProvisioner(RuntimeProvisioner):
+    def __init__(self, *, name: str = "static") -> None:
+        self.name = name or "static"
+
+
+class DockerRuntimeProvisioner(RuntimeProvisioner):
+    name = "docker"
+
+    @property
+    def supports_user_agents(self) -> bool:
+        return True
+
+    @property
+    def supports_runtime_automation(self) -> bool:
+        return True
+
+    @property
+    def manages_runtime_sessions(self) -> bool:
+        return True
+
+    @property
+    def requires_runtime_recreation_on_workspace_change(self) -> bool:
+        return True
+
+    async def ensure_live_session(self, session_id: str, *, allow_create: bool) -> tuple[LiveRuntimeSession, bool]:
+        return await _ensure_live_docker_session(session_id, allow_create=allow_create)
+
+    async def list_sessions(self) -> list[dict[str, Any]]:
+        return await asyncio.to_thread(_docker_list_argus_containers_sync)
+
+    async def delete_session(self, session_id: str) -> None:
+        container = await asyncio.to_thread(_docker_get_container_by_session_sync, session_id)
+        if container is None:
+            raise KeyError("Unknown session")
+        await _close_live_session(session_id)
+        await asyncio.to_thread(_docker_remove_container_sync, container)
+
+    async def remove_runtime(self, session_id: str) -> bool:
+        container = await asyncio.to_thread(_docker_get_container_by_session_sync, session_id)
+        if container is None:
+            return False
+        await asyncio.to_thread(_docker_remove_container_sync, container)
+        return True
+
+    async def restart_runtime(self, session_id: str) -> bool:
+        container = await asyncio.to_thread(_docker_get_container_by_session_sync, session_id)
+        if container is None:
+            return False
+        await asyncio.to_thread(container.restart, timeout=10)
+        return True
+
+
+class FugueRuntimeProvisioner(RuntimeProvisioner):
+    name = "fugue"
+
+    @property
+    def supports_user_agents(self) -> bool:
+        return True
+
+    @property
+    def supports_runtime_automation(self) -> bool:
+        return True
+
+    @property
+    def manages_runtime_sessions(self) -> bool:
+        return True
+
+    async def ensure_live_session(self, session_id: str, *, allow_create: bool) -> tuple[LiveRuntimeSession, bool]:
+        return await _ensure_live_fugue_session(session_id, allow_create=allow_create)
+
+    async def list_sessions(self) -> list[dict[str, Any]]:
+        return await asyncio.to_thread(_fugue_list_argus_sessions_sync)
+
+    async def delete_session(self, session_id: str) -> None:
+        deleted = await asyncio.to_thread(_fugue_delete_session_sync, session_id, True)
+        if not deleted:
+            raise KeyError("Unknown session")
+        await _close_live_session(session_id)
+
+    async def remove_runtime(self, session_id: str) -> bool:
+        return await asyncio.to_thread(_fugue_delete_session_sync, session_id, True)
+
+    async def restart_runtime(self, session_id: str) -> bool:
+        return await asyncio.to_thread(_fugue_restart_session_sync, session_id)
+
+
+def _build_runtime_provisioner() -> RuntimeProvisioner:
+    mode = _provision_mode()
+    if mode in ("", "static"):
+        return StaticRuntimeProvisioner()
+    if mode == "docker":
+        return DockerRuntimeProvisioner()
+    if mode == "fugue":
+        return FugueRuntimeProvisioner()
+    raise RuntimeError(
+        f"Unsupported resolved provision mode {mode!r}; supported modes are: 'static', 'docker', 'fugue'"
+    )
+
+
+def _runtime_provisioner() -> RuntimeProvisioner:
+    provisioner = getattr(app.state, "runtime_provisioner", None)
+    if provisioner is None:
+        provisioner = _build_runtime_provisioner()
+        app.state.runtime_provisioner = provisioner
+    return provisioner
+
+
+def _provisioner_mode_name() -> str:
+    return _runtime_provisioner().name
+
+
+def _provisioner_supports_user_agents() -> bool:
+    return _runtime_provisioner().supports_user_agents
+
+
+def _provisioner_supports_runtime_automation() -> bool:
+    return _runtime_provisioner().supports_runtime_automation
+
+
+def _provisioner_manages_runtime_sessions() -> bool:
+    return _runtime_provisioner().manages_runtime_sessions
+
+
+def _provisioner_requires_runtime_recreation_on_workspace_change() -> bool:
+    return _runtime_provisioner().requires_runtime_recreation_on_workspace_change
+
+
+def _require_user_agent_support() -> None:
+    if not _provisioner_supports_user_agents():
+        raise RuntimeError(f"User agents are not supported in provision mode '{_provisioner_mode_name()}'")
+
+
+def _require_runtime_automation_support(*, feature: str) -> None:
+    if not _provisioner_supports_runtime_automation():
+        raise RuntimeError(f"{feature} is not supported in provision mode '{_provisioner_mode_name()}'")
+
+
+async def _ensure_live_session(session_id: str, *, allow_create: bool) -> tuple[LiveRuntimeSession, bool]:
+    return await _runtime_provisioner().ensure_live_session(session_id, allow_create=allow_create)
+
+
+async def _list_managed_sessions() -> list[dict[str, Any]]:
+    return await _runtime_provisioner().list_sessions()
+
+
+async def _delete_managed_session(session_id: str) -> None:
+    await _runtime_provisioner().delete_session(session_id)
+
+
+async def _remove_managed_runtime(session_id: str) -> bool:
+    return await _runtime_provisioner().remove_runtime(session_id)
+
+
+async def _restart_managed_runtime(session_id: str) -> bool:
+    return await _runtime_provisioner().restart_runtime(session_id)
+
+
+def _fugue_workspace_enabled() -> bool:
+    return isinstance(_runtime_provisioner(), FugueRuntimeProvisioner)
+
+
+def _fugue_relative_workspace_path(cfg: FugueProvisionConfig, workspace_path: str) -> Optional[str]:
+    path_str = str(workspace_path or "").replace("\\", "/").strip()
+    if not path_str:
+        return None
+    base = cfg.workspace_mount_path.rstrip("/")
+    if path_str == base:
+        return None
+    prefix = base + "/"
+    if not path_str.startswith(prefix):
+        return None
+    return _normalize_workspace_relative_path(path_str[len(prefix) :])
+
+
+async def _sync_session_workspace_snapshot(session_id: str, root: Path) -> None:
+    if not _fugue_workspace_enabled():
+        return
+    cfg = _fugue_cfg()
+    try:
+        await asyncio.to_thread(_fugue_push_workspace_snapshot_sync, cfg, session_id, root)
+    except KeyError:
+        return
+
+
+async def _sync_session_workspace_file(session_id: str, root: Path, path_obj: Path) -> None:
+    if not _fugue_workspace_enabled():
+        return
+    rel = _relative_workspace_path(root, path_obj)
+    if not rel or not path_obj.is_file():
+        return
+    data = await asyncio.to_thread(path_obj.read_bytes)
+    cfg = _fugue_cfg()
+    try:
+        await asyncio.to_thread(_fugue_put_workspace_file_sync, cfg, session_id, rel, data)
+    except KeyError:
+        return
+
+
+async def _pull_session_workspace_file_to_local(
+    session_id: str,
+    *,
+    relative_path: str,
+    dest_path: Path,
+    max_bytes: int,
+) -> bool:
+    if not _fugue_workspace_enabled():
+        return False
+    rel = _normalize_workspace_relative_path(relative_path)
+    if not rel:
+        return False
+    cfg = _fugue_cfg()
+    data = await asyncio.to_thread(_fugue_read_workspace_file_bytes_sync, cfg, session_id, rel, max_bytes=max_bytes)
+    if data is None:
+        return False
+
+    def _write() -> None:
+        dest_path.parent.mkdir(parents=True, exist_ok=True)
+        _atomic_write_bytes(dest_path, data)
+
+    await asyncio.to_thread(_write)
+    return True
+
+
+async def _sync_session_prompt_context_to_local(session_id: str, root: Path, *, include_heartbeat: bool) -> None:
+    if not _fugue_workspace_enabled():
+        return
+    filenames = list(PROJECT_CONTEXT_FILENAMES)
+    if include_heartbeat:
+        filenames.append(HEARTBEAT_FILENAME)
+    for name in filenames:
+        try:
+            await _pull_session_workspace_file_to_local(
+                session_id,
+                relative_path=name,
+                dest_path=root / name,
+                max_bytes=512 * 1024,
+            )
+        except Exception:
+            log.exception("Failed to sync workspace file %s for session %s", name, session_id)
+
+    try:
+        cfg = _fugue_cfg()
+        entries = await asyncio.to_thread(_fugue_list_workspace_tree_sync, cfg, session_id, SKILLS_DIRNAME, depth=3)
+    except Exception:
+        log.exception("Failed to sync skills tree for session %s", session_id)
+        return
+
+    for entry in entries:
+        path_val = entry.get("path")
+        kind = str(entry.get("kind") or "").strip().lower()
+        if kind != "file" or not isinstance(path_val, str) or not path_val.endswith(f"/{SKILL_MD_FILENAME}"):
+            continue
+        rel = _fugue_relative_workspace_path(cfg, path_val)
+        if not rel:
+            continue
+        try:
+            await _pull_session_workspace_file_to_local(
+                session_id,
+                relative_path=rel,
+                dest_path=root / rel,
+                max_bytes=512 * 1024,
+            )
+        except Exception:
+            log.exception("Failed to sync skill file %s for session %s", rel, session_id)
+
+
 def _extract_token(ws: WebSocket) -> Optional[str]:
     auth = ws.headers.get("authorization") or ws.headers.get("Authorization")
     if auth:
@@ -8092,12 +8564,28 @@ app.add_middleware(
 
 @app.on_event("startup")
 async def _startup():
+    mode_resolution = _resolve_provision_mode()
+    app.state.runtime_provisioner = _build_runtime_provisioner()
     app.state.sessions_lock = asyncio.Lock()
-    app.state.sessions: dict[str, LiveDockerSession] = {}
+    app.state.sessions: dict[str, LiveRuntimeSession] = {}
     app.state.node_registry = NodeRegistry()
     app.state.mcp_lock = asyncio.Lock()
     app.state.mcp_sessions: dict[str, McpSessionState] = {}
-    log.info("Argus gateway starting (version=%s)", ARGUS_VERSION)
+    log.info(
+        "Argus gateway starting (version=%s, configured_provision_mode=%s, provision_mode=%s, reason=%s)",
+        ARGUS_VERSION,
+        mode_resolution.raw_mode,
+        _provisioner_mode_name(),
+        mode_resolution.reason,
+    )
+    for warning in mode_resolution.warnings:
+        log.warning("%s", warning)
+    if _provisioner_manages_runtime_sessions() and not (os.getenv("ARGUS_RUNTIME_CMD") or "").strip():
+        log.warning(
+            "Managed runtime provisioning is enabled (mode=%s) but ARGUS_RUNTIME_CMD is unset; "
+            "session startup may fail because the runtime image requires APP_SERVER_CMD.",
+            _provisioner_mode_name(),
+        )
 
     home_host_path = os.getenv("ARGUS_HOME_HOST_PATH") or None
     workspace_host_path = os.getenv("ARGUS_WORKSPACE_HOST_PATH") or None
@@ -10167,6 +10655,69 @@ def _docker_cfg() -> DockerProvisionConfig:
     )
 
 
+def _fugue_cfg() -> FugueProvisionConfig:
+    base_url = (os.getenv("ARGUS_FUGUE_BASE_URL") or os.getenv("FUGUE_BASE_URL") or "").strip().rstrip("/")
+    token = (os.getenv("ARGUS_FUGUE_TOKEN") or os.getenv("FUGUE_TOKEN") or "").strip()
+    project_id = (os.getenv("ARGUS_FUGUE_PROJECT_ID") or "").strip()
+    image = (os.getenv("ARGUS_FUGUE_RUNTIME_IMAGE") or os.getenv("ARGUS_RUNTIME_IMAGE") or "").strip()
+    runtime_id = (os.getenv("ARGUS_FUGUE_RUNTIME_ID") or "runtime_managed_shared").strip() or "runtime_managed_shared"
+    gateway_internal_host = (os.getenv("ARGUS_GATEWAY_INTERNAL_HOST") or os.getenv("ARGUS_FUGUE_GATEWAY_INTERNAL_HOST") or "").strip()
+    runtime_cmd = (os.getenv("ARGUS_RUNTIME_CMD") or "").strip() or None
+    workspace_mount_path = (os.getenv("ARGUS_FUGUE_WORKSPACE_MOUNT_PATH") or "/workspace").strip() or "/workspace"
+    workspace_storage_size = (os.getenv("ARGUS_FUGUE_WORKSPACE_STORAGE_SIZE") or "10Gi").strip() or "10Gi"
+    workspace_storage_class_name = (os.getenv("ARGUS_FUGUE_WORKSPACE_STORAGE_CLASS") or "").strip() or None
+    app_name_prefix = (os.getenv("ARGUS_FUGUE_APP_NAME_PREFIX") or "argus-session").strip().lower() or "argus-session"
+    connect_timeout_s = float(os.getenv("ARGUS_CONNECT_TIMEOUT_S", "30"))
+    try:
+        jsonl_line_limit_bytes = int(os.getenv("ARGUS_JSONL_LINE_LIMIT_BYTES", str(DEFAULT_JSONL_LINE_LIMIT_BYTES)))
+    except Exception:
+        jsonl_line_limit_bytes = DEFAULT_JSONL_LINE_LIMIT_BYTES
+    try:
+        service_port = int(os.getenv("ARGUS_FUGUE_SERVICE_PORT", "7777"))
+    except Exception:
+        service_port = 7777
+
+    if not base_url:
+        raise RuntimeError("ARGUS_FUGUE_BASE_URL is required in fugue provision mode")
+    if not token:
+        raise RuntimeError("ARGUS_FUGUE_TOKEN is required in fugue provision mode")
+    if not project_id:
+        raise RuntimeError("ARGUS_FUGUE_PROJECT_ID is required in fugue provision mode")
+    if not image:
+        raise RuntimeError("ARGUS_FUGUE_RUNTIME_IMAGE or ARGUS_RUNTIME_IMAGE is required in fugue provision mode")
+    if not gateway_internal_host:
+        raise RuntimeError("ARGUS_GATEWAY_INTERNAL_HOST is required in fugue provision mode")
+    if service_port <= 0:
+        raise RuntimeError("ARGUS_FUGUE_SERVICE_PORT must be > 0")
+    if not workspace_mount_path.startswith("/"):
+        raise RuntimeError("ARGUS_FUGUE_WORKSPACE_MOUNT_PATH must be an absolute container path")
+
+    return FugueProvisionConfig(
+        base_url=base_url,
+        token=token,
+        project_id=project_id,
+        image=image,
+        runtime_id=runtime_id,
+        gateway_internal_host=gateway_internal_host,
+        workspace_mount_path=workspace_mount_path,
+        runtime_cmd=runtime_cmd,
+        connect_timeout_s=connect_timeout_s,
+        jsonl_line_limit_bytes=jsonl_line_limit_bytes,
+        workspace_storage_size=workspace_storage_size,
+        workspace_storage_class_name=workspace_storage_class_name,
+        service_port=service_port,
+        app_name_prefix=app_name_prefix,
+    )
+
+
+def _session_app_name(prefix: str, session_id: str) -> str:
+    sid = _normalize_runtime_session_id(session_id)
+    if not sid:
+        raise RuntimeError("Invalid session id")
+    prefix_norm = re.sub(r"[^a-z0-9-]+", "-", (prefix or "").strip().lower()).strip("-") or "argus-session"
+    return f"{prefix_norm}-{sid}"
+
+
 def _resolve_workspace_host_path_for_session(session_id: str) -> Optional[str]:
     sid = session_id.strip() if isinstance(session_id, str) else ""
     if not sid:
@@ -10453,6 +11004,9 @@ def _docker_list_argus_containers_sync():
         out.append(
             {
                 "sessionId": labels.get("io.argus.session_id"),
+                "provider": "docker",
+                "runtimeId": c.id,
+                "runtimeName": c.name,
                 "containerId": c.id,
                 "name": c.name,
                 "status": c.status,
@@ -10516,6 +11070,30 @@ async def _wait_for_tcp(host: str, port: int, timeout_s: float):
             await asyncio.sleep(0.2)
 
 
+async def _close_live_session(session_id: str) -> None:
+    live: Optional[LiveRuntimeSession] = None
+    try:
+        async with app.state.sessions_lock:
+            live = app.state.sessions.pop(session_id, None)
+    except Exception:
+        live = None
+    if live is None:
+        return
+    try:
+        live.closed = True
+    except Exception:
+        pass
+    try:
+        live.writer.close()
+    except Exception:
+        pass
+    try:
+        if live.pump_task is not None:
+            live.pump_task.cancel()
+    except Exception:
+        pass
+
+
 async def _read_jsonl_line(
     reader: asyncio.StreamReader,
     buffer: bytearray,
@@ -10541,7 +11119,137 @@ async def _read_jsonl_line(
         buffer.extend(chunk)
 
 
-async def _ensure_live_docker_session(session_id: str, *, allow_create: bool) -> tuple[LiveDockerSession, bool]:
+async def _activate_live_session(live: LiveRuntimeSession) -> LiveRuntimeSession:
+    session_id = live.session_id
+
+    async def pump() -> None:
+        buf = bytearray()
+        try:
+            while True:
+                raw = await _read_jsonl_line(live.reader, buf, max_line_bytes=live.jsonl_line_limit_bytes)
+                if raw is None:
+                    log.info("Upstream TCP closed for session %s", session_id)
+                    break
+                text = raw.decode("utf-8", errors="replace").rstrip("\r")
+
+                msg: Any = None
+                try:
+                    msg = json.loads(text)
+                except Exception:
+                    msg = None
+
+                should_broadcast = True
+                if isinstance(msg, dict):
+                    if "id" in msg and "method" in msg:
+                        rid = str(msg.get("id"))
+                        if rid not in live.pending_server_requests:
+                            live.pending_server_requests[rid] = text
+                        params = msg.get("params")
+                        thread_id: Optional[str] = None
+                        if isinstance(params, dict):
+                            tid = params.get("threadId")
+                            if isinstance(tid, str) and tid.strip():
+                                thread_id = tid.strip()
+                        await live.deliver_server_request(text, thread_id=thread_id)
+                        continue
+
+                    if "id" in msg and "method" not in msg:
+                        rid = str(msg.get("id"))
+                        should_resolve = False
+                        client_turn_start_thread_id: Optional[str] = None
+                        async with live.attach_lock:
+                            if rid in live.pending_initialize_ids:
+                                live.pending_initialize_ids.discard(rid)
+                                if isinstance(msg.get("result"), dict):
+                                    live.initialized_result = msg["result"]
+                                    should_resolve = True
+                            client_turn_start_thread_id = live.pending_client_turn_starts.pop(rid, None)
+                        if should_resolve:
+                            await live.resolve_initialize_waiters()
+                        if client_turn_start_thread_id:
+                            automation: Optional[AutomationManager] = getattr(app.state, "automation", None)
+                            if automation is not None:
+                                try:
+                                    await automation.on_client_turn_start_response(session_id, client_turn_start_thread_id, msg)
+                                except Exception:
+                                    log.exception("Automation client turn-start response handler failed")
+                        await live.resolve_internal_response(msg)
+                        await live.deliver_response(msg)
+                        continue
+
+                    if "method" in msg and "id" not in msg:
+                        automation = getattr(app.state, "automation", None)
+                        if automation is not None:
+                            try:
+                                automation.on_upstream_notification(session_id, msg)
+                                if automation._is_heartbeat_commentary_notification(session_id, msg):
+                                    should_broadcast = False
+                                text = json.dumps(msg)
+                            except Exception:
+                                log.exception("Automation notification handler failed")
+
+                    if msg.get("method") == "turn/completed":
+                        params = msg.get("params")
+                        if isinstance(params, dict):
+                            tid = params.get("threadId")
+                            if isinstance(tid, str) and tid.strip():
+                                await live.clear_turn_owner(tid.strip())
+
+                if should_broadcast:
+                    await live.broadcast(text)
+        except asyncio.CancelledError:
+            pass
+        except Exception as e:
+            log.exception("Pump failed for session %s: %s", session_id, str(e))
+        finally:
+            try:
+                live.closed = True
+                live.writer.close()
+            except Exception:
+                pass
+            try:
+                async with live.attach_lock:
+                    for fut in live.pending_internal_requests.values():
+                        if not fut.done():
+                            fut.set_exception(RuntimeError("Session closed"))
+                    live.pending_internal_requests.clear()
+            except Exception:
+                pass
+            try:
+                async with app.state.sessions_lock:
+                    current = app.state.sessions.get(session_id)
+                    if current is live:
+                        app.state.sessions.pop(session_id, None)
+            except Exception:
+                pass
+            try:
+                await live.broadcast(json.dumps({"method": "argus/session_closed", "params": {"id": session_id}}))
+            except Exception:
+                pass
+            try:
+                await live.close_attached_websockets(code=1011, reason="Upstream session closed")
+            except Exception:
+                pass
+            try:
+                automation = getattr(app.state, "automation", None)
+                if automation is not None:
+                    try:
+                        automation.on_runtime_session_closed(session_id)
+                    except Exception:
+                        log.exception("Automation cleanup failed for closed session %s", session_id)
+            except Exception:
+                pass
+
+    live.pump_task = asyncio.create_task(pump())
+
+    async with app.state.sessions_lock:
+        app.state.sessions[session_id] = live
+
+    log.info("Provisioned session %s -> %s:%s", session_id, live.upstream_host, live.upstream_port)
+    return live
+
+
+async def _ensure_live_docker_session(session_id: str, *, allow_create: bool) -> tuple[LiveRuntimeSession, bool]:
     async with app.state.sessions_lock:
         existing = app.state.sessions.get(session_id)
     if existing is not None:
@@ -10590,15 +11298,17 @@ async def _ensure_live_docker_session(session_id: str, *, allow_create: bool) ->
     host = await _docker_wait_for_ip(container, cfg.network, cfg.connect_timeout_s)
     reader, writer = await _wait_for_tcp(host, 7777, cfg.connect_timeout_s)
 
-    live = LiveDockerSession(
+    live = LiveRuntimeSession(
         session_id=session_id,
-        container_id=container.id,
-        container_name=container.name,
+        provider="docker",
+        runtime_id=container.id,
+        runtime_name=container.name,
+        workspace_runtime_path=cfg.workspace_container_path,
+        jsonl_line_limit_bytes=cfg.jsonl_line_limit_bytes,
         upstream_host=host,
         upstream_port=7777,
         reader=reader,
         writer=writer,
-        cfg=cfg,
         pump_task=None,
         attach_lock=asyncio.Lock(),
         attached_wss=set(),
@@ -10615,128 +11325,497 @@ async def _ensure_live_docker_session(session_id: str, *, allow_create: bool) ->
         pending_client_turn_starts={},
         turn_owners_by_thread={},
     )
+    live = await _activate_live_session(live)
+    return live, created
 
-    async def pump() -> None:
-        buf = bytearray()
+
+def _fugue_headers(cfg: FugueProvisionConfig) -> dict[str, str]:
+    return {
+        "Accept": "application/json",
+        "Authorization": f"Bearer {cfg.token}",
+    }
+
+
+def _fugue_response_detail(payload: Any) -> Optional[str]:
+    if isinstance(payload, dict):
+        for key in ("error", "detail", "message"):
+            value = payload.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+    return None
+
+
+def _fugue_request_json_sync(
+    cfg: FugueProvisionConfig,
+    method: str,
+    path: str,
+    *,
+    params: Optional[dict[str, Any]] = None,
+    body: Optional[dict[str, Any]] = None,
+    expected_statuses: tuple[int, ...] = (200,),
+) -> Any:
+    url = cfg.base_url + path
+    kwargs: dict[str, Any] = {
+        "headers": _fugue_headers(cfg),
+        "params": params,
+        "timeout": max(10.0, cfg.connect_timeout_s),
+    }
+    if body is not None:
+        kwargs["json"] = body
+    response = requests.request(method, url, **kwargs)
+    payload: Any = None
+    try:
+        if response.content:
+            payload = response.json()
+    except Exception:
+        payload = None
+    if response.status_code not in expected_statuses:
+        detail = _fugue_response_detail(payload)
+        suffix = f": {detail}" if detail else ""
+        raise RuntimeError(f"Fugue API {method} {path} failed with {response.status_code}{suffix}")
+    return payload
+
+
+def _fugue_app_name(cfg: FugueProvisionConfig, session_id: str) -> str:
+    return _session_app_name(cfg.app_name_prefix, session_id)
+
+
+def _fugue_build_runtime_env(cfg: FugueProvisionConfig, session_id: str) -> dict[str, str]:
+    env: dict[str, str] = {
+        "APP_HOME": cfg.home_container_path,
+        "APP_WORKSPACE": cfg.workspace_mount_path,
+        "ARGUS_RUNTIME_LAYOUT": RUNTIME_LAYOUT,
+        "ARGUS_NODE_ID": f"runtime:{session_id}",
+        "ARGUS_NODE_DISPLAY_NAME": f"runtime-{session_id}",
+        "ARGUS_NODE_WS_URL": f"ws://{cfg.gateway_internal_host}:8080/nodes/ws",
+        "ARGUS_SESSION_ID": session_id,
+        "ARGUS_CODEX_MODEL": _resolve_agent_model_for_session(session_id),
+        "ARGUS_CODEX_MCP_URL": f"http://{cfg.gateway_internal_host}:8080/mcp",
+    }
+    if cfg.runtime_cmd:
+        env["APP_SERVER_CMD"] = cfg.runtime_cmd
+
+    gateway_token = os.getenv("ARGUS_TOKEN") or None
+    mcp_master = os.getenv("ARGUS_MCP_TOKEN") or gateway_token
+    if mcp_master:
+        env["ARGUS_MCP_TOKEN"] = _mcp_derive_session_token(mcp_master, session_id)
+
+    try:
+        quoted = urllib.parse.quote
+    except Exception:
+        quoted = None
+    node_master = os.getenv("ARGUS_NODE_TOKEN") or gateway_token
+    if node_master:
+        derived = _node_derive_session_token(node_master, session_id)
+        q = quoted(derived, safe="") if quoted is not None else derived
+        env["ARGUS_NODE_WS_URL"] = f"ws://{cfg.gateway_internal_host}:8080/nodes/ws?token={q}"
+
+    openai_master = (os.getenv("ARGUS_OPENAI_TOKEN") or gateway_token or "").strip() or None
+    if openai_master:
+        env["ARGUS_OPENAI_TOKEN"] = _openai_proxy_derive_session_token(openai_master, session_id)
+        env["ARGUS_CODEX_OPENAI_PROXY_BASE_URL"] = f"http://{cfg.gateway_internal_host}:8080/openai/v1"
+
+    return env
+
+
+def _fugue_list_apps_sync(cfg: FugueProvisionConfig) -> list[dict[str, Any]]:
+    payload = _fugue_request_json_sync(
+        cfg,
+        "GET",
+        "/v1/apps",
+        params={"include_live_status": "true", "include_resource_usage": "false"},
+        expected_statuses=(200,),
+    )
+    apps = payload.get("apps") if isinstance(payload, dict) else None
+    return [app for app in apps if isinstance(app, dict)] if isinstance(apps, list) else []
+
+
+def _fugue_find_session_app_sync(cfg: FugueProvisionConfig, session_id: str) -> Optional[dict[str, Any]]:
+    expected_name = _fugue_app_name(cfg, session_id)
+    for app_data in _fugue_list_apps_sync(cfg):
+        if str(app_data.get("project_id") or "").strip() != cfg.project_id:
+            continue
+        if str(app_data.get("name") or "").strip() != expected_name:
+            continue
+        return app_data
+    return None
+
+
+def _fugue_get_app_sync(cfg: FugueProvisionConfig, app_id: str) -> dict[str, Any]:
+    payload = _fugue_request_json_sync(cfg, "GET", f"/v1/apps/{app_id}", expected_statuses=(200,))
+    app_data = payload.get("app") if isinstance(payload, dict) else None
+    if not isinstance(app_data, dict):
+        raise RuntimeError(f"Invalid Fugue app payload for {app_id}")
+    return app_data
+
+
+def _fugue_create_session_app_sync(cfg: FugueProvisionConfig, session_id: str) -> dict[str, Any]:
+    if not cfg.runtime_cmd:
+        raise RuntimeError("ARGUS_RUNTIME_CMD is required in fugue provision mode")
+    request_body: dict[str, Any] = {
+        "project_id": cfg.project_id,
+        "image_ref": cfg.image,
+        "name": _fugue_app_name(cfg, session_id),
+        "description": f"Argus managed runtime session {session_id}",
+        "runtime_id": cfg.runtime_id,
+        "replicas": 1,
+        "network_mode": "internal",
+        "service_port": cfg.service_port,
+        "env": _fugue_build_runtime_env(cfg, session_id),
+        "persistent_storage": {
+            "storage_size": cfg.workspace_storage_size,
+            "mounts": [
+                {
+                    "kind": "directory",
+                    "path": cfg.workspace_mount_path,
+                }
+            ],
+        },
+    }
+    if cfg.workspace_storage_class_name:
+        request_body["persistent_storage"]["storage_class_name"] = cfg.workspace_storage_class_name
+    payload = _fugue_request_json_sync(
+        cfg,
+        "POST",
+        "/v1/apps/import-image",
+        body=request_body,
+        expected_statuses=(202,),
+    )
+    app_data = payload.get("app") if isinstance(payload, dict) else None
+    if not isinstance(app_data, dict):
+        raise RuntimeError("Invalid Fugue import-image response")
+    return app_data
+
+
+def _fugue_wait_for_app_ready_sync(cfg: FugueProvisionConfig, app_id: str) -> dict[str, Any]:
+    deadline = time.time() + max(60.0, cfg.connect_timeout_s * 6.0)
+    last_phase = ""
+    last_message = ""
+    while True:
+        app_data = _fugue_get_app_sync(cfg, app_id)
+        status = app_data.get("status") if isinstance(app_data.get("status"), dict) else {}
+        phase = str(status.get("phase") or "").strip().lower()
+        last_phase = phase or last_phase
+        last_message = str(status.get("last_message") or "").strip() or last_message
+        internal_service = app_data.get("internal_service")
+        if phase in ("deployed", "scaled", "migrated", "failed-over") and isinstance(internal_service, dict):
+            host = str(internal_service.get("host") or "").strip()
+            port = internal_service.get("port")
+            if host and isinstance(port, int) and port > 0:
+                return app_data
+        if phase in ("failed", "deleted"):
+            detail = f" ({last_message})" if last_message else ""
+            raise RuntimeError(f"Fugue app {app_id} entered phase {phase}{detail}")
+        if time.time() >= deadline:
+            detail = f" message={last_message}" if last_message else ""
+            raise TimeoutError(f"Timed out waiting for Fugue app {app_id} to become ready (phase={last_phase}){detail}")
+        time.sleep(1.0)
+
+
+def _fugue_ensure_session_app_ready_sync(cfg: FugueProvisionConfig, session_id: str, allow_create: bool) -> tuple[dict[str, Any], bool]:
+    app_data = _fugue_find_session_app_sync(cfg, session_id)
+    created = False
+    if app_data is None:
+        if not allow_create:
+            raise KeyError("Unknown session")
+        app_data = _fugue_create_session_app_sync(cfg, session_id)
+        created = True
+    app_id = str(app_data.get("id") or "").strip()
+    if not app_id:
+        raise RuntimeError(f"Fugue app id missing for session {session_id}")
+    return _fugue_wait_for_app_ready_sync(cfg, app_id), created
+
+
+def _fugue_internal_service_target(app_data: dict[str, Any]) -> tuple[str, int]:
+    internal_service = app_data.get("internal_service")
+    if not isinstance(internal_service, dict):
+        raise RuntimeError("Fugue app is missing internal service metadata")
+    host = str(internal_service.get("host") or "").strip()
+    port = internal_service.get("port")
+    if not host or not isinstance(port, int) or port <= 0:
+        raise RuntimeError("Fugue app internal service metadata is incomplete")
+    return host, port
+
+
+def _fugue_session_record_from_app(session_id: str, app_data: dict[str, Any]) -> dict[str, Any]:
+    status = app_data.get("status") if isinstance(app_data.get("status"), dict) else {}
+    return {
+        "sessionId": session_id,
+        "provider": "fugue",
+        "runtimeId": app_data.get("id"),
+        "runtimeName": app_data.get("name"),
+        "containerId": app_data.get("id"),
+        "name": app_data.get("name"),
+        "status": status.get("phase"),
+        "runtimeLayout": RUNTIME_LAYOUT,
+    }
+
+
+def _fugue_list_argus_sessions_sync() -> list[dict[str, Any]]:
+    cfg = _fugue_cfg()
+    prefix = _fugue_app_name(cfg, "000000000000")[:-12]
+    out: list[dict[str, Any]] = []
+    for app_data in _fugue_list_apps_sync(cfg):
+        if str(app_data.get("project_id") or "").strip() != cfg.project_id:
+            continue
+        name = str(app_data.get("name") or "").strip()
+        if not name.startswith(prefix):
+            continue
+        sid = name[len(prefix) :]
+        sid = _normalize_runtime_session_id(sid)
+        if not sid:
+            continue
+        out.append(_fugue_session_record_from_app(sid, app_data))
+    out.sort(key=lambda item: str(item.get("name") or ""))
+    return out
+
+
+def _fugue_delete_session_sync(session_id: str, force: bool) -> bool:
+    cfg = _fugue_cfg()
+    app_data = _fugue_find_session_app_sync(cfg, session_id)
+    if app_data is None:
+        return False
+    app_id = str(app_data.get("id") or "").strip()
+    if not app_id:
+        return False
+    _fugue_request_json_sync(
+        cfg,
+        "DELETE",
+        f"/v1/apps/{app_id}",
+        params={"force": "true" if force else "false"},
+        expected_statuses=(202,),
+    )
+    return True
+
+
+def _fugue_restart_session_sync(session_id: str) -> bool:
+    cfg = _fugue_cfg()
+    app_data = _fugue_find_session_app_sync(cfg, session_id)
+    if app_data is None:
+        return False
+    app_id = str(app_data.get("id") or "").strip()
+    if not app_id:
+        return False
+    _fugue_request_json_sync(cfg, "POST", f"/v1/apps/{app_id}/restart", body={}, expected_statuses=(202,))
+    return True
+
+
+def _relative_workspace_path(root: Path, target: Path) -> Optional[str]:
+    try:
+        rel = target.resolve().relative_to(root.resolve()).as_posix()
+    except Exception:
+        return None
+    rel = rel.strip()
+    if not rel or rel == ".":
+        return None
+    return rel
+
+
+def _fugue_workspace_path(cfg: FugueProvisionConfig, relative_path: str) -> str:
+    rel = str(relative_path or "").replace("\\", "/").strip().lstrip("/")
+    if not rel:
+        return cfg.workspace_mount_path
+    return f"{cfg.workspace_mount_path.rstrip('/')}/{rel}"
+
+
+def _decode_fugue_filesystem_content(content: Any, encoding: Any) -> bytes:
+    raw = content if isinstance(content, str) else ""
+    enc = str(encoding or "utf-8").strip().lower()
+    if enc in ("", "utf-8", "utf8", "text"):
+        return raw.encode("utf-8")
+    if enc == "base64":
+        return base64.b64decode(raw.encode("utf-8"))
+    raise RuntimeError(f"Unsupported Fugue filesystem encoding: {enc}")
+
+
+def _fugue_put_workspace_file_for_app_sync(
+    cfg: FugueProvisionConfig,
+    app_id: str,
+    relative_path: str,
+    data: bytes,
+) -> None:
+    if not app_id:
+        raise RuntimeError("Fugue app id missing")
+    try:
+        content = data.decode("utf-8")
+        encoding = "utf-8"
+    except UnicodeDecodeError:
+        content = base64.b64encode(data).decode("ascii")
+        encoding = "base64"
+    _fugue_request_json_sync(
+        cfg,
+        "PUT",
+        f"/v1/apps/{app_id}/filesystem/file",
+        params={"component": "app"},
+        body={
+            "path": _fugue_workspace_path(cfg, relative_path),
+            "content": content,
+            "encoding": encoding,
+            "mkdir_parents": True,
+        },
+        expected_statuses=(200,),
+    )
+
+
+def _fugue_put_workspace_file_sync(cfg: FugueProvisionConfig, session_id: str, relative_path: str, data: bytes) -> None:
+    app_data = _fugue_find_session_app_sync(cfg, session_id)
+    if app_data is None:
+        raise KeyError("Unknown session")
+    app_id = str(app_data.get("id") or "").strip()
+    _fugue_put_workspace_file_for_app_sync(cfg, app_id, relative_path, data)
+
+
+def _fugue_push_workspace_snapshot_sync(cfg: FugueProvisionConfig, session_id: str, root: Path) -> None:
+    if not root.exists() or not root.is_dir():
+        return
+    app_data = _fugue_find_session_app_sync(cfg, session_id)
+    if app_data is None:
+        raise KeyError("Unknown session")
+    app_id = str(app_data.get("id") or "").strip()
+    for path_obj in sorted(root.rglob("*")):
+        if not path_obj.is_file():
+            continue
+        rel = _relative_workspace_path(root, path_obj)
+        if not rel:
+            continue
         try:
-            while True:
-                raw = await _read_jsonl_line(live.reader, buf, max_line_bytes=cfg.jsonl_line_limit_bytes)
-                if raw is None:
-                    log.info("Upstream TCP closed for session %s", session_id)
-                    break
-                text = raw.decode("utf-8", errors="replace").rstrip("\r")
-
-                msg: Any = None
-                try:
-                    msg = json.loads(text)
-                except Exception:
-                    msg = None
-
-                should_broadcast = True
-                if isinstance(msg, dict):
-                    # Server requests (approvals, etc).
-                    if "id" in msg and "method" in msg:
-                        rid = str(msg.get("id"))
-                        if rid not in live.pending_server_requests:
-                            live.pending_server_requests[rid] = text
-                        params = msg.get("params")
-                        thread_id: Optional[str] = None
-                        if isinstance(params, dict):
-                            tid = params.get("threadId")
-                            if isinstance(tid, str) and tid.strip():
-                                thread_id = tid.strip()
-                        await live.deliver_server_request(text, thread_id=thread_id)
-                        continue
-
-                    # Responses.
-                    if "id" in msg and "method" not in msg:
-                        rid = str(msg.get("id"))
-                        should_resolve = False
-                        client_turn_start_thread_id: Optional[str] = None
-                        async with live.attach_lock:
-                            if rid in live.pending_initialize_ids:
-                                live.pending_initialize_ids.discard(rid)
-                                if isinstance(msg.get("result"), dict):
-                                    live.initialized_result = msg["result"]
-                                    should_resolve = True
-                            client_turn_start_thread_id = live.pending_client_turn_starts.pop(rid, None)
-                        if should_resolve:
-                            await live.resolve_initialize_waiters()
-                        if client_turn_start_thread_id:
-                            automation: Optional[AutomationManager] = getattr(app.state, "automation", None)
-                            if automation is not None:
-                                try:
-                                    await automation.on_client_turn_start_response(session_id, client_turn_start_thread_id, msg)
-                                except Exception:
-                                    log.exception("Automation client turn-start response handler failed")
-                        await live.resolve_internal_response(msg)
-                        await live.deliver_response(msg)
-                        continue
-
-                    # Notifications: feed automation.
-                    if "method" in msg and "id" not in msg:
-                        automation: Optional[AutomationManager] = getattr(app.state, "automation", None)
-                        if automation is not None:
-                            try:
-                                automation.on_upstream_notification(session_id, msg)
-                                if automation._is_heartbeat_commentary_notification(session_id, msg):
-                                    should_broadcast = False
-                                text = json.dumps(msg)
-                            except Exception:
-                                log.exception("Automation notification handler failed")
-
-                    if msg.get("method") == "turn/completed":
-                        params = msg.get("params")
-                        if isinstance(params, dict):
-                            tid = params.get("threadId")
-                            if isinstance(tid, str) and tid.strip():
-                                await live.clear_turn_owner(tid.strip())
-
-                if should_broadcast:
-                    await live.broadcast(text)
+            data = path_obj.read_bytes()
         except Exception:
-            log.exception("Upstream pump failed for session %s", session_id)
-        finally:
-            live.closed = True
-            try:
-                live.writer.close()
-            except Exception:
-                pass
-            async with live.attach_lock:
-                for fut in live.pending_internal_requests.values():
-                    if not fut.done():
-                        fut.set_exception(RuntimeError("Session closed"))
-                live.pending_internal_requests.clear()
-            async with app.state.sessions_lock:
-                current = app.state.sessions.get(session_id)
-                if current is live:
-                    app.state.sessions.pop(session_id, None)
-            await live.close_attached_websockets(code=1011, reason="Upstream session closed")
-            automation: Optional[AutomationManager] = getattr(app.state, "automation", None)
-            if automation is not None:
-                try:
-                    automation.on_runtime_session_closed(session_id)
-                except Exception:
-                    log.exception("Automation cleanup failed for closed session %s", session_id)
+            continue
+        _fugue_put_workspace_file_for_app_sync(cfg, app_id, rel, data)
 
-    live.pump_task = asyncio.create_task(pump())
 
+def _fugue_read_workspace_file_bytes_sync(cfg: FugueProvisionConfig, session_id: str, relative_path: str, *, max_bytes: int) -> Optional[bytes]:
+    app_data = _fugue_find_session_app_sync(cfg, session_id)
+    if app_data is None:
+        return None
+    app_id = str(app_data.get("id") or "").strip()
+    if not app_id:
+        return None
+    try:
+        payload = _fugue_request_json_sync(
+            cfg,
+            "GET",
+            f"/v1/apps/{app_id}/filesystem/file",
+            params={
+                "component": "app",
+                "path": _fugue_workspace_path(cfg, relative_path),
+                "max_bytes": str(max(1, int(max_bytes))),
+            },
+            expected_statuses=(200,),
+        )
+    except RuntimeError as e:
+        if " 404" in str(e):
+            return None
+        raise
+    if not isinstance(payload, dict):
+        return None
+    return _decode_fugue_filesystem_content(payload.get("content"), payload.get("encoding"))
+
+
+def _fugue_list_workspace_tree_sync(cfg: FugueProvisionConfig, session_id: str, relative_path: str, *, depth: int) -> list[dict[str, Any]]:
+    app_data = _fugue_find_session_app_sync(cfg, session_id)
+    if app_data is None:
+        return []
+    app_id = str(app_data.get("id") or "").strip()
+    if not app_id:
+        return []
+    try:
+        payload = _fugue_request_json_sync(
+            cfg,
+            "GET",
+            f"/v1/apps/{app_id}/filesystem/tree",
+            params={
+                "component": "app",
+                "path": _fugue_workspace_path(cfg, relative_path),
+                "depth": str(max(1, int(depth))),
+            },
+            expected_statuses=(200,),
+        )
+    except RuntimeError as e:
+        if " 404" in str(e):
+            return []
+        raise
+    entries = payload.get("entries") if isinstance(payload, dict) else None
+    return [entry for entry in entries if isinstance(entry, dict)] if isinstance(entries, list) else []
+
+
+async def _ensure_live_fugue_session(session_id: str, *, allow_create: bool) -> tuple[LiveRuntimeSession, bool]:
     async with app.state.sessions_lock:
-        app.state.sessions[session_id] = live
+        existing = app.state.sessions.get(session_id)
+    if existing is not None:
+        try:
+            writer_closing = existing.writer.is_closing()
+        except Exception:
+            writer_closing = False
+        if not existing.closed and not writer_closing:
+            return existing, False
+        log.info("Ignoring stale live session for %s (closed=%s, writer_closing=%s)", session_id, existing.closed, writer_closing)
 
-    log.info("Provisioned session %s -> %s:%s", session_id, host, 7777)
+    cfg = _fugue_cfg()
+    workspace_host_path = _resolve_workspace_host_path_for_session(session_id) or _derive_default_workspace_host_path_for_session(
+        session_id,
+        home_host_path=os.getenv("ARGUS_HOME_HOST_PATH") or None,
+        workspace_base_host_path=os.getenv("ARGUS_WORKSPACE_HOST_PATH") or None,
+    )
+    if not workspace_host_path:
+        raise RuntimeError("workspace root is not configured (ARGUS_HOME_HOST_PATH/ARGUS_WORKSPACE_HOST_PATH)")
+    if not os.path.isabs(workspace_host_path):
+        raise RuntimeError(f"Invalid workspaceHostPath for session {session_id}: not an absolute path")
+    workspace_root = Path(workspace_host_path)
+    try:
+        workspace_root.mkdir(parents=True, exist_ok=True)
+    except Exception as e:
+        log.warning("Failed to create local workspace mirror for session %s at %s: %s", session_id, workspace_host_path, str(e))
+
+    app_data, created = await asyncio.to_thread(_fugue_ensure_session_app_ready_sync, cfg, session_id, allow_create)
+    await asyncio.to_thread(_fugue_push_workspace_snapshot_sync, cfg, session_id, workspace_root)
+    host, port = _fugue_internal_service_target(app_data)
+    reader, writer = await _wait_for_tcp(host, port, cfg.connect_timeout_s)
+
+    live = LiveRuntimeSession(
+        session_id=session_id,
+        provider="fugue",
+        runtime_id=str(app_data.get("id") or ""),
+        runtime_name=str(app_data.get("name") or _fugue_app_name(cfg, session_id)),
+        workspace_runtime_path=cfg.workspace_mount_path,
+        jsonl_line_limit_bytes=cfg.jsonl_line_limit_bytes,
+        upstream_host=host,
+        upstream_port=port,
+        reader=reader,
+        writer=writer,
+        pump_task=None,
+        attach_lock=asyncio.Lock(),
+        attached_wss=set(),
+        request_handler_ws=None,
+        initialized_result=None,
+        handshake_done=False,
+        pending_initialize_ids=set(),
+        initialize_waiters=[],
+        pending_client_requests={},
+        pending_internal_requests={},
+        next_upstream_id=1_000_000_000,
+        pending_server_requests={},
+        outbox=deque(),
+        pending_client_turn_starts={},
+        turn_owners_by_thread={},
+    )
+    live = await _activate_live_session(live)
     return live, created
 
 
 @app.get("/sessions")
 async def list_sessions(request: Request):
     _http_require_token(request)
-    if _provision_mode() != "docker":
-        raise HTTPException(status_code=400, detail="Not in docker provision mode")
+    if not _provisioner_manages_runtime_sessions():
+        raise HTTPException(
+            status_code=400,
+            detail=f"Managed sessions are not available in provision mode '{_provisioner_mode_name()}'",
+        )
     try:
-        sessions = await asyncio.to_thread(_docker_list_argus_containers_sync)
+        sessions = await _list_managed_sessions()
     except Exception as e:
-        log.exception("Failed to list docker sessions")
+        log.exception("Failed to list managed sessions")
         raise HTTPException(status_code=500, detail=str(e)) from e
     return {"sessions": sessions}
 
@@ -11979,32 +13058,19 @@ async def automation_heartbeat_now(request: Request):
 @app.delete("/sessions/{session_id}")
 async def delete_session(session_id: str, request: Request):
     _http_require_token(request)
-    if _provision_mode() != "docker":
-        raise HTTPException(status_code=400, detail="Not in docker provision mode")
+    if not _provisioner_manages_runtime_sessions():
+        raise HTTPException(
+            status_code=400,
+            detail=f"Managed sessions are not available in provision mode '{_provisioner_mode_name()}'",
+        )
     try:
-        container = await asyncio.to_thread(_docker_get_container_by_session_sync, session_id)
-        if container is None:
-            raise HTTPException(status_code=404, detail="Session not found")
-        async with app.state.sessions_lock:
-            live = app.state.sessions.pop(session_id, None)
-        if live is not None:
-            try:
-                live.closed = True
-                try:
-                    live.writer.close()
-                except Exception:
-                    pass
-                try:
-                    live.pump_task.cancel()
-                except Exception:
-                    pass
-            except Exception:
-                pass
-        await asyncio.to_thread(_docker_remove_container_sync, container)
+        await _delete_managed_session(session_id)
+    except KeyError as e:
+        raise HTTPException(status_code=404, detail="Session not found") from e
     except HTTPException:
         raise
     except Exception as e:
-        log.exception("Failed to delete docker session %s", session_id)
+        log.exception("Failed to delete managed session %s", session_id)
         raise HTTPException(status_code=500, detail=str(e)) from e
     return {"ok": True, "sessionId": session_id}
 
@@ -12336,7 +13402,7 @@ async def ws_nodes(ws: WebSocket):
 async def ws_proxy(ws: WebSocket):
     provided = _extract_token(ws)
 
-    if _provision_mode() == "docker":
+    if _provisioner_manages_runtime_sessions():
         expected = os.getenv("ARGUS_TOKEN")
         if expected and provided != expected:
             await ws.accept()
@@ -12374,12 +13440,12 @@ async def ws_proxy(ws: WebSocket):
                     )
                     if derived and Path(derived).is_dir():
                         allow_create = True
-            live, created = await _ensure_live_docker_session(session_id, allow_create=allow_create)
+            live, created = await _ensure_live_session(session_id, allow_create=allow_create)
         except KeyError:
             await ws.close(code=1008, reason="Unknown session")
             return
         except Exception:
-            await ws.close(code=1011, reason="Failed to provision upstream container")
+            await ws.close(code=1011, reason="Failed to provision upstream runtime")
             return
 
         await live.attach(ws)
@@ -12392,7 +13458,8 @@ async def ws_proxy(ws: WebSocket):
                             "method": "argus/session",
                             "params": {
                                 "id": session_id,
-                                "mode": "docker",
+                                "mode": _provisioner_mode_name(),
+                                "provider": live.provider,
                                 "attached": bool(requested_session),
                                 "created": created,
                             },

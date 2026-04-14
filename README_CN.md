@@ -76,17 +76,17 @@ cp .env.example .env
 | `ARGUS_TOKEN` | 推荐设置；如果要暴露到 localhost 之外，几乎等同必需 | 未设置 | `/ws` 与 HTTP 管理接口共用的 Bearer token。同时也是 `ARGUS_NODE_TOKEN`、`ARGUS_MCP_TOKEN`、`ARGUS_OPENAI_TOKEN` 的回退 master secret。它**不是** OpenAI API Key。 |
 | `ARGUS_NODE_TOKEN` | 可选 | 回退到 `ARGUS_TOKEN` | 用于派生 `/nodes/ws` 的 session 级 token。如果你希望 node 访问和主网关 token 分离，就单独设置它。 |
 | `ARGUS_MCP_TOKEN` | 可选 | 回退到 `ARGUS_TOKEN` | gateway MCP 端点使用的独立 master secret。runtime 容器里拿到的是按 session 派生后的 token，而不是原始 secret。 |
-| `ARGUS_HOME_HOST_PATH` | 在 Compose 中可选，但强烈推荐设置清楚 | Compose 下默认 `${HOME}/.argus`；直接运行 gateway 时默认未设置 | 用于存放 gateway 持久化状态和按用户隔离的 workspace。若直接运行 gateway 且未设置它，automation state 会落到 `/tmp/argus-gateway-state.json`。设置时必须是**宿主机绝对路径**。 |
-| `ARGUS_WORKSPACE_HOST_PATH` | 可选 | 未设置 | 通用 `/ws` session 的 workspace 基础目录。未设置时，通用 session 使用 `${ARGUS_HOME_HOST_PATH}/workspaces/sess-<sessionId>`。设置时必须是**宿主机绝对路径**。 |
+| `ARGUS_HOME_HOST_PATH` | 在 Compose 中可选，但强烈推荐设置清楚 | Compose 下默认 `${HOME}/.argus`；直接运行 gateway 时默认未设置 | 用于存放 gateway 持久化状态和本地 workspace 镜像。在 `docker` 模式下，这些目录会 bind mount 到 runtime 容器；在 `fugue` 模式下，gateway 会把这些镜像目录同步到 Fugue 管理的持久化存储。若直接运行 gateway 且未设置它，automation state 会落到 `/tmp/argus-gateway-state.json`。设置时必须是**宿主机绝对路径**。 |
+| `ARGUS_WORKSPACE_HOST_PATH` | 可选 | 未设置 | 通用 `/ws` session 的本地 workspace 镜像基础目录。未设置时，通用 session 使用 `${ARGUS_HOME_HOST_PATH}/workspaces/sess-<sessionId>`。设置时必须是**宿主机绝对路径**。 |
 | `ARGUS_CORS_ORIGINS` | 可选 | `*` | 逗号分隔的 HTTP 允许来源，例如 `https://app.example.com,https://admin.example.com`。如果你要把 HTTP API 暴露给浏览器，建议收紧。 |
-| `ARGUS_GC_DELETE_ORPHAN_RUNTIMES` | 可选 | `delete` | 控制 gateway 启动时是否清理未被状态文件引用的 docker runtime 容器。支持：`off`、`dry-run`、`delete`（也接受 `true` / `yes` / `on`）。 |
+| `ARGUS_GC_DELETE_ORPHAN_RUNTIMES` | 可选 | `delete` | 控制 gateway 启动时是否清理未被状态文件引用的托管 runtime。`docker` 模式下清理的是 session 容器，`fugue` 模式下清理的是配置项目里的 session app。支持：`off`、`dry-run`、`delete`（也接受 `true` / `yes` / `on`）。 |
 | `ARGUS_STUCK_TURN_TIMEOUT_S` | 可选 | `900` | 防止某个上游 turn 永远不返回 `turn/completed`，导致 lane 一直卡在 `busy`。设为 `0` 可关闭这层保护。 |
 
 ### Docker runtime 创建与资源控制
 
 | 变量 | 是否必需 | 默认值 | 作用 / 注意事项 |
 | --- | --- | --- | --- |
-| `ARGUS_PROVISION_MODE` | 只有在你不走仓库自带 Compose 时才需要关心 | Compose 固定为 `docker`；代码默认 `static` | `docker` 表示 `/ws` 连接会自动创建 runtime 容器；`static` 表示 gateway 只代理到预先存在的 app-server。 |
+| `ARGUS_PROVISION_MODE` | 只有在你想覆盖自动探测结果时才需要设置 | 代码默认 `auto`；仓库自带 Compose 也默认 `auto` | `auto` 会按顺序自动判定：先看是否具备完整 Fugue 配置，有则用 `fugue`；否则若检测到 Docker 端点则用 `docker`；再否则回退到 `static`。`docker` 表示 `/ws` 连接会自动创建 runtime 容器；`fugue` 表示每个托管 session 都会在同一个 Fugue 项目里自动创建一个独立 app/service；`static` 表示 gateway 只代理到预先存在的 app-server。 |
 | `ARGUS_RUNTIME_IMAGE` | 可选 | `argus-runtime` | gateway 创建 runtime session 容器时使用的镜像 tag。 |
 | `ARGUS_DOCKER_NETWORK` | 可选 | `argus-net` | gateway 与 runtime 容器加入的 Docker 网络。 |
 | `ARGUS_RUNTIME_INSTALL_CMD` | 可选 | `npm i -g @openai/codex` | runtime 镜像的**构建期**安装命令（对应 `Dockerfile` 的 `APP_SERVER_INSTALL_CMD`）。如果你要切换 bundled runtime，就改这里并重新 build。 |
@@ -100,6 +100,22 @@ cp .env.example .env
 | `ARGUS_JSONL_LINE_LIMIT_BYTES` | 可选 | `134217728`（128 MiB） | runtime 上游单条 JSONL 消息允许的最大字节数。如果你遇到 `Separator is not found, and chunk exceed the limit`，通常该调它。 |
 | `DOCKER_SOCK` | 可选 | `/var/run/docker.sock` | 挂进 gateway 容器的宿主机 Docker socket 路径。适用于 OrbStack 或自定义 Docker 安装。注意：挂载 docker.sock 基本等价宿主机 root 权限。 |
 
+### Fugue runtime 创建
+
+| 变量 | 是否必需 | 默认值 | 作用 / 注意事项 |
+| --- | --- | --- | --- |
+| `ARGUS_FUGUE_BASE_URL` | `fugue` 模式下必需 | 未设置 | Fugue API server 的 base URL，例如 `https://fugue.example.com`。 |
+| `ARGUS_FUGUE_TOKEN` | `fugue` 模式下必需 | 未设置 | gateway 用来创建、查询、重启和删除 session app 的 Bearer token。 |
+| `ARGUS_FUGUE_PROJECT_ID` | `fugue` 模式下必需 | 未设置 | 放置 gateway 管理 session app 的 Fugue project。一个逻辑 Argus session 会映射成这个项目里的一个 Fugue app。 |
+| `ARGUS_FUGUE_RUNTIME_IMAGE` | `fugue` 模式下必需；若设置了 `ARGUS_RUNTIME_IMAGE` 可回退使用后者 | 未设置 | session app 使用的运行时镜像引用。通常应与 Docker 模式里使用的 app-server 镜像保持一致。 |
+| `ARGUS_FUGUE_RUNTIME_ID` | 可选 | `runtime_managed_shared` | 新建 session app 默认使用的 Fugue runtime target id。 |
+| `ARGUS_GATEWAY_INTERNAL_HOST` | `fugue` 模式下必需 | `docker` 模式下自动探测 gateway 容器名，失败后回退到 `gateway` | session app 回连 gateway（`/mcp`、`/nodes/ws`、`/openai/v1`）时使用的集群内主机名。在 Fugue 模式下，它应当能从同一集群 / 项目内的其他 app 解析到 gateway。 |
+| `ARGUS_FUGUE_WORKSPACE_MOUNT_PATH` | 可选 | `/workspace` | Fugue 为每个 session app 挂载持久化存储时使用的容器内路径。 |
+| `ARGUS_FUGUE_WORKSPACE_STORAGE_SIZE` | 可选 | `10Gi` | 每个 Fugue session app 申请的持久化存储大小。 |
+| `ARGUS_FUGUE_WORKSPACE_STORAGE_CLASS` | 可选 | 未设置 | 需要指定 PVC storage class 时使用。 |
+| `ARGUS_FUGUE_SERVICE_PORT` | 可选 | `7777` | 每个 Fugue session app 内部 app-server bridge 监听的 TCP 端口。 |
+| `ARGUS_FUGUE_APP_NAME_PREFIX` | 可选 | `argus-session` | Fugue app 名称前缀，最终类似 `argus-session-<sessionId>`。 |
+
 ### 模型提供方 / OpenAI 兼容代理
 
 | 变量 | 是否必需 | 默认值 | 作用 / 注意事项 |
@@ -108,7 +124,7 @@ cp .env.example .env
 | `ARGUS_OPENAI_API_KEY` | 可选 | 未设置 | `OPENAI_API_KEY` 的兼容别名。内置 `gateway` 渠道会先读 `OPENAI_API_KEY`，再回退到这个名字。 |
 | `ARGUS_OPENAI_RESPONSES_UPSTREAM_URL` | 可选 | `https://api.openai.com/v1/responses` | 内置 `gateway` 渠道真正转发到的 Responses API 地址。若你想改成自己的 OpenAI-compatible 提供方、公司内网代理或自建网关，就改这里。 |
 | `ARGUS_OPENAI_TOKEN` | 可选 | 回退到 `ARGUS_TOKEN` | gateway 用来派生 `/openai/v1/responses` session 级 Bearer token 的 master secret。注意：在 gateway 进程里它表示 master secret；在 runtime 容器里同名变量表示**派生后的 session token**。它只控制代理访问权限，真正走哪个上游由当前渠道决定。 |
-| `ARGUS_GATEWAY_INTERNAL_HOST` | 可选 | 自动探测当前 gateway 容器名，失败后回退到 `gateway` | runtime 容器回连 gateway（`/mcp`、`/nodes/ws`、`/openai/v1`）时使用的主机名。即使用户切换渠道，runtime 里仍保持这个固定的 gateway 地址。只有当你的 Docker DNS / 服务名和默认假设不一致时才需要手动设。 |
+| `ARGUS_GATEWAY_INTERNAL_HOST` | `fugue` 模式下必需；`docker` 模式下可选 | `docker` 模式下自动探测当前 gateway 容器名，失败后回退到 `gateway` | runtime 回连 gateway（`/mcp`、`/nodes/ws`、`/openai/v1`）时使用的主机名。即使用户切换渠道，runtime 里仍保持这个固定的 gateway 地址。在 Fugue 模式下，这应该是 gateway service 的集群内地址。 |
 
 渠道行为：
 
@@ -155,7 +171,7 @@ cp .env.example .env
 
 ### 高级：static upstream 模式
 
-如果你**不想**让 Argus 自动创建 Docker runtime 容器，可以把 gateway 运行在 `ARGUS_PROVISION_MODE=static`，然后手动指向已经存在的 app-server。
+如果你**不想**让 Argus 自己创建 / 管理 runtime，可以把 gateway 运行在 `ARGUS_PROVISION_MODE=static`，然后手动指向已经存在的 app-server。
 
 | 变量 | 是否必需 | 默认值 | 作用 / 注意事项 |
 | --- | --- | --- | --- |
@@ -174,19 +190,22 @@ cp .env.example .env
 
 ### 一般**不要手动设置**的内部变量
 
-当 gateway 创建 runtime 容器时，会自动注入一批内部环境变量，包括 `APP_SERVER_CMD`、`APP_HOME`、`APP_WORKSPACE`、`CODEX_HOME`、`ARGUS_SESSION_ID`、`ARGUS_CODEX_MODEL`、`ARGUS_CODEX_MCP_URL`、派生后的 `ARGUS_MCP_TOKEN`、派生后的 `ARGUS_OPENAI_TOKEN`、以及 `ARGUS_NODE_WS_URL`。
+当 gateway 创建 runtime 容器或 Fugue app 时，会自动注入一批内部环境变量，包括 `APP_SERVER_CMD`、`APP_HOME`、`APP_WORKSPACE`、`CODEX_HOME`、`ARGUS_SESSION_ID`、`ARGUS_CODEX_MODEL`、`ARGUS_CODEX_MCP_URL`、派生后的 `ARGUS_MCP_TOKEN`、派生后的 `ARGUS_OPENAI_TOKEN`、以及 `ARGUS_NODE_WS_URL`。
 
 这些都属于 runtime bridge 的内部实现细节。正常部署时，优先设置上面那些高层 gateway 变量，而不是自己在 `.env` 里预填这些内部变量。
 
 ## 数据目录与工作区（workspace）
 
-默认情况下，Argus 会把数据存到 Docker 宿主机上：
+默认情况下，Argus 会把数据存到运行 gateway 的机器上：
 
 - `ARGUS_HOME_HOST_PATH`（默认：`${HOME}/.argus`）
   - 网关自动化状态：`${ARGUS_HOME_HOST_PATH}/gateway/state.json`
   - 同时保存每个用户的 API 渠道定义、当前选中的渠道，以及用户自行填写的 API Key；请按 secrets 文件对待。
 
-每个 runtime session 容器只会把**一个宿主机 workspace 目录**挂载到 `/workspace`。
+runtime 在容器内始终使用 `/workspace`，但底层存储会随 provision mode 改变：
+
+- `docker`：每个 runtime session 容器都会把**一个宿主机 workspace 目录**挂载到 `/workspace`。
+- `fugue`：每个 runtime session app 都会拥有自己挂载到 `/workspace` 的持久化存储，而 gateway 会在 `ARGUS_HOME_HOST_PATH` / `ARGUS_WORKSPACE_HOST_PATH` 下保留本地镜像，并把受管文件双向同步。
 
 - Codex 的状态（threads/历史记录、配置）默认存放在 `/workspace/.codex`（按 workspace 隔离）。
 - 宿主机工作区目录：
@@ -227,7 +246,7 @@ runtime 会管理这些 workspace 文件：
 迁移提示：
 
 - 启用该隔离方案不会自动删除旧 session 容器。
-- 默认情况下，gateway 启动时会删除 **未被** `${ARGUS_HOME_HOST_PATH}/gateway/state.json` **引用** 的 docker runtime 容器（可设置 `ARGUS_GC_DELETE_ORPHAN_RUNTIMES=off` 关闭，或 `dry-run` 仅预览）。
+- 默认情况下，gateway 启动时会删除 **未被** `${ARGUS_HOME_HOST_PATH}/gateway/state.json` **引用** 的托管 runtime（可设置 `ARGUS_GC_DELETE_ORPHAN_RUNTIMES=off` 关闭，或 `dry-run` 仅预览）。
 - 如果旧 session 在 automation state 中仍存在启用的 cron job，它会继续被 gateway 调度执行；要停止请禁用/删除 cron job，并在需要时删除对应 session 容器。
 
 ## 自动化（system events / heartbeat / cron）

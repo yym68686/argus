@@ -18,7 +18,7 @@ services:
     depends_on:
       - runtime-image
     environment:
-      ARGUS_PROVISION_MODE: docker
+      ARGUS_PROVISION_MODE: ${ARGUS_PROVISION_MODE:-auto}
       ARGUS_RUNTIME_IMAGE: argus-runtime
       ARGUS_DOCKER_NETWORK: argus-net
       ARGUS_HOME_HOST_PATH: ${ARGUS_HOME_HOST_PATH:-${HOME}/.argus}

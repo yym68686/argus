@@ -76,17 +76,17 @@ How changes take effect:
 | `ARGUS_TOKEN` | Recommended; effectively required if you expose the gateway beyond localhost | unset | Shared bearer token for `/ws` and the HTTP management endpoints. Also acts as the fallback master secret for `ARGUS_NODE_TOKEN`, `ARGUS_MCP_TOKEN`, and `ARGUS_OPENAI_TOKEN`. This is **not** an OpenAI API key. |
 | `ARGUS_NODE_TOKEN` | Optional | falls back to `ARGUS_TOKEN` | Separate master secret for derived `/nodes/ws` session tokens. Set this if you want node access scoped separately from the main gateway token. |
 | `ARGUS_MCP_TOKEN` | Optional | falls back to `ARGUS_TOKEN` | Separate master secret for the gateway MCP endpoint. Runtime containers receive per-session derived tokens instead of the raw secret. |
-| `ARGUS_HOME_HOST_PATH` | Optional in Compose, but strongly recommended | Compose: `${HOME}/.argus`; direct gateway run: unset | Host directory used for persistent gateway state and per-user workspaces. If you run the gateway directly without this set, automation state falls back to `/tmp/argus-gateway-state.json`. Must be an **absolute host path** when set. |
-| `ARGUS_WORKSPACE_HOST_PATH` | Optional | unset | Base directory for generic `/ws` sessions. When unset, generic sessions use `${ARGUS_HOME_HOST_PATH}/workspaces/sess-<sessionId>`. Must be an **absolute host path** when set. |
+| `ARGUS_HOME_HOST_PATH` | Optional in Compose, but strongly recommended | Compose: `${HOME}/.argus`; direct gateway run: unset | Host directory used for persistent gateway state and local workspace mirrors. In `docker` mode those mirrors are bind-mounted into runtime containers; in `fugue` mode the gateway syncs them into Fugue-managed persistent storage. If you run the gateway directly without this set, automation state falls back to `/tmp/argus-gateway-state.json`. Must be an **absolute host path** when set. |
+| `ARGUS_WORKSPACE_HOST_PATH` | Optional | unset | Base directory for generic `/ws` session local workspace mirrors. When unset, generic sessions use `${ARGUS_HOME_HOST_PATH}/workspaces/sess-<sessionId>`. Must be an **absolute host path** when set. |
 | `ARGUS_CORS_ORIGINS` | Optional | `*` | Comma-separated list of allowed HTTP origins, for example `https://app.example.com,https://admin.example.com`. Tighten this when exposing the HTTP APIs to browsers. |
-| `ARGUS_GC_DELETE_ORPHAN_RUNTIMES` | Optional | `delete` | Controls startup garbage collection for docker runtime containers not referenced by gateway state. Supported values: `off`, `dry-run`, `delete` (also `true` / `yes` / `on`). |
+| `ARGUS_GC_DELETE_ORPHAN_RUNTIMES` | Optional | `delete` | Controls startup garbage collection for managed runtimes not referenced by gateway state. In `docker` mode this targets session containers; in `fugue` mode it targets session apps inside the configured project. Supported values: `off`, `dry-run`, `delete` (also `true` / `yes` / `on`). |
 | `ARGUS_STUCK_TURN_TIMEOUT_S` | Optional | `900` | Safety timeout for lanes stuck in `busy` state because an upstream turn never completed. Set `0` to disable the reset logic. |
 
 ### Docker runtime provisioning
 
 | Variable | Required? | Default | What it does / notes |
 | --- | --- | --- | --- |
-| `ARGUS_PROVISION_MODE` | Only if you run the gateway outside the provided Compose setup | Compose sets `docker`; code default is `static` | `docker` means each `/ws` session can auto-create its own runtime container. `static` means the gateway proxies to pre-existing upstream app-servers instead. |
+| `ARGUS_PROVISION_MODE` | Only if you want to override auto-detection | Code default is `auto`; the provided Compose file also defaults to `auto` | `auto` resolves in this order: `fugue` when complete Fugue config is present, then `docker` when a Docker endpoint is available, otherwise `static`. `docker` means each `/ws` session auto-creates its own runtime container. `fugue` means each managed session auto-creates a dedicated Fugue app/service inside one project. `static` means the gateway proxies to pre-existing upstream app-servers instead. |
 | `ARGUS_RUNTIME_IMAGE` | Optional | `argus-runtime` | Docker image tag used for spawned runtime session containers. |
 | `ARGUS_DOCKER_NETWORK` | Optional | `argus-net` | Docker network that both the gateway and runtime containers join. |
 | `ARGUS_RUNTIME_INSTALL_CMD` | Optional | `npm i -g @openai/codex` | **Build-time** install command for the runtime image (`Dockerfile` build arg `APP_SERVER_INSTALL_CMD`). Change this when swapping the bundled runtime; rebuild afterward. |
@@ -100,6 +100,22 @@ How changes take effect:
 | `ARGUS_JSONL_LINE_LIMIT_BYTES` | Optional | `134217728` (128 MiB) | Max JSONL line size accepted from upstream runtimes. Increase this if you hit `Separator is not found, and chunk exceed the limit` on large tool outputs. |
 | `DOCKER_SOCK` | Optional | `/var/run/docker.sock` | Host path mounted into the gateway container as the Docker socket. Useful on OrbStack or custom Docker setups. Mounting the socket is root-equivalent on the host. |
 
+### Fugue runtime provisioning
+
+| Variable | Required? | Default | What it does / notes |
+| --- | --- | --- | --- |
+| `ARGUS_FUGUE_BASE_URL` | Required in `fugue` mode | unset | Base URL of the Fugue API server, for example `https://fugue.example.com`. |
+| `ARGUS_FUGUE_TOKEN` | Required in `fugue` mode | unset | Bearer token used by the gateway to create, inspect, restart, and delete session apps. |
+| `ARGUS_FUGUE_PROJECT_ID` | Required in `fugue` mode | unset | Fugue project that should contain the gateway-managed session apps. One logical Argus session maps to one Fugue app inside this project. |
+| `ARGUS_FUGUE_RUNTIME_IMAGE` | Required in `fugue` mode unless `ARGUS_RUNTIME_IMAGE` is set | unset | Published runtime image reference for session apps. This should be the same app-server image you would otherwise run in Docker mode. |
+| `ARGUS_FUGUE_RUNTIME_ID` | Optional | `runtime_managed_shared` | Fugue runtime target id used for newly created session apps. |
+| `ARGUS_GATEWAY_INTERNAL_HOST` | Required in `fugue` mode | Docker mode auto-detects the gateway container name, then falls back to `gateway` | Cluster-internal hostname that Fugue session apps should use when calling back into the gateway (`/mcp`, `/nodes/ws`, `/openai/v1`). In Fugue mode this should resolve from other apps inside the same cluster/project. |
+| `ARGUS_FUGUE_WORKSPACE_MOUNT_PATH` | Optional | `/workspace` | Container path where Fugue mounts each session app's persistent storage. |
+| `ARGUS_FUGUE_WORKSPACE_STORAGE_SIZE` | Optional | `10Gi` | Requested persistent storage size for each Fugue-managed session app. |
+| `ARGUS_FUGUE_WORKSPACE_STORAGE_CLASS` | Optional | unset | Storage class name for Fugue-managed workspaces, when you need a specific PVC class. |
+| `ARGUS_FUGUE_SERVICE_PORT` | Optional | `7777` | Internal TCP port that the app-server bridge listens on inside each Fugue session app. |
+| `ARGUS_FUGUE_APP_NAME_PREFIX` | Optional | `argus-session` | Prefix for Fugue app names. Resulting names look like `argus-session-<sessionId>`. |
+
 ### Model provider / OpenAI-compatible proxy
 
 | Variable | Required? | Default | What it does / notes |
@@ -108,7 +124,7 @@ How changes take effect:
 | `ARGUS_OPENAI_API_KEY` | Optional | unset | Compatibility alias for `OPENAI_API_KEY`. The built-in `gateway` channel checks `OPENAI_API_KEY` first, then this alias. |
 | `ARGUS_OPENAI_RESPONSES_UPSTREAM_URL` | Optional | `https://api.openai.com/v1/responses` | Upstream Responses API URL used by the built-in `gateway` channel. Point this at any OpenAI-compatible `/v1/responses` endpoint if you want the shared gateway channel to target your own provider or company proxy. |
 | `ARGUS_OPENAI_TOKEN` | Optional | falls back to `ARGUS_TOKEN` | Master secret used by the gateway to derive per-session bearer tokens for `/openai/v1/responses`. On the gateway this is the master secret; inside each runtime container the gateway injects a **derived session token** with the same env name. This controls access to the proxy; the actual upstream is chosen from the selected channel. |
-| `ARGUS_GATEWAY_INTERNAL_HOST` | Optional | auto-detect current gateway container name, then fall back to `gateway` | Hostname that spawned runtime containers should use when calling back into the gateway (`/mcp`, `/nodes/ws`, `/openai/v1`). Runtime containers keep this fixed gateway URL even when users switch channels. Set this only if Docker DNS / service naming differs from the default assumptions. |
+| `ARGUS_GATEWAY_INTERNAL_HOST` | Required in `fugue` mode; optional in `docker` mode | Docker mode auto-detects current gateway container name, then falls back to `gateway` | Hostname that spawned runtimes should use when calling back into the gateway (`/mcp`, `/nodes/ws`, `/openai/v1`). Runtime sessions keep this fixed gateway URL even when users switch channels. In Fugue mode this should be the cluster-internal address of the gateway service. |
 
 Channel behavior:
 
@@ -157,7 +173,7 @@ You normally do **not** need these when using the built-in runtime node-host; th
 
 ### Advanced: static upstream mode
 
-If you do **not** want Argus to auto-create Docker runtime containers, you can run the gateway in `ARGUS_PROVISION_MODE=static` and point it at pre-existing app-servers.
+If you do **not** want Argus to create/manage runtimes at all, you can run the gateway in `ARGUS_PROVISION_MODE=static` and point it at pre-existing app-servers.
 
 | Variable | Required? | Default | What it does / notes |
 | --- | --- | --- | --- |
@@ -176,19 +192,22 @@ Example `ARGUS_UPSTREAMS_JSON`:
 
 ### Variables you normally should **not** set manually
 
-When the gateway provisions a runtime container, it injects several internal env vars automatically, including `APP_SERVER_CMD`, `APP_HOME`, `APP_WORKSPACE`, `CODEX_HOME`, `ARGUS_SESSION_ID`, `ARGUS_CODEX_MODEL`, `ARGUS_CODEX_MCP_URL`, derived `ARGUS_MCP_TOKEN`, derived `ARGUS_OPENAI_TOKEN`, and `ARGUS_NODE_WS_URL`.
+When the gateway provisions a runtime container or Fugue app, it injects several internal env vars automatically, including `APP_SERVER_CMD`, `APP_HOME`, `APP_WORKSPACE`, `CODEX_HOME`, `ARGUS_SESSION_ID`, `ARGUS_CODEX_MODEL`, `ARGUS_CODEX_MCP_URL`, derived `ARGUS_MCP_TOKEN`, derived `ARGUS_OPENAI_TOKEN`, and `ARGUS_NODE_WS_URL`.
 
 These are implementation details of the runtime bridge; in normal deployments you should set the higher-level gateway vars above instead of pre-filling these manually.
 
 ## Data & workspace
 
-By default Argus persists data on the Docker host at:
+By default Argus persists data on the machine where the gateway runs:
 
 - `ARGUS_HOME_HOST_PATH` (default: `${HOME}/.argus`)
   - Gateway automation state: `${ARGUS_HOME_HOST_PATH}/gateway/state.json`
   - Also stores per-user API channel definitions, the selected current channel, and user-supplied API keys. Treat it as a secret-bearing file.
 
-Each runtime session container mounts a **single host workspace directory** at `/workspace`.
+Runtime workspaces always live at `/workspace` inside the app-server, but the backing storage differs by provision mode:
+
+- `docker`: each runtime session container bind-mounts a single host workspace directory at `/workspace`.
+- `fugue`: each runtime session app gets its own persistent storage mounted at `/workspace`, while the gateway keeps a local mirror under `ARGUS_HOME_HOST_PATH` / `ARGUS_WORKSPACE_HOST_PATH` and syncs managed files in both directions.
 
 - Codex state (threads/history, config) is stored under `/workspace/.codex` by default.
 - Host workspace directories:
@@ -232,7 +251,7 @@ When using `apps/telegram-bot`, the gateway can isolate runtime containers (agen
 Migration notes:
 
 - Enabling this does not delete existing session containers.
-- By default, the gateway deletes orphan docker runtime containers on startup (set `ARGUS_GC_DELETE_ORPHAN_RUNTIMES=off` to disable, or `dry-run` to preview).
+- By default, the gateway deletes orphan managed runtimes on startup (set `ARGUS_GC_DELETE_ORPHAN_RUNTIMES=off` to disable, or `dry-run` to preview).
 - If older sessions still have enabled cron jobs in automation state, the gateway will keep scheduling them until you disable/delete those jobs and remove the sessions.
 
 ## Automation (system events, heartbeat, cron)
