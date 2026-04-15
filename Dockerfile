@@ -19,11 +19,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
   && rm -rf /var/lib/apt/lists/*
 
 ARG APP_SERVER_INSTALL_CMD
-RUN if [ -z "${APP_SERVER_INSTALL_CMD:-}" ]; then \
-      echo "ERROR: APP_SERVER_INSTALL_CMD is required (e.g. install your agent CLI/runtime)." >&2; \
-      exit 2; \
-    fi \
-    && sh -lc "$APP_SERVER_INSTALL_CMD"
+RUN install_cmd="${APP_SERVER_INSTALL_CMD:-npm i -g @openai/codex}" \
+    && sh -lc "$install_cmd"
 
 ENV APP_HOME=/root/.argus \
     APP_WORKSPACE=/workspace

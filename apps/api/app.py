@@ -167,9 +167,12 @@ class FugueProvisionConfig:
     base_url: str
     token: str
     project_id: str
-    image: str
     runtime_id: str
     gateway_internal_host: str
+    image: Optional[str] = None
+    runtime_app_id: Optional[str] = None
+    runtime_app_name: Optional[str] = None
+    runtime_compose_service: Optional[str] = None
     workspace_mount_path: str = "/workspace"
     home_container_path: str = "/root/.argus"
     runtime_cmd: Optional[str] = None
@@ -8076,9 +8079,13 @@ def _fugue_detection_values() -> dict[str, str]:
         "token": (os.getenv("ARGUS_FUGUE_TOKEN") or os.getenv("FUGUE_TOKEN") or "").strip(),
         "project_id": (os.getenv("ARGUS_FUGUE_PROJECT_ID") or "").strip(),
         "image": (os.getenv("ARGUS_FUGUE_RUNTIME_IMAGE") or os.getenv("ARGUS_RUNTIME_IMAGE") or "").strip(),
+        "runtime_app_id": (os.getenv("ARGUS_FUGUE_RUNTIME_APP_ID") or "").strip(),
+        "runtime_app_name": (os.getenv("ARGUS_FUGUE_RUNTIME_APP_NAME") or "").strip(),
+        "runtime_compose_service": (os.getenv("ARGUS_FUGUE_RUNTIME_COMPOSE_SERVICE") or "").strip(),
         "gateway_internal_host": (
             os.getenv("ARGUS_GATEWAY_INTERNAL_HOST") or os.getenv("ARGUS_FUGUE_GATEWAY_INTERNAL_HOST") or ""
         ).strip(),
+        "gateway_compose_service": (os.getenv("ARGUS_FUGUE_GATEWAY_COMPOSE_SERVICE") or "").strip(),
     }
 
 
@@ -8088,10 +8095,22 @@ def _fugue_detection_missing_fields() -> list[str]:
         "base_url": "ARGUS_FUGUE_BASE_URL/FUGUE_BASE_URL",
         "token": "ARGUS_FUGUE_TOKEN/FUGUE_TOKEN",
         "project_id": "ARGUS_FUGUE_PROJECT_ID",
-        "image": "ARGUS_FUGUE_RUNTIME_IMAGE/ARGUS_RUNTIME_IMAGE",
-        "gateway_internal_host": "ARGUS_GATEWAY_INTERNAL_HOST/ARGUS_FUGUE_GATEWAY_INTERNAL_HOST",
     }
-    return [env_name for field, env_name in required_fields.items() if not values.get(field)]
+    missing = [env_name for field, env_name in required_fields.items() if not values.get(field)]
+    has_runtime_source = any(
+        bool(values.get(field)) for field in ("image", "runtime_app_id", "runtime_app_name", "runtime_compose_service")
+    )
+    if not has_runtime_source:
+        missing.append(
+            "ARGUS_FUGUE_RUNTIME_IMAGE/ARGUS_RUNTIME_IMAGE or "
+            "ARGUS_FUGUE_RUNTIME_APP_ID/ARGUS_FUGUE_RUNTIME_APP_NAME/ARGUS_FUGUE_RUNTIME_COMPOSE_SERVICE"
+        )
+    has_gateway_target = any(bool(values.get(field)) for field in ("gateway_internal_host", "gateway_compose_service"))
+    if not has_gateway_target:
+        missing.append(
+            "ARGUS_GATEWAY_INTERNAL_HOST/ARGUS_FUGUE_GATEWAY_INTERNAL_HOST or ARGUS_FUGUE_GATEWAY_COMPOSE_SERVICE"
+        )
+    return missing
 
 
 def _has_any_fugue_detection_env() -> bool:
@@ -10660,8 +10679,14 @@ def _fugue_cfg() -> FugueProvisionConfig:
     token = (os.getenv("ARGUS_FUGUE_TOKEN") or os.getenv("FUGUE_TOKEN") or "").strip()
     project_id = (os.getenv("ARGUS_FUGUE_PROJECT_ID") or "").strip()
     image = (os.getenv("ARGUS_FUGUE_RUNTIME_IMAGE") or os.getenv("ARGUS_RUNTIME_IMAGE") or "").strip()
+    runtime_app_id = (os.getenv("ARGUS_FUGUE_RUNTIME_APP_ID") or "").strip() or None
+    runtime_app_name = (os.getenv("ARGUS_FUGUE_RUNTIME_APP_NAME") or "").strip() or None
+    runtime_compose_service = (os.getenv("ARGUS_FUGUE_RUNTIME_COMPOSE_SERVICE") or "").strip() or None
     runtime_id = (os.getenv("ARGUS_FUGUE_RUNTIME_ID") or "runtime_managed_shared").strip() or "runtime_managed_shared"
-    gateway_internal_host = (os.getenv("ARGUS_GATEWAY_INTERNAL_HOST") or os.getenv("ARGUS_FUGUE_GATEWAY_INTERNAL_HOST") or "").strip()
+    gateway_internal_host = (
+        os.getenv("ARGUS_GATEWAY_INTERNAL_HOST") or os.getenv("ARGUS_FUGUE_GATEWAY_INTERNAL_HOST") or ""
+    ).strip()
+    gateway_compose_service = (os.getenv("ARGUS_FUGUE_GATEWAY_COMPOSE_SERVICE") or "").strip() or None
     runtime_cmd = (os.getenv("ARGUS_RUNTIME_CMD") or "").strip() or None
     workspace_mount_path = (os.getenv("ARGUS_FUGUE_WORKSPACE_MOUNT_PATH") or "/workspace").strip() or "/workspace"
     workspace_storage_size = (os.getenv("ARGUS_FUGUE_WORKSPACE_STORAGE_SIZE") or "10Gi").strip() or "10Gi"
@@ -10683,10 +10708,17 @@ def _fugue_cfg() -> FugueProvisionConfig:
         raise RuntimeError("ARGUS_FUGUE_TOKEN is required in fugue provision mode")
     if not project_id:
         raise RuntimeError("ARGUS_FUGUE_PROJECT_ID is required in fugue provision mode")
-    if not image:
-        raise RuntimeError("ARGUS_FUGUE_RUNTIME_IMAGE or ARGUS_RUNTIME_IMAGE is required in fugue provision mode")
+    if not image and not runtime_app_id and not runtime_app_name and not runtime_compose_service:
+        raise RuntimeError(
+            "One of ARGUS_FUGUE_RUNTIME_IMAGE, ARGUS_RUNTIME_IMAGE, ARGUS_FUGUE_RUNTIME_APP_ID, "
+            "ARGUS_FUGUE_RUNTIME_APP_NAME, or ARGUS_FUGUE_RUNTIME_COMPOSE_SERVICE is required in fugue provision mode"
+        )
     if not gateway_internal_host:
-        raise RuntimeError("ARGUS_GATEWAY_INTERNAL_HOST is required in fugue provision mode")
+        if not gateway_compose_service:
+            raise RuntimeError(
+                "ARGUS_GATEWAY_INTERNAL_HOST or ARGUS_FUGUE_GATEWAY_COMPOSE_SERVICE is required in fugue provision mode"
+            )
+        gateway_internal_host = _fugue_compose_service_alias(project_id, gateway_compose_service)
     if service_port <= 0:
         raise RuntimeError("ARGUS_FUGUE_SERVICE_PORT must be > 0")
     if not workspace_mount_path.startswith("/"):
@@ -10696,7 +10728,10 @@ def _fugue_cfg() -> FugueProvisionConfig:
         base_url=base_url,
         token=token,
         project_id=project_id,
-        image=image,
+        image=image or None,
+        runtime_app_id=runtime_app_id,
+        runtime_app_name=runtime_app_name,
+        runtime_compose_service=runtime_compose_service,
         runtime_id=runtime_id,
         gateway_internal_host=gateway_internal_host,
         workspace_mount_path=workspace_mount_path,
@@ -10716,6 +10751,31 @@ def _session_app_name(prefix: str, session_id: str) -> str:
         raise RuntimeError("Invalid session id")
     prefix_norm = re.sub(r"[^a-z0-9-]+", "-", (prefix or "").strip().lower()).strip("-") or "argus-session"
     return f"{prefix_norm}-{sid}"
+
+
+def _fugue_slugify(value: str) -> str:
+    text = (value or "").strip().lower()
+    if not text:
+        return ""
+    text = re.sub(r"[^a-z0-9-]+", "-", text)
+    text = re.sub(r"-+", "-", text).strip("-")
+    return text
+
+
+def _fugue_compose_service_alias(project_id: str, compose_service: str) -> str:
+    base = _fugue_slugify(project_id.replace("_", "-"))
+    suffix = _fugue_slugify(compose_service)
+    if not suffix:
+        return base[:63] if base else ""
+    if not base:
+        return suffix[:63]
+    name = f"{base}-{suffix}"
+    if len(name) <= 63:
+        return name
+    max_base_len = 63 - len(suffix) - 1
+    if max_base_len <= 0:
+        return name[:63]
+    return f"{base[:max_base_len]}-{suffix}"
 
 
 def _resolve_workspace_host_path_for_session(session_id: str) -> Optional[str]:
@@ -11441,6 +11501,43 @@ def _fugue_find_session_app_sync(cfg: FugueProvisionConfig, session_id: str) -> 
     return None
 
 
+def _fugue_find_app_by_name_sync(cfg: FugueProvisionConfig, app_name: str) -> Optional[dict[str, Any]]:
+    expected_name = (app_name or "").strip()
+    if not expected_name:
+        return None
+    for app_data in _fugue_list_apps_sync(cfg):
+        if str(app_data.get("project_id") or "").strip() != cfg.project_id:
+            continue
+        if str(app_data.get("name") or "").strip() != expected_name:
+            continue
+        return app_data
+    return None
+
+
+def _fugue_find_app_by_compose_service_sync(cfg: FugueProvisionConfig, compose_service: str) -> dict[str, Any]:
+    expected_service = _fugue_slugify(compose_service)
+    if not expected_service:
+        raise RuntimeError("Fugue runtime compose service is empty")
+    matches: list[dict[str, Any]] = []
+    for app_data in _fugue_list_apps_sync(cfg):
+        if str(app_data.get("project_id") or "").strip() != cfg.project_id:
+            continue
+        source = app_data.get("source") if isinstance(app_data.get("source"), dict) else {}
+        if _fugue_slugify(str(source.get("compose_service") or "").strip()) != expected_service:
+            continue
+        matches.append(app_data)
+    if not matches:
+        raise RuntimeError(
+            f"Fugue app with compose_service={expected_service!r} was not found in project {cfg.project_id}"
+        )
+    if len(matches) > 1:
+        raise RuntimeError(
+            f"Multiple Fugue apps in project {cfg.project_id} use compose_service={expected_service!r}; "
+            "set ARGUS_FUGUE_RUNTIME_APP_ID or ARGUS_FUGUE_RUNTIME_APP_NAME explicitly"
+        )
+    return matches[0]
+
+
 def _fugue_get_app_sync(cfg: FugueProvisionConfig, app_id: str) -> dict[str, Any]:
     payload = _fugue_request_json_sync(cfg, "GET", f"/v1/apps/{app_id}", expected_statuses=(200,))
     app_data = payload.get("app") if isinstance(payload, dict) else None
@@ -11449,12 +11546,53 @@ def _fugue_get_app_sync(cfg: FugueProvisionConfig, app_id: str) -> dict[str, Any
     return app_data
 
 
+def _fugue_runtime_image_from_app(app_data: dict[str, Any]) -> str:
+    source = app_data.get("source") if isinstance(app_data.get("source"), dict) else {}
+    spec = app_data.get("spec") if isinstance(app_data.get("spec"), dict) else {}
+    for candidate in (
+        source.get("resolved_image_ref"),
+        spec.get("image"),
+        source.get("image_ref"),
+    ):
+        value = str(candidate or "").strip()
+        if value:
+            return value
+    app_name = str(app_data.get("name") or app_data.get("id") or "").strip() or "unknown"
+    raise RuntimeError(f"Fugue app {app_name} does not expose a usable runtime image reference yet")
+
+
+def _fugue_resolve_runtime_image_sync(cfg: FugueProvisionConfig) -> str:
+    if cfg.image:
+        return cfg.image
+
+    app_data: Optional[dict[str, Any]] = None
+    if cfg.runtime_app_id:
+        app_data = _fugue_get_app_sync(cfg, cfg.runtime_app_id)
+    elif cfg.runtime_app_name:
+        app_data = _fugue_find_app_by_name_sync(cfg, cfg.runtime_app_name)
+        if app_data is None:
+            raise RuntimeError(
+                f"Fugue runtime app named {cfg.runtime_app_name!r} was not found in project {cfg.project_id}"
+            )
+    elif cfg.runtime_compose_service:
+        app_data = _fugue_find_app_by_compose_service_sync(cfg, cfg.runtime_compose_service)
+
+    if not isinstance(app_data, dict):
+        raise RuntimeError("Fugue runtime image source is not configured")
+
+    if str(app_data.get("project_id") or "").strip() != cfg.project_id:
+        raise RuntimeError(
+            f"Configured Fugue runtime app {app_data.get('id') or app_data.get('name')!r} is not in project {cfg.project_id}"
+        )
+    return _fugue_runtime_image_from_app(app_data)
+
+
 def _fugue_create_session_app_sync(cfg: FugueProvisionConfig, session_id: str) -> dict[str, Any]:
     if not cfg.runtime_cmd:
         raise RuntimeError("ARGUS_RUNTIME_CMD is required in fugue provision mode")
     request_body: dict[str, Any] = {
         "project_id": cfg.project_id,
-        "image_ref": cfg.image,
+        "image_ref": _fugue_resolve_runtime_image_sync(cfg),
         "name": _fugue_app_name(cfg, session_id),
         "description": f"Argus managed runtime session {session_id}",
         "runtime_id": cfg.runtime_id,

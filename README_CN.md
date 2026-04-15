@@ -86,7 +86,7 @@ cp .env.example .env
 
 | 变量 | 是否必需 | 默认值 | 作用 / 注意事项 |
 | --- | --- | --- | --- |
-| `ARGUS_PROVISION_MODE` | 只有在你想覆盖自动探测结果时才需要设置 | 代码默认 `auto`；仓库自带 Compose 也默认 `auto` | `auto` 会按顺序自动判定：先看是否具备完整 Fugue 配置，有则用 `fugue`；否则若检测到 Docker 端点则用 `docker`；再否则回退到 `static`。`docker` 表示 `/ws` 连接会自动创建 runtime 容器；`fugue` 表示每个托管 session 都会在同一个 Fugue 项目里自动创建一个独立 app/service；`static` 表示 gateway 只代理到预先存在的 app-server。 |
+| `ARGUS_PROVISION_MODE` | 只有在你想覆盖自动探测结果时才需要设置 | 代码默认 `auto`；仓库自带 Compose 也默认 `auto` | `auto` 会按顺序自动判定：先看是否具备完整 Fugue 配置，有则用 `fugue`；否则若检测到 Docker 端点则用 `docker`；再否则回退到 `static`。完整 Fugue 配置指：base URL + token + project id + 一个 runtime 来源（`ARGUS_FUGUE_RUNTIME_IMAGE`、`ARGUS_FUGUE_RUNTIME_APP_ID`、`ARGUS_FUGUE_RUNTIME_APP_NAME` 或 `ARGUS_FUGUE_RUNTIME_COMPOSE_SERVICE`）+ 一个 gateway 回调目标（`ARGUS_GATEWAY_INTERNAL_HOST` 或 `ARGUS_FUGUE_GATEWAY_COMPOSE_SERVICE`）。`docker` 表示 `/ws` 连接会自动创建 runtime 容器；`fugue` 表示每个托管 session 都会在同一个 Fugue 项目里自动创建一个独立 app/service；`static` 表示 gateway 只代理到预先存在的 app-server。 |
 | `ARGUS_RUNTIME_IMAGE` | 可选 | `argus-runtime` | gateway 创建 runtime session 容器时使用的镜像 tag。 |
 | `ARGUS_DOCKER_NETWORK` | 可选 | `argus-net` | gateway 与 runtime 容器加入的 Docker 网络。 |
 | `ARGUS_RUNTIME_INSTALL_CMD` | 可选 | `npm i -g @openai/codex` | runtime 镜像的**构建期**安装命令（对应 `Dockerfile` 的 `APP_SERVER_INSTALL_CMD`）。如果你要切换 bundled runtime，就改这里并重新 build。 |
@@ -107,9 +107,13 @@ cp .env.example .env
 | `ARGUS_FUGUE_BASE_URL` | `fugue` 模式下必需 | 未设置 | Fugue API server 的 base URL，例如 `https://fugue.example.com`。 |
 | `ARGUS_FUGUE_TOKEN` | `fugue` 模式下必需 | 未设置 | gateway 用来创建、查询、重启和删除 session app 的 Bearer token。 |
 | `ARGUS_FUGUE_PROJECT_ID` | `fugue` 模式下必需 | 未设置 | 放置 gateway 管理 session app 的 Fugue project。一个逻辑 Argus session 会映射成这个项目里的一个 Fugue app。 |
-| `ARGUS_FUGUE_RUNTIME_IMAGE` | `fugue` 模式下必需；若设置了 `ARGUS_RUNTIME_IMAGE` 可回退使用后者 | 未设置 | session app 使用的运行时镜像引用。通常应与 Docker 模式里使用的 app-server 镜像保持一致。 |
+| `ARGUS_FUGUE_RUNTIME_IMAGE` | 可选；当下面任一 runtime app 选择器已设置时可省略 | 未设置 | 新建 session app 时显式使用的运行时镜像引用。适合你已经自行发布 runtime 镜像的场景。 |
+| `ARGUS_FUGUE_RUNTIME_APP_ID` | 可选 | 未设置 | 从一个已部署的 Fugue app id 解析 session 镜像。 |
+| `ARGUS_FUGUE_RUNTIME_APP_NAME` | 可选 | 未设置 | 从 `ARGUS_FUGUE_PROJECT_ID` 内一个已部署的 Fugue app 名称解析 session 镜像。 |
+| `ARGUS_FUGUE_RUNTIME_COMPOSE_SERVICE` | 可选 | 未设置 | 从 `ARGUS_FUGUE_PROJECT_ID` 内 `source.compose_service` 匹配该值的 Fugue app 解析 session 镜像。对仓库自带的 `fugue.yaml` 来说，这是最稳妥的做法，因为即使最终 app 名被 Fugue 自动加后缀，也不会失效。 |
 | `ARGUS_FUGUE_RUNTIME_ID` | 可选 | `runtime_managed_shared` | 新建 session app 默认使用的 Fugue runtime target id。 |
-| `ARGUS_GATEWAY_INTERNAL_HOST` | `fugue` 模式下必需 | `docker` 模式下自动探测 gateway 容器名，失败后回退到 `gateway` | session app 回连 gateway（`/mcp`、`/nodes/ws`、`/openai/v1`）时使用的集群内主机名。在 Fugue 模式下，它应当能从同一集群 / 项目内的其他 app 解析到 gateway。 |
+| `ARGUS_GATEWAY_INTERNAL_HOST` | `fugue` 模式下必需；若设置了 `ARGUS_FUGUE_GATEWAY_COMPOSE_SERVICE` 可省略 | `docker` 模式下自动探测 gateway 容器名，失败后回退到 `gateway` | session app 回连 gateway（`/mcp`、`/nodes/ws`、`/openai/v1`）时使用的集群内主机名。在 Fugue 模式下，它应当能从同一集群 / 项目内的其他 app 解析到 gateway。 |
+| `ARGUS_FUGUE_GATEWAY_COMPOSE_SERVICE` | 可选 | 未设置 | 不再写死最终 app 名，而是根据 Fugue project id 加 `compose_service` 别名规则计算 gateway 回调地址。仓库自带 `fugue.yaml` 应使用 `gateway`。 |
 | `ARGUS_FUGUE_WORKSPACE_MOUNT_PATH` | 可选 | `/workspace` | Fugue 为每个 session app 挂载持久化存储时使用的容器内路径。 |
 | `ARGUS_FUGUE_WORKSPACE_STORAGE_SIZE` | 可选 | `10Gi` | 每个 Fugue session app 申请的持久化存储大小。 |
 | `ARGUS_FUGUE_WORKSPACE_STORAGE_CLASS` | 可选 | 未设置 | 需要指定 PVC storage class 时使用。 |
@@ -303,6 +307,39 @@ open http://127.0.0.1:3000
 
 - 安装/构建命令：`ARGUS_RUNTIME_INSTALL_CMD`（默认安装 `@openai/codex`）
 - 启动命令：`ARGUS_RUNTIME_CMD`（默认 `codex app-server`）
+- 根目录 `Dockerfile` 在没有传入 `APP_SERVER_INSTALL_CMD` 时，也会默认安装 `@openai/codex`。这让仓库自带的 Fugue `runtime` 服务不依赖 Compose 专用 build args 也能直接 build。
+
+## 部署到 Fugue
+
+仓库现在自带 [fugue.yaml](/Users/yanyuming/Downloads/GitHub/argus/fugue.yaml)。推荐的 Fugue 拓扑是：
+
+- `gateway`：公网入口，运行在 `ARGUS_PROVISION_MODE=fugue`
+- `runtime`：非公网的模板 app，gateway 会复用它的当前镜像来创建每个 session app
+- `telegram-bot`：可选配套服务；只有在你提供 `TELEGRAM_BOT_TOKEN` 时才建议保留
+
+这份 manifest 故意没有把 `apps/web` 放进去，因为 Fugue 导入目前会忽略 Docker build args，而现有 web 构建依赖 `NEXT_PUBLIC_ARGUS_WS_URL`。
+
+由于 gateway 需要 `ARGUS_FUGUE_PROJECT_ID`，Fugue 部署不是单步导入，而是先准备 project，再部署进去：
+
+```bash
+# 1) 先创建或选定一个 project，并拿到它的 id。
+fugue --tenant <tenant> project create argus
+fugue --tenant <tenant> -o json project ls
+
+# 2) 填写部署到 Fugue 的环境变量文件。
+cp .env.fugue.example .env.fugue
+
+# 3) 从本地源码或 GitHub 直接部署。
+fugue --tenant <tenant> --project argus deploy . --env-file .env.fugue
+# 或
+fugue --tenant <tenant> --project argus deploy github yym68686/argus --env-file .env.fugue
+```
+
+说明：
+
+- `.env.fugue` 里的 `ARGUS_FUGUE_PROJECT_ID` 必须是 `--project` 对应现有 project 的 id。
+- gateway 通过 `ARGUS_FUGUE_RUNTIME_COMPOSE_SERVICE=runtime` 解析 runtime 模板镜像，不依赖最终 app 名，所以即使 Fugue 因命名冲突给 app 自动加后缀，也不会失效。
+- 如果你在 Fugue 上暂时不需要 Telegram，把 [fugue.yaml](/Users/yanyuming/Downloads/GitHub/argus/fugue.yaml) 里的 `telegram-bot` 服务删掉再部署即可。
 
 ### OpenAI 代理与 API 渠道
 

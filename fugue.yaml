@@ -1,0 +1,47 @@
+version: 1
+primary_service: gateway
+
+services:
+  gateway:
+    public: true
+    port: 8080
+    build:
+      strategy: dockerfile
+      context: .
+      dockerfile: apps/api/Dockerfile
+    env:
+      ARGUS_PROVISION_MODE: fugue
+      ARGUS_HOME_HOST_PATH: /data/argus
+      ARGUS_FUGUE_GATEWAY_COMPOSE_SERVICE: gateway
+      ARGUS_FUGUE_RUNTIME_COMPOSE_SERVICE: runtime
+      ARGUS_RUNTIME_CMD: codex app-server
+    depends_on:
+      - runtime
+    volumes:
+      - ./.fugue/gateway-data:/data/argus
+
+  runtime:
+    port: 7777
+    build:
+      strategy: dockerfile
+      context: .
+      dockerfile: Dockerfile
+    env:
+      APP_SERVER_CMD: codex app-server
+      ARGUS_CODEX_MCP_URL: http://gateway:8080/mcp
+
+  # Optional but enabled by default for the main Argus deployment shape.
+  # If you do not want Telegram support on Fugue, remove this service before deploy.
+  telegram-bot:
+    build:
+      strategy: dockerfile
+      context: .
+      dockerfile: apps/telegram-bot/Dockerfile
+    env:
+      ARGUS_GATEWAY_WS_URL: ws://gateway:8080/ws
+      ARGUS_GATEWAY_HTTP_URL: http://gateway:8080
+      STATE_PATH: /data/state.json
+    depends_on:
+      - gateway
+    volumes:
+      - ./.fugue/telegram-bot-data:/data

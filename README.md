@@ -86,7 +86,7 @@ How changes take effect:
 
 | Variable | Required? | Default | What it does / notes |
 | --- | --- | --- | --- |
-| `ARGUS_PROVISION_MODE` | Only if you want to override auto-detection | Code default is `auto`; the provided Compose file also defaults to `auto` | `auto` resolves in this order: `fugue` when complete Fugue config is present, then `docker` when a Docker endpoint is available, otherwise `static`. `docker` means each `/ws` session auto-creates its own runtime container. `fugue` means each managed session auto-creates a dedicated Fugue app/service inside one project. `static` means the gateway proxies to pre-existing upstream app-servers instead. |
+| `ARGUS_PROVISION_MODE` | Only if you want to override auto-detection | Code default is `auto`; the provided Compose file also defaults to `auto` | `auto` resolves in this order: `fugue` when complete Fugue config is present, then `docker` when a Docker endpoint is available, otherwise `static`. Fugue completeness means base URL + token + project id + a runtime source (`ARGUS_FUGUE_RUNTIME_IMAGE`, `ARGUS_FUGUE_RUNTIME_APP_ID`, `ARGUS_FUGUE_RUNTIME_APP_NAME`, or `ARGUS_FUGUE_RUNTIME_COMPOSE_SERVICE`) + a gateway callback target (`ARGUS_GATEWAY_INTERNAL_HOST` or `ARGUS_FUGUE_GATEWAY_COMPOSE_SERVICE`). `docker` means each `/ws` session auto-creates its own runtime container. `fugue` means each managed session auto-creates a dedicated Fugue app/service inside one project. `static` means the gateway proxies to pre-existing upstream app-servers instead. |
 | `ARGUS_RUNTIME_IMAGE` | Optional | `argus-runtime` | Docker image tag used for spawned runtime session containers. |
 | `ARGUS_DOCKER_NETWORK` | Optional | `argus-net` | Docker network that both the gateway and runtime containers join. |
 | `ARGUS_RUNTIME_INSTALL_CMD` | Optional | `npm i -g @openai/codex` | **Build-time** install command for the runtime image (`Dockerfile` build arg `APP_SERVER_INSTALL_CMD`). Change this when swapping the bundled runtime; rebuild afterward. |
@@ -107,9 +107,13 @@ How changes take effect:
 | `ARGUS_FUGUE_BASE_URL` | Required in `fugue` mode | unset | Base URL of the Fugue API server, for example `https://fugue.example.com`. |
 | `ARGUS_FUGUE_TOKEN` | Required in `fugue` mode | unset | Bearer token used by the gateway to create, inspect, restart, and delete session apps. |
 | `ARGUS_FUGUE_PROJECT_ID` | Required in `fugue` mode | unset | Fugue project that should contain the gateway-managed session apps. One logical Argus session maps to one Fugue app inside this project. |
-| `ARGUS_FUGUE_RUNTIME_IMAGE` | Required in `fugue` mode unless `ARGUS_RUNTIME_IMAGE` is set | unset | Published runtime image reference for session apps. This should be the same app-server image you would otherwise run in Docker mode. |
+| `ARGUS_FUGUE_RUNTIME_IMAGE` | Optional in `fugue` mode when one of the runtime app selectors below is set | unset | Explicit runtime image reference for newly created session apps. Use this when you already publish the runtime image yourself. |
+| `ARGUS_FUGUE_RUNTIME_APP_ID` | Optional | unset | Resolve the session image from an already deployed Fugue app id. |
+| `ARGUS_FUGUE_RUNTIME_APP_NAME` | Optional | unset | Resolve the session image from an already deployed Fugue app name inside `ARGUS_FUGUE_PROJECT_ID`. |
+| `ARGUS_FUGUE_RUNTIME_COMPOSE_SERVICE` | Optional | unset | Resolve the session image from the Fugue app whose `source.compose_service` matches this value inside `ARGUS_FUGUE_PROJECT_ID`. This is the most robust option for the bundled `fugue.yaml`, because it survives app-name suffixing when the project already contains conflicting names. |
 | `ARGUS_FUGUE_RUNTIME_ID` | Optional | `runtime_managed_shared` | Fugue runtime target id used for newly created session apps. |
-| `ARGUS_GATEWAY_INTERNAL_HOST` | Required in `fugue` mode | Docker mode auto-detects the gateway container name, then falls back to `gateway` | Cluster-internal hostname that Fugue session apps should use when calling back into the gateway (`/mcp`, `/nodes/ws`, `/openai/v1`). In Fugue mode this should resolve from other apps inside the same cluster/project. |
+| `ARGUS_GATEWAY_INTERNAL_HOST` | Required in `fugue` mode unless `ARGUS_FUGUE_GATEWAY_COMPOSE_SERVICE` is set | Docker mode auto-detects the gateway container name, then falls back to `gateway` | Cluster-internal hostname that Fugue session apps should use when calling back into the gateway (`/mcp`, `/nodes/ws`, `/openai/v1`). In Fugue mode this should resolve from other apps inside the same cluster/project. |
+| `ARGUS_FUGUE_GATEWAY_COMPOSE_SERVICE` | Optional | unset | Compute the gateway callback hostname from the Fugue project id plus a `compose_service` alias instead of hard-coding the final app name. Use `gateway` for the bundled `fugue.yaml`. |
 | `ARGUS_FUGUE_WORKSPACE_MOUNT_PATH` | Optional | `/workspace` | Container path where Fugue mounts each session app's persistent storage. |
 | `ARGUS_FUGUE_WORKSPACE_STORAGE_SIZE` | Optional | `10Gi` | Requested persistent storage size for each Fugue-managed session app. |
 | `ARGUS_FUGUE_WORKSPACE_STORAGE_CLASS` | Optional | unset | Storage class name for Fugue-managed workspaces, when you need a specific PVC class. |
@@ -309,6 +313,39 @@ Default runtime (Codex):
 - Build/install command: `ARGUS_RUNTIME_INSTALL_CMD` (defaults to installing `@openai/codex`)
 - Start command: `ARGUS_RUNTIME_CMD` (defaults to `codex app-server`)
 - The base runtime image includes a few common CLI tools by default, including `curl`, `git`, `rg`, and `strings`.
+- The root `Dockerfile` now falls back to `npm i -g @openai/codex` when `APP_SERVER_INSTALL_CMD` is not provided, which makes the bundled Fugue `runtime` service buildable without Docker Compose-only build args.
+
+## Deploy To Fugue
+
+This repo now ships with [fugue.yaml](/Users/yanyuming/Downloads/GitHub/argus/fugue.yaml). The intended Fugue topology is:
+
+- `gateway`: public service, runs in `ARGUS_PROVISION_MODE=fugue`
+- `runtime`: non-public template app whose current image is reused for per-session Fugue apps
+- `telegram-bot`: optional companion service; keep it only when `TELEGRAM_BOT_TOKEN` is set
+
+The bundled manifest intentionally does **not** include `apps/web`, because Fugue import currently ignores Docker build args and the current web build depends on `NEXT_PUBLIC_ARGUS_WS_URL`.
+
+Because the gateway needs `ARGUS_FUGUE_PROJECT_ID`, Fugue deployment is a two-step flow: create/select the project first, then deploy into it.
+
+```bash
+# 1) Create or choose a project, then capture its id.
+fugue --tenant <tenant> project create argus
+fugue --tenant <tenant> -o json project ls
+
+# 2) Fill the runtime env file used by the deployed services.
+cp .env.fugue.example .env.fugue
+
+# 3) Deploy from local source or directly from GitHub.
+fugue --tenant <tenant> --project argus deploy . --env-file .env.fugue
+# or
+fugue --tenant <tenant> --project argus deploy github yym68686/argus --env-file .env.fugue
+```
+
+Notes:
+
+- Set `ARGUS_FUGUE_PROJECT_ID` inside `.env.fugue` to the id of the existing project selected by `--project`.
+- The gateway resolves the runtime template via `ARGUS_FUGUE_RUNTIME_COMPOSE_SERVICE=runtime`, so it does not depend on the final Fugue app name and still works if Fugue adds a random suffix to avoid naming conflicts.
+- If you do not want Telegram on Fugue, remove the `telegram-bot` service from [fugue.yaml](/Users/yanyuming/Downloads/GitHub/argus/fugue.yaml) before deploy.
 
 ### OpenAI proxy & API channels
 
