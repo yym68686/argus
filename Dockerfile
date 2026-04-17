@@ -8,6 +8,7 @@ FROM node:22-trixie-slim
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
   binutils \
+  bubblewrap \
   ca-certificates \
   curl \
   git \

@@ -217,6 +217,7 @@ class LiveRuntimeSession:
     pending_client_turn_starts: dict[str, str]
 
     turn_owners_by_thread: dict[str, WebSocket]
+    non_json_lines_dropped: int = 0
 
     closed: bool = False
 
@@ -11215,68 +11216,95 @@ async def _activate_live_session(live: LiveRuntimeSession) -> LiveRuntimeSession
                     break
                 text = raw.decode("utf-8", errors="replace").rstrip("\r")
 
-                msg: Any = None
                 try:
-                    msg = json.loads(text)
+                    msg: Any = json.loads(text)
                 except Exception:
-                    msg = None
+                    live.non_json_lines_dropped += 1
+                    preview = text.strip()
+                    if len(preview) > 240:
+                        preview = preview[:240] + "..."
+                    if live.non_json_lines_dropped <= 3:
+                        log.warning(
+                            "Dropping non-JSON upstream line for session %s (%d): %s",
+                            session_id,
+                            live.non_json_lines_dropped,
+                            preview,
+                        )
+                    elif live.non_json_lines_dropped == 4:
+                        log.warning("Further non-JSON upstream lines will be suppressed for session %s", session_id)
+                    continue
+
+                if not isinstance(msg, dict):
+                    live.non_json_lines_dropped += 1
+                    preview = text.strip()
+                    if len(preview) > 240:
+                        preview = preview[:240] + "..."
+                    if live.non_json_lines_dropped <= 3:
+                        log.warning(
+                            "Dropping non-object upstream JSON for session %s (%d): %s",
+                            session_id,
+                            live.non_json_lines_dropped,
+                            preview,
+                        )
+                    elif live.non_json_lines_dropped == 4:
+                        log.warning("Further malformed upstream frames will be suppressed for session %s", session_id)
+                    continue
 
                 should_broadcast = True
-                if isinstance(msg, dict):
-                    if "id" in msg and "method" in msg:
-                        rid = str(msg.get("id"))
-                        if rid not in live.pending_server_requests:
-                            live.pending_server_requests[rid] = text
-                        params = msg.get("params")
-                        thread_id: Optional[str] = None
-                        if isinstance(params, dict):
-                            tid = params.get("threadId")
-                            if isinstance(tid, str) and tid.strip():
-                                thread_id = tid.strip()
-                        await live.deliver_server_request(text, thread_id=thread_id)
-                        continue
+                if "id" in msg and "method" in msg:
+                    rid = str(msg.get("id"))
+                    if rid not in live.pending_server_requests:
+                        live.pending_server_requests[rid] = text
+                    params = msg.get("params")
+                    thread_id: Optional[str] = None
+                    if isinstance(params, dict):
+                        tid = params.get("threadId")
+                        if isinstance(tid, str) and tid.strip():
+                            thread_id = tid.strip()
+                    await live.deliver_server_request(text, thread_id=thread_id)
+                    continue
 
-                    if "id" in msg and "method" not in msg:
-                        rid = str(msg.get("id"))
-                        should_resolve = False
-                        client_turn_start_thread_id: Optional[str] = None
-                        async with live.attach_lock:
-                            if rid in live.pending_initialize_ids:
-                                live.pending_initialize_ids.discard(rid)
-                                if isinstance(msg.get("result"), dict):
-                                    live.initialized_result = msg["result"]
-                                    should_resolve = True
-                            client_turn_start_thread_id = live.pending_client_turn_starts.pop(rid, None)
-                        if should_resolve:
-                            await live.resolve_initialize_waiters()
-                        if client_turn_start_thread_id:
-                            automation: Optional[AutomationManager] = getattr(app.state, "automation", None)
-                            if automation is not None:
-                                try:
-                                    await automation.on_client_turn_start_response(session_id, client_turn_start_thread_id, msg)
-                                except Exception:
-                                    log.exception("Automation client turn-start response handler failed")
-                        await live.resolve_internal_response(msg)
-                        await live.deliver_response(msg)
-                        continue
-
-                    if "method" in msg and "id" not in msg:
-                        automation = getattr(app.state, "automation", None)
+                if "id" in msg and "method" not in msg:
+                    rid = str(msg.get("id"))
+                    should_resolve = False
+                    client_turn_start_thread_id: Optional[str] = None
+                    async with live.attach_lock:
+                        if rid in live.pending_initialize_ids:
+                            live.pending_initialize_ids.discard(rid)
+                            if isinstance(msg.get("result"), dict):
+                                live.initialized_result = msg["result"]
+                                should_resolve = True
+                        client_turn_start_thread_id = live.pending_client_turn_starts.pop(rid, None)
+                    if should_resolve:
+                        await live.resolve_initialize_waiters()
+                    if client_turn_start_thread_id:
+                        automation: Optional[AutomationManager] = getattr(app.state, "automation", None)
                         if automation is not None:
                             try:
-                                automation.on_upstream_notification(session_id, msg)
-                                if automation._is_heartbeat_commentary_notification(session_id, msg):
-                                    should_broadcast = False
-                                text = json.dumps(msg)
+                                await automation.on_client_turn_start_response(session_id, client_turn_start_thread_id, msg)
                             except Exception:
-                                log.exception("Automation notification handler failed")
+                                log.exception("Automation client turn-start response handler failed")
+                    await live.resolve_internal_response(msg)
+                    await live.deliver_response(msg)
+                    continue
 
-                    if msg.get("method") == "turn/completed":
-                        params = msg.get("params")
-                        if isinstance(params, dict):
-                            tid = params.get("threadId")
-                            if isinstance(tid, str) and tid.strip():
-                                await live.clear_turn_owner(tid.strip())
+                if "method" in msg and "id" not in msg:
+                    automation = getattr(app.state, "automation", None)
+                    if automation is not None:
+                        try:
+                            automation.on_upstream_notification(session_id, msg)
+                            if automation._is_heartbeat_commentary_notification(session_id, msg):
+                                should_broadcast = False
+                            text = json.dumps(msg)
+                        except Exception:
+                            log.exception("Automation notification handler failed")
+
+                if msg.get("method") == "turn/completed":
+                    params = msg.get("params")
+                    if isinstance(params, dict):
+                        tid = params.get("threadId")
+                        if isinstance(tid, str) and tid.strip():
+                            await live.clear_turn_owner(tid.strip())
 
                 if should_broadcast:
                     await live.broadcast(text)
