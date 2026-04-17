@@ -8657,6 +8657,11 @@ async def healthz():
     return {"ok": True}
 
 
+@app.get("/readyz")
+async def readyz():
+    return {"ok": True}
+
+
 @app.get("/")
 async def index():
     return PlainTextResponse("Argus gateway is running. Optional web UI runs separately (see README.md).")
