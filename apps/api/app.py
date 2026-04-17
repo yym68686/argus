@@ -8063,6 +8063,22 @@ def _configured_provision_mode() -> str:
     return (os.getenv("ARGUS_PROVISION_MODE") or "").strip().lower()
 
 
+def _configured_home_host_path() -> Optional[str]:
+    return (
+        os.getenv("ARGUS_FUGUE_HOME_PATH")
+        or os.getenv("ARGUS_HOME_HOST_PATH")
+        or None
+    )
+
+
+def _configured_workspace_host_path() -> Optional[str]:
+    return (
+        os.getenv("ARGUS_FUGUE_WORKSPACE_PATH")
+        or os.getenv("ARGUS_WORKSPACE_HOST_PATH")
+        or None
+    )
+
+
 def _running_in_kubernetes() -> bool:
     host = (os.getenv("KUBERNETES_SERVICE_HOST") or "").strip()
     return bool(host and os.path.exists(KUBERNETES_SERVICEACCOUNT_TOKEN_PATH))
@@ -8611,8 +8627,8 @@ async def _startup():
             _provisioner_mode_name(),
         )
 
-    home_host_path = os.getenv("ARGUS_HOME_HOST_PATH") or None
-    workspace_host_path = os.getenv("ARGUS_WORKSPACE_HOST_PATH") or None
+    home_host_path = _configured_home_host_path()
+    workspace_host_path = _configured_workspace_host_path()
     if home_host_path:
         state_path = Path(home_host_path) / "gateway" / "state.json"
     else:
@@ -10636,8 +10652,8 @@ def _docker_cfg() -> DockerProvisionConfig:
     image = os.getenv("ARGUS_RUNTIME_IMAGE", "argus-runtime")
     network = os.getenv("ARGUS_DOCKER_NETWORK", "argus-net")
 
-    home_host_path = os.getenv("ARGUS_HOME_HOST_PATH") or None
-    workspace_host_path = os.getenv("ARGUS_WORKSPACE_HOST_PATH") or None
+    home_host_path = _configured_home_host_path()
+    workspace_host_path = _configured_workspace_host_path()
     runtime_cmd = os.getenv("ARGUS_RUNTIME_CMD") or None
 
     if home_host_path and not os.path.isabs(home_host_path):
@@ -11915,8 +11931,8 @@ async def _ensure_live_fugue_session(session_id: str, *, allow_create: bool) -> 
     cfg = _fugue_cfg()
     workspace_host_path = _resolve_workspace_host_path_for_session(session_id) or _derive_default_workspace_host_path_for_session(
         session_id,
-        home_host_path=os.getenv("ARGUS_HOME_HOST_PATH") or None,
-        workspace_base_host_path=os.getenv("ARGUS_WORKSPACE_HOST_PATH") or None,
+        home_host_path=_configured_home_host_path(),
+        workspace_base_host_path=_configured_workspace_host_path(),
     )
     if not workspace_host_path:
         raise RuntimeError("workspace root is not configured (ARGUS_HOME_HOST_PATH/ARGUS_WORKSPACE_HOST_PATH)")
@@ -13595,8 +13611,8 @@ async def ws_proxy(ws: WebSocket):
                 if not allow_create:
                     derived = _derive_default_workspace_host_path_for_session(
                         requested_session,
-                        home_host_path=os.getenv("ARGUS_HOME_HOST_PATH") or None,
-                        workspace_base_host_path=os.getenv("ARGUS_WORKSPACE_HOST_PATH") or None,
+                        home_host_path=_configured_home_host_path(),
+                        workspace_base_host_path=_configured_workspace_host_path(),
                     )
                     if derived and Path(derived).is_dir():
                         allow_create = True

@@ -1,9 +1,9 @@
 version: 1
-primary_service: gateway
+primary_service: web
 
 services:
   gateway:
-    public: true
+    network_mode: internal
     port: 8080
     build:
       strategy: dockerfile
@@ -11,14 +11,18 @@ services:
       dockerfile: apps/api/Dockerfile
     env:
       ARGUS_PROVISION_MODE: fugue
-      ARGUS_HOME_HOST_PATH: /data/argus
+      ARGUS_FUGUE_HOME_PATH: /data/argus
       ARGUS_FUGUE_GATEWAY_COMPOSE_SERVICE: gateway
       ARGUS_FUGUE_RUNTIME_COMPOSE_SERVICE: runtime
       ARGUS_RUNTIME_CMD: codex app-server
-    volumes:
-      - ./.fugue/gateway-data:/data/argus
+    persistent_storage:
+      storage_size: 512Mi
+      mounts:
+        - kind: directory
+          path: /data/argus
 
   runtime:
+    network_mode: internal
     port: 7777
     build:
       strategy: dockerfile
@@ -27,3 +31,34 @@ services:
     env:
       APP_SERVER_CMD: codex app-server
       ARGUS_CODEX_MCP_URL: http://gateway:8080/mcp
+
+  web:
+    public: true
+    port: 80
+    build:
+      strategy: dockerfile
+      context: apps/web
+      dockerfile: Dockerfile
+    env:
+      ARGUS_GATEWAY_HTTP_URL: http://gateway:8080
+    depends_on:
+      - gateway
+
+  telegram-bot:
+    network_mode: background
+    build:
+      strategy: dockerfile
+      context: .
+      dockerfile: apps/telegram-bot/Dockerfile
+    env:
+      ARGUS_GATEWAY_HTTP_URL: http://gateway:8080
+      ARGUS_GATEWAY_WS_URL: ws://gateway:8080/ws
+      ARGUS_CWD: /workspace
+      STATE_PATH: /data/state.json
+    depends_on:
+      - gateway
+    persistent_storage:
+      storage_size: 256Mi
+      mounts:
+        - kind: directory
+          path: /data

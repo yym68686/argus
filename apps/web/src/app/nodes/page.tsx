@@ -38,6 +38,12 @@ function httpBaseFromWsUrl(url: string): string {
   }
 }
 
+function nodeApiUrl(httpBase: string, path: string): string {
+  const trimmed = path.startsWith("/") ? path.slice(1) : path;
+  const suffix = trimmed ? `/${trimmed}` : "";
+  return new URL(`/api/nodes${suffix}`, httpBase).toString();
+}
+
 function extractTokenFromWsUrl(url: string): string {
   try {
     const parsed = new URL(url);
@@ -122,9 +128,9 @@ export default function NodesPage() {
     setLoading(true);
     setError(null);
     try {
-      const url = new URL("/nodes", httpBase);
+      const url = nodeApiUrl(httpBase, "");
       if (token) url.searchParams.set("token", token);
-      const res = await fetch(url.toString(), { cache: "no-store" });
+      const res = await fetch(url, { cache: "no-store" });
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       const data = (await res.json()) as { nodes?: NodeInfo[] };
       const nextNodes = Array.isArray(data.nodes) ? data.nodes : [];
@@ -160,7 +166,7 @@ export default function NodesPage() {
 
     setLoading(true);
     try {
-      const url = new URL("/nodes/invoke", httpBase);
+      const url = new URL(nodeApiUrl(httpBase, "invoke"));
       if (token) url.searchParams.set("token", token);
       const res = await fetch(url.toString(), {
         method: "POST",
@@ -209,8 +215,8 @@ export default function NodesPage() {
         <div className="flex flex-col gap-2">
           <h1 className="text-2xl font-semibold tracking-tight">Nodes</h1>
           <p className="text-sm text-muted-foreground">
-            Minimal node management + invoke tester. Node host connects to{" "}
-            <code className="rounded bg-muted px-1 py-0.5">/nodes/ws</code>.
+            Minimal node management + invoke tester. The web UI talks to the gateway through{" "}
+            <code className="rounded bg-muted px-1 py-0.5">/api/nodes</code>.
           </p>
         </div>
 
