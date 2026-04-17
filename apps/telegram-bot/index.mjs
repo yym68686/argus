@@ -1,11 +1,14 @@
 import process from "node:process";
 import crypto from "node:crypto";
+import http from "node:http";
 import { readFileSync } from "node:fs";
 import fs from "node:fs/promises";
 import path from "node:path";
 import WebSocket from "ws";
 
 const DEFAULT_BOT_VERSION = "0.0.0";
+const TELEGRAM_WEBHOOK_PATH = "/telegram/webhook";
+const TELEGRAM_WEBHOOK_BODY_LIMIT_BYTES = 1024 * 1024;
 
 function loadBotVersion() {
   const override = typeof process.env.ARGUS_VERSION === "string" ? process.env.ARGUS_VERSION.trim() : "";
@@ -63,6 +66,16 @@ function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+function waitForServerClose(server) {
+  return new Promise((resolve) => {
+    if (!server) {
+      resolve();
+      return;
+    }
+    server.close(() => resolve());
+  });
+}
+
 function parseJson(text) {
   try {
     return JSON.parse(text);
@@ -107,6 +120,134 @@ function stripOuterQuotes(value) {
 function clampNumber(value, fallback) {
   const n = Number(value);
   return Number.isFinite(n) ? n : fallback;
+}
+
+function normalizeTelegramDeliveryMode(value) {
+  const raw = isNonEmptyString(value) ? value.trim().toLowerCase() : "";
+  if (raw === "polling" || raw === "webhook") return raw;
+  return "auto";
+}
+
+function deriveTelegramWebhookUrl(explicitUrl, appUrl) {
+  const direct = stripOuterQuotes(explicitUrl);
+  if (isNonEmptyString(direct)) return direct.replace(/\/+$/, "");
+  const base = stripOuterQuotes(appUrl);
+  if (!isNonEmptyString(base)) return null;
+  return `${base.replace(/\/+$/, "")}${TELEGRAM_WEBHOOK_PATH}`;
+}
+
+function deriveTelegramWebhookSecret(explicitSecret, telegramToken, appId) {
+  const direct = stripOuterQuotes(explicitSecret);
+  if (isNonEmptyString(direct)) return direct;
+  const salt = isNonEmptyString(appId) ? appId.trim() : "telegram-bot";
+  return crypto.createHash("sha256").update(`${telegramToken}:${salt}`, "utf8").digest("base64url").slice(0, 48);
+}
+
+function resolveTelegramWebhookConfig({ deliveryMode, explicitUrl, appUrl, explicitSecret, telegramToken, appId }) {
+  const normalizedMode = normalizeTelegramDeliveryMode(deliveryMode);
+  const webhookUrl = deriveTelegramWebhookUrl(explicitUrl, appUrl);
+  const wantsWebhook = normalizedMode === "webhook" || (normalizedMode === "auto" && isNonEmptyString(webhookUrl));
+  if (!wantsWebhook) {
+    return { mode: "polling" };
+  }
+  if (!isNonEmptyString(webhookUrl)) {
+    throw new Error("TELEGRAM_DELIVERY_MODE=webhook requires TELEGRAM_WEBHOOK_URL or FUGUE_APP_URL");
+  }
+  let parsed;
+  try {
+    parsed = new URL(webhookUrl);
+  } catch (e) {
+    throw new Error(`Invalid Telegram webhook URL: ${e instanceof Error ? e.message : String(e)}`);
+  }
+  if (!/^https?:$/.test(parsed.protocol)) {
+    throw new Error(`Unsupported Telegram webhook protocol: ${parsed.protocol}`);
+  }
+  return {
+    mode: "webhook",
+    url: parsed.toString(),
+    path: parsed.pathname || TELEGRAM_WEBHOOK_PATH,
+    secretToken: deriveTelegramWebhookSecret(explicitSecret, telegramToken, appId)
+  };
+}
+
+async function startTelegramWebhookServer({ port, path: pathName, secretToken, onUpdate }) {
+  const expectedPath = isNonEmptyString(pathName) ? pathName : TELEGRAM_WEBHOOK_PATH;
+  return await new Promise((resolve, reject) => {
+    const server = http.createServer((req, res) => {
+      let requestPath = "/";
+      try {
+        requestPath = new URL(req.url || "/", "http://127.0.0.1").pathname;
+      } catch {
+        requestPath = req.url || "/";
+      }
+
+      if (req.method === "GET" && (requestPath === "/healthz" || requestPath === "/readyz")) {
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify({ ok: true }));
+        return;
+      }
+
+      if (requestPath !== expectedPath) {
+        res.writeHead(404, { "content-type": "text/plain; charset=utf-8" });
+        res.end("not found");
+        return;
+      }
+      if (req.method !== "POST") {
+        res.writeHead(405, { "allow": "POST", "content-type": "text/plain; charset=utf-8" });
+        res.end("method not allowed");
+        return;
+      }
+      if (isNonEmptyString(secretToken)) {
+        const header = req.headers["x-telegram-bot-api-secret-token"];
+        const received = Array.isArray(header) ? header[0] : header;
+        if (received !== secretToken) {
+          res.writeHead(403, { "content-type": "text/plain; charset=utf-8" });
+          res.end("forbidden");
+          return;
+        }
+      }
+
+      let totalBytes = 0;
+      let ended = false;
+      const chunks = [];
+      req.on("data", (chunk) => {
+        if (ended) return;
+        totalBytes += chunk.length;
+        if (totalBytes > TELEGRAM_WEBHOOK_BODY_LIMIT_BYTES) {
+          ended = true;
+          res.writeHead(413, { "content-type": "text/plain; charset=utf-8" });
+          res.end("payload too large");
+          req.destroy();
+          return;
+        }
+        chunks.push(chunk);
+      });
+      req.on("end", () => {
+        if (ended) return;
+        const update = parseJson(Buffer.concat(chunks).toString("utf8"));
+        if (!isObjectRecord(update)) {
+          res.writeHead(400, { "content-type": "text/plain; charset=utf-8" });
+          res.end("bad request");
+          return;
+        }
+        res.writeHead(200, { "content-type": "text/plain; charset=utf-8" });
+        res.end("ok");
+        Promise.resolve(onUpdate(update)).catch((e) => {
+          log("Webhook update failed:", e instanceof Error ? e.message : String(e));
+        });
+      });
+      req.on("error", (e) => {
+        if (!res.headersSent) {
+          res.writeHead(400, { "content-type": "text/plain; charset=utf-8" });
+          res.end("bad request");
+        }
+        log("Telegram webhook request error:", e instanceof Error ? e.message : String(e));
+      });
+    });
+
+    server.on("error", reject);
+    server.listen(port, "0.0.0.0", () => resolve(server));
+  });
 }
 
 function nowMs() {
@@ -325,6 +466,18 @@ class TelegramApi {
 
   async getUpdates(params) {
     return await this.call("getUpdates", params);
+  }
+
+  async setWebhook(params) {
+    return await this.call("setWebhook", params);
+  }
+
+  async deleteWebhook(params) {
+    return await this.call("deleteWebhook", params);
+  }
+
+  async getWebhookInfo() {
+    return await this.call("getWebhookInfo", {});
   }
 
   async sendMessage(params) {
@@ -1963,6 +2116,16 @@ async function main() {
   const state = new StateStore(statePath);
   await state.load();
   log("State path:", statePath);
+  const telegramDelivery = resolveTelegramWebhookConfig({
+    deliveryMode: process.env.TELEGRAM_DELIVERY_MODE,
+    explicitUrl: process.env.TELEGRAM_WEBHOOK_URL,
+    appUrl: process.env.FUGUE_APP_URL,
+    explicitSecret: process.env.TELEGRAM_WEBHOOK_SECRET,
+    telegramToken,
+    appId: process.env.FUGUE_APP_ID
+  });
+  const webhookListenPort = Math.max(1, clampNumber(process.env.PORT, 8080));
+  let webhookServer = null;
 
   // HTTP-only helper (does not need a WS connection).
   const argusHttp = new ArgusClient({ gatewayHttpUrl, gatewayWsUrl, token: argusToken, cwd });
@@ -2140,6 +2303,29 @@ async function main() {
   }
 
   const queue = new SerialQueue();
+  const webhookPendingUpdates = [];
+  const webhookWaiters = [];
+
+  function enqueueWebhookUpdate(update) {
+    if (!isObjectRecord(update)) return;
+    if (webhookWaiters.length > 0) {
+      const resolve = webhookWaiters.shift();
+      if (typeof resolve === "function") {
+        resolve([update]);
+        return;
+      }
+    }
+    webhookPendingUpdates.push(update);
+  }
+
+  async function nextWebhookUpdates() {
+    if (webhookPendingUpdates.length > 0) {
+      return webhookPendingUpdates.splice(0, webhookPendingUpdates.length);
+    }
+    return await new Promise((resolve) => {
+      webhookWaiters.push(resolve);
+    });
+  }
 
   function chatIdFromChatKey(chatKey) {
     if (!isNonEmptyString(chatKey)) return null;
@@ -4653,40 +4839,81 @@ async function main() {
     await answerOnce(S.msg_unsupported_cb);
   }
 
-  let offset;
-  if (Number.isFinite(state.state.lastUpdateId)) {
-    offset = state.state.lastUpdateId + 1;
+  let offset = 0;
+  if (telegramDelivery.mode === "webhook") {
+    webhookServer = await startTelegramWebhookServer({
+      port: webhookListenPort,
+      path: telegramDelivery.path,
+      secretToken: telegramDelivery.secretToken,
+      onUpdate: enqueueWebhookUpdate
+    });
+    try {
+      await tg.setWebhook({
+        url: telegramDelivery.url,
+        secret_token: telegramDelivery.secretToken,
+        allowed_updates: ["message", "callback_query"],
+        drop_pending_updates: false
+      });
+      log("Telegram webhook enabled:", redactUrlSecrets(telegramDelivery.url));
+      const info = await tg.getWebhookInfo().catch(() => null);
+      if (isObjectRecord(info)) {
+        logEvent("INFO", "tg.webhook.enabled", {
+          url: redactUrlSecrets(info.url || telegramDelivery.url),
+          pending_update_count: Number.isFinite(info.pending_update_count) ? info.pending_update_count : undefined,
+          has_custom_certificate: info.has_custom_certificate === true
+        });
+      }
+    } catch (e) {
+      await waitForServerClose(webhookServer);
+      throw e;
+    }
+    log("Serving Telegram webhook…", `port=${webhookListenPort}`, `path=${telegramDelivery.path}`);
   } else {
     try {
-      const backlog = await tg.getUpdates({ offset: 0, timeout: 0, allowed_updates: ["message", "callback_query"] });
-      if (Array.isArray(backlog) && backlog.length > 0) {
-        const last = backlog[backlog.length - 1]?.update_id;
-        if (Number.isFinite(last)) {
-          offset = last + 1;
-          void state.setLastUpdateId(last);
-          log(`Skipped ${backlog.length} backlog updates (starting fresh).`);
+      await tg.deleteWebhook({ drop_pending_updates: false });
+    } catch (e) {
+      log("deleteWebhook failed (continuing):", e instanceof Error ? e.message : String(e));
+    }
+
+    if (Number.isFinite(state.state.lastUpdateId)) {
+      offset = state.state.lastUpdateId + 1;
+    } else {
+      try {
+        const backlog = await tg.getUpdates({ offset: 0, timeout: 0, allowed_updates: ["message", "callback_query"] });
+        if (Array.isArray(backlog) && backlog.length > 0) {
+          const last = backlog[backlog.length - 1]?.update_id;
+          if (Number.isFinite(last)) {
+            offset = last + 1;
+            void state.setLastUpdateId(last);
+            log(`Skipped ${backlog.length} backlog updates (starting fresh).`);
+          } else {
+            offset = 0;
+          }
         } else {
           offset = 0;
         }
-      } else {
+      } catch (e) {
         offset = 0;
+        log("Failed to flush backlog updates:", e instanceof Error ? e.message : String(e));
       }
-    } catch (e) {
-      offset = 0;
-      log("Failed to flush backlog updates:", e instanceof Error ? e.message : String(e));
     }
+
+    log("Polling Telegram updates…");
   }
 
-  log("Polling Telegram updates…");
   // eslint-disable-next-line no-constant-condition
   while (true) {
     let updates = [];
-    try {
-      updates = await tg.getUpdates({ offset, timeout: 50, allowed_updates: ["message", "callback_query"] });
-    } catch (e) {
-      log("getUpdates failed:", e instanceof Error ? e.message : String(e));
-      await sleep(2000);
-      continue;
+    if (telegramDelivery.mode === "webhook") {
+      updates = await nextWebhookUpdates();
+    } else {
+      try {
+        updates = await tg.getUpdates({ offset, timeout: 50, allowed_updates: ["message", "callback_query"] });
+      } catch (e) {
+        log("getUpdates failed:", e instanceof Error ? e.message : String(e));
+        await sleep(2000);
+        continue;
+      }
     }
 
     if (!Array.isArray(updates) || updates.length === 0) continue;
@@ -4694,7 +4921,10 @@ async function main() {
     for (const upd of updates) {
       const updateId = upd?.update_id;
       if (Number.isFinite(updateId)) {
-        offset = updateId + 1;
+        if (telegramDelivery.mode === "webhook" && Number.isFinite(state.state.lastUpdateId) && updateId <= state.state.lastUpdateId) {
+          continue;
+        }
+        if (telegramDelivery.mode !== "webhook") offset = updateId + 1;
         void state.setLastUpdateId(updateId);
       }
 

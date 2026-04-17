@@ -46,7 +46,8 @@ services:
       - gateway
 
   telegram-bot:
-    network_mode: background
+    public: true
+    port: 8080
     build:
       strategy: dockerfile
       context: .
@@ -56,6 +57,7 @@ services:
       ARGUS_GATEWAY_WS_URL: ws://gateway:8080/ws
       ARGUS_CWD: /workspace
       STATE_PATH: /data/state.json
+      TELEGRAM_DELIVERY_MODE: auto
     depends_on:
       - gateway
     persistent_storage:
