@@ -106,6 +106,7 @@ How changes take effect:
 | --- | --- | --- | --- |
 | `ARGUS_FUGUE_BASE_URL` | Required in `fugue` mode | unset | Base URL of the Fugue API server, for example `https://fugue.example.com`. |
 | `ARGUS_FUGUE_TOKEN` | Required in `fugue` mode | unset | Bearer token used by the gateway to create, inspect, restart, and delete session apps. |
+| `ARGUS_FUGUE_TENANT_ID` | Optional | falls back to `FUGUE_TENANT_ID` | Tenant id for Fugue API calls. Set this when the gateway uses a multi-tenant bootstrap/admin key; tenant-scoped API keys can usually omit it. |
 | `ARGUS_FUGUE_PROJECT_ID` | Required in `fugue` mode | unset | Fugue project that should contain the gateway-managed session apps. One logical Argus session maps to one Fugue app inside this project. |
 | `ARGUS_FUGUE_RUNTIME_IMAGE` | Optional in `fugue` mode when one of the runtime app selectors below is set | unset | Explicit runtime image reference for newly created session apps. Use this when you already publish the runtime image yourself. |
 | `ARGUS_FUGUE_RUNTIME_APP_ID` | Optional | unset | Resolve the session image from an already deployed Fugue app id. |

@@ -169,6 +169,7 @@ class FugueProvisionConfig:
     project_id: str
     runtime_id: str
     gateway_internal_host: str
+    tenant_id: Optional[str] = None
     image: Optional[str] = None
     runtime_app_id: Optional[str] = None
     runtime_app_name: Optional[str] = None
@@ -395,6 +396,10 @@ class LiveRuntimeSession:
                 self.outbox.appendleft(raw)
                 await self.detach(ws)
                 break
+
+
+def _is_expected_websocket_receive_runtime_error(exc: RuntimeError) -> bool:
+    return "WebSocket is not connected" in str(exc or "")
 
     async def close_attached_websockets(self, *, code: int, reason: str) -> None:
         async with self.attach_lock:
@@ -8077,7 +8082,7 @@ def _fugue_detection_values() -> dict[str, str]:
     return {
         "base_url": (os.getenv("ARGUS_FUGUE_BASE_URL") or os.getenv("FUGUE_BASE_URL") or "").strip().rstrip("/"),
         "token": (os.getenv("ARGUS_FUGUE_TOKEN") or os.getenv("FUGUE_TOKEN") or "").strip(),
-        "project_id": (os.getenv("ARGUS_FUGUE_PROJECT_ID") or "").strip(),
+        "project_id": (os.getenv("ARGUS_FUGUE_PROJECT_ID") or os.getenv("FUGUE_PROJECT_ID") or "").strip(),
         "image": (os.getenv("ARGUS_FUGUE_RUNTIME_IMAGE") or os.getenv("ARGUS_RUNTIME_IMAGE") or "").strip(),
         "runtime_app_id": (os.getenv("ARGUS_FUGUE_RUNTIME_APP_ID") or "").strip(),
         "runtime_app_name": (os.getenv("ARGUS_FUGUE_RUNTIME_APP_NAME") or "").strip(),
@@ -8094,7 +8099,7 @@ def _fugue_detection_missing_fields() -> list[str]:
     required_fields = {
         "base_url": "ARGUS_FUGUE_BASE_URL/FUGUE_BASE_URL",
         "token": "ARGUS_FUGUE_TOKEN/FUGUE_TOKEN",
-        "project_id": "ARGUS_FUGUE_PROJECT_ID",
+        "project_id": "ARGUS_FUGUE_PROJECT_ID/FUGUE_PROJECT_ID",
     }
     missing = [env_name for field, env_name in required_fields.items() if not values.get(field)]
     has_runtime_source = any(
@@ -10677,12 +10682,13 @@ def _docker_cfg() -> DockerProvisionConfig:
 def _fugue_cfg() -> FugueProvisionConfig:
     base_url = (os.getenv("ARGUS_FUGUE_BASE_URL") or os.getenv("FUGUE_BASE_URL") or "").strip().rstrip("/")
     token = (os.getenv("ARGUS_FUGUE_TOKEN") or os.getenv("FUGUE_TOKEN") or "").strip()
-    project_id = (os.getenv("ARGUS_FUGUE_PROJECT_ID") or "").strip()
+    project_id = (os.getenv("ARGUS_FUGUE_PROJECT_ID") or os.getenv("FUGUE_PROJECT_ID") or "").strip()
+    tenant_id = (os.getenv("ARGUS_FUGUE_TENANT_ID") or os.getenv("FUGUE_TENANT_ID") or "").strip() or None
     image = (os.getenv("ARGUS_FUGUE_RUNTIME_IMAGE") or os.getenv("ARGUS_RUNTIME_IMAGE") or "").strip()
     runtime_app_id = (os.getenv("ARGUS_FUGUE_RUNTIME_APP_ID") or "").strip() or None
     runtime_app_name = (os.getenv("ARGUS_FUGUE_RUNTIME_APP_NAME") or "").strip() or None
     runtime_compose_service = (os.getenv("ARGUS_FUGUE_RUNTIME_COMPOSE_SERVICE") or "").strip() or None
-    runtime_id = (os.getenv("ARGUS_FUGUE_RUNTIME_ID") or "runtime_managed_shared").strip() or "runtime_managed_shared"
+    runtime_id = (os.getenv("ARGUS_FUGUE_RUNTIME_ID") or os.getenv("FUGUE_RUNTIME_ID") or "runtime_managed_shared").strip() or "runtime_managed_shared"
     gateway_internal_host = (
         os.getenv("ARGUS_GATEWAY_INTERNAL_HOST") or os.getenv("ARGUS_FUGUE_GATEWAY_INTERNAL_HOST") or ""
     ).strip()
@@ -10707,7 +10713,7 @@ def _fugue_cfg() -> FugueProvisionConfig:
     if not token:
         raise RuntimeError("ARGUS_FUGUE_TOKEN is required in fugue provision mode")
     if not project_id:
-        raise RuntimeError("ARGUS_FUGUE_PROJECT_ID is required in fugue provision mode")
+        raise RuntimeError("ARGUS_FUGUE_PROJECT_ID or FUGUE_PROJECT_ID is required in fugue provision mode")
     if not image and not runtime_app_id and not runtime_app_name and not runtime_compose_service:
         raise RuntimeError(
             "One of ARGUS_FUGUE_RUNTIME_IMAGE, ARGUS_RUNTIME_IMAGE, ARGUS_FUGUE_RUNTIME_APP_ID, "
@@ -10728,6 +10734,7 @@ def _fugue_cfg() -> FugueProvisionConfig:
         base_url=base_url,
         token=token,
         project_id=project_id,
+        tenant_id=tenant_id,
         image=image or None,
         runtime_app_id=runtime_app_id,
         runtime_app_name=runtime_app_name,
@@ -11431,6 +11438,15 @@ def _fugue_request_json_sync(
         payload = None
     if response.status_code not in expected_statuses:
         detail = _fugue_response_detail(payload)
+        if (
+            response.status_code == 404
+            and not cfg.tenant_id
+            and path == "/v1/apps/import-image"
+        ):
+            extra = (
+                "set ARGUS_FUGUE_TENANT_ID/FUGUE_TENANT_ID when using a multi-tenant Fugue bootstrap key"
+            )
+            detail = f"{detail}; {extra}" if detail else extra
         suffix = f": {detail}" if detail else ""
         raise RuntimeError(f"Fugue API {method} {path} failed with {response.status_code}{suffix}")
     return payload
@@ -11483,7 +11499,11 @@ def _fugue_list_apps_sync(cfg: FugueProvisionConfig) -> list[dict[str, Any]]:
         cfg,
         "GET",
         "/v1/apps",
-        params={"include_live_status": "true", "include_resource_usage": "false"},
+        params={
+            "include_live_status": "true",
+            "include_resource_usage": "false",
+            **({"tenant_id": cfg.tenant_id} if cfg.tenant_id else {}),
+        },
         expected_statuses=(200,),
     )
     apps = payload.get("apps") if isinstance(payload, dict) else None
@@ -11610,6 +11630,8 @@ def _fugue_create_session_app_sync(cfg: FugueProvisionConfig, session_id: str) -
             ],
         },
     }
+    if cfg.tenant_id:
+        request_body["tenant_id"] = cfg.tenant_id
     if cfg.workspace_storage_class_name:
         request_body["persistent_storage"]["storage_class_name"] = cfg.workspace_storage_class_name
     payload = _fugue_request_json_sync(
@@ -13614,6 +13636,10 @@ async def ws_proxy(ws: WebSocket):
                     text = await ws.receive_text()
                 except WebSocketDisconnect:
                     break
+                except RuntimeError as exc:
+                    if _is_expected_websocket_receive_runtime_error(exc):
+                        break
+                    raise
 
                 msg: Any = None
                 try:
@@ -14122,7 +14148,12 @@ async def ws_proxy(ws: WebSocket):
     async def ws_to_tcp():
         try:
             while True:
-                text = await ws.receive_text()
+                try:
+                    text = await ws.receive_text()
+                except RuntimeError as exc:
+                    if _is_expected_websocket_receive_runtime_error(exc):
+                        break
+                    raise
                 if not text.endswith("\n"):
                     text += "\n"
                 writer.write(text.encode("utf-8"))

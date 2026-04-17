@@ -106,6 +106,7 @@ cp .env.example .env
 | --- | --- | --- | --- |
 | `ARGUS_FUGUE_BASE_URL` | `fugue` 模式下必需 | 未设置 | Fugue API server 的 base URL，例如 `https://fugue.example.com`。 |
 | `ARGUS_FUGUE_TOKEN` | `fugue` 模式下必需 | 未设置 | gateway 用来创建、查询、重启和删除 session app 的 Bearer token。 |
+| `ARGUS_FUGUE_TENANT_ID` | 可选 | 回退到 `FUGUE_TENANT_ID` | Fugue API 调用使用的 tenant id。如果 gateway 使用的是可见多个 tenant 的 bootstrap/admin key，建议显式设置它；若使用 tenant-scoped API key，通常可以省略。 |
 | `ARGUS_FUGUE_PROJECT_ID` | `fugue` 模式下必需 | 未设置 | 放置 gateway 管理 session app 的 Fugue project。一个逻辑 Argus session 会映射成这个项目里的一个 Fugue app。 |
 | `ARGUS_FUGUE_RUNTIME_IMAGE` | 可选；当下面任一 runtime app 选择器已设置时可省略 | 未设置 | 新建 session app 时显式使用的运行时镜像引用。适合你已经自行发布 runtime 镜像的场景。 |
 | `ARGUS_FUGUE_RUNTIME_APP_ID` | 可选 | 未设置 | 从一个已部署的 Fugue app id 解析 session 镜像。 |
