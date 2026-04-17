@@ -145,7 +145,7 @@ Channel behavior:
 
 | Variable | Required? | Default | What it does / notes |
 | --- | --- | --- | --- |
-| `NEXT_PUBLIC_ARGUS_WS_URL` | Optional | unset | **Build-time** preset WebSocket URL for the optional web UI. Rebuild `web` after changing it. Common example: `ws://127.0.0.1:8080/ws?token=...`. |
+| `NEXT_PUBLIC_ARGUS_WS_URL` | Optional | unset | **Build-time** preset WebSocket URL for the optional web UI. Rebuild `web` after changing it. Common example: `ws://127.0.0.1:8080/ws?token=...`. When the UI is served behind HTTPS and the preset still uses `ws://`, the client will automatically reuse the current page origin with `wss://` while preserving the original path/query. |
 | `TELEGRAM_BOT_TOKEN` | Required for `docker compose --profile tg ...` | unset | Telegram bot token from `@BotFather`. The Telegram bot service exits immediately if this is missing. |
 | `TELEGRAM_DRAFT_STREAMING` | Optional | `auto` | Controls gateway-side private-chat draft streaming. Accepted forms: `auto` / `on` / `true`, `force` / `always`, and `off`. |
 | `HOST` | Optional helper variable | `127.0.0.1` | Convenience host used by docs, examples, and Telegram bot URL derivation. It is **not** a security boundary and is not required by the gateway itself. In Docker, `gateway` is used automatically when appropriate. |
@@ -324,7 +324,7 @@ This repo now ships with [fugue.yaml](/Users/yanyuming/Downloads/GitHub/argus/fu
 - `runtime`: non-public template app whose current image is reused for per-session Fugue apps
 - `telegram-bot`: optional companion service; keep it only when `TELEGRAM_BOT_TOKEN` is set
 
-The bundled manifest intentionally does **not** include `apps/web`, because Fugue import currently ignores Docker build args and the current web build depends on `NEXT_PUBLIC_ARGUS_WS_URL`.
+The bundled manifest includes `gateway`, `runtime`, `web`, and `telegram-bot`. For `web`, you can either leave `NEXT_PUBLIC_ARGUS_WS_URL` unset and let the browser derive a same-origin WebSocket URL, or provide a build-time preset when you want the UI to point at a specific gateway.
 
 Because the gateway needs `ARGUS_FUGUE_PROJECT_ID`, Fugue deployment is a two-step flow: create/select the project first, then deploy into it.
 

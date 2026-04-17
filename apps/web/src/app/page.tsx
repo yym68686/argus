@@ -262,12 +262,29 @@ function interleaveMarkdownWithToolMarkers(parts: string[], toolIds: string[]): 
 
 function defaultWsUrl(): string {
   const preset = (process.env.NEXT_PUBLIC_ARGUS_WS_URL ?? "").trim();
-  if (preset) return preset;
   if (typeof window === "undefined") return "ws://127.0.0.1:8080/ws";
   const proto = window.location.protocol === "https:" ? "wss:" : "ws:";
   const host =
     window.location.port === "3000" ? `${window.location.hostname}:8080` : window.location.host;
-  return `${proto}//${host}/ws`;
+  const fallback = new URL(`${proto}//${host}/ws`);
+
+  if (preset) {
+    try {
+      const parsed = new URL(preset);
+      // On HTTPS deployments behind a reverse proxy, a baked-in ws:// preset becomes mixed content.
+      // Preserve the original path/query (including token) but switch to the current public origin.
+      if (window.location.protocol === "https:" && parsed.protocol === "ws:") {
+        fallback.pathname = parsed.pathname || "/ws";
+        fallback.search = parsed.search;
+        return fallback.toString();
+      }
+      return parsed.toString();
+    } catch {
+      return preset;
+    }
+  }
+
+  return fallback.toString();
 }
 
 function safeJsonParse(text: string): AnyWireMessage | null {

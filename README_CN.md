@@ -143,7 +143,7 @@ cp .env.example .env
 
 | 变量 | 是否必需 | 默认值 | 作用 / 注意事项 |
 | --- | --- | --- | --- |
-| `NEXT_PUBLIC_ARGUS_WS_URL` | 可选 | 未设置 | 可选 Web UI 的**构建期** WebSocket 预设地址。修改后需要重新 build `web`。常见示例：`ws://127.0.0.1:8080/ws?token=...`。 |
+| `NEXT_PUBLIC_ARGUS_WS_URL` | 可选 | 未设置 | 可选 Web UI 的**构建期** WebSocket 预设地址。修改后需要重新 build `web`。常见示例：`ws://127.0.0.1:8080/ws?token=...`。如果页面本身跑在 HTTPS 下，但预设仍然是 `ws://`，前端会自动改用当前页面同源的 `wss://`，同时保留原来的路径和 query。 |
 | `TELEGRAM_BOT_TOKEN` | `docker compose --profile tg ...` 时必需 | 未设置 | 从 `@BotFather` 获取的 bot token；缺失时 Telegram bot 服务会直接退出。 |
 | `TELEGRAM_DRAFT_STREAMING` | 可选 | `auto` | 控制 gateway 在私聊里是否发送实时草稿。接受形式：`auto` / `on` / `true`、`force` / `always`、`off`。 |
 | `HOST` | 可选辅助变量 | `127.0.0.1` | 主要给文档示例、Web 预设和 Telegram bot 自动推导 gateway 地址使用。它**不是**安全配置项，gateway 自身也不依赖它做鉴权。Docker 场景下会在需要时自动改用 `gateway`。 |
@@ -318,7 +318,7 @@ open http://127.0.0.1:3000
 - `runtime`：非公网的模板 app，gateway 会复用它的当前镜像来创建每个 session app
 - `telegram-bot`：可选配套服务；只有在你提供 `TELEGRAM_BOT_TOKEN` 时才建议保留
 
-这份 manifest 故意没有把 `apps/web` 放进去，因为 Fugue 导入目前会忽略 Docker build args，而现有 web 构建依赖 `NEXT_PUBLIC_ARGUS_WS_URL`。
+这份 manifest 现在已经包含 `gateway`、`runtime`、`web` 和 `telegram-bot`。对 `web` 来说，你可以不设置 `NEXT_PUBLIC_ARGUS_WS_URL`，让浏览器自动按当前页面同源推导 WebSocket 地址；也可以在需要指向特定网关时提供一个构建期预设。
 
 由于 gateway 需要 `ARGUS_FUGUE_PROJECT_ID`，Fugue 部署不是单步导入，而是先准备 project，再部署进去：
 
