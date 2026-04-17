@@ -17,6 +17,7 @@ const buttonVariants = cva(
     variants: {
       variant: {
         default: "",
+        outline: cn("bg-background/35 border-border/85 hover:border-primary/28"),
         secondary: cn("bg-secondary/40 border-border/70 hover:border-primary/25"),
         destructive: cn(
           "bg-destructive/15 border-destructive/45 text-destructive",
@@ -44,4 +45,3 @@ export interface ButtonProps
 export function Button({ className, variant, size, ...props }: ButtonProps) {
   return <button className={cn(buttonVariants({ variant, size }), className)} {...props} />;
 }
-
