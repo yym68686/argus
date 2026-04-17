@@ -179,7 +179,7 @@ class FugueProvisionConfig:
     runtime_cmd: Optional[str] = None
     connect_timeout_s: float = 30.0
     jsonl_line_limit_bytes: int = 8 * 1024 * 1024
-    workspace_storage_size: str = "10Gi"
+    workspace_storage_size: str = "1Gi"
     workspace_storage_class_name: Optional[str] = None
     service_port: int = 7777
     app_name_prefix: str = "argus-session"
@@ -397,10 +397,6 @@ class LiveRuntimeSession:
                 await self.detach(ws)
                 break
 
-
-def _is_expected_websocket_receive_runtime_error(exc: RuntimeError) -> bool:
-    return "WebSocket is not connected" in str(exc or "")
-
     async def close_attached_websockets(self, *, code: int, reason: str) -> None:
         async with self.attach_lock:
             targets = list(self.attached_wss)
@@ -433,6 +429,10 @@ def _is_expected_websocket_receive_runtime_error(exc: RuntimeError) -> bool:
             except Exception:
                 pass
             raise UpstreamSessionClosedError(f"Upstream session {self.session_id} is closed") from e
+
+
+def _is_expected_websocket_receive_runtime_error(exc: RuntimeError) -> bool:
+    return "WebSocket is not connected" in str(exc or "")
 
 
 # Backwards-compatible alias while the rest of the module migrates away from docker-specific naming.
@@ -10711,7 +10711,7 @@ def _fugue_cfg() -> FugueProvisionConfig:
     gateway_compose_service = (os.getenv("ARGUS_FUGUE_GATEWAY_COMPOSE_SERVICE") or "").strip() or None
     runtime_cmd = (os.getenv("ARGUS_RUNTIME_CMD") or "").strip() or None
     workspace_mount_path = (os.getenv("ARGUS_FUGUE_WORKSPACE_MOUNT_PATH") or "/workspace").strip() or "/workspace"
-    workspace_storage_size = (os.getenv("ARGUS_FUGUE_WORKSPACE_STORAGE_SIZE") or "10Gi").strip() or "10Gi"
+    workspace_storage_size = (os.getenv("ARGUS_FUGUE_WORKSPACE_STORAGE_SIZE") or "1Gi").strip() or "1Gi"
     workspace_storage_class_name = (os.getenv("ARGUS_FUGUE_WORKSPACE_STORAGE_CLASS") or "").strip() or None
     app_name_prefix = (os.getenv("ARGUS_FUGUE_APP_NAME_PREFIX") or "argus-session").strip().lower() or "argus-session"
     connect_timeout_s = float(os.getenv("ARGUS_CONNECT_TIMEOUT_S", "30"))

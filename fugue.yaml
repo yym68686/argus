@@ -12,6 +12,7 @@ services:
     env:
       ARGUS_PROVISION_MODE: fugue
       ARGUS_FUGUE_HOME_PATH: /data/argus
+      ARGUS_FUGUE_WORKSPACE_STORAGE_SIZE: 1Gi
       ARGUS_FUGUE_GATEWAY_COMPOSE_SERVICE: gateway
       ARGUS_FUGUE_RUNTIME_COMPOSE_SERVICE: runtime
       ARGUS_RUNTIME_CMD: codex app-server
