@@ -38,10 +38,10 @@ function httpBaseFromWsUrl(url: string): string {
   }
 }
 
-function nodeApiUrl(httpBase: string, path: string): string {
+function nodeApiUrl(httpBase: string, path: string): URL {
   const trimmed = path.startsWith("/") ? path.slice(1) : path;
   const suffix = trimmed ? `/${trimmed}` : "";
-  return new URL(`/api/nodes${suffix}`, httpBase).toString();
+  return new URL(`/api/nodes${suffix}`, httpBase);
 }
 
 function extractTokenFromWsUrl(url: string): string {
@@ -130,7 +130,7 @@ export default function NodesPage() {
     try {
       const url = nodeApiUrl(httpBase, "");
       if (token) url.searchParams.set("token", token);
-      const res = await fetch(url, { cache: "no-store" });
+      const res = await fetch(url.toString(), { cache: "no-store" });
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       const data = (await res.json()) as { nodes?: NodeInfo[] };
       const nextNodes = Array.isArray(data.nodes) ? data.nodes : [];
@@ -166,7 +166,7 @@ export default function NodesPage() {
 
     setLoading(true);
     try {
-      const url = new URL(nodeApiUrl(httpBase, "invoke"));
+      const url = nodeApiUrl(httpBase, "invoke");
       if (token) url.searchParams.set("token", token);
       const res = await fetch(url.toString(), {
         method: "POST",
