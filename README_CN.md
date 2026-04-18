@@ -358,6 +358,7 @@ Argus 会让 runtime 容器始终使用固定的 gateway 代理地址（`/openai
 - runtime 会写入一个生成的 `CODEX_HOME/config.toml`（不包含 provider secrets），用于把 Codex 指向 gateway 的 MCP 和代理。
   - 默认 `CODEX_HOME`：`/workspace/.codex`（按 workspace 隔离）
   - 默认模型：`gpt-5.4`（Telegram agent 可在 `/menu` 中切换 `gpt-5.2` / `gpt-5.4`，并按 agent 持久化）
+  - 生成的 provider block 会标记成 `OpenAI`，这样 Codex 可以继续使用官方压缩能力，但实际流量仍然走 Argus 的 gateway 代理地址。
 - 如果你希望所有用户开箱即用，就在 gateway 上配置 `OPENAI_API_KEY`；否则用户需要先选中一个“已就绪”的个人渠道。
 
 要替换 runtime，在 `docker compose up --build` 之前设置这两个环境变量即可。

@@ -112,7 +112,7 @@ EOF
   if [ -n "${ARGUS_CODEX_OPENAI_PROXY_BASE_URL:-}" ]; then
     cat >> "$tmp_cfg" <<EOF
 
-model_provider = "argus-openai-proxy"
+model_provider = "OpenAI"
 EOF
   fi
 
@@ -126,8 +126,8 @@ EOF
   if [ -n "${ARGUS_CODEX_OPENAI_PROXY_BASE_URL:-}" ]; then
     cat >> "$tmp_cfg" <<EOF
 
-[model_providers.argus-openai-proxy]
-name = "Argus OpenAI Proxy"
+[model_providers.OpenAI]
+name = "OpenAI"
 base_url = "${ARGUS_CODEX_OPENAI_PROXY_BASE_URL}"
 wire_api = "responses"
 env_key = "ARGUS_OPENAI_TOKEN"

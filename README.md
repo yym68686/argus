@@ -364,6 +364,7 @@ Notes:
 - The runtime writes a generated `CODEX_HOME/config.toml` (no provider secrets) to point Codex at the gateway MCP server and proxy.
   - Default `CODEX_HOME`: `/workspace/.codex` (workspace-scoped)
   - Default model: `gpt-5.4` (`gateway` is fixed to `gpt-5.2` / `gpt-5.4`; other OpenAI-compatible channels can expose their own model ids, and the selection is persisted per agent).
+  - The generated provider block is labeled as `OpenAI` so Codex keeps the official compression behavior, while the actual traffic still goes through the Argus gateway proxy URL.
 - If you want the default `gateway` channel to work out of the box for every user, set `OPENAI_API_KEY` on the gateway. Otherwise users must select a ready personal channel first.
 
 To swap runtimes, set these before `docker compose up --build`.
