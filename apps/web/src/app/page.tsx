@@ -29,7 +29,7 @@ import { toast } from "sonner";
 import { cn } from "@/lib/utils";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
-import { loadGatewayWsUrl, storeGatewayWsUrl } from "@/lib/gateway";
+import { useGatewayWsUrlState } from "@/lib/gateway";
 
 const ARGUS_WEB_VERSION = process.env.NEXT_PUBLIC_ARGUS_VERSION || "0.0.0";
 
@@ -263,33 +263,6 @@ function interleaveMarkdownWithToolMarkers(parts: string[], toolIds: string[]): 
     if (isNonEmptyString(toolId)) out.push(toolMarker(toolId));
   }
   return out.join("\n\n").trim();
-}
-
-function defaultWsUrl(): string {
-  const preset = (process.env.NEXT_PUBLIC_ARGUS_WS_URL ?? "").trim();
-  if (typeof window === "undefined") return "ws://127.0.0.1:8080/ws";
-  const proto = window.location.protocol === "https:" ? "wss:" : "ws:";
-  const host =
-    window.location.port === "3000" ? `${window.location.hostname}:8080` : window.location.host;
-  const fallback = new URL(`${proto}//${host}/ws`);
-
-  if (preset) {
-    try {
-      const parsed = new URL(preset);
-      // On HTTPS deployments behind a reverse proxy, a baked-in ws:// preset becomes mixed content.
-      // Preserve the original path/query (including token) but switch to the current public origin.
-      if (window.location.protocol === "https:" && parsed.protocol === "ws:") {
-        fallback.pathname = parsed.pathname || "/ws";
-        fallback.search = parsed.search;
-        return fallback.toString();
-      }
-      return parsed.toString();
-    } catch {
-      return preset;
-    }
-  }
-
-  return fallback.toString();
 }
 
 function safeJsonParse(text: string): AnyWireMessage | null {
@@ -716,7 +689,7 @@ function turnsToChatMessages(turns: unknown): ChatMessage[] {
 export default function Page() {
   type ActivePane = "chat" | "connection";
 
-  const [wsUrl, setWsUrl] = React.useState<string>(() => (typeof window === "undefined" ? "" : loadGatewayWsUrl()));
+  const [wsUrl, setWsUrl] = useGatewayWsUrlState();
   const [cwd, setCwd] = React.useState<string>("/workspace");
   const [approvalPolicy, setApprovalPolicy] = React.useState<ApprovalPolicy>("never");
 
@@ -819,6 +792,7 @@ export default function Page() {
       return true;
     });
   }, [activeChat?.messages, activeChat?.turnInProgress, activeChat?.turnId, reasoningTurnIds]);
+  const showChatEmptyState = displayMessages.length === 0 && !activeChat?.turnInProgress;
 
   const turnProgressInsertIndex = React.useMemo(() => {
     if (!activeChat?.turnInProgress) return null;
@@ -850,11 +824,7 @@ export default function Page() {
     chatScrollRef.current?.scrollTo({ top: chatScrollRef.current.scrollHeight });
   }, [activeThreadKey, activeChat?.messages]);
 
-  React.useEffect(() => {
-    if (!wsUrl.trim()) return;
-    storeGatewayWsUrl(wsUrl);
-  }, [wsUrl]);
-
+  // This bootstrap effect is intentionally one-shot per page load; the ref prevents reconnect churn.
   React.useEffect(() => {
     if (autoConnectAttemptedRef.current) return;
     const base = stripSessionFromWsUrl(wsUrl);
@@ -878,6 +848,7 @@ export default function Page() {
         toast.error(msg);
       }
     })();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [wsUrl]);
 
   React.useEffect(() => {
@@ -893,6 +864,7 @@ export default function Page() {
     return () => document.removeEventListener("click", onDoc);
   }, [sessionMenuOpenFor]);
 
+  // Refresh expanded thread groups when their backing data is still unloaded.
   React.useEffect(() => {
     const expandedIds = Object.entries(expandedSessions).filter(([, v]) => !!v).map(([k]) => k);
     if (expandedIds.length === 0) return;
@@ -903,6 +875,7 @@ export default function Page() {
       if (loaded && loaded.length >= 0) continue;
       void refreshThreadsForSession(sessionId, { silent: true });
     }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [expandedSessions, threadsBusyBySession, threadsBySession]);
 
   function setConnStatus(sessionId: string, status: { ok: boolean; text: string }): void {
@@ -2459,31 +2432,39 @@ export default function Page() {
         <div className="absolute -bottom-[30%] -right-[10%] h-[80vh] w-[80vw] argus-landing-blob argus-landing-blob-c" />
       </div>
 
-      <main className="relative z-[1] h-dvh w-full overflow-hidden">
-        <div className="grid h-dvh w-full grid-cols-[320px_1fr]">
+      <main className="relative z-[1] min-h-dvh w-full overflow-hidden px-3 py-3 md:px-4 md:py-4">
+        <div className="grid min-h-[calc(100dvh-1.5rem)] w-full grid-cols-1 gap-3 lg:h-[calc(100dvh-2rem)] lg:grid-cols-[336px_1fr]">
           <aside
             className={cn(
-              "flex h-dvh flex-col overflow-hidden border-r border-border bg-card/80 backdrop-blur-xl",
-              "shadow-[0_0_0_1px_oklch(var(--border)/0.55),0_14px_40px_oklch(0%_0_0/0.35)]"
+              "argus-shell-panel flex h-auto flex-col overflow-hidden rounded-[32px] backdrop-blur-xl lg:h-full"
             )}
           >
-            <div className="flex items-end gap-3 border-b border-border/60 bg-background/70 p-4 backdrop-blur-md">
+            <div className="border-b border-border/60 bg-background/62 p-4 backdrop-blur-md">
+              <div className="mb-4 flex items-center justify-between gap-3">
+                <div className="argus-surface-label">Workbench</div>
+                <div className="rounded-full border border-border/60 bg-background/45 px-2.5 py-1 font-mono text-[10px] uppercase tracking-[0.22em] text-muted-foreground">
+                  v{ARGUS_WEB_VERSION}
+                </div>
+              </div>
+
+              <div className="flex items-end gap-3">
               <div
                 className={cn(
-                  "flex h-11 w-11 items-center justify-center rounded-2xl border border-border",
-                  "bg-background/70 backdrop-blur-md",
-                  "shadow-[0_0_0_1px_oklch(var(--border)/0.55),0_14px_40px_oklch(0%_0_0/0.35)]"
+                  "argus-shell-glyph flex h-12 w-12 items-center justify-center rounded-[20px] border border-border/70"
                 )}
               >
                 <PlugZap className="h-5 w-5 text-primary" />
               </div>
               <div className="min-w-0">
-                <div className="truncate font-logo text-base tracking-wide text-foreground">Argus</div>
-                <div className="truncate text-sm text-muted-foreground">App-server WebSocket bridge</div>
+                <div className="truncate font-mono text-[15px] font-medium uppercase tracking-[0.22em] text-foreground">Argus</div>
+                <div className="mt-1 max-w-[15rem] text-sm leading-relaxed text-muted-foreground">
+                  Live operator view for sessions, threads, and runtime activity.
+                </div>
               </div>
             </div>
+            </div>
 
-            <div className="border-b border-border/60 bg-background/70 p-4 backdrop-blur-md">
+            <div className="border-b border-border/60 bg-background/56 p-4 backdrop-blur-md">
               <div className="relative">
                 <Search className="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-muted-foreground" />
                 <Input
@@ -2520,11 +2501,16 @@ export default function Page() {
                 <SidebarLinkItem icon={<Settings2 className="h-4 w-4" />} label="Settings" href="/settings" />
               </div>
 
-              <div className="mt-1 flex items-center gap-2 rounded-xl border border-transparent px-2 py-2 transition-colors hover:border-border/60 hover:bg-background/50">
-                <div className="flex h-9 w-9 items-center justify-center rounded-xl border border-border/60 bg-background/60 text-muted-foreground">
+              <div className="mt-4 px-2 argus-surface-label">Sessions</div>
+
+              <div className="mt-1 flex items-center gap-2 rounded-[22px] border border-border/55 bg-background/28 px-3 py-3 transition-colors hover:border-border/70 hover:bg-background/44">
+                <div className="argus-shell-glyph flex h-10 w-10 items-center justify-center rounded-2xl border border-border/60 text-muted-foreground">
                   <PlugZap className="h-4 w-4" />
                 </div>
-                <div className="min-w-0 flex-1 truncate text-sm text-muted-foreground">Sessions</div>
+                <div className="min-w-0 flex-1">
+                  <div className="truncate text-sm font-medium text-foreground">Session fleet</div>
+                  <div className="truncate text-xs text-muted-foreground">Open, inspect, or spawn a new runtime.</div>
+                </div>
                 <Button
                   type="button"
                   size="sm"
@@ -2541,7 +2527,7 @@ export default function Page() {
               </div>
 
               {sessions === null ? (
-                <div className="mt-2 rounded-xl border border-border/60 bg-background/60 px-3 py-2 text-sm text-muted-foreground">
+                <div className="mt-2 rounded-[20px] border border-border/60 bg-background/42 px-3 py-3 text-sm text-muted-foreground">
                   {sessionsError ? (
                     <>
                       Failed to load sessions: <code className="font-mono break-words">{sessionsError}</code>
@@ -2554,7 +2540,7 @@ export default function Page() {
                   )}
                 </div>
               ) : sessionsFiltered.length === 0 ? (
-                <div className="mt-2 rounded-xl border border-border/60 bg-background/60 px-3 py-2 text-sm text-muted-foreground">
+                <div className="mt-2 rounded-[20px] border border-border/60 bg-background/42 px-3 py-3 text-sm text-muted-foreground">
                   No sessions.
                 </div>
               ) : (
@@ -2576,7 +2562,7 @@ export default function Page() {
 	                      <React.Fragment key={sid || s.containerId || Math.random().toString(16)}>
 	                        <div
 	                          className={cn(
-	                            "group flex items-center gap-2 rounded-xl border border-transparent",
+	                            "group flex items-center gap-2 rounded-[20px] border border-transparent",
 	                            "transition-colors",
 	                            "focus-within:ring-4 focus-within:ring-ring/25",
 	                            isCurrent ? "border-primary/25 bg-primary/10" : "hover:border-border/60 hover:bg-background/50"
@@ -2601,20 +2587,15 @@ export default function Page() {
                             }}
                           >
                             {sid ? (
-                              isExpanded ? (
-                                <ChevronDown className="h-4 w-4 shrink-0 text-muted-foreground" />
-                              ) : (
-                                <ChevronRight className="h-4 w-4 shrink-0 text-muted-foreground" />
-                              )
+	                              isExpanded ? (
+	                                <ChevronDown className="h-4 w-4 shrink-0 text-muted-foreground" />
+	                              ) : (
+	                                <ChevronRight className="h-4 w-4 shrink-0 text-muted-foreground" />
+	                              )
                             ) : (
                               <ChevronRight className="h-4 w-4 shrink-0 text-muted-foreground opacity-40" />
                             )}
-                            <span
-                              className={cn(
-                                "h-1.5 w-1.5 shrink-0 rounded-full",
-                                connOk ? "bg-success" : connText === "connecting…" ? "bg-warning" : "bg-border"
-                              )}
-                            />
+                            <span className="argus-status-dot shrink-0" data-state={connOk ? "ok" : connText === "connecting…" ? "warn" : "idle"} />
                             <code className="min-w-0 flex-1 truncate font-mono text-xs text-foreground">
                               {sid || "-"}
                             </code>
@@ -2706,7 +2687,7 @@ export default function Page() {
                         {sid && isExpanded ? (
                           <div className="mb-2 mt-1">
                             {threadsBusy && threads == null ? (
-                              <div className="flex items-center gap-2 rounded-xl px-2 py-1.5 text-sm text-muted-foreground">
+                              <div className="flex items-center gap-2 rounded-[18px] px-2 py-1.5 text-sm text-muted-foreground">
                                 <RefreshCw className="h-4 w-4 animate-spin" />
                                 Loading threads…
                               </div>
@@ -2734,7 +2715,7 @@ export default function Page() {
 			                                    <div
 			                                      key={t.id}
 		                                      className={cn(
-		                                        "group flex items-center gap-2 rounded-xl border border-transparent",
+		                                        "group flex items-center gap-2 rounded-[18px] border border-transparent",
 		                                        "transition-colors",
 		                                        "focus-within:border-primary/25 focus-within:bg-primary/10 focus-within:text-foreground",
 		                                        isCurrentThread
@@ -2843,10 +2824,10 @@ export default function Page() {
             </div>
           </aside>
 
-          <section className="relative flex min-h-0 min-w-0 flex-col overflow-hidden bg-card/80 backdrop-blur-xl">
+          <section className="argus-shell-panel relative flex min-h-[68dvh] min-w-0 flex-col overflow-hidden rounded-[36px] bg-card/80 backdrop-blur-xl lg:min-h-0">
             {activePane === "connection" ? (
               <>
-                <div className="flex flex-wrap items-center justify-between gap-2 border-b border-border/60 bg-background/70 p-4 backdrop-blur-md">
+                <div className="argus-data-grid flex flex-wrap items-center justify-between gap-2 border-b border-border/60 bg-background/70 p-5 backdrop-blur-md">
                   <div className="flex items-center gap-2 text-sm font-medium text-foreground">
                     <LinkIcon className="h-4 w-4 text-primary" />
                     <span>Connection</span>
@@ -2872,14 +2853,20 @@ export default function Page() {
                   </div>
                 </div>
 
-                <div className="flex-1 overflow-auto p-4 scrollbar-hide md:p-5">
+                <div className="flex-1 overflow-auto p-5 scrollbar-hide md:p-6">
                   <div className="mx-auto grid w-full max-w-2xl gap-4">
                     <div
                       className={cn(
-                        "rounded-2xl border border-border/60 bg-background/60 p-4",
-                        "shadow-[0_0_0_1px_oklch(var(--border)/0.55),0_14px_40px_oklch(0%_0_0/0.35)]"
+                        "argus-shell-panel-soft rounded-[28px] p-5"
                       )}
                     >
+                      <div className="mb-4">
+                        <div className="argus-surface-label">Gateway link</div>
+                        <div className="mt-2 max-w-[32rem] text-sm leading-6 text-muted-foreground">
+                          Set the public WebSocket endpoint, working directory, and approval posture for new threads.
+                        </div>
+                      </div>
+
                       <div className="grid gap-4">
                         <div className="grid gap-1.5">
                           <FieldLabel icon={<LinkIcon className="h-4 w-4" />} label="WebSocket URL" />
@@ -2973,9 +2960,61 @@ export default function Page() {
 	                <div className="relative flex-1 min-h-0">
 	                  <div
 	                    ref={chatScrollRef}
-		                    className="h-full overflow-auto p-4 pt-12 pb-44 scrollbar-hide md:p-5 md:pt-14 md:pb-48"
+		                    className="h-full overflow-auto p-5 pt-14 pb-44 scrollbar-hide md:p-6 md:pt-16 md:pb-48"
 		                  >
 		                    <div className="mx-auto grid w-full max-w-3xl grid-cols-1 gap-3">
+                          {showChatEmptyState ? (
+                            <div className="argus-shell-panel-soft mt-8 rounded-[30px] p-6 md:mt-14 md:p-8">
+                              <div className="argus-kicker">Live workbench</div>
+                              <h2 className="mt-3 text-3xl font-semibold tracking-[-0.04em] text-foreground">
+                                Start a session or reconnect to an existing thread.
+                              </h2>
+                              <p className="mt-3 max-w-2xl text-sm leading-7 text-muted-foreground">
+                                Argus keeps the workbench thin on purpose. Point this browser at a gateway, open a
+                                runtime session, then use the left rail to move between threads and inspect tool output.
+                              </p>
+
+                              <div className="mt-6 grid gap-4 md:grid-cols-3">
+                                <div className="rounded-[22px] border border-border/60 bg-background/30 p-4">
+                                  <div className="argus-surface-label">1</div>
+                                  <div className="mt-2 font-medium text-foreground">Configure connection</div>
+                                  <div className="mt-2 text-sm leading-6 text-muted-foreground">
+                                    Set the gateway WebSocket URL, working directory, and approval posture.
+                                  </div>
+                                </div>
+                                <div className="rounded-[22px] border border-border/60 bg-background/30 p-4">
+                                  <div className="argus-surface-label">2</div>
+                                  <div className="mt-2 font-medium text-foreground">Create or reopen</div>
+                                  <div className="mt-2 text-sm leading-6 text-muted-foreground">
+                                    Spawn a fresh runtime or reopen an existing session from the session fleet.
+                                  </div>
+                                </div>
+                                <div className="rounded-[22px] border border-border/60 bg-background/30 p-4">
+                                  <div className="argus-surface-label">3</div>
+                                  <div className="mt-2 font-medium text-foreground">Work the thread</div>
+                                  <div className="mt-2 text-sm leading-6 text-muted-foreground">
+                                    Send a prompt, inspect reasoning and tools, then branch off with a new thread when needed.
+                                  </div>
+                                </div>
+                              </div>
+
+                              <div className="mt-6 flex flex-wrap gap-3">
+                                <Button type="button" onClick={() => setActivePane("connection")}>
+                                  Configure connection
+                                </Button>
+                                <Button
+                                  type="button"
+                                  variant="secondary"
+                                  disabled={!wsUrl.trim()}
+                                  onClick={() =>
+                                    void connectNewSession().catch((e) => toast.error((e as Error)?.message || String(e)))
+                                  }
+                                >
+                                  Start a new session
+                                </Button>
+                              </div>
+                            </div>
+                          ) : null}
 		                      {displayMessages.map((m, idx) => (
 		                        <React.Fragment key={m.id}>
 		                          {activeChat?.turnInProgress && turnProgressInsertIndex === idx ? (
@@ -2993,9 +3032,9 @@ export default function Page() {
 		                    </div>
 		                  </div>
 	
-	                  <div className="pointer-events-none absolute inset-x-0 bottom-0 z-10 px-4 pb-5 md:px-5">
+	                  <div className="pointer-events-none absolute inset-x-0 bottom-0 z-10 px-5 pb-5 md:px-6">
 	                    <div className="relative mx-auto w-full max-w-3xl">
-			                      <div className="pointer-events-auto flex items-center gap-3 rounded-full bg-background/55 px-3 py-2 backdrop-blur-xl">
+			                      <div className="pointer-events-auto flex items-center gap-3 rounded-[28px] border border-border/60 bg-background/55 px-3 py-2.5 backdrop-blur-xl shadow-[0_18px_50px_oklch(0%_0_0/0.24)]">
 		                        <button
 		                          type="button"
 		                          className={cn(
@@ -3104,14 +3143,14 @@ function SidebarNavItem({ icon, label, active = false, onClick }: SidebarNavItem
       onClick={onClick}
       aria-current={active ? "page" : undefined}
       className={cn(
-        "flex w-full items-center gap-3 rounded-xl border px-2 py-2 text-left",
+        "flex w-full items-center gap-3 rounded-[22px] border px-3 py-3 text-left",
         "transition-colors hover:bg-background/50",
         active ? "border-primary/25 bg-primary/10" : "border-transparent bg-transparent hover:border-border/60"
       )}
     >
       <span
         className={cn(
-          "flex h-9 w-9 items-center justify-center rounded-xl border border-border/60 bg-background/60",
+          "argus-shell-glyph flex h-10 w-10 items-center justify-center rounded-2xl border border-border/60",
           active ? "text-primary" : "text-muted-foreground"
         )}
       >
@@ -3129,11 +3168,11 @@ function SidebarLinkItem({ icon, label, href }: { icon: React.ReactNode; label: 
     <Link
       href={href}
       className={cn(
-        "flex w-full items-center gap-3 rounded-xl border border-transparent px-2 py-2 text-left",
+        "flex w-full items-center gap-3 rounded-[22px] border border-transparent px-3 py-3 text-left",
         "transition-colors hover:border-border/60 hover:bg-background/50"
       )}
     >
-      <span className="flex h-9 w-9 items-center justify-center rounded-xl border border-border/60 bg-background/60 text-muted-foreground">
+      <span className="argus-shell-glyph flex h-10 w-10 items-center justify-center rounded-2xl border border-border/60 text-muted-foreground">
         {icon}
       </span>
       <span className="min-w-0 flex-1 truncate text-sm text-muted-foreground">{label}</span>
@@ -3143,7 +3182,7 @@ function SidebarLinkItem({ icon, label, href }: { icon: React.ReactNode; label: 
 
 function FieldLabel({ label, icon }: { label: string; icon?: React.ReactNode }) {
   return (
-    <div className="mb-1.5 inline-flex items-center gap-2 text-xs text-muted-foreground">
+    <div className="mb-1.5 inline-flex items-center gap-2 text-xs uppercase tracking-[0.18em] text-muted-foreground">
       {icon ? <span className="text-primary">{icon}</span> : null}
       <span>{label}</span>
     </div>
@@ -3153,7 +3192,7 @@ function FieldLabel({ label, icon }: { label: string; icon?: React.ReactNode }) 
 function IdPill({ label, value }: { label: string; value: string | null }) {
   return (
     <div className="inline-flex items-center gap-2 rounded-full border border-border/60 bg-background/70 px-3 py-1 backdrop-blur-md">
-      <span className="text-xs text-muted-foreground">{label}:</span>
+      <span className="text-[10px] uppercase tracking-[0.18em] text-muted-foreground">{label}</span>
       <code className="font-mono text-xs text-foreground">{value ?? "-"}</code>
     </div>
   );
@@ -3227,12 +3266,12 @@ const markdownComponents = {
 	  return (
 	    <div className="w-full">
 	      <div className="max-w-[72ch]">
-	        <div className="inline-flex items-center gap-2 text-xs text-muted-foreground">
+	        <div className="inline-flex items-center gap-2 text-xs uppercase tracking-[0.18em] text-muted-foreground">
 	          <RefreshCw className="h-3.5 w-3.5 animate-spin text-primary" />
 	          <span>正在生成…</span>
 	        </div>
 	        {hasSummary || hasTools ? (
-	          <details className="group mt-2 rounded-2xl border border-border/60 bg-background/40 px-4 py-3" open>
+	          <details className="group mt-2 rounded-[24px] border border-border/60 bg-background/30 px-4 py-3.5 shadow-[inset_0_1px_0_0_oklch(var(--foreground)/0.04)]" open>
 	            <summary
 	              className={cn(
 	                "flex cursor-pointer list-none items-center gap-2 text-xs font-medium text-muted-foreground",
@@ -3331,7 +3370,7 @@ function ToolBubble({ message }: { message: Extract<ChatMessage, { role: "tool" 
   return (
     <div className="w-full">
       <div className="max-w-[72ch]">
-        <div className="relative overflow-hidden rounded-2xl border border-border/60 bg-background/55 shadow-[inset_0_1px_0_0_oklch(var(--foreground)/0.06)]">
+        <div className="relative overflow-hidden rounded-[24px] border border-border/60 bg-background/48 shadow-[inset_0_1px_0_0_oklch(var(--foreground)/0.06)]">
           <div className="pointer-events-none absolute left-4 top-3 text-xs font-medium text-muted-foreground">
             {label}
           </div>
@@ -3395,7 +3434,7 @@ function Bubble({
       <div className="flex w-full justify-end">
         <div
           className={cn(
-            "w-fit max-w-[80%] rounded-2xl border border-primary/25 bg-primary/10 px-4 py-3",
+            "w-fit max-w-[80%] rounded-[24px] border border-primary/25 bg-primary/10 px-4 py-3.5",
             "shadow-[inset_0_1px_0_0_oklch(var(--foreground)/0.06)]"
           )}
         >
@@ -3424,7 +3463,7 @@ function Bubble({
     const referencedToolIds = new Set<string>();
     return (
       <div className="w-full">
-        <details className="group max-w-[72ch] rounded-2xl border border-border/60 bg-background/40 px-4 py-3">
+        <details className="group max-w-[72ch] rounded-[24px] border border-border/60 bg-background/30 px-4 py-3.5 shadow-[inset_0_1px_0_0_oklch(var(--foreground)/0.04)]">
           <summary
             className={cn(
               "flex cursor-pointer list-none items-center gap-2 text-xs font-medium text-muted-foreground",

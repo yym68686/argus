@@ -10,11 +10,11 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { type AdminOverviewResponse, type AdminUsageResponse, type AdminUserSummary, fetchAdminOverview, fetchAdminUsage, fetchAdminUsers } from "@/lib/admin";
 import { formatCompact, formatInt, formatRelative, formatUsd, formatWhen } from "@/lib/format";
-import { loadGatewayWsUrl, storeGatewayWsUrl } from "@/lib/gateway";
+import { useGatewayWsUrlState } from "@/lib/gateway";
 import { cn } from "@/lib/utils";
 
 export default function UsagePage() {
-  const [wsUrl, setWsUrl] = React.useState(() => (typeof window === "undefined" ? "" : loadGatewayWsUrl()));
+  const [wsUrl, setWsUrl] = useGatewayWsUrlState();
   const [overview, setOverview] = React.useState<AdminOverviewResponse | null>(null);
   const [users, setUsers] = React.useState<AdminUserSummary[]>([]);
   const [usage, setUsage] = React.useState<AdminUsageResponse | null>(null);
@@ -23,11 +23,6 @@ export default function UsagePage() {
   const [selectedUserId, setSelectedUserId] = React.useState<string>("");
   const [hours, setHours] = React.useState("24");
   const [limit, setLimit] = React.useState("100");
-
-  React.useEffect(() => {
-    if (!wsUrl.trim()) return;
-    storeGatewayWsUrl(wsUrl);
-  }, [wsUrl]);
 
   const refresh = React.useCallback(async () => {
     if (!wsUrl.trim()) return;
@@ -123,29 +118,35 @@ export default function UsagePage() {
       <div className="grid gap-6 xl:grid-cols-[340px_1fr]">
         <section className="space-y-6">
           <PanelCard
+            eyebrow="Fleet snapshot"
             title="Fleet"
             subtitle={overview ? `Version ${overview.version}` : "Gateway-wide activity across all tracked users."}
           >
             <div className="grid gap-4 sm:grid-cols-2 xl:grid-cols-1">
-              <StatCard label="24h tokens" value={formatCompact(overview?.usage24h.totalTokens)} tone="primary" />
-              <StatCard label="24h requests" value={formatInt(overview?.usage24h.requestCount)} />
-              <StatCard label="Tracked users" value={formatInt(overview?.totals.userCount)} />
-              <StatCard label="Live sessions" value={formatInt(overview?.totals.sessionCount)} />
+              <StatCard
+                label="24h tokens"
+                value={formatCompact(overview?.usage24h.totalTokens)}
+                tone="primary"
+                hint="Total traffic recorded by the gateway ledger over the last rolling 24 hours."
+              />
+              <StatCard label="24h requests" value={formatInt(overview?.usage24h.requestCount)} hint="Successful and failed Responses calls." />
+              <StatCard label="Tracked users" value={formatInt(overview?.totals.userCount)} hint="Users with observable traffic or managed state." />
+              <StatCard label="Live sessions" value={formatInt(overview?.totals.sessionCount)} hint="Currently listed runtime sessions." />
             </div>
           </PanelCard>
 
-          <PanelCard title="Top users" subtitle="Sorted by 24h token usage from the same ledger.">
+          <PanelCard eyebrow="Operators" title="Top users" subtitle="Sorted by 24h token usage from the same ledger.">
             <div className="space-y-2">
               {users.slice(0, 8).map((user) => (
                 <button
                   key={user.userId}
                   type="button"
                   onClick={() => setSelectedUserId(String(user.userId))}
-                  className={cn(
-                    "w-full rounded-2xl border px-4 py-3 text-left transition-colors",
+                    className={cn(
+                    "w-full rounded-[22px] border px-4 py-4 text-left transition-colors",
                     String(user.userId) === selectedUserId
                       ? "border-primary/25 bg-primary/10"
-                      : "border-border/60 bg-background/40 hover:border-border hover:bg-background/55"
+                      : "border-border/60 bg-background/30 hover:border-border hover:bg-background/55"
                   )}
                 >
                   <div className="flex items-start justify-between gap-3">
@@ -174,16 +175,28 @@ export default function UsagePage() {
         </section>
 
         <section className="space-y-6">
-          <div className="grid gap-4 md:grid-cols-4">
-            <StatCard label="Filtered tokens" value={formatCompact(filteredSummary?.totalTokens)} tone="primary" />
-            <StatCard label="Filtered requests" value={formatInt(filteredSummary?.requestCount)} />
-            <StatCard label="Input / output" value={`${formatCompact(filteredSummary?.inputTokens)} / ${formatCompact(filteredSummary?.outputTokens)}`} />
-            <StatCard label="Est. cost" value={formatUsd(filteredSummary?.estimatedCostUsd)} />
+          <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-4">
+            <StatCard
+              label="Filtered tokens"
+              value={formatCompact(filteredSummary?.totalTokens)}
+              tone="primary"
+              hint={selectedUser ? `Scoped to user ${selectedUser.userId}` : "Current global filter window"}
+              className="md:col-span-2 xl:col-span-1"
+            />
+            <StatCard label="Filtered requests" value={formatInt(filteredSummary?.requestCount)} hint="Rows that matched the filter window." />
+            <StatCard
+              label="Input / output"
+              value={`${formatCompact(filteredSummary?.inputTokens)} / ${formatCompact(filteredSummary?.outputTokens)}`}
+              hint="Input first, output second."
+            />
+            <StatCard label="Est. cost" value={formatUsd(filteredSummary?.estimatedCostUsd)} hint="Derived from recorded upstream usage." />
           </div>
 
           <PanelCard
+            eyebrow="Current lens"
             title={selectedUser ? `User ${selectedUser.userId}` : "Current filter"}
             subtitle={selectedUser ? "The panels below are scoped to the selected user and time range." : "Use the filter bar to narrow the usage ledger."}
+            className="argus-data-grid"
           >
             <div className="grid gap-4 lg:grid-cols-2">
               <Fact label="Time window" value={hours.trim() ? `Last ${hours.trim()} hours` : "Full history"} />
@@ -193,10 +206,21 @@ export default function UsagePage() {
             </div>
           </PanelCard>
 
-          <PanelCard title="Recent calls" subtitle="Newest usage events first, as observed by the gateway proxy.">
-            <div className="overflow-hidden rounded-2xl border border-border/60">
+          <PanelCard
+            eyebrow="Ledger"
+            title="Recent calls"
+            subtitle="Newest usage events first, as observed by the gateway proxy."
+            contentClassName="space-y-4"
+          >
+            <div className="flex flex-wrap items-center gap-2 text-xs text-muted-foreground">
+              <Badge tone="default">{selectedUser ? `user ${selectedUser.userId}` : "all users"}</Badge>
+              <Badge tone="default">{hours.trim() ? `${hours.trim()}h window` : "full history"}</Badge>
+              <Badge tone="default">{formatInt(usage?.events.length)} rows</Badge>
+            </div>
+
+            <div className="argus-table-shell rounded-[24px]">
               <table className="w-full border-collapse text-sm">
-                <thead className="bg-background/60 text-left text-xs uppercase tracking-[0.22em] text-muted-foreground">
+                <thead className="argus-table-head text-left text-xs uppercase tracking-[0.22em] text-muted-foreground">
                   <tr>
                     <th className="px-4 py-3">When</th>
                     <th className="px-4 py-3">User</th>
@@ -221,9 +245,9 @@ export default function UsagePage() {
                     >
                       <td className="px-4 py-3 text-muted-foreground">{formatWhen(event.createdAtMs)}</td>
                       <td className="px-4 py-3">{event.ownerUserId || "—"}</td>
-                      <td className="px-4 py-3">{event.agentId || "—"}</td>
+                      <td className="px-4 py-3 font-mono text-[13px]">{event.agentId || "—"}</td>
                       <td className="px-4 py-3">{event.channelName || event.channelId || "—"}</td>
-                      <td className="px-4 py-3">{event.model || event.requestedModel || "—"}</td>
+                      <td className="px-4 py-3 font-mono text-[13px]">{event.model || event.requestedModel || "—"}</td>
                       <td className="px-4 py-3 text-right font-medium">{formatInt(event.totalTokens)}</td>
                       <td className="px-4 py-3">
                         <span

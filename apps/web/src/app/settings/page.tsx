@@ -10,7 +10,7 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { type AdminOverviewResponse, fetchAdminOverview } from "@/lib/admin";
 import { formatInt } from "@/lib/format";
-import { gatewayFetchJson, loadGatewayWsUrl, storeGatewayWsUrl } from "@/lib/gateway";
+import { gatewayFetchJson, useGatewayWsUrlState } from "@/lib/gateway";
 import { cn } from "@/lib/utils";
 
 interface GatewayHealth {
@@ -18,16 +18,11 @@ interface GatewayHealth {
 }
 
 export default function SettingsPage() {
-  const [wsUrl, setWsUrl] = React.useState(() => (typeof window === "undefined" ? "" : loadGatewayWsUrl()));
+  const [wsUrl, setWsUrl] = useGatewayWsUrlState();
   const [overview, setOverview] = React.useState<AdminOverviewResponse | null>(null);
   const [health, setHealth] = React.useState<GatewayHealth | null>(null);
   const [loading, setLoading] = React.useState(false);
   const [error, setError] = React.useState<string | null>(null);
-
-  React.useEffect(() => {
-    if (!wsUrl.trim()) return;
-    storeGatewayWsUrl(wsUrl);
-  }, [wsUrl]);
 
   const refresh = React.useCallback(async () => {
     if (!wsUrl.trim()) return;
@@ -85,21 +80,31 @@ export default function SettingsPage() {
       <div className="grid gap-6 xl:grid-cols-[1.15fr_0.85fr]">
         <section className="space-y-6">
           <div className="grid gap-4 md:grid-cols-3">
-            <StatCard label="Gateway health" value={health?.ok ? "Healthy" : "Unknown"} tone={health?.ok ? "primary" : "default"} />
-            <StatCard label="Tracked users" value={formatInt(overview?.totals.userCount)} />
-            <StatCard label="Live sessions" value={formatInt(overview?.totals.sessionCount)} />
+            <StatCard
+              label="Gateway health"
+              value={health?.ok ? "Healthy" : "Unknown"}
+              tone={health?.ok ? "primary" : "default"}
+              hint={health?.ok ? "Public health probe is returning ok." : "The browser has not observed a healthy response yet."}
+            />
+            <StatCard label="Tracked users" value={formatInt(overview?.totals.userCount)} hint="Users currently visible to the operator console." />
+            <StatCard label="Live sessions" value={formatInt(overview?.totals.sessionCount)} hint="Current runtime sessions on the connected gateway." />
           </div>
 
-          <PanelCard title="Connection" subtitle="This browser stores the shared gateway WebSocket URL in localStorage and reuses it across the operator console.">
+          <PanelCard
+            eyebrow="Connection state"
+            title="Connection"
+            subtitle="This browser stores the shared gateway WebSocket URL in localStorage and reuses it across the operator console."
+            className="argus-data-grid"
+          >
             <div className="grid gap-4 lg:grid-cols-2">
-              <Fact label="Saved WebSocket URL" value={wsUrl || "not configured"} />
+              <Fact label="Saved WebSocket URL" value={wsUrl || "not configured"} mono />
               <Fact label="Gateway version" value={overview?.version || "unknown"} />
               <Fact label="Auth model" value="Bearer token embedded in the gateway WebSocket URL" />
               <Fact label="Health probe" value={health?.ok ? "GET /healthz returned ok" : "No healthy response yet"} />
             </div>
           </PanelCard>
 
-          <PanelCard title="Operator notes" subtitle="This page documents what the refactored console assumes about the Argus control plane.">
+          <PanelCard eyebrow="Runbook" title="Operator notes" subtitle="This page documents what the refactored console assumes about the Argus control plane.">
             <div className="space-y-3 text-sm leading-relaxed text-muted-foreground">
               <p>
                 The new Users and Usage tabs call the gateway&apos;s admin APIs on the same public host. In deployed mode,
@@ -118,7 +123,7 @@ export default function SettingsPage() {
         </section>
 
         <section className="space-y-6">
-          <PanelCard title="Backend contracts" subtitle="Quick check of the APIs this console expects.">
+          <PanelCard eyebrow="Contracts" title="Backend contracts" subtitle="Quick check of the APIs this console expects.">
             <div className="space-y-3">
               <ContractRow label="Gateway health" ok={Boolean(health?.ok)} detail="GET /healthz" />
               <ContractRow label="Admin overview" ok={Boolean(overview?.ok)} detail="GET /admin/overview" />
@@ -130,7 +135,7 @@ export default function SettingsPage() {
             </div>
           </PanelCard>
 
-          <PanelCard title="Current state" subtitle="The current deploy should expose web, gateway, runtime, and Telegram bot behind one project.">
+          <PanelCard eyebrow="Current deploy" title="Current state" subtitle="The current deploy should expose web, gateway, runtime, and Telegram bot behind one project.">
             {overview ? (
               <div className="grid gap-4">
                 <Fact label="Tracked agents" value={formatInt(overview.totals.agentCount)} />
@@ -149,7 +154,7 @@ export default function SettingsPage() {
 
 function ContractRow({ label, ok, detail }: { label: string; ok: boolean; detail: string }) {
   return (
-    <div className="flex items-start gap-3 rounded-2xl border border-border/60 bg-background/40 px-4 py-3">
+    <div className="flex items-start gap-3 rounded-[22px] border border-border/60 bg-background/30 px-4 py-3.5 shadow-[inset_0_1px_0_0_oklch(var(--foreground)/0.04)]">
       <div
         className={cn(
           "mt-0.5 flex h-8 w-8 items-center justify-center rounded-full border",

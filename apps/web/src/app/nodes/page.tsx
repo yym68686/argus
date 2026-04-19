@@ -1,10 +1,12 @@
 "use client";
 
 import * as React from "react";
+import Link from "next/link";
 
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Textarea } from "@/components/ui/textarea";
+import { useStoredGatewayWsUrl } from "@/lib/gateway";
 import { cn } from "@/lib/utils";
 
 type NodeInfo = {
@@ -17,33 +19,6 @@ type NodeInfo = {
   connectedAtMs?: number | null;
   lastSeenMs?: number | null;
 };
-
-function defaultWsUrl(): string {
-  const preset = (process.env.NEXT_PUBLIC_ARGUS_WS_URL ?? "").trim();
-  if (typeof window === "undefined") return "ws://127.0.0.1:8080/ws";
-  const proto = window.location.protocol === "https:" ? "wss:" : "ws:";
-  const host =
-    window.location.port === "3000" ? `${window.location.hostname}:8080` : window.location.host;
-  const fallback = new URL(`${proto}//${host}/ws`);
-
-  if (preset) {
-    try {
-      const parsed = new URL(preset);
-      // On HTTPS deployments behind a reverse proxy, a baked-in ws:// preset becomes mixed content.
-      // Preserve the original path/query (including token) but switch to the current public origin.
-      if (window.location.protocol === "https:" && parsed.protocol === "ws:") {
-        fallback.pathname = parsed.pathname || "/ws";
-        fallback.search = parsed.search;
-        return fallback.toString();
-      }
-      return parsed.toString();
-    } catch {
-      return preset;
-    }
-  }
-
-  return fallback.toString();
-}
 
 function httpBaseFromWsUrl(url: string): string {
   try {
@@ -110,9 +85,10 @@ function splitKeys(text: string): string[] {
 }
 
 export default function NodesPage() {
-  const [wsUrl, setWsUrl] = React.useState<string>(() => defaultWsUrl());
-  const [httpBase, setHttpBase] = React.useState<string>(() => httpBaseFromWsUrl(defaultWsUrl()));
-  const [token, setToken] = React.useState<string>(() => extractTokenFromWsUrl(defaultWsUrl()));
+  const storedWsUrl = useStoredGatewayWsUrl();
+  const [wsUrl, setWsUrl] = React.useState<string | null>(null);
+  const [httpBase, setHttpBase] = React.useState<string | null>(null);
+  const [token, setToken] = React.useState<string | null>(null);
 
   const [loading, setLoading] = React.useState(false);
   const [nodes, setNodes] = React.useState<NodeInfo[]>([]);
@@ -134,6 +110,10 @@ export default function NodesPage() {
   const [pasteText, setPasteText] = React.useState<string>("");
   const [pasteBracketed, setPasteBracketed] = React.useState<boolean>(true);
 
+  const effectiveWsUrl = wsUrl ?? storedWsUrl;
+  const effectiveHttpBase = httpBase ?? httpBaseFromWsUrl(effectiveWsUrl);
+  const effectiveToken = token ?? extractTokenFromWsUrl(effectiveWsUrl);
+
   function syncFromWsUrl(nextWsUrl: string): void {
     setWsUrl(nextWsUrl);
     const derived = httpBaseFromWsUrl(nextWsUrl);
@@ -145,8 +125,8 @@ export default function NodesPage() {
     setLoading(true);
     setError(null);
     try {
-      const url = nodeApiUrl(httpBase, "");
-      if (token) url.searchParams.set("token", token);
+      const url = nodeApiUrl(effectiveHttpBase, "");
+      if (effectiveToken) url.searchParams.set("token", effectiveToken);
       const res = await fetch(url.toString(), { cache: "no-store" });
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       const data = (await res.json()) as { nodes?: NodeInfo[] };
@@ -183,8 +163,8 @@ export default function NodesPage() {
 
     setLoading(true);
     try {
-      const url = nodeApiUrl(httpBase, "invoke");
-      if (token) url.searchParams.set("token", token);
+      const url = nodeApiUrl(effectiveHttpBase, "invoke");
+      if (effectiveToken) url.searchParams.set("token", effectiveToken);
       const res = await fetch(url.toString(), {
         method: "POST",
         headers: { "content-type": "application/json" },
@@ -241,31 +221,31 @@ export default function NodesPage() {
           <div className="rounded-2xl border border-border bg-background/50 p-4">
             <div className="grid gap-3">
               <label className="text-sm font-medium">WebSocket URL (for deriving base + token)</label>
-              <Input value={wsUrl} onChange={(event) => syncFromWsUrl(event.target.value)} />
+              <Input value={effectiveWsUrl} onChange={(event) => syncFromWsUrl(event.target.value)} />
 
               <div className="grid grid-cols-1 gap-3 md:grid-cols-2">
                 <div className="grid gap-2">
                   <label className="text-sm font-medium">HTTP Base</label>
-                  <Input value={httpBase} onChange={(event) => setHttpBase(event.target.value)} />
+                  <Input value={effectiveHttpBase} onChange={(event) => setHttpBase(event.target.value)} />
                 </div>
                 <div className="grid gap-2">
                   <label className="text-sm font-medium">Token (optional)</label>
-                  <Input value={token} onChange={(event) => setToken(event.target.value)} />
+                  <Input value={effectiveToken} onChange={(event) => setToken(event.target.value)} />
                 </div>
               </div>
 
               <div className="flex flex-wrap items-center gap-2">
-                <Button type="button" onClick={refreshNodes} disabled={loading || !httpBase}>
+                <Button type="button" onClick={refreshNodes} disabled={loading || !effectiveHttpBase}>
                   {loading ? "Loading…" : "Refresh nodes"}
                 </Button>
-                <a
+                <Link
                   href="/"
                   className={cn(
                     "text-sm text-muted-foreground underline underline-offset-4 hover:text-foreground"
                   )}
                 >
                   Back to chat
-                </a>
+                </Link>
                 {error ? <span className="text-sm text-destructive">{error}</span> : null}
               </div>
             </div>

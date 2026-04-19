@@ -18,10 +18,10 @@ import {
 } from "@/lib/admin";
 import { formatCompact, formatInt, formatRelative, formatWhen } from "@/lib/format";
 import { cn } from "@/lib/utils";
-import { gatewayFetchJson, loadGatewayWsUrl, storeGatewayWsUrl } from "@/lib/gateway";
+import { gatewayFetchJson, useGatewayWsUrlState } from "@/lib/gateway";
 
 export default function UsersPage() {
-  const [wsUrl, setWsUrl] = React.useState<string>(() => (typeof window === "undefined" ? "" : loadGatewayWsUrl()));
+  const [wsUrl, setWsUrl] = useGatewayWsUrlState();
   const [users, setUsers] = React.useState<AdminUserSummary[]>([]);
   const [usersBusy, setUsersBusy] = React.useState(false);
   const [usersError, setUsersError] = React.useState<string | null>(null);
@@ -35,11 +35,6 @@ export default function UsersPage() {
   const [newChannelBaseUrl, setNewChannelBaseUrl] = React.useState("");
   const [newChannelApiKey, setNewChannelApiKey] = React.useState("");
   const [modelDraftByAgent, setModelDraftByAgent] = React.useState<Record<string, string>>({});
-
-  React.useEffect(() => {
-    if (!wsUrl.trim()) return;
-    storeGatewayWsUrl(wsUrl);
-  }, [wsUrl]);
 
   const refreshUsers = React.useCallback(
     async (opts?: { preserveSelection?: boolean }) => {
@@ -386,7 +381,7 @@ export default function UsersPage() {
     >
       <div className="grid gap-6 xl:grid-cols-[360px_1fr]">
         <section className="space-y-4">
-          <PanelCard title="Users" subtitle={usersBusy ? "Refreshing…" : `${users.length} tracked users`}>
+          <PanelCard eyebrow="Fleet roster" title="Users" subtitle={usersBusy ? "Refreshing…" : `${users.length} tracked users`}>
             {usersError ? <InlineError message={usersError} /> : null}
             <div className="space-y-2">
               {users.map((user) => {
@@ -397,10 +392,10 @@ export default function UsersPage() {
                     type="button"
                     onClick={() => setSelectedUserId(user.userId)}
                     className={cn(
-                      "w-full rounded-2xl border px-4 py-3 text-left transition-colors",
+                      "w-full rounded-[22px] border px-4 py-4 text-left transition-colors",
                       active
                         ? "border-primary/25 bg-primary/10"
-                        : "border-border/60 bg-background/40 hover:border-border hover:bg-background/55"
+                        : "border-border/60 bg-background/30 hover:border-border hover:bg-background/55"
                     )}
                   >
                     <div className="flex items-start justify-between gap-3">
@@ -444,26 +439,34 @@ export default function UsersPage() {
             </PanelCard>
           ) : detail ? (
             <>
-              <div className="grid gap-4 md:grid-cols-4">
-                <StatCard label="24h tokens" value={formatCompact(detail.user.usage24h.totalTokens)} tone="primary" />
-                <StatCard label="Total tokens" value={formatCompact(detail.user.usageTotal.totalTokens)} tone="default" />
-                <StatCard label="Agents" value={String(detail.user.agentCount)} tone="default" />
-                <StatCard label="Last active" value={formatRelative(detail.user.lastActiveMs)} tone="default" />
+              <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-4">
+                <StatCard
+                  label="24h tokens"
+                  value={formatCompact(detail.user.usage24h.totalTokens)}
+                  tone="primary"
+                  hint="Rolling activity window for this operator-managed user."
+                />
+                <StatCard label="Total tokens" value={formatCompact(detail.user.usageTotal.totalTokens)} hint="All recorded requests for this user." />
+                <StatCard label="Agents" value={String(detail.user.agentCount)} hint="Dedicated runtime bindings or persistent personas." />
+                <StatCard label="Last active" value={formatRelative(detail.user.lastActiveMs)} hint="Most recent observed interaction." />
               </div>
 
               <PanelCard
+                eyebrow="Selected user"
                 title={`User ${detail.user.userId}`}
                 subtitle={`Private chat ${detail.user.privateChatKey} · current channel ${detail.user.currentChannel?.name || detail.user.currentChannelId || "gateway"}`}
+                className="argus-data-grid"
               >
                 <div className="grid gap-4 lg:grid-cols-2">
-                  <Fact label="Current agent" value={detail.user.currentAgentId || "—"} />
-                  <Fact label="Current session" value={detail.user.currentSessionId || "—"} />
+                  <Fact label="Current agent" value={detail.user.currentAgentId || "—"} mono />
+                  <Fact label="Current session" value={detail.user.currentSessionId || "—"} mono />
                   <Fact label="Ready channels" value={`${detail.user.readyChannelCount}/${detail.user.channelCount}`} />
-                  <Fact label="Current model" value={detail.user.currentModel || "—"} />
+                  <Fact label="Current model" value={detail.user.currentModel || "—"} mono />
                 </div>
               </PanelCard>
 
               <PanelCard
+                eyebrow="Agent fleet"
                 title="Agents"
                 subtitle="Create dedicated agents, move the user's default binding, and pin per-agent model defaults."
                 action={
@@ -485,7 +488,7 @@ export default function UsersPage() {
                   {detail.agents.map((agent) => (
                     <div
                       key={agent.agentId}
-                      className="rounded-2xl border border-border/60 bg-background/40 p-4"
+                      className="rounded-[24px] border border-border/60 bg-background/30 p-4 shadow-[inset_0_1px_0_0_oklch(var(--foreground)/0.04)]"
                     >
                       <div className="flex flex-col gap-3 xl:flex-row xl:items-start xl:justify-between">
                         <div className="min-w-0">
@@ -495,7 +498,7 @@ export default function UsersPage() {
                             {detail.user.currentAgentId === agent.agentId ? <Badge tone="success">current</Badge> : null}
                           </div>
                           <div className="mt-2 text-xs text-muted-foreground">
-                            session <code>{agent.sessionId || "—"}</code> · created {formatWhen(agent.createdAtMs)}
+                            session <code className="font-mono">{agent.sessionId || "—"}</code> · created {formatWhen(agent.createdAtMs)}
                           </div>
                         </div>
 
@@ -524,7 +527,7 @@ export default function UsersPage() {
                             setModelDraftByAgent((prev) => ({ ...prev, [agent.agentId]: event.target.value }))
                           }
                           className={cn(
-                            "h-11 min-w-[220px] rounded-xl border border-border/60 bg-background/60 px-3 text-sm text-foreground outline-none",
+                            "h-11 min-w-[220px] rounded-2xl border border-border/60 bg-background/60 px-3 text-sm text-foreground outline-none",
                             "focus:border-primary/40 focus:ring-4 focus:ring-ring/20"
                           )}
                         >
@@ -549,6 +552,7 @@ export default function UsersPage() {
               </PanelCard>
 
               <PanelCard
+                eyebrow="Upstreams"
                 title="Channels"
                 subtitle="Switch the current upstream, rotate per-user keys, and keep the builtin gateway as fallback."
                 action={
@@ -578,7 +582,7 @@ export default function UsersPage() {
               >
                 <div className="grid gap-3">
                   {detail.channels.channels.map((channel) => (
-                    <div key={channel.channelId} className="rounded-2xl border border-border/60 bg-background/40 p-4">
+                    <div key={channel.channelId} className="rounded-[24px] border border-border/60 bg-background/30 p-4 shadow-[inset_0_1px_0_0_oklch(var(--foreground)/0.04)]">
                       <div className="flex flex-col gap-3 xl:flex-row xl:items-start xl:justify-between">
                         <div className="min-w-0">
                           <div className="flex flex-wrap items-center gap-2">
@@ -630,10 +634,10 @@ export default function UsersPage() {
                 </div>
               </PanelCard>
 
-              <PanelCard title="Recent usage" subtitle="Last 100 Responses calls attributed to this user.">
-                <div className="overflow-hidden rounded-2xl border border-border/60">
+              <PanelCard eyebrow="Ledger" title="Recent usage" subtitle="Last 100 Responses calls attributed to this user.">
+                <div className="argus-table-shell rounded-[24px]">
                   <table className="w-full border-collapse text-sm">
-                    <thead className="bg-background/60 text-left text-xs uppercase tracking-[0.22em] text-muted-foreground">
+                    <thead className="argus-table-head text-left text-xs uppercase tracking-[0.22em] text-muted-foreground">
                       <tr>
                         <th className="px-4 py-3">When</th>
                         <th className="px-4 py-3">Agent</th>
@@ -657,9 +661,9 @@ export default function UsersPage() {
                           className="border-t border-border/60"
                         >
                           <td className="px-4 py-3 text-muted-foreground">{formatWhen(entry.createdAtMs)}</td>
-                          <td className="px-4 py-3">{entry.agentId || "—"}</td>
+                          <td className="px-4 py-3 font-mono text-[13px]">{entry.agentId || "—"}</td>
                           <td className="px-4 py-3">{entry.channelName || entry.channelId || "—"}</td>
-                          <td className="px-4 py-3">{entry.model || entry.requestedModel || "—"}</td>
+                          <td className="px-4 py-3 font-mono text-[13px]">{entry.model || entry.requestedModel || "—"}</td>
                           <td className="px-4 py-3 text-right font-medium">{formatInt(entry.totalTokens)}</td>
                           <td className="px-4 py-3">
                             <span className={cn(

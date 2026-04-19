@@ -1,3 +1,5 @@
+import * as React from "react";
+
 export const GATEWAY_WS_STORAGE_KEY = "argus.gateway.wsUrl";
 
 export function stripSessionFromWsUrl(url: string): string {
@@ -53,6 +55,34 @@ export function storeGatewayWsUrl(url: string): void {
   } catch {
     // ignore
   }
+}
+
+function subscribeGatewayWsUrl(onStoreChange: () => void): () => void {
+  if (typeof window === "undefined") return () => {};
+  const onStorage = (event: StorageEvent) => {
+    if (event.key && event.key !== GATEWAY_WS_STORAGE_KEY) return;
+    onStoreChange();
+  };
+  window.addEventListener("storage", onStorage);
+  return () => window.removeEventListener("storage", onStorage);
+}
+
+export function useStoredGatewayWsUrl(): string {
+  return React.useSyncExternalStore(subscribeGatewayWsUrl, loadGatewayWsUrl, () => "");
+}
+
+export function useGatewayWsUrlState(): [string, (value: string) => void] {
+  const stored = useStoredGatewayWsUrl();
+  const [override, setOverride] = React.useState<string | null>(null);
+
+  const value = override ?? stored;
+
+  const setValue = React.useCallback((nextValue: string) => {
+    setOverride(nextValue);
+    storeGatewayWsUrl(nextValue);
+  }, []);
+
+  return [value, setValue];
 }
 
 export function extractTokenFromWsUrl(url: string): string | null {
