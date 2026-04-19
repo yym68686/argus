@@ -223,12 +223,7 @@ export async function verifyGatewayAdminAccess(wsUrl: string, token: string): Pr
   const resp = await fetch(`${base}/admin/overview`, { headers, cache: "no-store" });
   const text = await resp.text();
   if (resp.ok) return;
-  const payload = text ? safeParseJson(text) : null;
-  const detail =
-    payload && typeof payload === "object" && payload !== null && "detail" in payload
-      ? String((payload as { detail?: unknown }).detail ?? "")
-      : text;
-  throw new Error(detail || `Authentication failed: ${resp.status}`);
+  throw new Error(summarizeHttpFailure(resp, text, "Authentication check"));
 }
 
 export async function gatewayFetchJson<T>(wsUrl: string, path: string, init?: RequestInit): Promise<T> {
@@ -238,17 +233,31 @@ export async function gatewayFetchJson<T>(wsUrl: string, path: string, init?: Re
   if (!headers.has("Content-Type") && init?.body) {
     headers.set("Content-Type", "application/json");
   }
-  const resp = await fetch(`${base}${path}`, { ...init, headers });
+  const requestInit: RequestInit = { ...init, headers };
+  if (requestInit.cache === undefined) {
+    requestInit.cache = "no-store";
+  }
+  const resp = await fetch(`${base}${path}`, requestInit);
   const text = await resp.text();
   const payload = text ? safeParseJson(text) : null;
   if (!resp.ok) {
-    const detail =
-      payload && typeof payload === "object" && payload !== null && "detail" in payload
-        ? String((payload as { detail?: unknown }).detail ?? "")
-        : text;
-    throw new Error(detail || `Request failed: ${resp.status}`);
+    throw new Error(summarizeHttpFailure(resp, text, `Request to ${path}`));
   }
   return (payload as T) ?? ({} as T);
+}
+
+export function summarizeHttpFailure(resp: Response, text: string, scope = "Request"): string {
+  const status = collapseWhitespace([String(resp.status || ""), resp.statusText || ""].filter(Boolean).join(" "));
+  const detail = extractResponseDetail(text);
+  const prefix = status ? `${scope} failed with ${status}.` : `${scope} failed.`;
+  if (!detail) {
+    return prefix;
+  }
+  const normalizedDetail = detail.replace(/[.\s]+$/g, "");
+  if (status && normalizedDetail.toLowerCase() === status.toLowerCase()) {
+    return prefix;
+  }
+  return `${prefix} ${normalizedDetail}.`;
 }
 
 function safeParseJson(text: string): unknown {
@@ -257,4 +266,79 @@ function safeParseJson(text: string): unknown {
   } catch {
     return null;
   }
+}
+
+function extractResponseDetail(text: string): string {
+  const trimmed = text.trim();
+  if (!trimmed) return "";
+
+  const payload = safeParseJson(trimmed);
+  const payloadDetail = extractJsonErrorDetail(payload);
+  if (payloadDetail) {
+    return payloadDetail;
+  }
+
+  if (looksLikeHtml(trimmed)) {
+    return extractHtmlErrorDetail(trimmed);
+  }
+
+  return collapseWhitespace(trimmed).slice(0, 280);
+}
+
+function extractJsonErrorDetail(payload: unknown): string {
+  if (!payload || typeof payload !== "object") return "";
+  const record = payload as Record<string, unknown>;
+  for (const key of ["detail", "error", "message", "title"]) {
+    const value = record[key];
+    if (typeof value === "string" && collapseWhitespace(value)) {
+      return collapseWhitespace(value);
+    }
+  }
+  return "";
+}
+
+function looksLikeHtml(text: string): boolean {
+  return /<!doctype html/i.test(text) || /<html[\s>]/i.test(text) || /<(head|body|title|h1)\b/i.test(text);
+}
+
+function extractHtmlErrorDetail(text: string): string {
+  const combined = collapseWhitespace(stripHtmlTags(text));
+  const title = extractTagText(text, "title");
+  const heading = extractTagText(text, "h1");
+  const normalizedSignals = [combined, title, heading].filter(Boolean).join(" ");
+
+  if (/bad gateway/i.test(normalizedSignals)) {
+    return /cloudflare/i.test(normalizedSignals)
+      ? "Bad gateway from the upstream host (Cloudflare edge page)"
+      : "Bad gateway from the upstream host";
+  }
+  if (/gateway timeout/i.test(normalizedSignals)) {
+    return /cloudflare/i.test(normalizedSignals)
+      ? "Gateway timeout from the upstream host (Cloudflare edge page)"
+      : "Gateway timeout from the upstream host";
+  }
+  if (/unauthorized/i.test(normalizedSignals)) {
+    return "Unauthorized";
+  }
+  if (/forbidden/i.test(normalizedSignals)) {
+    return "Forbidden";
+  }
+
+  return title || heading || "Gateway returned an unexpected HTML error page";
+}
+
+function extractTagText(text: string, tag: string): string {
+  const match = text.match(new RegExp(`<${tag}\\b[^>]*>([\\s\\S]*?)</${tag}>`, "i"));
+  return match?.[1] ? collapseWhitespace(stripHtmlTags(match[1])) : "";
+}
+
+function stripHtmlTags(text: string): string {
+  return text
+    .replace(/<script\b[^<]*(?:(?!<\/script>)<[^<]*)*<\/script>/gi, " ")
+    .replace(/<style\b[^<]*(?:(?!<\/style>)<[^<]*)*<\/style>/gi, " ")
+    .replace(/<[^>]+>/g, " ");
+}
+
+function collapseWhitespace(text: string): string {
+  return text.replace(/\s+/g, " ").trim();
 }

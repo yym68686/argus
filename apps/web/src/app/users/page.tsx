@@ -571,6 +571,11 @@ export default function UsersPage() {
   }, [detail]);
 
   const showDetailSkeleton = Boolean(selectedUserId && detailBusy && !detail);
+  const rosterSubtitle = usersError
+    ? "Unable to load the operator roster from /admin/users."
+    : usersBusy
+      ? "Refreshing the operator roster."
+      : `${users.length} tracked users with agents, channels, and gateway activity.`;
 
   return (
     <ConsoleShell
@@ -600,11 +605,7 @@ export default function UsersPage() {
           <PanelCard
             eyebrow="Fleet roster"
             title="Users"
-            subtitle={
-              usersBusy
-                ? "Refreshing the operator roster."
-                : `${users.length} tracked users with agents, channels, and gateway activity.`
-            }
+            subtitle={rosterSubtitle}
             action={
               <div className="grid gap-2 md:grid-cols-[minmax(0,1fr)_auto]">
                 <Input
@@ -661,7 +662,11 @@ export default function UsersPage() {
         </section>
 
         <section className="space-y-6">
-          {!selectedUserId ? (
+          {usersError && !selectedUserId ? (
+            <PanelCard title="User detail" subtitle="Gateway user inventory is currently unavailable.">
+              <InlineError message={usersError} />
+            </PanelCard>
+          ) : !selectedUserId ? (
             <PanelCard title="User detail" subtitle="Select a user to inspect agents, channels, default bindings, and recent gateway activity.">
               <EmptyState title="Nothing selected" body="Pick a user from the list on the left." />
             </PanelCard>

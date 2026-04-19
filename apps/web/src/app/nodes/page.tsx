@@ -7,7 +7,7 @@ import { ConsoleShell } from "@/components/console-shell";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Textarea } from "@/components/ui/textarea";
-import { useStoredGatewayWsUrl } from "@/lib/gateway";
+import { summarizeHttpFailure, useStoredGatewayWsUrl } from "@/lib/gateway";
 import { cn } from "@/lib/utils";
 
 type NodeInfo = {
@@ -141,13 +141,14 @@ export default function NodesPage() {
       const url = nodeApiUrl(effectiveHttpBase, "");
       if (effectiveToken) url.searchParams.set("token", effectiveToken);
       const res = await fetch(url.toString(), { cache: "no-store" });
-      if (!res.ok) throw new Error(`HTTP ${res.status}`);
-      const data = (await res.json()) as { nodes?: NodeInfo[] };
+      const text = await res.text();
+      if (!res.ok) throw new Error(summarizeHttpFailure(res, text, "Node inventory request"));
+      const data = (safeParseJson(text) ?? {}) as { nodes?: NodeInfo[] };
       const nextNodes = Array.isArray(data.nodes) ? data.nodes : [];
       setNodes(nextNodes);
       if (!nodePick && nextNodes.length) setNodePick(nextNodes[0].nodeId);
     } catch (event) {
-      setError(String(event));
+      setError((event as Error)?.message || String(event));
     } finally {
       setLoading(false);
     }
@@ -191,9 +192,9 @@ export default function NodesPage() {
         setJobId(nextJobId);
       }
 
-      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      if (!res.ok) throw new Error(summarizeHttpFailure(res, text, "Node invoke request"));
     } catch (event) {
-      setError(String(event));
+      setError((event as Error)?.message || String(event));
     } finally {
       setLoading(false);
     }
