@@ -25,6 +25,9 @@ export interface AdminChannelEntry {
   modelsUrl?: string | null;
   hasApiKey?: boolean;
   apiKeyMasked?: string | null;
+  enabledForUser?: boolean;
+  disabledByAdmin?: boolean;
+  canAdminToggleAccess?: boolean;
   ready?: boolean;
   reason?: string | null;
   canRename?: boolean;

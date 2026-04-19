@@ -337,6 +337,29 @@ export default function UsersPage() {
     }
   }
 
+  async function setBuiltinChannelAccess(channel: AdminChannelEntry, enabled: boolean): Promise<void> {
+    if (!selectedUserId) return;
+    try {
+      await gatewayFetchJson(
+        wsUrl,
+        `/admin/users/${selectedUserId}/channels/${encodeURIComponent(channel.channelId)}/access`,
+        {
+          method: "PUT",
+          body: JSON.stringify({ enabled }),
+        },
+      );
+      toast.success(
+        enabled
+          ? `${channel.name || channel.channelId} enabled for this user`
+          : `${channel.name || channel.channelId} blocked for this user`,
+      );
+      await refreshUsers({ preserveSelection: true });
+      await refreshDetail(selectedUserId);
+    } catch (error) {
+      toast.error((error as Error)?.message || String(error));
+    }
+  }
+
   const availableModels = React.useMemo(() => {
     const fromList = detail?.availableModels?.filter(Boolean) ?? [];
     if (fromList.length) return fromList;
@@ -554,7 +577,7 @@ export default function UsersPage() {
               <PanelCard
                 eyebrow="Upstreams"
                 title="Channels"
-                subtitle="Switch the current upstream, rotate per-user keys, and keep the builtin gateway as fallback."
+                subtitle="Switch upstreams, rotate per-user keys, and explicitly allow or block the built-in gateway API."
                 action={
                   <div className="grid gap-2 md:grid-cols-[160px_220px_220px_auto]">
                     <Input
@@ -588,7 +611,13 @@ export default function UsersPage() {
                           <div className="flex flex-wrap items-center gap-2">
                             <div className="font-medium text-foreground">{channel.name}</div>
                             {channel.selected ? <Badge tone="primary">selected</Badge> : null}
-                            {channel.ready ? <Badge tone="success">ready</Badge> : <Badge tone="warning">needs setup</Badge>}
+                            {channel.disabledByAdmin ? (
+                              <Badge tone="warning">blocked</Badge>
+                            ) : channel.ready ? (
+                              <Badge tone="success">ready</Badge>
+                            ) : (
+                              <Badge tone="warning">needs setup</Badge>
+                            )}
                             {channel.isBuiltin ? <Badge tone="default">{channel.builtinKind || "builtin"}</Badge> : null}
                           </div>
                           <div className="mt-2 truncate text-xs text-muted-foreground">
@@ -600,10 +629,24 @@ export default function UsersPage() {
                         </div>
 
                         <div className="flex flex-wrap gap-2">
-                          <Button type="button" variant="secondary" disabled={channel.selected} onClick={() => void selectChannel(channel)}>
+                          <Button
+                            type="button"
+                            variant="secondary"
+                            disabled={channel.selected || !channel.ready}
+                            onClick={() => void selectChannel(channel)}
+                          >
                             <RadioTower className="mr-2 h-4 w-4" />
                             Select
                           </Button>
+                          {channel.canAdminToggleAccess ? (
+                            <Button
+                              type="button"
+                              variant={channel.enabledForUser === false ? "secondary" : "destructive"}
+                              onClick={() => void setBuiltinChannelAccess(channel, channel.enabledForUser === false)}
+                            >
+                              {channel.enabledForUser === false ? "Enable gateway API" : "Block gateway API"}
+                            </Button>
+                          ) : null}
                           {channel.canRename ? (
                             <Button type="button" variant="secondary" onClick={() => void renameChannel(channel)}>
                               <Pencil className="mr-2 h-4 w-4" />

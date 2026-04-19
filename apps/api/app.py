@@ -2496,6 +2496,7 @@ class PersistedUserChannelState:
     current_channel_id: str = CHANNEL_ID_GATEWAY
     custom_channels: dict[str, PersistedUserChannel] = field(default_factory=dict)
     builtin_api_keys: dict[str, str] = field(default_factory=dict)
+    disabled_builtin_channels: list[str] = field(default_factory=list)
 
     def to_json(self, *, redact_secrets: bool = False) -> dict[str, Any]:
         custom_channels: dict[str, Any] = {}
@@ -2512,10 +2513,19 @@ class PersistedUserChannelState:
             if not normalized_key:
                 continue
             builtin_api_keys[cid] = _mask_secret(normalized_key) if redact_secrets else normalized_key
+        disabled_builtin_channels: list[str] = []
+        seen_disabled_builtin_channels: set[str] = set()
+        for raw_channel_id in (self.disabled_builtin_channels or []):
+            cid = _normalize_channel_id(raw_channel_id)
+            if cid not in CHANNEL_IDS_BUILTIN or cid in seen_disabled_builtin_channels:
+                continue
+            seen_disabled_builtin_channels.add(cid)
+            disabled_builtin_channels.append(cid)
         return {
             "currentChannelId": _normalize_channel_id(self.current_channel_id) or CHANNEL_ID_GATEWAY,
             "customChannels": custom_channels,
             "builtinApiKeys": builtin_api_keys,
+            "disabledBuiltinChannels": disabled_builtin_channels,
         }
 
     @staticmethod
@@ -2546,10 +2556,21 @@ class PersistedUserChannelState:
                 if not api_key:
                     continue
                 builtin_api_keys[channel_id] = api_key
+        disabled_builtin_channels_raw = obj.get("disabledBuiltinChannels")
+        disabled_builtin_channels: list[str] = []
+        if isinstance(disabled_builtin_channels_raw, list):
+            seen_disabled_builtin_channels: set[str] = set()
+            for raw_channel_id in disabled_builtin_channels_raw:
+                channel_id = _normalize_channel_id(raw_channel_id)
+                if channel_id not in CHANNEL_IDS_BUILTIN or channel_id in seen_disabled_builtin_channels:
+                    continue
+                seen_disabled_builtin_channels.add(channel_id)
+                disabled_builtin_channels.append(channel_id)
         return PersistedUserChannelState(
             current_channel_id=current_channel_id,
             custom_channels=custom_channels,
             builtin_api_keys=builtin_api_keys,
+            disabled_builtin_channels=disabled_builtin_channels,
         )
 
 
@@ -3474,13 +3495,29 @@ class AutomationManager:
                 return channel.channel_id
         return ""
 
+    def _is_builtin_channel_enabled_for_user_state(
+        self,
+        *,
+        user_state: PersistedUserChannelState,
+        channel_id: str,
+    ) -> bool:
+        normalized_channel_id = _normalize_channel_id(channel_id)
+        if normalized_channel_id not in CHANNEL_IDS_BUILTIN:
+            return True
+        disabled = getattr(user_state, "disabled_builtin_channels", None)
+        if not isinstance(disabled, list):
+            return True
+        return normalized_channel_id not in disabled
+
     def _current_channel_id_for_user_state(self, *, user_state: PersistedUserChannelState) -> str:
         channel_id = _normalize_channel_id(getattr(user_state, "current_channel_id", None))
         if channel_id in CHANNEL_IDS_BUILTIN:
-            return channel_id
+            if self._is_builtin_channel_enabled_for_user_state(user_state=user_state, channel_id=channel_id):
+                return channel_id
+            return self._best_channel_fallback_id_for_user_state(user_state=user_state)
         if channel_id and channel_id in (user_state.custom_channels or {}):
             return channel_id
-        return CHANNEL_ID_GATEWAY
+        return self._best_channel_fallback_id_for_user_state(user_state=user_state)
 
     def _iter_custom_channels_for_user_state(self, *, user_state: PersistedUserChannelState) -> list[PersistedUserChannel]:
         out: list[PersistedUserChannel] = []
@@ -3501,8 +3538,17 @@ class AutomationManager:
         normalized_channel_id = _normalize_channel_id(channel_id)
         if normalized_channel_id == CHANNEL_ID_GATEWAY:
             api_key = _gateway_openai_api_key()
-            ready = bool(api_key)
+            enabled = self._is_builtin_channel_enabled_for_user_state(
+                user_state=user_state,
+                channel_id=CHANNEL_ID_GATEWAY,
+            )
+            ready = bool(api_key) and enabled
             base_url = _base_url_from_responses_url(_gateway_openai_responses_upstream_url())
+            reason: Optional[str] = None
+            if not enabled:
+                reason = "Disabled by admin"
+            elif not api_key:
+                reason = "Gateway OPENAI_API_KEY is not configured"
             return {
                 "channelId": CHANNEL_ID_GATEWAY,
                 "name": CHANNEL_ID_GATEWAY,
@@ -3515,8 +3561,11 @@ class AutomationManager:
                 "modelsUrl": _models_url_from_base_url(base_url),
                 "hasApiKey": bool(api_key),
                 "apiKeyMasked": None,
+                "enabledForUser": enabled,
+                "disabledByAdmin": not enabled,
+                "canAdminToggleAccess": True,
                 "ready": ready,
-                "reason": None if ready else "Gateway OPENAI_API_KEY is not configured",
+                "reason": reason,
                 "canRename": False,
                 "canDelete": False,
                 "canSetKey": False,
@@ -3525,8 +3574,17 @@ class AutomationManager:
             }
         if normalized_channel_id == CHANNEL_ID_ZERO_ZERO_PRO:
             api_key = _normalize_channel_api_key((user_state.builtin_api_keys or {}).get(CHANNEL_ID_ZERO_ZERO_PRO))
-            ready = bool(api_key)
+            enabled = self._is_builtin_channel_enabled_for_user_state(
+                user_state=user_state,
+                channel_id=CHANNEL_ID_ZERO_ZERO_PRO,
+            )
+            ready = bool(api_key) and enabled
             responses_url = _responses_url_from_base_url(CHANNEL_ZERO_ZERO_PRO_BASE_URL)
+            reason: Optional[str] = None
+            if not enabled:
+                reason = "Disabled by admin"
+            elif not api_key:
+                reason = "Missing apiKey"
             return {
                 "channelId": CHANNEL_ID_ZERO_ZERO_PRO,
                 "name": CHANNEL_ID_ZERO_ZERO_PRO,
@@ -3539,8 +3597,11 @@ class AutomationManager:
                 "modelsUrl": _models_url_from_base_url(CHANNEL_ZERO_ZERO_PRO_BASE_URL),
                 "hasApiKey": bool(api_key),
                 "apiKeyMasked": _mask_secret(api_key),
+                "enabledForUser": enabled,
+                "disabledByAdmin": not enabled,
+                "canAdminToggleAccess": False,
                 "ready": ready,
-                "reason": None if ready else "Missing apiKey",
+                "reason": reason,
                 "canRename": False,
                 "canDelete": False,
                 "canSetKey": True,
@@ -3569,6 +3630,9 @@ class AutomationManager:
             "modelsUrl": _models_url_from_base_url(channel.base_url),
             "hasApiKey": bool(api_key),
             "apiKeyMasked": _mask_secret(api_key),
+            "enabledForUser": True,
+            "disabledByAdmin": False,
+            "canAdminToggleAccess": False,
             "ready": ready,
             "reason": None if ready else f"Missing {'/'.join(missing)}",
             "canRename": True,
@@ -3598,7 +3662,14 @@ class AutomationManager:
                 current_channel_id=None,
             ).get("ready"):
                 return channel.channel_id
-        return CHANNEL_ID_GATEWAY
+        if self._is_builtin_channel_enabled_for_user_state(user_state=user_state, channel_id=CHANNEL_ID_GATEWAY):
+            return CHANNEL_ID_GATEWAY
+        if self._is_builtin_channel_enabled_for_user_state(user_state=user_state, channel_id=CHANNEL_ID_ZERO_ZERO_PRO):
+            return CHANNEL_ID_ZERO_ZERO_PRO
+        first_custom = next(iter(self._iter_custom_channels_for_user_state(user_state=user_state)), None)
+        if isinstance(first_custom, PersistedUserChannel):
+            return first_custom.channel_id
+        return CHANNEL_ID_ZERO_ZERO_PRO
 
     def list_channels_for_user(self, *, user_id: int) -> dict[str, Any]:
         user_state = self._get_user_channel_state_for_user(user_id=user_id)
@@ -3733,6 +3804,12 @@ class AutomationManager:
             channel_id=resolved_channel_id,
             current_channel_id=current_channel_id,
         )
+        if not bool(channel_entry.get("ready")):
+            return _fallback_model_catalog(
+                current_model=normalized_current_model,
+                error=str(channel_entry.get("reason") or f"Channel is not ready: {resolved_channel_id}"),
+                channel=channel_entry,
+            )
         if resolved_channel_id == CHANNEL_ID_GATEWAY:
             return _static_model_catalog(
                 models=ARGUS_GATEWAY_AGENT_MODELS,
@@ -3962,12 +4039,13 @@ class AutomationManager:
                 st.user_channels[user_key] = user_state
             if resolved_channel_id not in CHANNEL_IDS_BUILTIN and resolved_channel_id not in (user_state.custom_channels or {}):
                 raise ValueError(f"Unknown channel: {channel_id}")
-            if not self._channel_entry_for_user_state(
+            channel_entry = self._channel_entry_for_user_state(
                 user_state=user_state,
                 channel_id=resolved_channel_id,
                 current_channel_id=None,
-            ).get("ready"):
-                raise ValueError(f"Channel is not ready: {resolved_channel_id}")
+            )
+            if not channel_entry.get("ready"):
+                raise ValueError(str(channel_entry.get("reason") or f"Channel is not ready: {resolved_channel_id}"))
             user_state.current_channel_id = resolved_channel_id
 
         await self._store.update(_write)
@@ -4070,6 +4148,58 @@ class AutomationManager:
             "channelId": resolved_channel_id,
             "channel": selected_channel,
             "currentChannel": current_channel,
+            "currentChannelId": listed.get("currentChannelId"),
+        }
+
+    async def set_user_builtin_channel_access(self, *, user_id: int, channel_id: str, enabled: bool) -> dict[str, Any]:
+        if not isinstance(user_id, int) or user_id <= 0:
+            raise ValueError("Invalid userId")
+        normalized_channel_id = _normalize_channel_id(channel_id)
+        if normalized_channel_id != CHANNEL_ID_GATEWAY:
+            raise ValueError(f"Unsupported builtin channel: {channel_id}")
+        enabled_flag = bool(enabled)
+
+        def _write(st: PersistedGatewayAutomationState) -> None:
+            st.version = max(int(getattr(st, "version", 1) or 1), AUTOMATION_STATE_VERSION)
+            user_key = str(user_id)
+            user_state = st.user_channels.get(user_key)
+            if not isinstance(user_state, PersistedUserChannelState):
+                user_state = PersistedUserChannelState()
+                st.user_channels[user_key] = user_state
+            disabled = [
+                cid
+                for cid in (user_state.disabled_builtin_channels or [])
+                if _normalize_channel_id(cid) in CHANNEL_IDS_BUILTIN
+            ]
+            if enabled_flag:
+                disabled = [cid for cid in disabled if cid != normalized_channel_id]
+            elif normalized_channel_id not in disabled:
+                disabled.append(normalized_channel_id)
+            user_state.disabled_builtin_channels = disabled
+            if (
+                not enabled_flag
+                and _normalize_channel_id(getattr(user_state, "current_channel_id", None)) == normalized_channel_id
+            ):
+                user_state.current_channel_id = self._best_channel_fallback_id_for_user_state(user_state=user_state)
+
+        await self._store.update(_write)
+        self._invalidate_model_catalog_cache(user_id=user_id, channel_id=normalized_channel_id)
+        self._invalidate_model_catalog_cache(user_id=user_id)
+        await self._sync_user_agent_models_for_current_channel(user_id=user_id)
+        listed = self.list_channels_for_user(user_id=user_id)
+        selected_channel = next(
+            (
+                dict(item)
+                for item in listed.get("channels", [])
+                if isinstance(item, dict) and item.get("channelId") == normalized_channel_id
+            ),
+            None,
+        )
+        return {
+            "channelId": normalized_channel_id,
+            "enabled": enabled_flag,
+            "channel": selected_channel,
+            "currentChannel": listed.get("currentChannel"),
             "currentChannelId": listed.get("currentChannelId"),
         }
 
@@ -13946,6 +14076,43 @@ async def admin_user_channel_key_clear(user_id: int, channel_id: str, request: R
         raise HTTPException(status_code=400, detail="Invalid userId")
     try:
         result = await automation.clear_user_channel_api_key(user_id=user_id, channel_id=channel_id)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    listed = automation.list_channels_for_user(user_id=user_id)
+    return {"ok": True, **result, **listed}
+
+
+@app.put("/admin/users/{user_id}/channels/{channel_id}/access")
+async def admin_user_channel_access_set(user_id: int, channel_id: str, request: Request):
+    _http_require_token(request)
+    automation = _get_automation_or_500()
+    if user_id <= 0:
+        raise HTTPException(status_code=400, detail="Invalid userId")
+    try:
+        body = await request.json()
+    except Exception as e:
+        raise HTTPException(status_code=400, detail="Invalid JSON body") from e
+    if not isinstance(body, dict):
+        raise HTTPException(status_code=400, detail="Invalid JSON body")
+    raw_enabled = body.get("enabled")
+    if isinstance(raw_enabled, bool):
+        enabled = raw_enabled
+    elif isinstance(raw_enabled, str):
+        lowered = raw_enabled.strip().lower()
+        if lowered in {"true", "1", "yes", "on"}:
+            enabled = True
+        elif lowered in {"false", "0", "no", "off"}:
+            enabled = False
+        else:
+            raise HTTPException(status_code=400, detail="Invalid 'enabled'")
+    else:
+        raise HTTPException(status_code=400, detail="Invalid 'enabled'")
+    try:
+        result = await automation.set_user_builtin_channel_access(
+            user_id=user_id,
+            channel_id=channel_id,
+            enabled=enabled,
+        )
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e)) from e
     listed = automation.list_channels_for_user(user_id=user_id)
