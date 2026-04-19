@@ -83,7 +83,7 @@ export default function UsagePage() {
               value={wsUrl}
               onChange={(event) => setWsUrl(event.target.value)}
               className="w-[320px]"
-              placeholder="Gateway ws://.../ws?token=..."
+              placeholder="Gateway wss://.../ws"
               spellCheck={false}
             />
             <Button type="button" variant="secondary" disabled={loading} onClick={() => void refresh()}>

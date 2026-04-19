@@ -6,6 +6,7 @@ import { GeistMono } from "geist/font/mono";
 import { GeistSans } from "geist/font/sans";
 import { Toaster } from "sonner";
 
+import { AdminGate } from "@/components/admin-gate";
 import { cn } from "@/lib/utils";
 
 const THEME_INIT_SCRIPT = `
@@ -55,9 +56,8 @@ export default function RootLayout({ children }: RootLayoutProps) {
       </head>
       <body className={cn("min-h-dvh bg-background font-sans text-foreground")}>
         <Toaster theme="dark" richColors closeButton />
-        {children}
+        <AdminGate>{children}</AdminGate>
       </body>
     </html>
   );
 }
-

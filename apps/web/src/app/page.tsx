@@ -29,7 +29,7 @@ import { toast } from "sonner";
 import { cn } from "@/lib/utils";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
-import { useGatewayWsUrlState } from "@/lib/gateway";
+import { buildGatewayHeaders, useGatewayWsUrlState, withGatewayAdminToken } from "@/lib/gateway";
 
 const ARGUS_WEB_VERSION = process.env.NEXT_PUBLIC_ARGUS_VERSION || "0.0.0";
 
@@ -1938,7 +1938,7 @@ export default function Page() {
   }
 
   async function ensureSessionReady(sessionId: string): Promise<void> {
-    const base = stripSessionFromWsUrl(wsUrl);
+    const base = withGatewayAdminToken(stripSessionFromWsUrl(wsUrl));
     if (!base.trim()) throw new Error("WebSocket URL is required");
     const rt = getOrCreateRuntime(sessionId);
     const ws = rt.ws;
@@ -1949,7 +1949,7 @@ export default function Page() {
   }
 
   async function connectNewSession(): Promise<string> {
-    const base = stripSessionFromWsUrl(wsUrl);
+    const base = withGatewayAdminToken(stripSessionFromWsUrl(wsUrl));
     if (!base.trim()) throw new Error("WebSocket URL is required");
     const pendingId = `__pending__${Date.now()}_${Math.random().toString(16).slice(2)}`;
 
@@ -2047,7 +2047,7 @@ export default function Page() {
   }
 
   async function connectOrCreateForUi(): Promise<void> {
-    const base = stripSessionFromWsUrl(wsUrl);
+    const base = withGatewayAdminToken(stripSessionFromWsUrl(wsUrl));
     if (!base.trim()) throw new Error("WebSocket URL is required");
 
     if (activeSessionId) {
@@ -2172,11 +2172,8 @@ export default function Page() {
     setSessionsBusy(true);
     setSessionsError(null);
     try {
-      const token = extractTokenFromWsUrl(wsUrl);
       const base = httpBaseFromWsUrl(wsUrl) ?? "";
-      const headers: Record<string, string> = {};
-      if (token) headers["Authorization"] = `Bearer ${token}`;
-      const resp = await fetch(`${base}/sessions`, { headers });
+      const resp = await fetch(`${base}/sessions`, { headers: buildGatewayHeaders(wsUrl) });
       if (!resp.ok) throw new Error(`Failed to list sessions: ${resp.status}`);
       const body = (await resp.json()) as { sessions?: SessionRow[] };
       const list = body.sessions ?? [];
@@ -2226,13 +2223,10 @@ export default function Page() {
         return next;
       });
 
-      const token = extractTokenFromWsUrl(wsUrl);
       const base = httpBaseFromWsUrl(wsUrl) ?? "";
-      const headers: Record<string, string> = {};
-      if (token) headers["Authorization"] = `Bearer ${token}`;
       const resp = await fetch(`${base}/sessions/${encodeURIComponent(id)}`, {
         method: "DELETE",
-        headers
+        headers: buildGatewayHeaders(wsUrl)
       });
       if (!resp.ok) throw new Error(`Failed to delete session: ${resp.status}`);
       toast.success("Session deleted");

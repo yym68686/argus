@@ -64,7 +64,7 @@ export default function SettingsPage() {
               value={wsUrl}
               onChange={(event) => setWsUrl(event.target.value)}
               className="w-[320px]"
-              placeholder="Gateway ws://.../ws?token=..."
+              placeholder="Gateway wss://.../ws"
               spellCheck={false}
             />
             <Button type="button" variant="secondary" disabled={loading} onClick={() => void refresh()}>
@@ -99,7 +99,7 @@ export default function SettingsPage() {
             <div className="grid gap-4 lg:grid-cols-2">
               <Fact label="Saved WebSocket URL" value={wsUrl || "not configured"} mono />
               <Fact label="Gateway version" value={overview?.version || "unknown"} />
-              <Fact label="Auth model" value="Bearer token embedded in the gateway WebSocket URL" />
+              <Fact label="Auth model" value="Admin bearer token stored in the browser and attached automatically" />
               <Fact label="Health probe" value={health?.ok ? "GET /healthz returned ok" : "No healthy response yet"} />
             </div>
           </PanelCard>

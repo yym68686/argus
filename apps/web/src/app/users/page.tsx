@@ -355,7 +355,7 @@ export default function UsersPage() {
               value={wsUrl}
               onChange={(event) => setWsUrl(event.target.value)}
               className="w-[320px]"
-              placeholder="Gateway ws://.../ws?token=..."
+              placeholder="Gateway wss://.../ws"
               spellCheck={false}
             />
             <Button type="button" variant="secondary" onClick={() => void refreshUsers()} disabled={usersBusy}>
