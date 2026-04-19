@@ -1,6 +1,7 @@
 "use client";
 
 import React from "react";
+import Link from "next/link";
 import {
   ArrowUp,
   Archive,
@@ -8,14 +9,17 @@ import {
   ChevronDown,
   ChevronRight,
   Copy,
+  Gauge,
   Link as LinkIcon,
   MoreHorizontal,
   Paperclip,
   PlugZap,
   RefreshCw,
   Search,
+  Settings2,
   SquarePen,
   Trash2,
+  Users2,
   XCircle
 } from "lucide-react";
 import ReactMarkdown from "react-markdown";
@@ -25,6 +29,7 @@ import { toast } from "sonner";
 import { cn } from "@/lib/utils";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
+import { loadGatewayWsUrl, storeGatewayWsUrl } from "@/lib/gateway";
 
 const ARGUS_WEB_VERSION = process.env.NEXT_PUBLIC_ARGUS_VERSION || "0.0.0";
 
@@ -711,7 +716,7 @@ function turnsToChatMessages(turns: unknown): ChatMessage[] {
 export default function Page() {
   type ActivePane = "chat" | "connection";
 
-  const [wsUrl, setWsUrl] = React.useState<string>("");
+  const [wsUrl, setWsUrl] = React.useState<string>(() => (typeof window === "undefined" ? "" : loadGatewayWsUrl()));
   const [cwd, setCwd] = React.useState<string>("/workspace");
   const [approvalPolicy, setApprovalPolicy] = React.useState<ApprovalPolicy>("never");
 
@@ -846,8 +851,9 @@ export default function Page() {
   }, [activeThreadKey, activeChat?.messages]);
 
   React.useEffect(() => {
-    setWsUrl(stripSessionFromWsUrl(defaultWsUrl()));
-  }, []);
+    if (!wsUrl.trim()) return;
+    storeGatewayWsUrl(wsUrl);
+  }, [wsUrl]);
 
   React.useEffect(() => {
     if (autoConnectAttemptedRef.current) return;
@@ -2504,6 +2510,16 @@ export default function Page() {
                 onClick={() => setActivePane("connection")}
               />
 
+              <div className="mt-4 px-2 text-[11px] font-semibold uppercase tracking-[0.22em] text-muted-foreground">
+                Console
+              </div>
+
+              <div className="mt-1 flex flex-col gap-1">
+                <SidebarLinkItem icon={<Users2 className="h-4 w-4" />} label="Users" href="/users" />
+                <SidebarLinkItem icon={<Gauge className="h-4 w-4" />} label="Usage" href="/usage" />
+                <SidebarLinkItem icon={<Settings2 className="h-4 w-4" />} label="Settings" href="/settings" />
+              </div>
+
               <div className="mt-1 flex items-center gap-2 rounded-xl border border-transparent px-2 py-2 transition-colors hover:border-border/60 hover:bg-background/50">
                 <div className="flex h-9 w-9 items-center justify-center rounded-xl border border-border/60 bg-background/60 text-muted-foreground">
                   <PlugZap className="h-4 w-4" />
@@ -3105,6 +3121,23 @@ function SidebarNavItem({ icon, label, active = false, onClick }: SidebarNavItem
         {label}
       </span>
     </button>
+  );
+}
+
+function SidebarLinkItem({ icon, label, href }: { icon: React.ReactNode; label: string; href: string }) {
+  return (
+    <Link
+      href={href}
+      className={cn(
+        "flex w-full items-center gap-3 rounded-xl border border-transparent px-2 py-2 text-left",
+        "transition-colors hover:border-border/60 hover:bg-background/50"
+      )}
+    >
+      <span className="flex h-9 w-9 items-center justify-center rounded-xl border border-border/60 bg-background/60 text-muted-foreground">
+        {icon}
+      </span>
+      <span className="min-w-0 flex-1 truncate text-sm text-muted-foreground">{label}</span>
+    </Link>
   );
 }
 

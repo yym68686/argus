@@ -1,5 +1,6 @@
 import asyncio
 import base64
+import codecs
 import functools
 import hashlib
 import hmac
@@ -7,6 +8,8 @@ import json
 import logging
 import os
 import re
+import sqlite3
+import threading
 import time
 import uuid
 import urllib.error
@@ -2685,6 +2688,483 @@ class AutomationStateStore:
             return self._state
 
 
+def _usage_int(value: Any) -> int:
+    try:
+        parsed = int(value)
+    except Exception:
+        return 0
+    return parsed if parsed > 0 else 0
+
+
+def _usage_float(value: Any) -> Optional[float]:
+    try:
+        parsed = float(value)
+    except Exception:
+        return None
+    if parsed < 0:
+        return None
+    return parsed
+
+
+def _extract_openai_usage(payload: Any) -> dict[str, Any]:
+    if not isinstance(payload, dict):
+        return {}
+
+    root = payload
+    response_obj = payload.get("response") if isinstance(payload.get("response"), dict) else payload
+    usage_obj = response_obj.get("usage") if isinstance(response_obj, dict) and isinstance(response_obj.get("usage"), dict) else {}
+    output_details = (
+        usage_obj.get("output_tokens_details")
+        if isinstance(usage_obj, dict) and isinstance(usage_obj.get("output_tokens_details"), dict)
+        else {}
+    )
+
+    input_tokens = _usage_int(usage_obj.get("input_tokens") if isinstance(usage_obj, dict) else None)
+    if input_tokens <= 0:
+        input_tokens = _usage_int(usage_obj.get("prompt_tokens") if isinstance(usage_obj, dict) else None)
+
+    output_tokens = _usage_int(usage_obj.get("output_tokens") if isinstance(usage_obj, dict) else None)
+    if output_tokens <= 0:
+        output_tokens = _usage_int(usage_obj.get("completion_tokens") if isinstance(usage_obj, dict) else None)
+
+    reasoning_tokens = _usage_int(output_details.get("reasoning_tokens") if isinstance(output_details, dict) else None)
+    if reasoning_tokens <= 0:
+        reasoning_tokens = _usage_int(
+            usage_obj.get("reasoning_tokens") if isinstance(usage_obj, dict) else None
+        )
+
+    total_tokens = _usage_int(usage_obj.get("total_tokens") if isinstance(usage_obj, dict) else None)
+    if total_tokens <= 0 and (input_tokens > 0 or output_tokens > 0):
+        total_tokens = max(0, input_tokens + output_tokens)
+
+    status = ""
+    if isinstance(response_obj, dict):
+        status = str(response_obj.get("status") or "").strip().lower()
+    if not status:
+        event_type = str(root.get("type") or "").strip().lower()
+        if event_type == "response.failed":
+            status = "failed"
+        elif event_type == "response.completed":
+            status = "completed"
+
+    error = ""
+    for candidate in (
+        response_obj.get("error") if isinstance(response_obj, dict) else None,
+        root.get("error"),
+    ):
+        if isinstance(candidate, dict):
+            message = candidate.get("message")
+            if isinstance(message, str) and message.strip():
+                error = message.strip()
+                break
+        elif isinstance(candidate, str) and candidate.strip():
+            error = candidate.strip()
+            break
+
+    return {
+        "responseId": str(
+            (response_obj.get("id") if isinstance(response_obj, dict) else None)
+            or root.get("id")
+            or ""
+        ).strip()
+        or None,
+        "model": str(
+            (response_obj.get("model") if isinstance(response_obj, dict) else None)
+            or root.get("model")
+            or ""
+        ).strip()
+        or None,
+        "status": status or None,
+        "error": error or None,
+        "inputTokens": input_tokens,
+        "outputTokens": output_tokens,
+        "reasoningTokens": reasoning_tokens,
+        "totalTokens": total_tokens,
+    }
+
+
+class ResponsesStreamUsageCapture:
+    def __init__(self) -> None:
+        self._decoder = codecs.getincrementaldecoder("utf-8")()
+        self._buffer = ""
+        self._current_data_lines: list[str] = []
+        self._snapshot: dict[str, Any] = {}
+
+    def feed(self, chunk: bytes) -> None:
+        if not chunk:
+            return
+        self._buffer += self._decoder.decode(chunk)
+        self._drain_lines()
+
+    def finish(self) -> None:
+        try:
+            self._buffer += self._decoder.decode(b"", final=True)
+        except Exception:
+            pass
+        self._drain_lines(flush_final=True)
+
+    def snapshot(self) -> dict[str, Any]:
+        return dict(self._snapshot)
+
+    def _drain_lines(self, *, flush_final: bool = False) -> None:
+        while True:
+            newline_idx = self._buffer.find("\n")
+            if newline_idx < 0:
+                break
+            line = self._buffer[:newline_idx]
+            self._buffer = self._buffer[newline_idx + 1 :]
+            self._consume_line(line.rstrip("\r"))
+        if flush_final:
+            tail = self._buffer.rstrip("\r")
+            self._buffer = ""
+            if tail:
+                self._consume_line(tail)
+            self._flush_event()
+
+    def _consume_line(self, line: str) -> None:
+        if line == "":
+            self._flush_event()
+            return
+        if line.startswith(":"):
+            return
+        if line.startswith("data:"):
+            self._current_data_lines.append(line[5:].lstrip())
+
+    def _flush_event(self) -> None:
+        if not self._current_data_lines:
+            return
+        raw = "\n".join(self._current_data_lines).strip()
+        self._current_data_lines = []
+        if not raw or raw == "[DONE]":
+            return
+        try:
+            payload = json.loads(raw)
+        except Exception:
+            return
+        extracted = _extract_openai_usage(payload)
+        if not extracted:
+            return
+        for key, value in extracted.items():
+            if value in (None, "", 0):
+                continue
+            self._snapshot[key] = value
+
+
+class UsageLedgerStore:
+    def __init__(self, db_path: Path) -> None:
+        self._path = db_path
+        self._lock = threading.Lock()
+        self._initialized = False
+
+    def initialize(self) -> None:
+        with self._lock:
+            if self._initialized:
+                return
+            self._path.parent.mkdir(parents=True, exist_ok=True)
+            with self._connect() as conn:
+                conn.executescript(
+                    """
+                    CREATE TABLE IF NOT EXISTS usage_events (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        created_at_ms INTEGER NOT NULL,
+                        session_id TEXT,
+                        agent_id TEXT,
+                        owner_user_id INTEGER,
+                        channel_id TEXT,
+                        channel_name TEXT,
+                        model TEXT,
+                        requested_model TEXT,
+                        provider TEXT,
+                        upstream_url TEXT,
+                        response_id TEXT,
+                        status TEXT,
+                        error TEXT,
+                        request_stream INTEGER NOT NULL DEFAULT 0,
+                        input_tokens INTEGER NOT NULL DEFAULT 0,
+                        output_tokens INTEGER NOT NULL DEFAULT 0,
+                        reasoning_tokens INTEGER NOT NULL DEFAULT 0,
+                        total_tokens INTEGER NOT NULL DEFAULT 0,
+                        estimated_cost_usd REAL
+                    );
+                    CREATE INDEX IF NOT EXISTS idx_usage_events_created_at_ms
+                        ON usage_events(created_at_ms DESC);
+                    CREATE INDEX IF NOT EXISTS idx_usage_events_owner_user_id_created_at
+                        ON usage_events(owner_user_id, created_at_ms DESC);
+                    CREATE INDEX IF NOT EXISTS idx_usage_events_agent_id_created_at
+                        ON usage_events(agent_id, created_at_ms DESC);
+                    CREATE INDEX IF NOT EXISTS idx_usage_events_session_id_created_at
+                        ON usage_events(session_id, created_at_ms DESC);
+                    CREATE INDEX IF NOT EXISTS idx_usage_events_channel_id_created_at
+                        ON usage_events(channel_id, created_at_ms DESC);
+                    """
+                )
+            self._initialized = True
+
+    def record(self, event: dict[str, Any]) -> None:
+        self.initialize()
+        with self._connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO usage_events (
+                    created_at_ms,
+                    session_id,
+                    agent_id,
+                    owner_user_id,
+                    channel_id,
+                    channel_name,
+                    model,
+                    requested_model,
+                    provider,
+                    upstream_url,
+                    response_id,
+                    status,
+                    error,
+                    request_stream,
+                    input_tokens,
+                    output_tokens,
+                    reasoning_tokens,
+                    total_tokens,
+                    estimated_cost_usd
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    _usage_int(event.get("createdAtMs")) or _now_ms(),
+                    str(event.get("sessionId") or "").strip() or None,
+                    str(event.get("agentId") or "").strip() or None,
+                    _usage_int(event.get("ownerUserId")) or None,
+                    str(event.get("channelId") or "").strip() or None,
+                    str(event.get("channelName") or "").strip() or None,
+                    str(event.get("model") or "").strip() or None,
+                    str(event.get("requestedModel") or "").strip() or None,
+                    str(event.get("provider") or "").strip() or None,
+                    str(event.get("upstreamUrl") or "").strip() or None,
+                    str(event.get("responseId") or "").strip() or None,
+                    str(event.get("status") or "").strip() or None,
+                    str(event.get("error") or "").strip() or None,
+                    1 if bool(event.get("requestStream")) else 0,
+                    _usage_int(event.get("inputTokens")),
+                    _usage_int(event.get("outputTokens")),
+                    _usage_int(event.get("reasoningTokens")),
+                    _usage_int(event.get("totalTokens")),
+                    _usage_float(event.get("estimatedCostUsd")),
+                ),
+            )
+
+    def summarize(
+        self,
+        *,
+        owner_user_id: Optional[int] = None,
+        agent_id: Optional[str] = None,
+        session_id: Optional[str] = None,
+        channel_id: Optional[str] = None,
+        since_ms: Optional[int] = None,
+    ) -> dict[str, Any]:
+        self.initialize()
+        where, args = self._build_filters(
+            owner_user_id=owner_user_id,
+            agent_id=agent_id,
+            session_id=session_id,
+            channel_id=channel_id,
+            since_ms=since_ms,
+        )
+        query = f"""
+            SELECT
+                COUNT(*) AS request_count,
+                SUM(CASE WHEN error IS NULL OR error = '' THEN 1 ELSE 0 END) AS ok_count,
+                SUM(CASE WHEN error IS NOT NULL AND error != '' THEN 1 ELSE 0 END) AS error_count,
+                COALESCE(SUM(input_tokens), 0) AS input_tokens,
+                COALESCE(SUM(output_tokens), 0) AS output_tokens,
+                COALESCE(SUM(reasoning_tokens), 0) AS reasoning_tokens,
+                COALESCE(SUM(total_tokens), 0) AS total_tokens,
+                COALESCE(SUM(estimated_cost_usd), 0) AS estimated_cost_usd,
+                MIN(created_at_ms) AS first_at_ms,
+                MAX(created_at_ms) AS last_at_ms
+            FROM usage_events
+            {where}
+        """
+        with self._connect() as conn:
+            row = conn.execute(query, args).fetchone()
+        if row is None:
+            return self._empty_summary()
+        return {
+            "requestCount": _usage_int(row["request_count"]),
+            "okCount": _usage_int(row["ok_count"]),
+            "errorCount": _usage_int(row["error_count"]),
+            "inputTokens": _usage_int(row["input_tokens"]),
+            "outputTokens": _usage_int(row["output_tokens"]),
+            "reasoningTokens": _usage_int(row["reasoning_tokens"]),
+            "totalTokens": _usage_int(row["total_tokens"]),
+            "estimatedCostUsd": _usage_float(row["estimated_cost_usd"]) or 0.0,
+            "firstAtMs": _usage_int(row["first_at_ms"]) or None,
+            "lastAtMs": _usage_int(row["last_at_ms"]) or None,
+        }
+
+    def list_events(
+        self,
+        *,
+        owner_user_id: Optional[int] = None,
+        agent_id: Optional[str] = None,
+        session_id: Optional[str] = None,
+        channel_id: Optional[str] = None,
+        since_ms: Optional[int] = None,
+        limit: int = 100,
+    ) -> list[dict[str, Any]]:
+        self.initialize()
+        clamped_limit = max(1, min(int(limit or 100), 500))
+        where, args = self._build_filters(
+            owner_user_id=owner_user_id,
+            agent_id=agent_id,
+            session_id=session_id,
+            channel_id=channel_id,
+            since_ms=since_ms,
+        )
+        query = f"""
+            SELECT
+                created_at_ms,
+                session_id,
+                agent_id,
+                owner_user_id,
+                channel_id,
+                channel_name,
+                model,
+                requested_model,
+                provider,
+                upstream_url,
+                response_id,
+                status,
+                error,
+                request_stream,
+                input_tokens,
+                output_tokens,
+                reasoning_tokens,
+                total_tokens,
+                estimated_cost_usd
+            FROM usage_events
+            {where}
+            ORDER BY created_at_ms DESC, id DESC
+            LIMIT ?
+        """
+        with self._connect() as conn:
+            rows = conn.execute(query, [*args, clamped_limit]).fetchall()
+        return [self._row_to_event(row) for row in rows]
+
+    def summarize_by_user(self, *, since_ms: Optional[int] = None) -> dict[int, dict[str, Any]]:
+        self.initialize()
+        where = "WHERE owner_user_id IS NOT NULL"
+        args: list[Any] = []
+        if since_ms is not None and since_ms > 0:
+            where += " AND created_at_ms >= ?"
+            args.append(int(since_ms))
+        query = f"""
+            SELECT
+                owner_user_id,
+                COUNT(*) AS request_count,
+                SUM(CASE WHEN error IS NULL OR error = '' THEN 1 ELSE 0 END) AS ok_count,
+                SUM(CASE WHEN error IS NOT NULL AND error != '' THEN 1 ELSE 0 END) AS error_count,
+                COALESCE(SUM(input_tokens), 0) AS input_tokens,
+                COALESCE(SUM(output_tokens), 0) AS output_tokens,
+                COALESCE(SUM(reasoning_tokens), 0) AS reasoning_tokens,
+                COALESCE(SUM(total_tokens), 0) AS total_tokens,
+                COALESCE(SUM(estimated_cost_usd), 0) AS estimated_cost_usd,
+                MAX(created_at_ms) AS last_at_ms
+            FROM usage_events
+            {where}
+            GROUP BY owner_user_id
+        """
+        with self._connect() as conn:
+            rows = conn.execute(query, args).fetchall()
+        out: dict[int, dict[str, Any]] = {}
+        for row in rows:
+            user_id = _usage_int(row["owner_user_id"])
+            if user_id <= 0:
+                continue
+            out[user_id] = {
+                "requestCount": _usage_int(row["request_count"]),
+                "okCount": _usage_int(row["ok_count"]),
+                "errorCount": _usage_int(row["error_count"]),
+                "inputTokens": _usage_int(row["input_tokens"]),
+                "outputTokens": _usage_int(row["output_tokens"]),
+                "reasoningTokens": _usage_int(row["reasoning_tokens"]),
+                "totalTokens": _usage_int(row["total_tokens"]),
+                "estimatedCostUsd": _usage_float(row["estimated_cost_usd"]) or 0.0,
+                "lastAtMs": _usage_int(row["last_at_ms"]) or None,
+            }
+        return out
+
+    def _empty_summary(self) -> dict[str, Any]:
+        return {
+            "requestCount": 0,
+            "okCount": 0,
+            "errorCount": 0,
+            "inputTokens": 0,
+            "outputTokens": 0,
+            "reasoningTokens": 0,
+            "totalTokens": 0,
+            "estimatedCostUsd": 0.0,
+            "firstAtMs": None,
+            "lastAtMs": None,
+        }
+
+    def _row_to_event(self, row: sqlite3.Row) -> dict[str, Any]:
+        return {
+            "createdAtMs": _usage_int(row["created_at_ms"]),
+            "sessionId": str(row["session_id"] or "").strip() or None,
+            "agentId": str(row["agent_id"] or "").strip() or None,
+            "ownerUserId": _usage_int(row["owner_user_id"]) or None,
+            "channelId": str(row["channel_id"] or "").strip() or None,
+            "channelName": str(row["channel_name"] or "").strip() or None,
+            "model": str(row["model"] or "").strip() or None,
+            "requestedModel": str(row["requested_model"] or "").strip() or None,
+            "provider": str(row["provider"] or "").strip() or None,
+            "upstreamUrl": str(row["upstream_url"] or "").strip() or None,
+            "responseId": str(row["response_id"] or "").strip() or None,
+            "status": str(row["status"] or "").strip() or None,
+            "error": str(row["error"] or "").strip() or None,
+            "requestStream": bool(row["request_stream"]),
+            "inputTokens": _usage_int(row["input_tokens"]),
+            "outputTokens": _usage_int(row["output_tokens"]),
+            "reasoningTokens": _usage_int(row["reasoning_tokens"]),
+            "totalTokens": _usage_int(row["total_tokens"]),
+            "estimatedCostUsd": _usage_float(row["estimated_cost_usd"]),
+        }
+
+    def _build_filters(
+        self,
+        *,
+        owner_user_id: Optional[int] = None,
+        agent_id: Optional[str] = None,
+        session_id: Optional[str] = None,
+        channel_id: Optional[str] = None,
+        since_ms: Optional[int] = None,
+    ) -> tuple[str, list[Any]]:
+        clauses: list[str] = []
+        args: list[Any] = []
+        if isinstance(owner_user_id, int) and owner_user_id > 0:
+            clauses.append("owner_user_id = ?")
+            args.append(owner_user_id)
+        if isinstance(agent_id, str) and agent_id.strip():
+            clauses.append("agent_id = ?")
+            args.append(agent_id.strip())
+        if isinstance(session_id, str) and session_id.strip():
+            clauses.append("session_id = ?")
+            args.append(session_id.strip())
+        if isinstance(channel_id, str) and channel_id.strip():
+            clauses.append("channel_id = ?")
+            args.append(channel_id.strip())
+        if isinstance(since_ms, int) and since_ms > 0:
+            clauses.append("created_at_ms >= ?")
+            args.append(since_ms)
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        return where, args
+
+    def _connect(self) -> sqlite3.Connection:
+        conn = sqlite3.connect(str(self._path), timeout=30.0)
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA synchronous=NORMAL")
+        return conn
+
+
 @dataclass
 class ThreadLane:
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
@@ -2940,7 +3420,7 @@ class AutomationManager:
         agent = self._store.state.agents.get(agent_id)
         return agent if isinstance(agent, PersistedAgentRuntime) else None
 
-    def get_owner_user_id_for_session(self, session_id: str) -> Optional[int]:
+    def get_agent_for_session(self, session_id: str) -> Optional[PersistedAgentRuntime]:
         sid = session_id.strip() if isinstance(session_id, str) else ""
         if not sid:
             return None
@@ -2948,12 +3428,24 @@ class AutomationManager:
         for agent in (st.agents or {}).values():
             if not isinstance(agent, PersistedAgentRuntime):
                 continue
-            if agent.session_id != sid:
-                continue
-            owner_user_id = getattr(agent, "owner_user_id", None)
-            if isinstance(owner_user_id, int) and owner_user_id > 0:
-                return owner_user_id
+            if agent.session_id == sid:
+                return agent
+        return None
+
+    def get_agent_id_for_session(self, session_id: str) -> Optional[str]:
+        agent = self.get_agent_for_session(session_id)
+        if not isinstance(agent, PersistedAgentRuntime):
             return None
+        aid = _normalize_agent_id(agent.agent_id)
+        return aid or None
+
+    def get_owner_user_id_for_session(self, session_id: str) -> Optional[int]:
+        agent = self.get_agent_for_session(session_id)
+        if not isinstance(agent, PersistedAgentRuntime):
+            return None
+        owner_user_id = getattr(agent, "owner_user_id", None)
+        if isinstance(owner_user_id, int) and owner_user_id > 0:
+            return owner_user_id
         return None
 
     def _get_user_channel_state_for_user(self, *, user_id: int) -> PersistedUserChannelState:
@@ -8632,8 +9124,10 @@ async def _startup():
     workspace_host_path = _configured_workspace_host_path()
     if home_host_path:
         state_path = Path(home_host_path) / "gateway" / "state.json"
+        usage_db_path = Path(home_host_path) / "gateway" / "usage.db"
     else:
         state_path = Path("/tmp/argus-gateway-state.json")
+        usage_db_path = Path("/tmp/argus-usage.db")
         log.warning("ARGUS_HOME_HOST_PATH is not set; automation state will be stored at %s", str(state_path))
 
     app.state.automation_store = AutomationStateStore(state_path)
@@ -8642,6 +9136,8 @@ async def _startup():
         home_host_path=home_host_path,
         workspace_host_path=workspace_host_path,
     )
+    app.state.usage_store = UsageLedgerStore(usage_db_path)
+    app.state.usage_store.initialize()
     await app.state.automation.start()
 
 
@@ -8675,6 +9171,49 @@ async def chat():
 @app.get("/robots.txt")
 async def robots():
     return PlainTextResponse("User-agent: *\nDisallow: /\n")
+
+
+def _build_openai_proxy_usage_context(
+    automation: AutomationManager,
+    *,
+    session_id: Optional[str],
+    target: dict[str, Any],
+    body: Any,
+) -> dict[str, Any]:
+    scoped_session_id = str(session_id or "").strip() or None
+    requested_model = ""
+    if isinstance(body, dict):
+        requested_model = str(body.get("model") or "").strip()
+    return {
+        "createdAtMs": _now_ms(),
+        "sessionId": scoped_session_id,
+        "agentId": automation.get_agent_id_for_session(scoped_session_id or ""),
+        "ownerUserId": _usage_int(target.get("ownerUserId")) or None,
+        "channelId": str(target.get("channelId") or "").strip() or None,
+        "channelName": str(target.get("name") or target.get("channelId") or "").strip() or None,
+        "requestedModel": requested_model or None,
+        "provider": "openai.responses",
+        "upstreamUrl": str(target.get("upstreamUrl") or "").strip() or None,
+        "requestStream": bool(isinstance(body, dict) and body.get("stream")),
+    }
+
+
+def _record_openai_proxy_usage(event: dict[str, Any], payload: Any = None) -> None:
+    usage_store: Optional[UsageLedgerStore] = getattr(app.state, "usage_store", None)
+    if usage_store is None:
+        return
+    try:
+        snapshot = _extract_openai_usage(payload) if payload is not None else {}
+        recorded = dict(event)
+        for key, value in snapshot.items():
+            if value in (None, "", 0):
+                continue
+            recorded[key] = value
+        if not recorded.get("model") and recorded.get("requestedModel"):
+            recorded["model"] = recorded.get("requestedModel")
+        usage_store.record(recorded)
+    except Exception:
+        log.exception("Failed to record OpenAI proxy usage")
 
 
 @app.post("/openai/v1/responses")
@@ -8721,6 +9260,12 @@ def openai_responses_proxy(request: Request, body: Any = Body(...)):
         forward_headers[k] = v
 
     forward_headers["Authorization"] = f"Bearer {openai_api_key}"
+    usage_context = _build_openai_proxy_usage_context(
+        automation,
+        session_id=str(scoped_session_id or ""),
+        target=target,
+        body=body,
+    )
 
     try:
         upstream = requests.post(
@@ -8731,23 +9276,51 @@ def openai_responses_proxy(request: Request, body: Any = Body(...)):
             timeout=(10, 600),
         )
     except requests.RequestException as e:
+        usage_context["status"] = "request_error"
+        usage_context["error"] = str(e)
+        _record_openai_proxy_usage(usage_context)
         raise HTTPException(status_code=502, detail=f"OpenAI upstream request failed: {e}") from e
 
     content_type = upstream.headers.get("content-type") or "application/octet-stream"
 
     def iter_bytes():
+        capture = ResponsesStreamUsageCapture()
+        usage_status = "ok" if upstream.status_code < 400 else f"http_{upstream.status_code}"
+        usage_error = None if upstream.status_code < 400 else f"upstream returned HTTP {upstream.status_code}"
         try:
             for chunk in upstream.iter_content(chunk_size=65536):
                 if chunk:
+                    capture.feed(chunk)
                     yield chunk
+        except Exception as e:
+            usage_status = "stream_error"
+            usage_error = str(e)
+            raise
         finally:
+            capture.finish()
+            event = dict(usage_context)
+            event["status"] = usage_status
+            if usage_error:
+                event["error"] = usage_error
+            _record_openai_proxy_usage(event, capture.snapshot())
             upstream.close()
 
     if "text/event-stream" in content_type.lower():
         return StreamingResponse(iter_bytes(), status_code=upstream.status_code, media_type=content_type)
 
     content = upstream.content
+    payload: Any = None
+    try:
+        if content:
+            payload = upstream.json()
+    except Exception:
+        payload = None
     upstream.close()
+    usage_event = dict(usage_context)
+    usage_event["status"] = "ok" if upstream.status_code < 400 else f"http_{upstream.status_code}"
+    if upstream.status_code >= 400 and payload is None:
+        usage_event["error"] = f"upstream returned HTTP {upstream.status_code}"
+    _record_openai_proxy_usage(usage_event, payload)
     return Response(content=content, status_code=upstream.status_code, media_type=content_type)
 
 
@@ -12129,6 +12702,155 @@ def _node_status_payload(automation: AutomationManager, node: dict[str, Any]) ->
     return out
 
 
+def _get_usage_store_or_500() -> UsageLedgerStore:
+    usage_store: Optional[UsageLedgerStore] = getattr(app.state, "usage_store", None)
+    if usage_store is None:
+        raise HTTPException(status_code=500, detail="Usage store is not initialized")
+    return usage_store
+
+
+def _admin_private_chat_key_for_user(user_id: int) -> str:
+    return str(int(user_id))
+
+
+def _admin_collect_user_ids(automation: AutomationManager) -> list[int]:
+    st = automation._store.state
+    ids: set[int] = set()
+    if isinstance(getattr(st, "user_channels", None), dict):
+        for raw_user_id in st.user_channels.keys():
+            try:
+                user_id = int(raw_user_id)
+            except Exception:
+                continue
+            if user_id > 0:
+                ids.add(user_id)
+    for agent in (st.agents or {}).values():
+        if not isinstance(agent, PersistedAgentRuntime):
+            continue
+        owner_user_id = getattr(agent, "owner_user_id", None)
+        if isinstance(owner_user_id, int) and owner_user_id > 0:
+            ids.add(owner_user_id)
+    if isinstance(getattr(st, "chat_bindings", None), dict):
+        for chat_key in st.chat_bindings.keys():
+            user_id = _parse_telegram_private_user_id(chat_key)
+            if isinstance(user_id, int) and user_id > 0:
+                ids.add(user_id)
+    return sorted(ids)
+
+
+def _admin_last_active_ms_for_user(automation: AutomationManager, user_id: int) -> Optional[int]:
+    if not isinstance(user_id, int) or user_id <= 0:
+        return None
+    st = automation._store.state
+    latest = 0
+    for agent in (st.agents or {}).values():
+        if not isinstance(agent, PersistedAgentRuntime):
+            continue
+        if agent.owner_user_id != user_id:
+            continue
+        sess = st.sessions.get(agent.session_id) if isinstance(getattr(st, "sessions", None), dict) else None
+        if not isinstance(sess, PersistedSessionAutomation):
+            latest = max(latest, int(agent.created_at_ms or 0))
+            continue
+        for tgt in (sess.last_active_by_thread or {}).values():
+            if not isinstance(tgt, PersistedLastActiveTarget):
+                continue
+            latest = max(latest, int(tgt.at_ms or 0))
+        latest = max(latest, int(agent.created_at_ms or 0))
+    return latest or None
+
+
+def _admin_resolve_current_agent_id_for_user(automation: AutomationManager, user_id: int) -> Optional[str]:
+    if not isinstance(user_id, int) or user_id <= 0:
+        return None
+    st = automation._store.state
+    private_chat_key = _admin_private_chat_key_for_user(user_id)
+    bound = st.chat_bindings.get(private_chat_key) if isinstance(getattr(st, "chat_bindings", None), dict) else None
+    bound_id = bound.strip() if isinstance(bound, str) and bound.strip() else None
+    if bound_id and automation.can_user_access_agent_id(user_id=user_id, agent_id=bound_id):
+        return bound_id
+    main_id = _user_agent_id(user_id=user_id, short_name="main")
+    if automation.can_user_access_agent_id(user_id=user_id, agent_id=main_id):
+        return main_id
+    return None
+
+
+def _admin_normalize_agent_id_for_user(user_id: int, raw_agent_id: Any) -> str:
+    aid_raw = _normalize_agent_id(raw_agent_id)
+    if not aid_raw:
+        raise HTTPException(status_code=400, detail="Invalid 'agentId'")
+    if re.match(r"^u\d+-", aid_raw):
+        return aid_raw
+    return _user_agent_id(user_id=user_id, short_name=aid_raw)
+
+
+def _admin_usage_since_ms(request: Request, *, default_hours: int = 24) -> Optional[int]:
+    raw_since = request.query_params.get("since_ms")
+    if raw_since:
+        try:
+            parsed = int(raw_since)
+        except Exception as e:
+            raise HTTPException(status_code=400, detail="Invalid 'since_ms'") from e
+        return parsed if parsed > 0 else None
+    raw_hours = request.query_params.get("hours")
+    if raw_hours:
+        try:
+            hours = int(raw_hours)
+        except Exception as e:
+            raise HTTPException(status_code=400, detail="Invalid 'hours'") from e
+        if hours <= 0:
+            return None
+        return _now_ms() - (hours * 60 * 60 * 1000)
+    return _now_ms() - (default_hours * 60 * 60 * 1000)
+
+
+def _admin_user_summary_payload(
+    automation: AutomationManager,
+    usage_store: UsageLedgerStore,
+    user_id: int,
+    *,
+    usage_24h: Optional[dict[str, Any]] = None,
+    usage_total: Optional[dict[str, Any]] = None,
+) -> dict[str, Any]:
+    if not isinstance(user_id, int) or user_id <= 0:
+        raise ValueError("Invalid userId")
+
+    agents = automation.list_agents_for_user(user_id=user_id)
+    current_agent_id = _admin_resolve_current_agent_id_for_user(automation, user_id)
+    current_agent = automation._get_agent(current_agent_id) if current_agent_id else None
+    current_session_id = automation.resolve_agent_session_id(current_agent_id) if current_agent_id else None
+    channel_info = automation.list_channels_for_user(user_id=user_id)
+    current_channel = channel_info.get("currentChannel") if isinstance(channel_info.get("currentChannel"), dict) else None
+    channels = channel_info.get("channels") if isinstance(channel_info.get("channels"), list) else []
+    ready_channel_count = sum(1 for item in channels if isinstance(item, dict) and bool(item.get("ready")))
+    custom_channel_count = sum(1 for item in channels if isinstance(item, dict) and item.get("kind") == "custom")
+    last_active_ms = _admin_last_active_ms_for_user(automation, user_id)
+    if usage_24h is None:
+        usage_24h = usage_store.summarize(owner_user_id=user_id, since_ms=_now_ms() - 24 * 60 * 60 * 1000)
+    if usage_total is None:
+        usage_total = usage_store.summarize(owner_user_id=user_id)
+
+    return {
+        "userId": user_id,
+        "privateChatKey": _admin_private_chat_key_for_user(user_id),
+        "agentCount": len(agents),
+        "sessionCount": sum(1 for item in agents if isinstance(item, dict) and str(item.get("sessionId") or "").strip()),
+        "defaultAgentId": _user_agent_id(user_id=user_id, short_name="main"),
+        "currentAgentId": current_agent_id,
+        "currentSessionId": current_session_id,
+        "currentModel": automation._channel_adjusted_agent_model(current_agent),
+        "currentChannelId": channel_info.get("currentChannelId"),
+        "currentChannel": current_channel,
+        "channelCount": len(channels),
+        "customChannelCount": custom_channel_count,
+        "readyChannelCount": ready_channel_count,
+        "lastActiveMs": last_active_ms,
+        "usage24h": dict(usage_24h or {}),
+        "usageTotal": dict(usage_total or {}),
+        "initialized": bool(agents),
+    }
+
+
 async def _list_nodes_with_state(*, scope_session_id: Optional[str] = None) -> list[dict[str, Any]]:
     automation = _get_automation_or_500()
     nodes = await app.state.node_registry.list_connected(scope_session_id=scope_session_id)
@@ -12834,6 +13556,457 @@ async def automation_channel_key_clear(request: Request):
 
     listed = automation.list_channels_for_user(user_id=user_id)
     return {"ok": True, "chatKey": chat_key, **result, **listed}
+
+
+@app.get("/admin/overview")
+async def admin_overview(request: Request):
+    _http_require_token(request)
+    automation = _get_automation_or_500()
+    usage_store = _get_usage_store_or_500()
+
+    user_ids = _admin_collect_user_ids(automation)
+    usage_24h = await asyncio.to_thread(usage_store.summarize, since_ms=_now_ms() - 24 * 60 * 60 * 1000)
+    usage_total = await asyncio.to_thread(usage_store.summarize)
+    st = automation._store.state
+    agent_count = sum(1 for agent in (st.agents or {}).values() if isinstance(agent, PersistedAgentRuntime))
+    session_count = sum(1 for sid in (st.sessions or {}).keys() if isinstance(sid, str) and sid.strip())
+    channel_count = 0
+    for user_id in user_ids:
+        listed = automation.list_channels_for_user(user_id=user_id)
+        channel_count += len(listed.get("channels") or [])
+
+    return {
+        "ok": True,
+        "version": ARGUS_VERSION,
+        "totals": {
+            "userCount": len(user_ids),
+            "agentCount": agent_count,
+            "sessionCount": session_count,
+            "channelCount": channel_count,
+        },
+        "usage24h": usage_24h,
+        "usageTotal": usage_total,
+    }
+
+
+@app.get("/admin/users")
+async def admin_users(request: Request):
+    _http_require_token(request)
+    automation = _get_automation_or_500()
+    usage_store = _get_usage_store_or_500()
+
+    user_ids = _admin_collect_user_ids(automation)
+    usage_24h_by_user = await asyncio.to_thread(
+        usage_store.summarize_by_user,
+        since_ms=_now_ms() - 24 * 60 * 60 * 1000,
+    )
+    usage_total_by_user = await asyncio.to_thread(usage_store.summarize_by_user)
+
+    users: list[dict[str, Any]] = []
+    for user_id in user_ids:
+        users.append(
+            _admin_user_summary_payload(
+                automation,
+                usage_store,
+                user_id,
+                usage_24h=usage_24h_by_user.get(user_id),
+                usage_total=usage_total_by_user.get(user_id),
+            )
+        )
+
+    users.sort(
+        key=lambda item: (
+            -int(((item.get("usage24h") or {}).get("totalTokens") or 0)),
+            -int(item.get("lastActiveMs") or 0),
+            int(item.get("userId") or 0),
+        )
+    )
+    return {"ok": True, "users": users}
+
+
+@app.post("/admin/users/{user_id}/bootstrap")
+async def admin_user_bootstrap(user_id: int, request: Request):
+    _http_require_token(request)
+    automation = _get_automation_or_500()
+    usage_store = _get_usage_store_or_500()
+    if user_id <= 0:
+        raise HTTPException(status_code=400, detail="Invalid userId")
+    try:
+        agent, created_main = await automation.ensure_user_main_agent(user_id=user_id)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    except RuntimeError as e:
+        raise HTTPException(status_code=500, detail=str(e)) from e
+
+    detail = _admin_user_summary_payload(automation, usage_store, user_id)
+    model_info = await _automation_model_payload(automation, agent=agent, user_id=user_id)
+    return {
+        "ok": True,
+        "createdMain": created_main,
+        "user": detail,
+        "agent": agent.to_json(),
+        "availableModels": model_info.get("availableModels"),
+        "models": model_info.get("models"),
+        "modelSource": model_info.get("source"),
+        "modelError": model_info.get("error"),
+    }
+
+
+@app.get("/admin/users/{user_id}")
+async def admin_user_detail(user_id: int, request: Request):
+    _http_require_token(request)
+    automation = _get_automation_or_500()
+    usage_store = _get_usage_store_or_500()
+    if user_id <= 0:
+        raise HTTPException(status_code=400, detail="Invalid userId")
+
+    known_user_ids = set(_admin_collect_user_ids(automation))
+    usage_total = await asyncio.to_thread(usage_store.summarize, owner_user_id=user_id)
+    if user_id not in known_user_ids and int(usage_total.get("requestCount") or 0) <= 0:
+        raise HTTPException(status_code=404, detail="Unknown user")
+
+    current_agent_id = _admin_resolve_current_agent_id_for_user(automation, user_id)
+    current_agent = automation._get_agent(current_agent_id) if current_agent_id else None
+    model_info = await _automation_model_payload(automation, agent=current_agent, user_id=user_id)
+    detail = _admin_user_summary_payload(
+        automation,
+        usage_store,
+        user_id,
+        usage_total=usage_total,
+    )
+    recent_usage = await asyncio.to_thread(usage_store.list_events, owner_user_id=user_id, limit=100)
+    return {
+        "ok": True,
+        "user": detail,
+        "agents": automation.list_agents_for_user(user_id=user_id),
+        "channels": automation.list_channels_for_user(user_id=user_id),
+        "availableModels": model_info.get("availableModels"),
+        "models": model_info.get("models"),
+        "modelSource": model_info.get("source"),
+        "modelError": model_info.get("error"),
+        "recentUsage": recent_usage,
+    }
+
+
+@app.post("/admin/users/{user_id}/agents")
+async def admin_user_agent_create(user_id: int, request: Request):
+    _http_require_token(request)
+    automation = _get_automation_or_500()
+    if user_id <= 0:
+        raise HTTPException(status_code=400, detail="Invalid userId")
+    try:
+        body = await request.json()
+    except Exception as e:
+        raise HTTPException(status_code=400, detail="Invalid JSON body") from e
+    if not isinstance(body, dict):
+        raise HTTPException(status_code=400, detail="Invalid JSON body")
+    raw_name = body.get("agentId") or body.get("name")
+    try:
+        agent = await automation.create_user_agent(user_id=user_id, short_name=str(raw_name or ""))
+    except PermissionError as e:
+        raise HTTPException(status_code=403, detail=str(e)) from e
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    model_info = await _automation_model_payload(automation, agent=agent, user_id=user_id)
+    return {
+        "ok": True,
+        "agent": agent.to_json(),
+        "agents": automation.list_agents_for_user(user_id=user_id),
+        "availableModels": model_info.get("availableModels"),
+        "models": model_info.get("models"),
+        "modelSource": model_info.get("source"),
+        "modelError": model_info.get("error"),
+    }
+
+
+@app.post("/admin/users/{user_id}/agents/{agent_id}/use")
+async def admin_user_agent_use(user_id: int, agent_id: str, request: Request):
+    _http_require_token(request)
+    automation = _get_automation_or_500()
+    if user_id <= 0:
+        raise HTTPException(status_code=400, detail="Invalid userId")
+    normalized_agent_id = _admin_normalize_agent_id_for_user(user_id, agent_id)
+    try:
+        agent = await automation.bind_private_user_to_agent(
+            user_id=user_id,
+            chat_key=_admin_private_chat_key_for_user(user_id),
+            agent_id=normalized_agent_id,
+        )
+    except PermissionError as e:
+        raise HTTPException(status_code=403, detail=str(e)) from e
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    model_info = await _automation_model_payload(automation, agent=agent, user_id=user_id)
+    return {
+        "ok": True,
+        "agent": agent.to_json(),
+        "agents": automation.list_agents_for_user(user_id=user_id),
+        "currentAgentId": normalized_agent_id,
+        "currentSessionId": automation.resolve_agent_session_id(normalized_agent_id),
+        "availableModels": model_info.get("availableModels"),
+        "models": model_info.get("models"),
+        "modelSource": model_info.get("source"),
+        "modelError": model_info.get("error"),
+    }
+
+
+@app.post("/admin/users/{user_id}/agents/{agent_id}/model")
+async def admin_user_agent_model_set(user_id: int, agent_id: str, request: Request):
+    _http_require_token(request)
+    automation = _get_automation_or_500()
+    if user_id <= 0:
+        raise HTTPException(status_code=400, detail="Invalid userId")
+    try:
+        body = await request.json()
+    except Exception as e:
+        raise HTTPException(status_code=400, detail="Invalid JSON body") from e
+    if not isinstance(body, dict):
+        raise HTTPException(status_code=400, detail="Invalid JSON body")
+    normalized_agent_id = _admin_normalize_agent_id_for_user(user_id, agent_id)
+    try:
+        agent, synced = await automation.set_user_agent_model(
+            user_id=user_id,
+            agent_id=normalized_agent_id,
+            model=str(body.get("model") or ""),
+        )
+    except PermissionError as e:
+        raise HTTPException(status_code=403, detail=str(e)) from e
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    model_info = await _automation_model_payload(automation, agent=agent, user_id=user_id)
+    return {
+        "ok": True,
+        "agent": agent.to_json(),
+        "liveModelSynced": synced,
+        "agents": automation.list_agents_for_user(user_id=user_id),
+        "availableModels": model_info.get("availableModels"),
+        "models": model_info.get("models"),
+        "modelSource": model_info.get("source"),
+        "modelError": model_info.get("error"),
+    }
+
+
+@app.patch("/admin/users/{user_id}/agents/{agent_id}")
+async def admin_user_agent_rename(user_id: int, agent_id: str, request: Request):
+    _http_require_token(request)
+    automation = _get_automation_or_500()
+    if user_id <= 0:
+        raise HTTPException(status_code=400, detail="Invalid userId")
+    try:
+        body = await request.json()
+    except Exception as e:
+        raise HTTPException(status_code=400, detail="Invalid JSON body") from e
+    if not isinstance(body, dict):
+        raise HTTPException(status_code=400, detail="Invalid JSON body")
+    normalized_agent_id = _admin_normalize_agent_id_for_user(user_id, agent_id)
+    raw_name = body.get("newName") or body.get("name")
+    try:
+        agent = await automation.rename_user_agent(user_id=user_id, agent_id=normalized_agent_id, new_short_name=str(raw_name or ""))
+    except PermissionError as e:
+        raise HTTPException(status_code=403, detail=str(e)) from e
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    return {"ok": True, "agent": agent.to_json(), "agents": automation.list_agents_for_user(user_id=user_id)}
+
+
+@app.delete("/admin/users/{user_id}/agents/{agent_id}")
+async def admin_user_agent_delete(user_id: int, agent_id: str, request: Request):
+    _http_require_token(request)
+    automation = _get_automation_or_500()
+    if user_id <= 0:
+        raise HTTPException(status_code=400, detail="Invalid userId")
+    normalized_agent_id = _admin_normalize_agent_id_for_user(user_id, agent_id)
+    try:
+        result = await automation.delete_user_agent(
+            user_id=user_id,
+            chat_key=_admin_private_chat_key_for_user(user_id),
+            agent_id=normalized_agent_id,
+        )
+    except PermissionError as e:
+        raise HTTPException(status_code=403, detail=str(e)) from e
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    return {"ok": True, **(result or {}), "agents": automation.list_agents_for_user(user_id=user_id)}
+
+
+@app.post("/admin/users/{user_id}/channels")
+async def admin_user_channel_create(user_id: int, request: Request):
+    _http_require_token(request)
+    automation = _get_automation_or_500()
+    if user_id <= 0:
+        raise HTTPException(status_code=400, detail="Invalid userId")
+    try:
+        body = await request.json()
+    except Exception as e:
+        raise HTTPException(status_code=400, detail="Invalid JSON body") from e
+    if not isinstance(body, dict):
+        raise HTTPException(status_code=400, detail="Invalid JSON body")
+    try:
+        created = await automation.create_user_channel(
+            user_id=user_id,
+            name=str(body.get("name") or body.get("channelName") or ""),
+            base_url=str(body.get("baseUrl") or ""),
+            api_key=str(body.get("apiKey") or ""),
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    listed = automation.list_channels_for_user(user_id=user_id)
+    created_entry = next(
+        (dict(item) for item in listed.get("channels", []) if isinstance(item, dict) and item.get("channelId") == created.channel_id),
+        None,
+    )
+    return {"ok": True, "channel": created_entry, **listed}
+
+
+@app.post("/admin/users/{user_id}/channels/{channel_id}/select")
+async def admin_user_channel_select(user_id: int, channel_id: str, request: Request):
+    _http_require_token(request)
+    automation = _get_automation_or_500()
+    if user_id <= 0:
+        raise HTTPException(status_code=400, detail="Invalid userId")
+    try:
+        await automation.select_user_channel(user_id=user_id, channel_id=channel_id)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    listed = automation.list_channels_for_user(user_id=user_id)
+    return {"ok": True, **listed}
+
+
+@app.patch("/admin/users/{user_id}/channels/{channel_id}")
+async def admin_user_channel_rename(user_id: int, channel_id: str, request: Request):
+    _http_require_token(request)
+    automation = _get_automation_or_500()
+    if user_id <= 0:
+        raise HTTPException(status_code=400, detail="Invalid userId")
+    try:
+        body = await request.json()
+    except Exception as e:
+        raise HTTPException(status_code=400, detail="Invalid JSON body") from e
+    if not isinstance(body, dict):
+        raise HTTPException(status_code=400, detail="Invalid JSON body")
+    try:
+        updated = await automation.rename_user_channel(
+            user_id=user_id,
+            channel_id=channel_id,
+            new_name=str(body.get("newName") or body.get("name") or ""),
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    listed = automation.list_channels_for_user(user_id=user_id)
+    updated_entry = next(
+        (dict(item) for item in listed.get("channels", []) if isinstance(item, dict) and item.get("channelId") == updated.channel_id),
+        None,
+    )
+    return {"ok": True, "channel": updated_entry, **listed}
+
+
+@app.delete("/admin/users/{user_id}/channels/{channel_id}")
+async def admin_user_channel_delete(user_id: int, channel_id: str, request: Request):
+    _http_require_token(request)
+    automation = _get_automation_or_500()
+    if user_id <= 0:
+        raise HTTPException(status_code=400, detail="Invalid userId")
+    try:
+        deleted = await automation.delete_user_channel(user_id=user_id, channel_id=channel_id)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    listed = automation.list_channels_for_user(user_id=user_id)
+    return {"ok": True, **deleted, **listed}
+
+
+@app.put("/admin/users/{user_id}/channels/{channel_id}/key")
+async def admin_user_channel_key_set(user_id: int, channel_id: str, request: Request):
+    _http_require_token(request)
+    automation = _get_automation_or_500()
+    if user_id <= 0:
+        raise HTTPException(status_code=400, detail="Invalid userId")
+    try:
+        body = await request.json()
+    except Exception as e:
+        raise HTTPException(status_code=400, detail="Invalid JSON body") from e
+    if not isinstance(body, dict):
+        raise HTTPException(status_code=400, detail="Invalid JSON body")
+    try:
+        result = await automation.set_user_channel_api_key(
+            user_id=user_id,
+            channel_id=channel_id,
+            api_key=str(body.get("apiKey") or ""),
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    listed = automation.list_channels_for_user(user_id=user_id)
+    return {"ok": True, **result, **listed}
+
+
+@app.delete("/admin/users/{user_id}/channels/{channel_id}/key")
+async def admin_user_channel_key_clear(user_id: int, channel_id: str, request: Request):
+    _http_require_token(request)
+    automation = _get_automation_or_500()
+    if user_id <= 0:
+        raise HTTPException(status_code=400, detail="Invalid userId")
+    try:
+        result = await automation.clear_user_channel_api_key(user_id=user_id, channel_id=channel_id)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    listed = automation.list_channels_for_user(user_id=user_id)
+    return {"ok": True, **result, **listed}
+
+
+@app.get("/admin/usage")
+async def admin_usage(request: Request):
+    _http_require_token(request)
+    usage_store = _get_usage_store_or_500()
+
+    owner_user_id: Optional[int] = None
+    raw_user_id = request.query_params.get("user_id")
+    if raw_user_id:
+        try:
+            owner_user_id = int(raw_user_id)
+        except Exception as e:
+            raise HTTPException(status_code=400, detail="Invalid 'user_id'") from e
+        if owner_user_id <= 0:
+            owner_user_id = None
+
+    agent_id = str(request.query_params.get("agent_id") or "").strip() or None
+    session_id = str(request.query_params.get("session_id") or "").strip() or None
+    channel_id = str(request.query_params.get("channel_id") or "").strip() or None
+    since_ms = _admin_usage_since_ms(request)
+    raw_limit = request.query_params.get("limit") or ""
+    try:
+        limit = int(raw_limit) if raw_limit else 100
+    except Exception as e:
+        raise HTTPException(status_code=400, detail="Invalid 'limit'") from e
+
+    summary = await asyncio.to_thread(
+        usage_store.summarize,
+        owner_user_id=owner_user_id,
+        agent_id=agent_id,
+        session_id=session_id,
+        channel_id=channel_id,
+        since_ms=since_ms,
+    )
+    events = await asyncio.to_thread(
+        usage_store.list_events,
+        owner_user_id=owner_user_id,
+        agent_id=agent_id,
+        session_id=session_id,
+        channel_id=channel_id,
+        since_ms=since_ms,
+        limit=limit,
+    )
+    return {
+        "ok": True,
+        "filters": {
+            "userId": owner_user_id,
+            "agentId": agent_id,
+            "sessionId": session_id,
+            "channelId": channel_id,
+            "sinceMs": since_ms,
+            "limit": max(1, min(limit, 500)),
+        },
+        "summary": summary,
+        "events": events,
+    }
 
 
 @app.post("/automation/chat/bind")
