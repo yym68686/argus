@@ -10,18 +10,39 @@ services:
     image: argus-runtime
     command: ["sh", "-lc", "echo 'runtime image built'"]
 
+  postgres:
+    image: postgres:17.6-alpine
+    environment:
+      POSTGRES_DB: ${ARGUS_POSTGRES_DB:-argus}
+      POSTGRES_USER: ${ARGUS_POSTGRES_USER:-argus}
+      POSTGRES_PASSWORD: ${ARGUS_POSTGRES_PASSWORD:-argus}
+    volumes:
+      - argus-postgres-data:/var/lib/postgresql/data
+    networks:
+      - argus-net
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${ARGUS_POSTGRES_USER:-argus} -d ${ARGUS_POSTGRES_DB:-argus}"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    restart: unless-stopped
+
   gateway:
     build:
       context: .
       dockerfile: apps/api/Dockerfile
     image: argus-gateway
     depends_on:
-      - runtime-image
+      runtime-image:
+        condition: service_completed_successfully
+      postgres:
+        condition: service_healthy
     environment:
       ARGUS_PROVISION_MODE: ${ARGUS_PROVISION_MODE:-auto}
       ARGUS_RUNTIME_IMAGE: argus-runtime
       ARGUS_DOCKER_NETWORK: argus-net
       ARGUS_HOME_HOST_PATH: ${ARGUS_HOME_HOST_PATH:-${HOME}/.argus}
+      ARGUS_DATABASE_URL: ${ARGUS_DATABASE_URL:-postgresql://argus:argus@postgres:5432/argus}
       # Optional (advanced): base directory for auto-created `/ws` session workspaces; when unset, uses `${ARGUS_HOME_HOST_PATH}/workspaces`.
       ARGUS_WORKSPACE_HOST_PATH: ${ARGUS_WORKSPACE_HOST_PATH:-}
       # Command executed inside each spawned runtime container.
@@ -53,7 +74,7 @@ services:
     volumes:
       # WARNING: mounting the Docker socket grants root-equivalent access to the host.
       - ${DOCKER_SOCK:-/var/run/docker.sock}:/var/run/docker.sock
-      # Persist gateway automation state under ARGUS_HOME_HOST_PATH.
+      # Persist local workspace mirrors (and sqlite fallback files when ARGUS_DATABASE_URL is unset).
       - ${ARGUS_HOME_HOST_PATH:-${HOME}/.argus}:${ARGUS_HOME_HOST_PATH:-${HOME}/.argus}
     ports:
       - "8080:8080"
@@ -100,3 +121,5 @@ networks:
 volumes:
   telegram-bot-data:
     name: argus-telegram-bot-data
+  argus-postgres-data:
+    name: argus-postgres-data

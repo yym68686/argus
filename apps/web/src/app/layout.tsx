@@ -1,13 +1,36 @@
 import "@/app/globals.css";
-import "@fontsource/press-start-2p/latin-400.css";
 
 import type { Metadata } from "next";
-import { GeistMono } from "geist/font/mono";
-import { GeistSans } from "geist/font/sans";
+import type { CSSProperties } from "react";
+import { IBM_Plex_Mono, IBM_Plex_Sans, Instrument_Serif } from "next/font/google";
 import { Toaster } from "sonner";
 
 import { AdminGate } from "@/components/admin-gate";
 import { cn } from "@/lib/utils";
+
+const sans = IBM_Plex_Sans({
+  subsets: ["latin"],
+  weight: ["400", "500", "600", "700"],
+  display: "swap",
+});
+
+const mono = IBM_Plex_Mono({
+  subsets: ["latin"],
+  weight: ["400", "500"],
+  display: "swap",
+});
+
+const display = Instrument_Serif({
+  subsets: ["latin"],
+  weight: ["400"],
+  style: ["normal", "italic"],
+  display: "swap",
+});
+
+const ROOT_FONT_VARS = {
+  "--argus-font-mono": mono.style.fontFamily,
+  "--argus-font-display": display.style.fontFamily,
+} as CSSProperties;
 
 const THEME_INIT_SCRIPT = `
 (function () {
@@ -37,7 +60,7 @@ const THEME_INIT_SCRIPT = `
 
 export const metadata: Metadata = {
   title: "Argus",
-  description: "Gateway chat UI"
+  description: "Gateway operator console"
 };
 
 interface RootLayoutProps {
@@ -48,13 +71,20 @@ export default function RootLayout({ children }: RootLayoutProps) {
   return (
     <html
       lang="en"
-      className={cn("dark", GeistSans.variable, GeistMono.variable)}
+      className="dark"
+      style={ROOT_FONT_VARS}
       suppressHydrationWarning
     >
       <head>
         <script dangerouslySetInnerHTML={{ __html: THEME_INIT_SCRIPT }} />
       </head>
-      <body className={cn("min-h-dvh bg-background font-sans text-foreground")}>
+      <body className={cn(sans.className, "min-h-dvh bg-background text-foreground antialiased")}>
+        <a
+          href="#argus-main"
+          className="sr-only focus:not-sr-only focus:fixed focus:left-4 focus:top-4 focus:z-[100] focus:rounded-lg focus:border focus:border-border/80 focus:bg-background focus:px-3 focus:py-2 focus:text-sm focus:text-foreground"
+        >
+          Skip to content
+        </a>
         <Toaster theme="dark" richColors closeButton />
         <AdminGate>{children}</AdminGate>
       </body>

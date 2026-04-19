@@ -57,19 +57,20 @@ export default function SettingsPage() {
   return (
     <ConsoleShell
       title="Settings"
-      subtitle="Operator-level connection state for the gateway, including the shared access URL this browser will reuse across Workbench, Users, and Usage."
+      subtitle="Connection posture, backend contracts, and deploy assumptions for the gateway this browser will reuse across the entire operator console."
       actions={
-        <div className="flex flex-col gap-2 md:items-end">
+        <div className="flex flex-col gap-2 xl:items-end">
+          <div className="argus-surface-label">Gateway endpoint</div>
           <div className="flex flex-wrap items-center gap-2">
             <Input
               value={wsUrl}
               onChange={(event) => setWsUrl(event.target.value)}
-              className="w-[320px]"
+              className="w-[min(30rem,100%)]"
               placeholder="Gateway wss://.../ws"
               spellCheck={false}
             />
             <Button type="button" variant="secondary" disabled={loading} onClick={() => void refresh()}>
-              <RefreshCw className={cn("mr-2 h-4 w-4", loading && "animate-spin")} />
+              <RefreshCw className={cn("h-4 w-4", loading ? "animate-spin" : null)} />
               Refresh
             </Button>
           </div>
@@ -78,114 +79,134 @@ export default function SettingsPage() {
     >
       {error ? <InlineError message={error} /> : null}
 
-      <div className="grid gap-6 xl:grid-cols-[1.15fr_0.85fr]">
-        <section className="space-y-6">
-          {showSkeleton ? (
-            <div className="grid gap-4 md:grid-cols-3">
-              {Array.from({ length: 3 }).map((_, index) => (
-                <div key={index} className="argus-metric-card rounded-[26px] p-5 md:p-6">
-                  <Skeleton className="h-4 w-24 rounded-full" />
-                  <Skeleton className="mt-4 h-10 w-32" />
-                  <Skeleton className="mt-3 h-3 w-40" />
+      <div className="grid gap-4">
+        {showSkeleton ? (
+          <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-4">
+            {Array.from({ length: 4 }).map((_, index) => (
+              <div key={index} className="argus-metric-card rounded-[20px] p-4">
+                <Skeleton className="h-3 w-24 rounded-full" />
+                <Skeleton className="mt-3 h-8 w-28" />
+                <Skeleton className="mt-3 h-3 w-full max-w-[14rem]" />
+              </div>
+            ))}
+          </div>
+        ) : (
+          <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-4">
+            <StatCard
+              label="Gateway health"
+              value={health?.ok ? "Healthy" : "Unknown"}
+              tone={health?.ok ? "primary" : "default"}
+              hint={health?.ok ? "Public health probe is returning ok." : "The browser has not observed a healthy response yet."}
+            />
+            <StatCard label="Gateway version" value={overview?.version || "unknown"} hint="Build reported by /admin/overview." />
+            <StatCard label="Tracked users" value={formatInt(overview?.totals.userCount)} hint="Users currently visible to the operator console." />
+            <StatCard label="Live sessions" value={formatInt(overview?.totals.sessionCount)} hint="Current runtime sessions on the connected gateway." />
+          </div>
+        )}
+
+        <div className="grid gap-4 xl:grid-cols-[1.1fr_0.9fr]">
+          <section className="space-y-4">
+            <PanelCard
+              eyebrow="Connection"
+              title="Gateway connection contract"
+              subtitle="The browser stores the shared gateway WebSocket URL locally and reuses it across Workbench, Users, Usage, and Nodes."
+              className="argus-data-grid"
+            >
+              {showSkeleton ? (
+                <div className="grid gap-3 lg:grid-cols-2">
+                  {Array.from({ length: 6 }).map((_, index) => (
+                    <div
+                      key={index}
+                      className="rounded-[16px] border border-border/70 bg-background/24 px-3.5 py-3"
+                    >
+                      <Skeleton className="h-3 w-24 rounded-full" />
+                      <Skeleton className="mt-3 h-5 w-full" />
+                    </div>
+                  ))}
                 </div>
-              ))}
-            </div>
-          ) : (
-            <div className="grid gap-4 md:grid-cols-3">
-              <StatCard
-                label="Gateway health"
-                value={health?.ok ? "Healthy" : "Unknown"}
-                tone={health?.ok ? "primary" : "default"}
-                hint={health?.ok ? "Public health probe is returning ok." : "The browser has not observed a healthy response yet."}
-              />
-              <StatCard label="Tracked users" value={formatInt(overview?.totals.userCount)} hint="Users currently visible to the operator console." />
-              <StatCard label="Live sessions" value={formatInt(overview?.totals.sessionCount)} hint="Current runtime sessions on the connected gateway." />
-            </div>
-          )}
+              ) : (
+                <div className="grid gap-3 lg:grid-cols-2">
+                  <Fact label="Saved WebSocket URL" value={wsUrl || "not configured"} mono />
+                  <Fact label="Gateway version" value={overview?.version || "unknown"} />
+                  <Fact label="Health probe" value={health?.ok ? "GET /healthz returned ok" : "No healthy response yet"} />
+                  <Fact label="Auth model" value="Admin bearer token is stored in the browser and attached automatically" />
+                  <Fact label="Ledger source" value="/openai/v1/responses on the gateway proxy" mono />
+                  <Fact label="Expected host shape" value="Same public host for /ws, /admin/*, /sessions, and /openai/*" />
+                </div>
+              )}
+            </PanelCard>
 
-          <PanelCard
-            eyebrow="Connection state"
-            title="Connection"
-            subtitle="This browser stores the shared gateway WebSocket URL in localStorage and reuses it across the operator console."
-            className="argus-data-grid"
-          >
-            {showSkeleton ? (
-              <div className="grid gap-4 lg:grid-cols-2">
-                {Array.from({ length: 4 }).map((_, index) => (
-                  <div
-                    key={index}
-                    className="rounded-[22px] border border-border/60 bg-background/30 px-4 py-3.5 shadow-[inset_0_1px_0_0_oklch(var(--foreground)/0.04)]"
-                  >
-                    <Skeleton className="h-3 w-24 rounded-full" />
-                    <Skeleton className="mt-3 h-5 w-full" />
-                  </div>
-                ))}
+            <PanelCard
+              eyebrow="Runbook"
+              title="Operator assumptions"
+              subtitle="This UI is intentionally opinionated about the shape of the Argus control plane."
+            >
+              <div className="grid gap-3">
+                <div className="argus-row-shell rounded-[16px] px-4 py-3">
+                  <div className="argus-surface-label">Shared host</div>
+                  <p className="mt-2 text-sm leading-6 text-muted-foreground">
+                    In deployed mode, nginx should proxy <code>/admin/*</code>, <code>/sessions</code>, <code>/openai/*</code>, and <code>/ws</code> on the same public origin.
+                  </p>
+                </div>
+                <div className="argus-row-shell rounded-[16px] px-4 py-3">
+                  <div className="argus-surface-label">Usage accounting</div>
+                  <p className="mt-2 text-sm leading-6 text-muted-foreground">
+                    Token and request accounting is gateway-side only. Usage appears once Requests API traffic flows through the Argus proxy.
+                  </p>
+                </div>
+                <div className="argus-row-shell rounded-[16px] px-4 py-3">
+                  <div className="argus-surface-label">Trust model</div>
+                  <p className="mt-2 text-sm leading-6 text-muted-foreground">
+                    The frontend assumes a trusted operator with a bearer token. It is not designed for end-user login or per-user browser sessions.
+                  </p>
+                </div>
               </div>
-            ) : (
-              <div className="grid gap-4 lg:grid-cols-2">
-                <Fact label="Saved WebSocket URL" value={wsUrl || "not configured"} mono />
-                <Fact label="Gateway version" value={overview?.version || "unknown"} />
-                <Fact label="Auth model" value="Admin bearer token stored in the browser and attached automatically" />
-                <Fact label="Health probe" value={health?.ok ? "GET /healthz returned ok" : "No healthy response yet"} />
-              </div>
-            )}
-          </PanelCard>
+            </PanelCard>
+          </section>
 
-          <PanelCard eyebrow="Runbook" title="Operator notes" subtitle="This page documents what the refactored console assumes about the Argus control plane.">
-            <div className="space-y-3 text-sm leading-relaxed text-muted-foreground">
-              <p>
-                The new Users and Usage tabs call the gateway&apos;s admin APIs on the same public host. In deployed mode,
-                nginx must proxy <code>/admin/*</code>, <code>/sessions</code>, and <code>/openai/*</code> to the gateway.
-              </p>
-              <p>
-                Token accounting is gateway-side only. The ledger is sourced from <code>/openai/v1/responses</code>, so
-                usage appears when Requests API traffic flows through the Argus proxy.
-              </p>
-              <p>
-                The console is still operator-facing. It assumes a trusted bearer token, not end-user login or per-user web
-                sessions.
-              </p>
-            </div>
-          </PanelCard>
-        </section>
-
-        <section className="space-y-6">
-          <PanelCard eyebrow="Contracts" title="Backend contracts" subtitle="Quick check of the APIs this console expects.">
-            <div className="space-y-3">
-              <ContractRow label="Gateway health" ok={Boolean(health?.ok)} detail="GET /healthz" />
-              <ContractRow label="Admin overview" ok={Boolean(overview?.ok)} detail="GET /admin/overview" />
-              <ContractRow
-                label="Usage ledger"
-                ok={Boolean(overview?.usageTotal)}
-                detail="GET /admin/usage is expected to return summary + events"
-              />
-            </div>
-          </PanelCard>
-
-          <PanelCard eyebrow="Current deploy" title="Current state" subtitle="The current deploy should expose web, gateway, runtime, and Telegram bot behind one project.">
-            {showSkeleton ? (
-              <div className="grid gap-4">
-                {Array.from({ length: 3 }).map((_, index) => (
-                  <div
-                    key={index}
-                    className="rounded-[22px] border border-border/60 bg-background/30 px-4 py-3.5 shadow-[inset_0_1px_0_0_oklch(var(--foreground)/0.04)]"
-                  >
-                    <Skeleton className="h-3 w-24 rounded-full" />
-                    <Skeleton className="mt-3 h-5 w-40" />
-                  </div>
-                ))}
+          <section className="space-y-4">
+            <PanelCard eyebrow="Contracts" title="Backend checks" subtitle="Quick verification of the APIs this console expects to exist.">
+              <div className="space-y-3">
+                <ContractRow label="Gateway health" ok={Boolean(health?.ok)} detail="GET /healthz" />
+                <ContractRow label="Admin overview" ok={Boolean(overview?.ok)} detail="GET /admin/overview" />
+                <ContractRow
+                  label="Usage ledger"
+                  ok={Boolean(overview?.usageTotal)}
+                  detail="GET /admin/usage should return summary plus event rows"
+                />
               </div>
-            ) : overview ? (
-              <div className="grid gap-4">
-                <Fact label="Tracked agents" value={formatInt(overview.totals.agentCount)} />
-                <Fact label="Channels" value={formatInt(overview.totals.channelCount)} />
-                <Fact label="Total 24h requests" value={formatInt(overview.usage24h.requestCount)} />
-              </div>
-            ) : (
-              <EmptyState title="No overview yet" body="Configure the gateway URL above, then refresh to inspect the current backend." />
-            )}
-          </PanelCard>
-        </section>
+            </PanelCard>
+
+            <PanelCard
+              eyebrow="Deploy snapshot"
+              title="Current deployment"
+              subtitle="The operator console expects the project to expose web, gateway, runtime, and Telegram bot as one cohesive deploy."
+            >
+              {showSkeleton ? (
+                <div className="grid gap-3">
+                  {Array.from({ length: 4 }).map((_, index) => (
+                    <div
+                      key={index}
+                      className="rounded-[16px] border border-border/70 bg-background/24 px-3.5 py-3"
+                    >
+                      <Skeleton className="h-3 w-24 rounded-full" />
+                      <Skeleton className="mt-3 h-5 w-32" />
+                    </div>
+                  ))}
+                </div>
+              ) : overview ? (
+                <div className="grid gap-3">
+                  <Fact label="Tracked agents" value={formatInt(overview.totals.agentCount)} />
+                  <Fact label="Channels" value={formatInt(overview.totals.channelCount)} />
+                  <Fact label="24h requests" value={formatInt(overview.usage24h.requestCount)} />
+                  <Fact label="24h tokens" value={formatInt(overview.usage24h.totalTokens)} />
+                </div>
+              ) : (
+                <EmptyState title="No overview yet" body="Configure the gateway URL above, then refresh to inspect the current backend." />
+              )}
+            </PanelCard>
+          </section>
+        </div>
       </div>
     </ConsoleShell>
   );
@@ -193,11 +214,13 @@ export default function SettingsPage() {
 
 function ContractRow({ label, ok, detail }: { label: string; ok: boolean; detail: string }) {
   return (
-    <div className="flex items-start gap-3 rounded-[22px] border border-border/60 bg-background/30 px-4 py-3.5 shadow-[inset_0_1px_0_0_oklch(var(--foreground)/0.04)]">
+    <div className="argus-row-shell flex items-start gap-3 rounded-[16px] px-4 py-3">
       <div
         className={cn(
-          "mt-0.5 flex h-8 w-8 items-center justify-center rounded-full border",
-          ok ? "border-emerald-500/30 bg-emerald-500/10 text-emerald-400" : "border-border/60 bg-background/60 text-muted-foreground"
+          "mt-0.5 flex h-8 w-8 items-center justify-center rounded-lg border",
+          ok
+            ? "border-emerald-500/28 bg-emerald-500/10 text-emerald-400"
+            : "border-border/70 bg-background/40 text-muted-foreground"
         )}
       >
         {ok ? <CheckCircle2 className="h-4 w-4" /> : <XCircle className="h-4 w-4" />}

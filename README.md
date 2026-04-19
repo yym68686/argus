@@ -76,10 +76,11 @@ How changes take effect:
 | `ARGUS_TOKEN` | Recommended; effectively required if you expose the gateway beyond localhost | unset | Shared bearer token for `/ws` and the HTTP management endpoints. Also acts as the fallback master secret for `ARGUS_NODE_TOKEN`, `ARGUS_MCP_TOKEN`, and `ARGUS_OPENAI_TOKEN`. This is **not** an OpenAI API key. |
 | `ARGUS_NODE_TOKEN` | Optional | falls back to `ARGUS_TOKEN` | Separate master secret for derived `/nodes/ws` session tokens. Set this if you want node access scoped separately from the main gateway token. |
 | `ARGUS_MCP_TOKEN` | Optional | falls back to `ARGUS_TOKEN` | Separate master secret for the gateway MCP endpoint. Runtime containers receive per-session derived tokens instead of the raw secret. |
-| `ARGUS_HOME_HOST_PATH` | Optional in Compose, but strongly recommended | Compose: `${HOME}/.argus`; direct gateway run: unset | Host directory used for persistent gateway state and local workspace mirrors. In `docker` mode those mirrors are bind-mounted into runtime containers; in `fugue` mode the gateway syncs them into Fugue-managed persistent storage. If you run the gateway directly without this set, automation state falls back to `/tmp/argus-gateway-state.json`. Must be an **absolute host path** when set. |
+| `ARGUS_DATABASE_URL` | Optional, but recommended for non-trivial deployments | unset | PostgreSQL DSN used for gateway automation state and usage ledger, for example `postgresql://argus:argus@postgres:5432/argus`. When set, Argus stores gateway state in PostgreSQL and auto-imports legacy `state.json`, `state.db`, and `usage.db` on first boot when the target tables are still empty. |
+| `ARGUS_HOME_HOST_PATH` | Optional in Compose, but strongly recommended | Compose: `${HOME}/.argus`; direct gateway run: unset | Host directory used for local workspace mirrors. When `ARGUS_DATABASE_URL` is unset, gateway state also falls back to local sqlite files under this directory. In `docker` mode these mirrors are bind-mounted into runtime containers; in `fugue` mode the gateway syncs them into Fugue-managed persistent storage. Must be an **absolute host path** when set. |
 | `ARGUS_WORKSPACE_HOST_PATH` | Optional | unset | Base directory for generic `/ws` session local workspace mirrors. When unset, generic sessions use `${ARGUS_HOME_HOST_PATH}/workspaces/sess-<sessionId>`. Must be an **absolute host path** when set. |
 | `ARGUS_CORS_ORIGINS` | Optional | `*` | Comma-separated list of allowed HTTP origins, for example `https://app.example.com,https://admin.example.com`. Tighten this when exposing the HTTP APIs to browsers. |
-| `ARGUS_GC_DELETE_ORPHAN_RUNTIMES` | Optional | `delete` | Controls startup garbage collection for managed runtimes not referenced by gateway state. In `docker` mode this targets session containers; in `fugue` mode it targets session apps inside the configured project. Supported values: `off`, `dry-run`, `delete` (also `true` / `yes` / `on`). |
+| `ARGUS_GC_DELETE_ORPHAN_RUNTIMES` | Optional | `delete` | Controls startup garbage collection for managed runtimes not referenced by gateway state. In `docker` mode this targets session containers; in `fugue` mode it targets session apps inside the configured project. The reference set comes from PostgreSQL when `ARGUS_DATABASE_URL` is set, otherwise from the local sqlite fallback. Supported values: `off`, `dry-run`, `delete` (also `true` / `yes` / `on`). |
 | `ARGUS_STUCK_TURN_TIMEOUT_S` | Optional | `900` | Safety timeout for lanes stuck in `busy` state because an upstream turn never completed. Set `0` to disable the reset logic. |
 
 ### Docker runtime provisioning
@@ -138,7 +139,7 @@ Channel behavior:
 - Custom channels: each user can add/delete/rename their own OpenAI-compatible `baseUrl` + API key entries.
 - The built-in `gateway` channel keeps a fixed model list: `gpt-5.2` / `gpt-5.4`.
 - The `0-0.pro` and custom channels fetch their model lists from `<baseUrl>/models` (OpenAI-compatible shape). If that request fails, Argus falls back to the agent's current model so the session still stays usable.
-- The channel list and user API keys are stored in `${ARGUS_HOME_HOST_PATH}/gateway/state.json`. Protect this file like any other secret store.
+- The channel list and user API keys are stored in the gateway state store. When `ARGUS_DATABASE_URL` is set this means PostgreSQL; otherwise Argus falls back to `${ARGUS_HOME_HOST_PATH}/gateway/state.db`. Protect either backend like any other secret store. Legacy `${ARGUS_HOME_HOST_PATH}/gateway/state.json` / `state.db` files are imported automatically on first PostgreSQL boot when the target tables are still empty.
 - Switching the current channel is **user-global**: one switch affects that user's existing and future agents/containers.
 
 ### Web UI and Telegram bot
@@ -206,8 +207,10 @@ These are implementation details of the runtime bridge; in normal deployments yo
 By default Argus persists data on the machine where the gateway runs:
 
 - `ARGUS_HOME_HOST_PATH` (default: `${HOME}/.argus`)
-  - Gateway automation state: `${ARGUS_HOME_HOST_PATH}/gateway/state.json`
-  - Also stores per-user API channel definitions, the selected current channel, and user-supplied API keys. Treat it as a secret-bearing file.
+  - When `ARGUS_DATABASE_URL` is unset, gateway automation state falls back to `${ARGUS_HOME_HOST_PATH}/gateway/state.db`
+  - When `ARGUS_DATABASE_URL` is unset, the usage ledger falls back to `${ARGUS_HOME_HOST_PATH}/gateway/usage.db`
+  - When `ARGUS_DATABASE_URL` is set, both gateway state and usage are stored in PostgreSQL instead
+  - Legacy `${ARGUS_HOME_HOST_PATH}/gateway/state.json`, `state.db`, and `usage.db` are auto-imported into PostgreSQL on first boot when the target tables are still empty.
 
 Runtime workspaces always live at `/workspace` inside the app-server, but the backing storage differs by provision mode:
 
@@ -250,13 +253,13 @@ When using `apps/telegram-bot`, the gateway can isolate runtime containers (agen
   - **Delete Agent**: delete the current agent (owner-only; includes `main`). If you delete `main`, you’ll be prompted to create a new `main`.
   - **New Conversation**: reset the main thread for the current agent (affects heartbeat + DM routing).
 - In groups/topics, run `/menu` in the chat/topic and use **Bind This Chat** to route that chat/topic to an agent.
-- Admin sharing: edit `${ARGUS_HOME_HOST_PATH}/gateway/state.json` and add the target user tgid into `allowedUserIds` for the desired `agentId`.
-  - Recommended: edit with the gateway stopped, or restart after edits (the gateway continuously writes back `state.json`).
+- Admin sharing metadata now lives in the same gateway state backend as the rest of Argus (`ARGUS_DATABASE_URL` when set, otherwise the local sqlite fallback).
+  - Prefer managing sharing through Argus admin APIs / UI instead of editing the database manually.
 
 Migration notes:
 
 - Enabling this does not delete existing session containers.
-- By default, the gateway deletes orphan managed runtimes on startup (set `ARGUS_GC_DELETE_ORPHAN_RUNTIMES=off` to disable, or `dry-run` to preview).
+- By default, the gateway deletes orphan managed runtimes on startup (set `ARGUS_GC_DELETE_ORPHAN_RUNTIMES=off` to disable, or `dry-run` to preview). The reference set comes from the configured gateway state backend.
 - If older sessions still have enabled cron jobs in automation state, the gateway will keep scheduling them until you disable/delete those jobs and remove the sessions.
 
 ## Automation (system events, heartbeat, cron)
@@ -269,7 +272,8 @@ Argus has a minimal automation layer in the gateway:
 
 Automation state is persisted under:
 
-- `${ARGUS_HOME_HOST_PATH}/gateway/state.json`
+- PostgreSQL via `ARGUS_DATABASE_URL`, when configured
+- otherwise `${ARGUS_HOME_HOST_PATH}/gateway/state.db`
 
 ## Nodes (optional)
 
@@ -321,10 +325,11 @@ Default runtime (Codex):
 This repo now ships with [fugue.yaml](/Users/yanyuming/Downloads/GitHub/argus/fugue.yaml). The intended Fugue topology is:
 
 - `gateway`: public service, runs in `ARGUS_PROVISION_MODE=fugue`
+- `postgres`: internal PostgreSQL backing service for gateway state + usage
 - `runtime`: non-public template app whose current image is reused for per-session Fugue apps
 - `telegram-bot`: optional companion service; keep it only when `TELEGRAM_BOT_TOKEN` is set
 
-The bundled manifest includes `gateway`, `runtime`, `web`, and `telegram-bot`. For `web`, you can either leave `NEXT_PUBLIC_ARGUS_WS_URL` unset and let the browser derive a same-origin WebSocket URL, or provide a build-time preset when you want the UI to point at a specific gateway.
+The bundled manifest includes `gateway`, `postgres`, `runtime`, `web`, and `telegram-bot`. For `web`, you can either leave `NEXT_PUBLIC_ARGUS_WS_URL` unset and let the browser derive a same-origin WebSocket URL, or provide a build-time preset when you want the UI to point at a specific gateway.
 
 Because the gateway needs `ARGUS_FUGUE_PROJECT_ID`, Fugue deployment is a two-step flow: create/select the project first, then deploy into it.
 
@@ -357,7 +362,7 @@ Notes:
 - The built-in `gateway` channel is selected by default and uses `OPENAI_API_KEY` / `ARGUS_OPENAI_API_KEY` plus `ARGUS_OPENAI_RESPONSES_UPSTREAM_URL`.
 - The built-in promo channel `0-0.pro` always points to `https://api.0-0.pro/v1`; each user provides their own API key before switching to it.
 - Users can add/delete/rename extra OpenAI-compatible channels from the Telegram **API Channels** menu.
-- The channel list, selected current channel, and user-supplied API keys are stored in `${ARGUS_HOME_HOST_PATH}/gateway/state.json`.
+- The channel list, selected current channel, and user-supplied API keys are stored in the configured gateway state backend (PostgreSQL via `ARGUS_DATABASE_URL`, or the local sqlite fallback when unset).
 - Switching the current channel is **user-global**: it affects that user's existing and future agents/containers.
 - Sessions without an owning Telegram user still fall back to the built-in `gateway` channel.
 - The proxy requires a per-session derived bearer token (master: `ARGUS_OPENAI_TOKEN`, fallback: `ARGUS_TOKEN`).

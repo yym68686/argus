@@ -3,32 +3,37 @@
 
 @layer base {
   :root {
-    --background: 99% 0.004 250;
-    --foreground: 22% 0.02 250;
-    --card: 100% 0.004 250;
-    --card-foreground: 22% 0.02 250;
-    --popover: 100% 0.004 250;
-    --popover-foreground: 22% 0.02 250;
-    --primary: 60% 0.18 245;
-    --primary-foreground: 12% 0.02 250;
-    --secondary: 96% 0.01 250;
-    --secondary-foreground: 22% 0.02 250;
-    --muted: 96% 0.01 250;
-    --muted-foreground: 46% 0.02 250;
-    --accent: 96% 0.01 250;
-    --accent-foreground: 22% 0.02 250;
-    --destructive: 62% 0.22 25;
-    --destructive-foreground: 98% 0.01 20;
-    --border: 90% 0.01 250;
-    --input: 90% 0.01 250;
-    --ring: 60% 0.18 245;
-    --success: 64% 0.16 150;
-    --warning: 72% 0.17 80;
-    --font-press-start: "Press Start 2P";
+    --background: 97.5% 0.006 240;
+    --foreground: 24% 0.02 240;
+    --card: 100% 0.004 240;
+    --card-foreground: 24% 0.02 240;
+    --popover: 100% 0.004 240;
+    --popover-foreground: 24% 0.02 240;
+    --primary: 59% 0.12 229;
+    --primary-foreground: 98% 0.003 240;
+    --secondary: 94% 0.008 240;
+    --secondary-foreground: 24% 0.02 240;
+    --muted: 94% 0.008 240;
+    --muted-foreground: 48% 0.018 238;
+    --accent: 94% 0.01 240;
+    --accent-foreground: 24% 0.02 240;
+    --destructive: 62% 0.2 28;
+    --destructive-foreground: 98% 0.003 24;
+    --border: 87% 0.01 240;
+    --input: 87% 0.01 240;
+    --ring: 59% 0.12 229;
+    --success: 64% 0.14 164;
+    --warning: 74% 0.16 86;
+    --surface-0: 98% 0.004 240;
+    --surface-1: 96% 0.006 240;
+    --surface-2: 93% 0.008 240;
+    --surface-3: 89% 0.01 240;
+    --argus-font-mono: ui-monospace;
+    --argus-font-display: Georgia;
 
     --argus-vt-x: 50vw;
-    --argus-vt-y: 20vh;
-    --argus-vt-duration: 1.1s;
+    --argus-vt-y: 18vh;
+    --argus-vt-duration: 0.9s;
     --argus-expo-out: linear(
       0 0%,
       0.1684 2.66%,
@@ -50,35 +55,47 @@
   }
 
   .dark {
-    --background: 15% 0.012 248;
-    --foreground: 95% 0.008 236;
-    --card: 18% 0.014 247;
-    --card-foreground: 95% 0.008 236;
-    --popover: 18% 0.014 247;
-    --popover-foreground: 95% 0.008 236;
-    --primary: 72% 0.165 233;
-    --primary-foreground: 12% 0.015 240;
-    --secondary: 22% 0.016 247;
-    --secondary-foreground: 95% 0.008 236;
-    --muted: 22% 0.016 247;
-    --muted-foreground: 78% 0.014 240;
-    --accent: 22% 0.016 247;
-    --accent-foreground: 95% 0.008 236;
-    --destructive: 62% 0.22 25;
-    --destructive-foreground: 95% 0.008 236;
-    --border: 28% 0.016 247;
-    --input: 28% 0.016 247;
-    --ring: 72% 0.165 233;
-    --success: 76% 0.15 165;
-    --warning: 80% 0.16 88;
+    --background: 16% 0.012 238;
+    --foreground: 95% 0.006 224;
+    --card: 18% 0.013 238;
+    --card-foreground: 95% 0.006 224;
+    --popover: 18% 0.013 238;
+    --popover-foreground: 95% 0.006 224;
+    --primary: 70% 0.1 228;
+    --primary-foreground: 15% 0.012 238;
+    --secondary: 22% 0.014 238;
+    --secondary-foreground: 95% 0.006 224;
+    --muted: 22% 0.014 238;
+    --muted-foreground: 77% 0.012 228;
+    --accent: 22% 0.016 238;
+    --accent-foreground: 95% 0.006 224;
+    --destructive: 66% 0.19 28;
+    --destructive-foreground: 96% 0.004 24;
+    --border: 30% 0.015 238;
+    --input: 30% 0.015 238;
+    --ring: 70% 0.1 228;
+    --success: 76% 0.13 164;
+    --warning: 81% 0.15 86;
+    --surface-0: 15% 0.011 238;
+    --surface-1: 17% 0.012 238;
+    --surface-2: 20% 0.013 238;
+    --surface-3: 24% 0.015 238;
   }
 
   * {
+    box-sizing: border-box;
     border-color: oklch(var(--border));
+  }
+
+  *::selection {
+    background: oklch(var(--primary) / 0.28);
+    color: oklch(var(--foreground));
   }
 
   html {
     color-scheme: light;
+    scroll-behavior: smooth;
+    font-synthesis-weight: none;
   }
 
   html.dark {
@@ -86,12 +103,84 @@
   }
 
   body {
+    position: relative;
     background:
-      radial-gradient(circle at top left, oklch(var(--primary) / 0.1), transparent 22%),
-      radial-gradient(circle at 85% 8%, oklch(var(--success) / 0.07), transparent 24%),
-      linear-gradient(180deg, oklch(var(--background)) 0%, oklch(13% 0.01 248) 100%);
+      radial-gradient(circle at 10% -8%, oklch(var(--primary) / 0.18), transparent 28%),
+      radial-gradient(circle at 100% 0%, oklch(var(--primary) / 0.09), transparent 24%),
+      linear-gradient(180deg, oklch(var(--surface-2)) 0%, oklch(var(--surface-1)) 18%, oklch(var(--background)) 100%);
     color: oklch(var(--foreground));
-    font-feature-settings: "rlig" 1, "calt" 1;
+    font-feature-settings: "rlig" 1, "calt" 1, "cv11" 1;
+    text-rendering: optimizeLegibility;
+  }
+
+  body::before {
+    content: "";
+    position: fixed;
+    inset: 0;
+    pointer-events: none;
+    background-image:
+      linear-gradient(oklch(var(--foreground) / 0.025) 1px, transparent 1px),
+      linear-gradient(90deg, oklch(var(--foreground) / 0.025) 1px, transparent 1px);
+    background-size: 40px 40px;
+    mask-image: radial-gradient(circle at center, black 36%, transparent 88%);
+    opacity: 0.85;
+  }
+
+  body::after {
+    content: "";
+    position: fixed;
+    inset: 0;
+    pointer-events: none;
+    background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='220' height='220'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='.8' numOctaves='3' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='220' height='220' filter='url(%23n)' opacity='.16'/%3E%3C/svg%3E");
+    background-size: 220px 220px;
+    mix-blend-mode: overlay;
+    opacity: 0.11;
+  }
+
+  h1,
+  h2,
+  h3,
+  h4 {
+    text-wrap: balance;
+  }
+
+  p {
+    text-wrap: pretty;
+  }
+
+  a,
+  button,
+  input,
+  textarea,
+  select {
+    transition:
+      border-color 150ms ease,
+      background-color 150ms ease,
+      color 150ms ease,
+      box-shadow 150ms ease,
+      opacity 150ms ease,
+      transform 150ms ease;
+  }
+
+  code,
+  pre,
+  .font-mono {
+    font-family: var(--argus-font-mono), ui-monospace, "SF Mono", monospace !important;
+    font-variant-numeric: tabular-nums;
+  }
+
+  .argus-display {
+    font-family: var(--argus-font-display), serif;
+    font-style: normal;
+    letter-spacing: -0.04em;
+    line-height: 0.94;
+  }
+
+  .argus-display-ui {
+    font-family: var(--argus-font-display), serif;
+    font-style: normal;
+    letter-spacing: -0.03em;
+    line-height: 0.98;
   }
 
   @property --argus-vt-r {
@@ -138,21 +227,29 @@
   }
 
   @media (prefers-reduced-motion: reduce) {
-    ::view-transition-group(root) {
+    html {
+      scroll-behavior: auto;
+    }
+
+    body::before,
+    body::after {
       animation: none;
     }
-    ::view-transition-new(root) {
+
+    ::view-transition-group(root),
+    ::view-transition-new(root),
+    ::view-transition-old(root),
+    html.dark::view-transition-old(root) {
       animation: none;
       -webkit-mask: none;
       mask: none;
     }
-    ::view-transition-old(root),
-    html.dark::view-transition-old(root) {
+
+    .argus-skeleton,
+    .argus-landing-grid-64,
+    .argus-landing-noise,
+    .argus-landing-blob {
       animation: none;
-    }
-    .argus-skeleton {
-      animation: none;
-      background-position: 50% 0;
     }
   }
 }
@@ -168,44 +265,38 @@
   }
 
   @keyframes argus-blob-float-a {
-    0% {
-      transform: translate3d(-6%, -2%, 0) rotate(0deg);
-      opacity: 0.55;
+    0%,
+    100% {
+      transform: translate3d(-4%, -1%, 0);
+      opacity: 0.3;
     }
     50% {
-      transform: translate3d(4%, -6%, 0) rotate(1deg);
-      opacity: 0.75;
-    }
-    100% {
-      transform: translate3d(-6%, -2%, 0) rotate(0deg);
-      opacity: 0.55;
+      transform: translate3d(4%, -5%, 0);
+      opacity: 0.46;
     }
   }
 
   @keyframes argus-blob-float-b {
-    0% {
-      transform: translate3d(8%, 4%, 0) rotate(0deg);
-      opacity: 0.45;
+    0%,
+    100% {
+      transform: translate3d(5%, 2%, 0);
+      opacity: 0.24;
     }
     50% {
-      transform: translate3d(0%, -5%, 0) rotate(-1deg);
-      opacity: 0.62;
-    }
-    100% {
-      transform: translate3d(8%, 4%, 0) rotate(0deg);
-      opacity: 0.45;
+      transform: translate3d(0%, -4%, 0);
+      opacity: 0.38;
     }
   }
 
   @keyframes argus-blob-pulse {
     0%,
     100% {
-      opacity: 0.22;
-      transform: translate3d(0, 0, 0) scale(1);
+      opacity: 0.18;
+      transform: scale(1);
     }
     50% {
-      opacity: 0.34;
-      transform: translate3d(0, -2%, 0) scale(1.02);
+      opacity: 0.28;
+      transform: scale(1.03);
     }
   }
 
@@ -215,53 +306,18 @@
       transform: translate3d(0, 0, 0);
     }
     50% {
-      transform: translate3d(-1%, 0.5%, 0);
+      transform: translate3d(-0.5%, 0.5%, 0);
     }
   }
 
   @keyframes argus-grid-drift {
-    0% {
-      transform: translateY(0);
-      opacity: 0.55;
-    }
-    50% {
-      transform: translateY(-10px);
-      opacity: 0.7;
-    }
+    0%,
     100% {
       transform: translateY(0);
-      opacity: 0.55;
     }
-  }
-
-  .argus-landing-canvas {
-    background-image:
-      radial-gradient(circle at 12% 8%, oklch(var(--primary) / 0.13), transparent 28%),
-      radial-gradient(circle at 88% 12%, oklch(var(--success) / 0.08), transparent 23%),
-      linear-gradient(
-        180deg,
-        oklch(var(--card) / 0.34) 0%,
-        oklch(var(--background) / 1) 44%,
-        oklch(var(--background) / 1) 100%
-      );
-  }
-
-  .argus-landing-grid-64 {
-    background-image:
-      linear-gradient(oklch(var(--foreground) / 0.03) 1px, transparent 1px),
-      linear-gradient(90deg, oklch(var(--foreground) / 0.03) 1px, transparent 1px);
-    background-size: 64px 64px;
-    mask-image: radial-gradient(closest-side, black 58%, transparent 100%);
-    animation: argus-grid-drift 12s ease-in-out infinite;
-  }
-
-  .argus-landing-noise {
-    background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='260' height='260'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='.8' numOctaves='3' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='260' height='260' filter='url(%23n)' opacity='.20'/%3E%3C/svg%3E");
-    background-size: 260px 260px;
-    mix-blend-mode: overlay;
-    opacity: 0.14;
-    animation: argus-noise-drift 9.5s linear infinite;
-    will-change: transform;
+    50% {
+      transform: translateY(-6px);
+    }
   }
 
   @keyframes argus-skeleton-shimmer {
@@ -271,6 +327,30 @@
     100% {
       background-position: -100% 0;
     }
+  }
+
+  .argus-landing-canvas {
+    background:
+      radial-gradient(circle at 14% 10%, oklch(var(--primary) / 0.12), transparent 26%),
+      radial-gradient(circle at 100% 0%, oklch(var(--foreground) / 0.03), transparent 32%),
+      linear-gradient(180deg, oklch(var(--surface-2) / 0.6) 0%, transparent 100%);
+  }
+
+  .argus-landing-grid-64 {
+    background-image:
+      linear-gradient(oklch(var(--foreground) / 0.03) 1px, transparent 1px),
+      linear-gradient(90deg, oklch(var(--foreground) / 0.03) 1px, transparent 1px);
+    background-size: 48px 48px;
+    mask-image: radial-gradient(circle at center, black 42%, transparent 92%);
+    animation: argus-grid-drift 12s ease-in-out infinite;
+  }
+
+  .argus-landing-noise {
+    background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='220' height='220'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='.78' numOctaves='3' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='220' height='220' filter='url(%23n)' opacity='.16'/%3E%3C/svg%3E");
+    background-size: 220px 220px;
+    mix-blend-mode: overlay;
+    opacity: 0.08;
+    animation: argus-noise-drift 9s linear infinite;
   }
 
   .argus-skeleton {
@@ -283,68 +363,37 @@
       ),
       oklch(var(--background) / 0.48);
     background-size: 220% 100%;
-    animation: argus-skeleton-shimmer 1.35s linear infinite;
+    animation: argus-skeleton-shimmer 1.25s linear infinite;
   }
 
   .argus-landing-blob {
     will-change: transform, opacity;
-  }
-
-  @media (min-width: 40rem) and (pointer: fine) {
-    .argus-landing-blob {
-      filter: blur(110px);
-    }
-  }
-
-  @media (min-width: 64rem) and (pointer: fine) {
-    .argus-landing-blob {
-      filter: blur(140px);
-    }
-  }
-
-  @media (max-width: 40rem) {
-    .argus-landing-noise {
-      animation: none;
-    }
+    filter: blur(120px);
   }
 
   .argus-landing-blob-a {
-    background-image: radial-gradient(
-      circle at 30% 30%,
-      oklch(var(--primary) / 0.30),
-      transparent 62%
-    );
-    animation: argus-blob-float-a 10s ease-in-out infinite;
+    background-image: radial-gradient(circle at 30% 30%, oklch(var(--primary) / 0.18), transparent 65%);
+    animation: argus-blob-float-a 12s ease-in-out infinite;
   }
 
   .argus-landing-blob-b {
-    background-image: radial-gradient(
-      circle at 60% 45%,
-      oklch(var(--primary) / 0.22),
-      transparent 64%
-    );
-    animation: argus-blob-float-b 12s ease-in-out infinite;
+    background-image: radial-gradient(circle at 55% 45%, oklch(var(--primary) / 0.12), transparent 66%);
+    animation: argus-blob-float-b 14s ease-in-out infinite;
   }
 
   .argus-landing-blob-c {
-    background-image: radial-gradient(
-      circle at 50% 50%,
-      oklch(var(--primary) / 0.18),
-      transparent 60%
-    );
-    animation: argus-blob-pulse 9s ease-in-out infinite;
+    background-image: radial-gradient(circle at 50% 50%, oklch(var(--primary) / 0.1), transparent 62%);
+    animation: argus-blob-pulse 10s ease-in-out infinite;
   }
 
   .argus-shell-panel {
     position: relative;
-    overflow: hidden;
-    border: 1px solid oklch(var(--border) / 0.7);
+    border: 1px solid oklch(var(--border) / 0.9);
     background:
-      linear-gradient(180deg, oklch(var(--card) / 0.96) 0%, oklch(var(--background) / 0.9) 100%);
+      linear-gradient(180deg, oklch(var(--surface-2) / 0.95) 0%, oklch(var(--surface-1) / 0.98) 100%);
     box-shadow:
-      0 0 0 1px oklch(var(--foreground) / 0.025),
-      0 24px 80px oklch(0% 0 0 / 0.32),
-      inset 0 1px 0 0 oklch(var(--foreground) / 0.055);
+      0 1px 0 oklch(var(--foreground) / 0.05) inset,
+      0 24px 64px oklch(0% 0 0 / 0.22);
   }
 
   .argus-shell-panel::before {
@@ -352,107 +401,145 @@
     position: absolute;
     inset: 0 0 auto 0;
     height: 1px;
-    background:
-      linear-gradient(90deg, transparent 0%, oklch(var(--primary) / 0.45) 18%, transparent 68%);
+    background: linear-gradient(90deg, transparent 0%, oklch(var(--primary) / 0.5) 18%, transparent 72%);
     pointer-events: none;
   }
 
   .argus-shell-panel-soft {
     position: relative;
-    border: 1px solid oklch(var(--border) / 0.64);
+    border: 1px solid oklch(var(--border) / 0.82);
     background:
-      linear-gradient(180deg, oklch(var(--background) / 0.7) 0%, oklch(var(--background) / 0.46) 100%);
+      linear-gradient(180deg, oklch(var(--surface-2) / 0.76) 0%, oklch(var(--surface-1) / 0.92) 100%);
     box-shadow: inset 0 1px 0 0 oklch(var(--foreground) / 0.04);
   }
 
   .argus-shell-glyph {
     background:
-      radial-gradient(circle at 30% 25%, oklch(var(--primary) / 0.24), transparent 62%),
-      linear-gradient(180deg, oklch(var(--card) / 0.92) 0%, oklch(var(--background) / 0.88) 100%);
+      linear-gradient(180deg, oklch(var(--surface-3) / 0.9) 0%, oklch(var(--surface-1) / 0.95) 100%);
     box-shadow:
       inset 0 1px 0 0 oklch(var(--foreground) / 0.08),
-      0 16px 42px oklch(0% 0 0 / 0.28);
+      0 12px 30px oklch(0% 0 0 / 0.16);
   }
 
   .argus-kicker {
     font-size: 0.68rem;
-    font-weight: 650;
-    letter-spacing: 0.28em;
+    font-weight: 600;
+    letter-spacing: 0.18em;
     text-transform: uppercase;
-    color: oklch(var(--primary) / 0.88);
+    color: oklch(var(--primary) / 0.92);
   }
 
   .argus-surface-label {
-    font-size: 0.68rem;
-    font-weight: 650;
-    letter-spacing: 0.24em;
+    font-size: 0.7rem;
+    font-weight: 600;
+    letter-spacing: 0.12em;
     text-transform: uppercase;
     color: oklch(var(--muted-foreground) / 0.88);
   }
 
   .argus-data-grid {
     background-image:
-      linear-gradient(oklch(var(--foreground) / 0.028) 1px, transparent 1px),
-      linear-gradient(90deg, oklch(var(--foreground) / 0.028) 1px, transparent 1px);
-    background-size: 28px 28px;
+      linear-gradient(oklch(var(--foreground) / 0.022) 1px, transparent 1px),
+      linear-gradient(90deg, oklch(var(--foreground) / 0.022) 1px, transparent 1px);
+    background-size: 24px 24px;
     background-position: center;
   }
 
   .argus-metric-card {
     position: relative;
     overflow: hidden;
-    border: 1px solid oklch(var(--border) / 0.66);
+    border: 1px solid oklch(var(--border) / 0.82);
     background:
-      linear-gradient(180deg, oklch(var(--background) / 0.78) 0%, oklch(var(--background) / 0.52) 100%);
+      linear-gradient(180deg, oklch(var(--surface-2) / 0.82) 0%, oklch(var(--surface-1) / 0.95) 100%);
     box-shadow: inset 0 1px 0 0 oklch(var(--foreground) / 0.04);
   }
 
-  .argus-metric-card::after {
+  .argus-metric-card::before {
     content: "";
     position: absolute;
-    inset: auto auto 0 0;
-    width: 100%;
-    height: 2px;
-    background: linear-gradient(90deg, oklch(var(--primary) / 0.72), transparent 78%);
-    opacity: 0.75;
+    inset: 0 auto 0 0;
+    width: 2px;
+    background: linear-gradient(180deg, oklch(var(--primary) / 0.8), transparent 85%);
   }
 
   .argus-metric-card-primary {
-    border-color: oklch(var(--primary) / 0.24);
+    border-color: oklch(var(--primary) / 0.28);
     background:
-      radial-gradient(circle at top left, oklch(var(--primary) / 0.12), transparent 42%),
-      linear-gradient(180deg, oklch(var(--primary) / 0.13) 0%, oklch(var(--background) / 0.58) 100%);
+      radial-gradient(circle at top left, oklch(var(--primary) / 0.14), transparent 40%),
+      linear-gradient(180deg, oklch(var(--surface-2) / 0.88) 0%, oklch(var(--surface-1) / 0.96) 100%);
   }
 
   .argus-table-shell {
-    overflow: hidden;
-    border: 1px solid oklch(var(--border) / 0.64);
+    overflow: auto;
+    border: 1px solid oklch(var(--border) / 0.82);
     background:
-      linear-gradient(180deg, oklch(var(--background) / 0.64) 0%, oklch(var(--background) / 0.44) 100%);
+      linear-gradient(180deg, oklch(var(--surface-2) / 0.8) 0%, oklch(var(--surface-1) / 0.94) 100%);
     box-shadow: inset 0 1px 0 0 oklch(var(--foreground) / 0.04);
   }
 
   .argus-table-head {
     background:
-      linear-gradient(180deg, oklch(var(--background) / 0.9) 0%, oklch(var(--background) / 0.58) 100%);
+      linear-gradient(180deg, oklch(var(--surface-3) / 0.9) 0%, oklch(var(--surface-2) / 0.92) 100%);
   }
 
   .argus-status-dot {
     display: inline-flex;
-    height: 0.55rem;
-    width: 0.55rem;
+    height: 0.52rem;
+    width: 0.52rem;
     border-radius: 9999px;
     background: oklch(var(--border));
-    box-shadow: 0 0 0 6px oklch(var(--border) / 0.12);
+    box-shadow: 0 0 0 5px oklch(var(--border) / 0.12);
   }
 
   .argus-status-dot[data-state="ok"] {
     background: oklch(var(--success));
-    box-shadow: 0 0 0 6px oklch(var(--success) / 0.12);
+    box-shadow: 0 0 0 5px oklch(var(--success) / 0.12);
   }
 
   .argus-status-dot[data-state="warn"] {
     background: oklch(var(--warning));
-    box-shadow: 0 0 0 6px oklch(var(--warning) / 0.12);
+    box-shadow: 0 0 0 5px oklch(var(--warning) / 0.12);
+  }
+
+  .argus-toolbar-band {
+    border: 1px solid oklch(var(--border) / 0.82);
+    background:
+      linear-gradient(180deg, oklch(var(--surface-2) / 0.72) 0%, oklch(var(--surface-1) / 0.94) 100%);
+    box-shadow: inset 0 1px 0 0 oklch(var(--foreground) / 0.04);
+  }
+
+  .argus-select {
+    height: 2.5rem;
+    width: 100%;
+    border-radius: 0.875rem;
+    border: 1px solid oklch(var(--input) / 0.82);
+    background:
+      linear-gradient(180deg, oklch(var(--surface-2) / 0.84) 0%, oklch(var(--surface-1) / 0.98) 100%);
+    padding: 0 0.875rem;
+    color: oklch(var(--foreground));
+    font-size: 0.925rem;
+    outline: none;
+    box-shadow: inset 0 1px 0 0 oklch(var(--foreground) / 0.05);
+  }
+
+  .argus-select:focus-visible {
+    border-color: oklch(var(--primary) / 0.44);
+    box-shadow:
+      0 0 0 4px oklch(var(--ring) / 0.18),
+      inset 0 1px 0 0 oklch(var(--foreground) / 0.05);
+  }
+
+  .argus-rail-stat {
+    border: 1px solid oklch(var(--border) / 0.78);
+    background:
+      linear-gradient(180deg, oklch(var(--surface-2) / 0.75) 0%, oklch(var(--surface-1) / 0.92) 100%);
+    box-shadow: inset 0 1px 0 0 oklch(var(--foreground) / 0.04);
+  }
+
+  .argus-row-shell {
+    border: 1px solid oklch(var(--border) / 0.8);
+    background:
+      linear-gradient(180deg, oklch(var(--surface-2) / 0.74) 0%, oklch(var(--surface-1) / 0.92) 100%);
+    box-shadow: inset 0 1px 0 0 oklch(var(--foreground) / 0.04);
   }
 }

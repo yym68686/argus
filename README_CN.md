@@ -76,10 +76,11 @@ cp .env.example .env
 | `ARGUS_TOKEN` | 推荐设置；如果要暴露到 localhost 之外，几乎等同必需 | 未设置 | `/ws` 与 HTTP 管理接口共用的 Bearer token。同时也是 `ARGUS_NODE_TOKEN`、`ARGUS_MCP_TOKEN`、`ARGUS_OPENAI_TOKEN` 的回退 master secret。它**不是** OpenAI API Key。 |
 | `ARGUS_NODE_TOKEN` | 可选 | 回退到 `ARGUS_TOKEN` | 用于派生 `/nodes/ws` 的 session 级 token。如果你希望 node 访问和主网关 token 分离，就单独设置它。 |
 | `ARGUS_MCP_TOKEN` | 可选 | 回退到 `ARGUS_TOKEN` | gateway MCP 端点使用的独立 master secret。runtime 容器里拿到的是按 session 派生后的 token，而不是原始 secret。 |
-| `ARGUS_HOME_HOST_PATH` | 在 Compose 中可选，但强烈推荐设置清楚 | Compose 下默认 `${HOME}/.argus`；直接运行 gateway 时默认未设置 | 用于存放 gateway 持久化状态和本地 workspace 镜像。在 `docker` 模式下，这些目录会 bind mount 到 runtime 容器；在 `fugue` 模式下，gateway 会把这些镜像目录同步到 Fugue 管理的持久化存储。若直接运行 gateway 且未设置它，automation state 会落到 `/tmp/argus-gateway-state.json`。设置时必须是**宿主机绝对路径**。 |
+| `ARGUS_DATABASE_URL` | 可选，但推荐在正式部署中设置 | 未设置 | gateway 自动化状态和 usage 账本使用的 PostgreSQL DSN，例如 `postgresql://argus:argus@postgres:5432/argus`。设置后 Argus 会把网关状态持久化到 PostgreSQL，并在首次启动且目标表为空时，自动导入旧的 `state.json`、`state.db`、`usage.db`。 |
+| `ARGUS_HOME_HOST_PATH` | 在 Compose 中可选，但强烈推荐设置清楚 | Compose 下默认 `${HOME}/.argus`；直接运行 gateway 时默认未设置 | 用于存放本地 workspace 镜像。当 `ARGUS_DATABASE_URL` 未设置时，gateway 状态也会回退到这个目录下的 sqlite 文件。在 `docker` 模式下，这些目录会 bind mount 到 runtime 容器；在 `fugue` 模式下，gateway 会把这些镜像目录同步到 Fugue 管理的持久化存储。设置时必须是**宿主机绝对路径**。 |
 | `ARGUS_WORKSPACE_HOST_PATH` | 可选 | 未设置 | 通用 `/ws` session 的本地 workspace 镜像基础目录。未设置时，通用 session 使用 `${ARGUS_HOME_HOST_PATH}/workspaces/sess-<sessionId>`。设置时必须是**宿主机绝对路径**。 |
 | `ARGUS_CORS_ORIGINS` | 可选 | `*` | 逗号分隔的 HTTP 允许来源，例如 `https://app.example.com,https://admin.example.com`。如果你要把 HTTP API 暴露给浏览器，建议收紧。 |
-| `ARGUS_GC_DELETE_ORPHAN_RUNTIMES` | 可选 | `delete` | 控制 gateway 启动时是否清理未被状态文件引用的托管 runtime。`docker` 模式下清理的是 session 容器，`fugue` 模式下清理的是配置项目里的 session app。支持：`off`、`dry-run`、`delete`（也接受 `true` / `yes` / `on`）。 |
+| `ARGUS_GC_DELETE_ORPHAN_RUNTIMES` | 可选 | `delete` | 控制 gateway 启动时是否清理未被状态库引用的托管 runtime。`docker` 模式下清理的是 session 容器，`fugue` 模式下清理的是配置项目里的 session app。若设置了 `ARGUS_DATABASE_URL`，引用集合来自 PostgreSQL；否则来自本地 sqlite 回退文件。支持：`off`、`dry-run`、`delete`（也接受 `true` / `yes` / `on`）。 |
 | `ARGUS_STUCK_TURN_TIMEOUT_S` | 可选 | `900` | 防止某个上游 turn 永远不返回 `turn/completed`，导致 lane 一直卡在 `busy`。设为 `0` 可关闭这层保护。 |
 
 ### Docker runtime 创建与资源控制
@@ -136,7 +137,7 @@ cp .env.example .env
 - 内置 `gateway`：默认选中；使用 `OPENAI_API_KEY` + `ARGUS_OPENAI_RESPONSES_UPSTREAM_URL`。
 - 内置 `0-0.pro`：固定 Base URL 为 `https://api.0-0.pro/v1`；每个用户自己在 Telegram 菜单里填 API Key。
 - 自定义渠道：每个用户都可以增删改自己的 OpenAI-compatible `baseUrl` + API Key。
-- 渠道列表和用户 API Key 都存放在 `${ARGUS_HOME_HOST_PATH}/gateway/state.json`；请把它当作带 secrets 的文件保护。
+- 渠道列表和用户 API Key 都保存在 gateway 状态库中。设置了 `ARGUS_DATABASE_URL` 时，主存储是 PostgreSQL；否则回退到 `${ARGUS_HOME_HOST_PATH}/gateway/state.db`。无论哪种后端，都请按带 secrets 的持久化存储保护。旧的 `${ARGUS_HOME_HOST_PATH}/gateway/state.json` / `state.db` 会在切到 PostgreSQL 后首次启动且目标表为空时自动导入。
 - “当前渠道”是**用户级全局状态**：切换一次，会影响该用户现有和未来的所有 agent / 容器。
 
 ### Web UI 与 Telegram bot
@@ -204,8 +205,10 @@ cp .env.example .env
 默认情况下，Argus 会把数据存到运行 gateway 的机器上：
 
 - `ARGUS_HOME_HOST_PATH`（默认：`${HOME}/.argus`）
-  - 网关自动化状态：`${ARGUS_HOME_HOST_PATH}/gateway/state.json`
-  - 同时保存每个用户的 API 渠道定义、当前选中的渠道，以及用户自行填写的 API Key；请按 secrets 文件对待。
+  - 当 `ARGUS_DATABASE_URL` 未设置时，网关自动化状态回退到 `${ARGUS_HOME_HOST_PATH}/gateway/state.db`
+  - 当 `ARGUS_DATABASE_URL` 未设置时，usage 账本回退到 `${ARGUS_HOME_HOST_PATH}/gateway/usage.db`
+  - 当 `ARGUS_DATABASE_URL` 已设置时，网关状态和 usage 都存放在 PostgreSQL 中
+  - 旧的 `${ARGUS_HOME_HOST_PATH}/gateway/state.json`、`state.db`、`usage.db` 会在切到 PostgreSQL 后首次启动且目标表为空时自动导入。
 
 runtime 在容器内始终使用 `/workspace`，但底层存储会随 provision mode 改变：
 
@@ -245,13 +248,13 @@ runtime 会管理这些 workspace 文件：
   - **Delete Agent**：删除当前 agent（仅 owner；包含 `main`）。删除 `main` 后，下次会提示创建新的 `main`。
   - **New Conversation**：重置当前 agent 的 main thread（会影响 heartbeat 与私聊路由）。
 - 在群聊/话题中发送 `/menu`，使用 **Bind This Chat** 把该 chat/topic 绑定到一个 agent。
-- **共享/授权**：管理员可编辑 `${ARGUS_HOME_HOST_PATH}/gateway/state.json`，在对应 `agentId` 下把目标用户的 tgid 加入 `allowedUserIds`。
-  - 建议在停止 gateway 后编辑，或编辑后重启（gateway 运行中会持续写回 `state.json`，手动修改可能被覆盖）。
+- **共享/授权**：这类元数据现在保存在和其他 Argus 状态相同的 gateway 状态后端中（设置了 `ARGUS_DATABASE_URL` 时是 PostgreSQL，否则是本地 sqlite 回退）。
+  - 更推荐通过 Argus 的管理 API / Web UI 维护，而不是直接手改数据库。
 
 迁移提示：
 
 - 启用该隔离方案不会自动删除旧 session 容器。
-- 默认情况下，gateway 启动时会删除 **未被** `${ARGUS_HOME_HOST_PATH}/gateway/state.json` **引用** 的托管 runtime（可设置 `ARGUS_GC_DELETE_ORPHAN_RUNTIMES=off` 关闭，或 `dry-run` 仅预览）。
+- 默认情况下，gateway 启动时会删除 **未被** 当前 gateway 状态后端引用的托管 runtime（可设置 `ARGUS_GC_DELETE_ORPHAN_RUNTIMES=off` 关闭，或 `dry-run` 仅预览）。
 - 如果旧 session 在 automation state 中仍存在启用的 cron job，它会继续被 gateway 调度执行；要停止请禁用/删除 cron job，并在需要时删除对应 session 容器。
 
 ## 自动化（system events / heartbeat / cron）
@@ -264,7 +267,8 @@ runtime 会管理这些 workspace 文件：
 
 自动化状态持久化位置：
 
-- `${ARGUS_HOME_HOST_PATH}/gateway/state.json`
+- 配置了 `ARGUS_DATABASE_URL` 时：PostgreSQL
+- 未配置时：`${ARGUS_HOME_HOST_PATH}/gateway/state.db`
 
 ## Nodes（可选）
 
@@ -315,10 +319,11 @@ open http://127.0.0.1:3000
 仓库现在自带 [fugue.yaml](/Users/yanyuming/Downloads/GitHub/argus/fugue.yaml)。推荐的 Fugue 拓扑是：
 
 - `gateway`：公网入口，运行在 `ARGUS_PROVISION_MODE=fugue`
+- `postgres`：内部 PostgreSQL backing service，负责保存 gateway 状态和 usage
 - `runtime`：非公网的模板 app，gateway 会复用它的当前镜像来创建每个 session app
 - `telegram-bot`：可选配套服务；只有在你提供 `TELEGRAM_BOT_TOKEN` 时才建议保留
 
-这份 manifest 现在已经包含 `gateway`、`runtime`、`web` 和 `telegram-bot`。对 `web` 来说，你可以不设置 `NEXT_PUBLIC_ARGUS_WS_URL`，让浏览器自动按当前页面同源推导 WebSocket 地址；也可以在需要指向特定网关时提供一个构建期预设。
+这份 manifest 现在已经包含 `gateway`、`postgres`、`runtime`、`web` 和 `telegram-bot`。对 `web` 来说，你可以不设置 `NEXT_PUBLIC_ARGUS_WS_URL`，让浏览器自动按当前页面同源推导 WebSocket 地址；也可以在需要指向特定网关时提供一个构建期预设。
 
 由于 gateway 需要 `ARGUS_FUGUE_PROJECT_ID`，Fugue 部署不是单步导入，而是先准备 project，再部署进去：
 
@@ -351,7 +356,7 @@ Argus 会让 runtime 容器始终使用固定的 gateway 代理地址（`/openai
 - 内置 `gateway` 渠道默认选中，使用 `OPENAI_API_KEY` / `ARGUS_OPENAI_API_KEY` 加上 `ARGUS_OPENAI_RESPONSES_UPSTREAM_URL`。
 - 内置宣传渠道 `0-0.pro` 永远指向 `https://api.0-0.pro/v1`；每个用户需要先填自己的 API Key 才能切过去。
 - 用户可以在 Telegram 的 **API Channels** 菜单里增删改其他 OpenAI-compatible 渠道。
-- 渠道列表、当前选中的渠道、以及用户填写的 API Key 都存放在 `${ARGUS_HOME_HOST_PATH}/gateway/state.json`。
+- 渠道列表、当前选中的渠道、以及用户填写的 API Key 都存放在当前配置的 gateway 状态后端中（`ARGUS_DATABASE_URL` 指向的 PostgreSQL，或未设置时的本地 sqlite 回退）。
 - “当前渠道”是**用户级全局状态**：会影响该用户现有和未来的所有 agent / 容器。
 - 没有归属 Telegram 用户的通用 session，仍然回退到内置 `gateway` 渠道。
 - 代理要求每个 session 的派生 Bearer token（master：`ARGUS_OPENAI_TOKEN`；未设置则回退到 `ARGUS_TOKEN`）。

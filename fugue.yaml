@@ -11,16 +11,27 @@ services:
       dockerfile: apps/api/Dockerfile
     env:
       ARGUS_PROVISION_MODE: fugue
+      ARGUS_DATABASE_URL: postgresql://argus:argus@postgres:5432/argus
       ARGUS_FUGUE_HOME_PATH: /data/argus
       ARGUS_FUGUE_WORKSPACE_STORAGE_SIZE: 1Gi
       ARGUS_FUGUE_GATEWAY_COMPOSE_SERVICE: gateway
       ARGUS_FUGUE_RUNTIME_COMPOSE_SERVICE: runtime
       ARGUS_RUNTIME_CMD: codex app-server
+    depends_on:
+      - postgres
     persistent_storage:
       storage_size: 512Mi
       mounts:
         - kind: directory
           path: /data/argus
+
+  postgres:
+    type: postgres
+    image: postgres:17.6-alpine
+    service_name: postgres
+    database: argus
+    user: argus
+    password: argus
 
   runtime:
     network_mode: internal

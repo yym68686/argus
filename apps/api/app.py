@@ -29,6 +29,13 @@ from starlette.websockets import WebSocketState
 
 from croniter import croniter
 
+try:
+    import psycopg
+    from psycopg.rows import dict_row as psycopg_dict_row
+except Exception:
+    psycopg = None
+    psycopg_dict_row = None
+
 
 log = logging.getLogger("argus_gateway")
 
@@ -2659,12 +2666,14 @@ class PersistedGatewayAutomationState:
         )
 
 
-class AutomationStateStore:
-    def __init__(self, state_path: Path) -> None:
-        self._path = state_path
+class _SQLiteAutomationStateStore:
+    def __init__(self, db_path: Path, *, legacy_state_path: Optional[Path] = None) -> None:
+        self._path = db_path
+        self._legacy_path = legacy_state_path
         self._lock = asyncio.Lock()
         self._state = PersistedGatewayAutomationState()
         self._loaded_from_disk_ok: bool = False
+        self._initialized = False
 
     @property
     def state(self) -> PersistedGatewayAutomationState:
@@ -2677,13 +2686,15 @@ class AutomationStateStore:
     async def load(self) -> PersistedGatewayAutomationState:
         async with self._lock:
             try:
-                raw = await asyncio.to_thread(self._path.read_text, "utf-8")
-                parsed = json.loads(raw)
-                self._state = PersistedGatewayAutomationState.from_json(parsed)
-                self._loaded_from_disk_ok = True
-            except FileNotFoundError:
-                self._state = PersistedGatewayAutomationState()
-                self._loaded_from_disk_ok = False
+                state, loaded_ok, migrated = await asyncio.to_thread(self._load_sync)
+                self._state = state
+                self._loaded_from_disk_ok = loaded_ok
+                if migrated and self._legacy_path is not None:
+                    log.info(
+                        "Migrated legacy automation state from %s into %s",
+                        str(self._legacy_path),
+                        str(self._path),
+                    )
             except Exception:
                 log.exception("Failed to load automation state from %s", str(self._path))
                 self._state = PersistedGatewayAutomationState()
@@ -2692,21 +2703,338 @@ class AutomationStateStore:
 
     async def save(self) -> None:
         async with self._lock:
-            data = self._state.to_json()
             try:
-                await asyncio.to_thread(_atomic_write_json, self._path, data)
+                await asyncio.to_thread(self._write_state_sync, self._state)
             except Exception:
                 log.exception("Failed to save automation state to %s", str(self._path))
 
     async def update(self, fn) -> PersistedGatewayAutomationState:
         async with self._lock:
             fn(self._state)
-            data = self._state.to_json()
             try:
-                await asyncio.to_thread(_atomic_write_json, self._path, data)
+                await asyncio.to_thread(self._write_state_sync, self._state)
             except Exception:
                 log.exception("Failed to save automation state to %s", str(self._path))
             return self._state
+
+    def _load_sync(self) -> tuple[PersistedGatewayAutomationState, bool, bool]:
+        with self._connect() as conn:
+            self._initialize_schema(conn)
+            if self._db_has_state(conn):
+                return self._read_state(conn), True, False
+
+        migrated_state = self._load_legacy_state()
+        if migrated_state is not None:
+            self._write_state_sync(migrated_state)
+            return migrated_state, True, True
+        return PersistedGatewayAutomationState(), False, False
+
+    def _load_legacy_state(self) -> Optional[PersistedGatewayAutomationState]:
+        if self._legacy_path is None:
+            return None
+        try:
+            raw = self._legacy_path.read_text(encoding="utf-8")
+        except FileNotFoundError:
+            return None
+        except Exception:
+            log.exception("Failed to read legacy automation state from %s", str(self._legacy_path))
+            return None
+        try:
+            parsed = json.loads(raw)
+        except Exception:
+            log.exception("Failed to parse legacy automation state from %s", str(self._legacy_path))
+            return None
+        return PersistedGatewayAutomationState.from_json(parsed)
+
+    def _write_state_sync(self, state: PersistedGatewayAutomationState) -> None:
+        with self._connect() as conn:
+            self._initialize_schema(conn)
+            now_ms = _now_ms()
+            with conn:
+                conn.execute(
+                    """
+                    INSERT INTO automation_state_meta (key, value_text, updated_at_ms)
+                    VALUES (?, ?, ?)
+                    ON CONFLICT(key) DO UPDATE SET
+                        value_text = excluded.value_text,
+                        updated_at_ms = excluded.updated_at_ms
+                    """,
+                    ("version", str(max(int(getattr(state, "version", 1) or 1), AUTOMATION_STATE_VERSION)), now_ms),
+                )
+
+                conn.execute("DELETE FROM automation_sessions")
+                if state.sessions:
+                    conn.executemany(
+                        """
+                        INSERT INTO automation_sessions (session_id, payload_json, updated_at_ms)
+                        VALUES (?, ?, ?)
+                        """,
+                        [
+                            (
+                                session_id,
+                                json.dumps(session.to_json(), ensure_ascii=False, separators=(",", ":")),
+                                now_ms,
+                            )
+                            for session_id, session in state.sessions.items()
+                            if isinstance(session_id, str)
+                            and session_id.strip()
+                            and isinstance(session, PersistedSessionAutomation)
+                        ],
+                    )
+
+                conn.execute("DELETE FROM automation_agents")
+                if state.agents:
+                    conn.executemany(
+                        """
+                        INSERT INTO automation_agents (agent_id, payload_json, updated_at_ms)
+                        VALUES (?, ?, ?)
+                        """,
+                        [
+                            (
+                                agent_id,
+                                json.dumps(agent.to_json(), ensure_ascii=False, separators=(",", ":")),
+                                now_ms,
+                            )
+                            for agent_id, agent in state.agents.items()
+                            if isinstance(agent_id, str)
+                            and agent_id.strip()
+                            and isinstance(agent, PersistedAgentRuntime)
+                        ],
+                    )
+
+                conn.execute("DELETE FROM automation_chat_bindings")
+                if state.chat_bindings:
+                    conn.executemany(
+                        """
+                        INSERT INTO automation_chat_bindings (chat_key, agent_id, updated_at_ms)
+                        VALUES (?, ?, ?)
+                        """,
+                        [
+                            (chat_key, agent_id, now_ms)
+                            for chat_key, agent_id in state.chat_bindings.items()
+                            if isinstance(chat_key, str)
+                            and chat_key.strip()
+                            and isinstance(agent_id, str)
+                            and agent_id.strip()
+                        ],
+                    )
+
+                conn.execute("DELETE FROM automation_user_channels")
+                if state.user_channels:
+                    conn.executemany(
+                        """
+                        INSERT INTO automation_user_channels (user_id, payload_json, updated_at_ms)
+                        VALUES (?, ?, ?)
+                        """,
+                        [
+                            (
+                                user_id,
+                                json.dumps(channel_state.to_json(), ensure_ascii=False, separators=(",", ":")),
+                                now_ms,
+                            )
+                            for user_id, channel_state in state.user_channels.items()
+                            if isinstance(user_id, str)
+                            and user_id.strip()
+                            and isinstance(channel_state, PersistedUserChannelState)
+                        ],
+                    )
+
+    def _initialize_schema(self, conn: sqlite3.Connection) -> None:
+        if self._initialized:
+            return
+        self._path.parent.mkdir(parents=True, exist_ok=True)
+        conn.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS automation_state_meta (
+                key TEXT PRIMARY KEY,
+                value_text TEXT NOT NULL,
+                updated_at_ms INTEGER NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS automation_sessions (
+                session_id TEXT PRIMARY KEY,
+                payload_json TEXT NOT NULL,
+                updated_at_ms INTEGER NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS automation_agents (
+                agent_id TEXT PRIMARY KEY,
+                payload_json TEXT NOT NULL,
+                updated_at_ms INTEGER NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS automation_chat_bindings (
+                chat_key TEXT PRIMARY KEY,
+                agent_id TEXT NOT NULL,
+                updated_at_ms INTEGER NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS automation_user_channels (
+                user_id TEXT PRIMARY KEY,
+                payload_json TEXT NOT NULL,
+                updated_at_ms INTEGER NOT NULL
+            );
+            """
+        )
+        self._initialized = True
+
+    def _db_has_state(self, conn: sqlite3.Connection) -> bool:
+        for table_name in (
+            "automation_state_meta",
+            "automation_sessions",
+            "automation_agents",
+            "automation_chat_bindings",
+            "automation_user_channels",
+        ):
+            row = conn.execute(f"SELECT 1 FROM {table_name} LIMIT 1").fetchone()
+            if row is not None:
+                return True
+        return False
+
+    def _read_state(self, conn: sqlite3.Connection) -> PersistedGatewayAutomationState:
+        version = AUTOMATION_STATE_VERSION
+        meta_row = conn.execute(
+            "SELECT value_text FROM automation_state_meta WHERE key = ? LIMIT 1",
+            ("version",),
+        ).fetchone()
+        if meta_row is not None:
+            try:
+                version = max(int(meta_row["value_text"] or AUTOMATION_STATE_VERSION), 1)
+            except Exception:
+                version = AUTOMATION_STATE_VERSION
+
+        sessions: dict[str, PersistedSessionAutomation] = {}
+        for row in conn.execute("SELECT session_id, payload_json FROM automation_sessions"):
+            try:
+                payload = json.loads(str(row["payload_json"] or "{}"))
+            except Exception:
+                continue
+            session = PersistedSessionAutomation.from_json(payload)
+            session_id = str(row["session_id"] or "").strip()
+            if session_id:
+                sessions[session_id] = session
+
+        agents: dict[str, PersistedAgentRuntime] = {}
+        for row in conn.execute("SELECT agent_id, payload_json FROM automation_agents"):
+            try:
+                payload = json.loads(str(row["payload_json"] or "{}"))
+            except Exception:
+                continue
+            agent = PersistedAgentRuntime.from_json(payload)
+            agent_id = _normalize_agent_id(row["agent_id"])
+            if agent is None:
+                continue
+            key = agent_id or agent.agent_id
+            if key:
+                agents[key] = agent
+
+        chat_bindings: dict[str, str] = {}
+        for row in conn.execute("SELECT chat_key, agent_id FROM automation_chat_bindings"):
+            chat_key = str(row["chat_key"] or "").strip()
+            agent_id = _normalize_agent_id(row["agent_id"])
+            if chat_key and agent_id:
+                chat_bindings[chat_key] = agent_id
+
+        user_channels: dict[str, PersistedUserChannelState] = {}
+        for row in conn.execute("SELECT user_id, payload_json FROM automation_user_channels"):
+            user_id = str(row["user_id"] or "").strip()
+            if not user_id:
+                continue
+            try:
+                int(user_id)
+            except Exception:
+                continue
+            try:
+                payload = json.loads(str(row["payload_json"] or "{}"))
+            except Exception:
+                continue
+            user_channels[user_id] = PersistedUserChannelState.from_json(payload)
+
+        return PersistedGatewayAutomationState(
+            version=version,
+            sessions=sessions,
+            agents=agents,
+            chat_bindings=chat_bindings,
+            user_channels=user_channels,
+        )
+
+    def _connect(self) -> sqlite3.Connection:
+        self._path.parent.mkdir(parents=True, exist_ok=True)
+        conn = sqlite3.connect(str(self._path), timeout=30.0)
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA synchronous=NORMAL")
+        return conn
+
+
+def _normalized_database_url(raw: Optional[str]) -> Optional[str]:
+    value = str(raw or "").strip()
+    return value or None
+
+
+def _configured_database_url() -> Optional[str]:
+    return _normalized_database_url(
+        os.getenv("ARGUS_DATABASE_URL")
+        or os.getenv("DATABASE_URL")
+    )
+
+
+def _is_postgres_database_url(database_url: Optional[str]) -> bool:
+    value = _normalized_database_url(database_url)
+    if not value:
+        return False
+    lowered = value.lower()
+    return lowered.startswith("postgres://") or lowered.startswith("postgresql://")
+
+
+def _load_legacy_automation_state_from_json(path: Optional[Path]) -> Optional[PersistedGatewayAutomationState]:
+    if path is None:
+        return None
+    try:
+        raw = path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return None
+    except Exception:
+        log.exception("Failed to read legacy automation state from %s", str(path))
+        return None
+    try:
+        parsed = json.loads(raw)
+    except Exception:
+        log.exception("Failed to parse legacy automation state from %s", str(path))
+        return None
+    return PersistedGatewayAutomationState.from_json(parsed)
+
+
+def _load_automation_state_from_sqlite(path: Optional[Path]) -> Optional[PersistedGatewayAutomationState]:
+    if path is None:
+        return None
+    try:
+        store = _SQLiteAutomationStateStore(path, legacy_state_path=None)
+        state, loaded_ok, _ = store._load_sync()
+    except Exception:
+        log.exception("Failed to load sqlite automation state from %s", str(path))
+        return None
+    return state if loaded_ok else None
+
+
+def _connect_postgres(database_url: str):
+    if not _is_postgres_database_url(database_url):
+        raise RuntimeError("ARGUS_DATABASE_URL must be a PostgreSQL DSN")
+    if psycopg is None or psycopg_dict_row is None:
+        raise RuntimeError("psycopg is required when ARGUS_DATABASE_URL points to PostgreSQL")
+
+    delay_s = 0.5
+    last_error: Optional[Exception] = None
+    for attempt in range(1, 11):
+        try:
+            return psycopg.connect(
+                database_url,
+                row_factory=psycopg_dict_row,
+                connect_timeout=5,
+            )
+        except Exception as exc:
+            last_error = exc
+            if attempt >= 10:
+                break
+            time.sleep(delay_s)
+            delay_s = min(delay_s * 1.5, 5.0)
+    raise RuntimeError(f"Failed to connect to PostgreSQL: {last_error}") from last_error
 
 
 def _usage_int(value: Any) -> int:
@@ -2871,7 +3199,7 @@ class ResponsesStreamUsageCapture:
             self._snapshot[key] = value
 
 
-class UsageLedgerStore:
+class _SQLiteUsageLedgerStore:
     def __init__(self, db_path: Path) -> None:
         self._path = db_path
         self._lock = threading.Lock()
@@ -3184,6 +3512,825 @@ class UsageLedgerStore:
         conn.execute("PRAGMA journal_mode=WAL")
         conn.execute("PRAGMA synchronous=NORMAL")
         return conn
+
+
+class _PostgresAutomationStateStore:
+    def __init__(
+        self,
+        database_url: str,
+        *,
+        sqlite_state_path: Optional[Path],
+        legacy_state_path: Optional[Path],
+    ) -> None:
+        self._database_url = database_url
+        self._sqlite_state_path = sqlite_state_path
+        self._legacy_path = legacy_state_path
+        self._lock = asyncio.Lock()
+        self._state = PersistedGatewayAutomationState()
+        self._loaded_from_disk_ok = False
+        self._initialized = False
+
+    @property
+    def state(self) -> PersistedGatewayAutomationState:
+        return self._state
+
+    @property
+    def loaded_from_disk_ok(self) -> bool:
+        return self._loaded_from_disk_ok
+
+    async def load(self) -> PersistedGatewayAutomationState:
+        async with self._lock:
+            try:
+                state, loaded_ok, migrated_from = await asyncio.to_thread(self._load_sync)
+                self._state = state
+                self._loaded_from_disk_ok = loaded_ok
+                if migrated_from is not None:
+                    log.info(
+                        "Migrated gateway automation state into PostgreSQL from %s",
+                        str(migrated_from),
+                    )
+            except Exception:
+                log.exception("Failed to load automation state from PostgreSQL")
+                self._state = PersistedGatewayAutomationState()
+                self._loaded_from_disk_ok = False
+            return self._state
+
+    async def save(self) -> None:
+        async with self._lock:
+            try:
+                await asyncio.to_thread(self._write_state_sync, self._state)
+            except Exception:
+                log.exception("Failed to save automation state to PostgreSQL")
+
+    async def update(self, fn) -> PersistedGatewayAutomationState:
+        async with self._lock:
+            fn(self._state)
+            try:
+                await asyncio.to_thread(self._write_state_sync, self._state)
+            except Exception:
+                log.exception("Failed to save automation state to PostgreSQL")
+            return self._state
+
+    def _load_sync(self) -> tuple[PersistedGatewayAutomationState, bool, Optional[Path]]:
+        with self._connect() as conn:
+            self._initialize_schema(conn)
+            if self._db_has_state(conn):
+                return self._read_state(conn), True, None
+
+        migrated_state = _load_automation_state_from_sqlite(self._sqlite_state_path)
+        migrated_from: Optional[Path] = self._sqlite_state_path if migrated_state is not None else None
+        if migrated_state is None:
+            migrated_state = _load_legacy_automation_state_from_json(self._legacy_path)
+            if migrated_state is not None:
+                migrated_from = self._legacy_path
+        if migrated_state is not None:
+            self._write_state_sync(migrated_state)
+            return migrated_state, True, migrated_from
+        return PersistedGatewayAutomationState(), False, None
+
+    def _write_state_sync(self, state: PersistedGatewayAutomationState) -> None:
+        with self._connect() as conn:
+            self._initialize_schema(conn)
+            now_ms = _now_ms()
+            with conn:
+                conn.execute(
+                    """
+                    INSERT INTO automation_state_meta (key, value_text, updated_at_ms)
+                    VALUES (%s, %s, %s)
+                    ON CONFLICT(key) DO UPDATE SET
+                        value_text = EXCLUDED.value_text,
+                        updated_at_ms = EXCLUDED.updated_at_ms
+                    """,
+                    ("version", str(max(int(getattr(state, "version", 1) or 1), AUTOMATION_STATE_VERSION)), now_ms),
+                )
+
+                with conn.cursor() as cur:
+                    cur.execute("DELETE FROM automation_sessions")
+                    if state.sessions:
+                        cur.executemany(
+                            """
+                            INSERT INTO automation_sessions (session_id, payload_json, updated_at_ms)
+                            VALUES (%s, %s, %s)
+                            """,
+                            [
+                                (
+                                    session_id,
+                                    json.dumps(session.to_json(), ensure_ascii=False, separators=(",", ":")),
+                                    now_ms,
+                                )
+                                for session_id, session in state.sessions.items()
+                                if isinstance(session_id, str)
+                                and session_id.strip()
+                                and isinstance(session, PersistedSessionAutomation)
+                            ],
+                        )
+
+                    cur.execute("DELETE FROM automation_agents")
+                    if state.agents:
+                        cur.executemany(
+                            """
+                            INSERT INTO automation_agents (agent_id, payload_json, updated_at_ms)
+                            VALUES (%s, %s, %s)
+                            """,
+                            [
+                                (
+                                    agent_id,
+                                    json.dumps(agent.to_json(), ensure_ascii=False, separators=(",", ":")),
+                                    now_ms,
+                                )
+                                for agent_id, agent in state.agents.items()
+                                if isinstance(agent_id, str)
+                                and agent_id.strip()
+                                and isinstance(agent, PersistedAgentRuntime)
+                            ],
+                        )
+
+                    cur.execute("DELETE FROM automation_chat_bindings")
+                    if state.chat_bindings:
+                        cur.executemany(
+                            """
+                            INSERT INTO automation_chat_bindings (chat_key, agent_id, updated_at_ms)
+                            VALUES (%s, %s, %s)
+                            """,
+                            [
+                                (chat_key, agent_id, now_ms)
+                                for chat_key, agent_id in state.chat_bindings.items()
+                                if isinstance(chat_key, str)
+                                and chat_key.strip()
+                                and isinstance(agent_id, str)
+                                and agent_id.strip()
+                            ],
+                        )
+
+                    cur.execute("DELETE FROM automation_user_channels")
+                    if state.user_channels:
+                        cur.executemany(
+                            """
+                            INSERT INTO automation_user_channels (user_id, payload_json, updated_at_ms)
+                            VALUES (%s, %s, %s)
+                            """,
+                            [
+                                (
+                                    user_id,
+                                    json.dumps(channel_state.to_json(), ensure_ascii=False, separators=(",", ":")),
+                                    now_ms,
+                                )
+                                for user_id, channel_state in state.user_channels.items()
+                                if isinstance(user_id, str)
+                                and user_id.strip()
+                                and isinstance(channel_state, PersistedUserChannelState)
+                            ],
+                        )
+
+    def _initialize_schema(self, conn) -> None:
+        if self._initialized:
+            return
+        for statement in (
+            """
+            CREATE TABLE IF NOT EXISTS automation_state_meta (
+                key TEXT PRIMARY KEY,
+                value_text TEXT NOT NULL,
+                updated_at_ms BIGINT NOT NULL
+            )
+            """,
+            """
+            CREATE TABLE IF NOT EXISTS automation_sessions (
+                session_id TEXT PRIMARY KEY,
+                payload_json TEXT NOT NULL,
+                updated_at_ms BIGINT NOT NULL
+            )
+            """,
+            """
+            CREATE TABLE IF NOT EXISTS automation_agents (
+                agent_id TEXT PRIMARY KEY,
+                payload_json TEXT NOT NULL,
+                updated_at_ms BIGINT NOT NULL
+            )
+            """,
+            """
+            CREATE TABLE IF NOT EXISTS automation_chat_bindings (
+                chat_key TEXT PRIMARY KEY,
+                agent_id TEXT NOT NULL,
+                updated_at_ms BIGINT NOT NULL
+            )
+            """,
+            """
+            CREATE TABLE IF NOT EXISTS automation_user_channels (
+                user_id TEXT PRIMARY KEY,
+                payload_json TEXT NOT NULL,
+                updated_at_ms BIGINT NOT NULL
+            )
+            """,
+        ):
+            conn.execute(statement)
+        self._initialized = True
+
+    def _db_has_state(self, conn) -> bool:
+        for table_name in (
+            "automation_state_meta",
+            "automation_sessions",
+            "automation_agents",
+            "automation_chat_bindings",
+            "automation_user_channels",
+        ):
+            row = conn.execute(f"SELECT 1 FROM {table_name} LIMIT 1").fetchone()
+            if row is not None:
+                return True
+        return False
+
+    def _read_state(self, conn) -> PersistedGatewayAutomationState:
+        version = AUTOMATION_STATE_VERSION
+        meta_row = conn.execute(
+            "SELECT value_text FROM automation_state_meta WHERE key = %s LIMIT 1",
+            ("version",),
+        ).fetchone()
+        if meta_row is not None:
+            try:
+                version = max(int(meta_row["value_text"] or AUTOMATION_STATE_VERSION), 1)
+            except Exception:
+                version = AUTOMATION_STATE_VERSION
+
+        sessions: dict[str, PersistedSessionAutomation] = {}
+        for row in conn.execute("SELECT session_id, payload_json FROM automation_sessions").fetchall():
+            try:
+                payload = json.loads(str(row["payload_json"] or "{}"))
+            except Exception:
+                continue
+            session = PersistedSessionAutomation.from_json(payload)
+            session_id = str(row["session_id"] or "").strip()
+            if session_id:
+                sessions[session_id] = session
+
+        agents: dict[str, PersistedAgentRuntime] = {}
+        for row in conn.execute("SELECT agent_id, payload_json FROM automation_agents").fetchall():
+            try:
+                payload = json.loads(str(row["payload_json"] or "{}"))
+            except Exception:
+                continue
+            agent = PersistedAgentRuntime.from_json(payload)
+            agent_id = _normalize_agent_id(row["agent_id"])
+            if agent is None:
+                continue
+            key = agent_id or agent.agent_id
+            if key:
+                agents[key] = agent
+
+        chat_bindings: dict[str, str] = {}
+        for row in conn.execute("SELECT chat_key, agent_id FROM automation_chat_bindings").fetchall():
+            chat_key = str(row["chat_key"] or "").strip()
+            agent_id = _normalize_agent_id(row["agent_id"])
+            if chat_key and agent_id:
+                chat_bindings[chat_key] = agent_id
+
+        user_channels: dict[str, PersistedUserChannelState] = {}
+        for row in conn.execute("SELECT user_id, payload_json FROM automation_user_channels").fetchall():
+            user_id = str(row["user_id"] or "").strip()
+            if not user_id:
+                continue
+            try:
+                int(user_id)
+            except Exception:
+                continue
+            try:
+                payload = json.loads(str(row["payload_json"] or "{}"))
+            except Exception:
+                continue
+            user_channels[user_id] = PersistedUserChannelState.from_json(payload)
+
+        return PersistedGatewayAutomationState(
+            version=version,
+            sessions=sessions,
+            agents=agents,
+            chat_bindings=chat_bindings,
+            user_channels=user_channels,
+        )
+
+    def _connect(self):
+        return _connect_postgres(self._database_url)
+
+
+class AutomationStateStore:
+    def __init__(
+        self,
+        db_path: Path,
+        *,
+        legacy_state_path: Optional[Path] = None,
+        database_url: Optional[str] = None,
+    ) -> None:
+        normalized_database_url = _normalized_database_url(database_url)
+        if normalized_database_url is not None and not _is_postgres_database_url(normalized_database_url):
+            raise RuntimeError("ARGUS_DATABASE_URL currently only supports PostgreSQL DSNs")
+        self._backend: Any
+        if normalized_database_url:
+            self._backend = _PostgresAutomationStateStore(
+                normalized_database_url,
+                sqlite_state_path=db_path,
+                legacy_state_path=legacy_state_path,
+            )
+        else:
+            self._backend = _SQLiteAutomationStateStore(db_path, legacy_state_path=legacy_state_path)
+
+    @property
+    def state(self) -> PersistedGatewayAutomationState:
+        return self._backend.state
+
+    @property
+    def loaded_from_disk_ok(self) -> bool:
+        return self._backend.loaded_from_disk_ok
+
+    async def load(self) -> PersistedGatewayAutomationState:
+        return await self._backend.load()
+
+    async def save(self) -> None:
+        await self._backend.save()
+
+    async def update(self, fn) -> PersistedGatewayAutomationState:
+        return await self._backend.update(fn)
+
+
+class _PostgresUsageLedgerStore:
+    def __init__(self, database_url: str, *, sqlite_usage_path: Optional[Path]) -> None:
+        self._database_url = database_url
+        self._sqlite_usage_path = sqlite_usage_path
+        self._lock = threading.Lock()
+        self._initialized = False
+
+    def initialize(self) -> None:
+        with self._lock:
+            if self._initialized:
+                return
+            with self._connect() as conn:
+                self._initialize_schema(conn)
+                if self._count_events(conn) == 0:
+                    imported = self._migrate_from_sqlite(conn)
+                    if imported > 0 and self._sqlite_usage_path is not None:
+                        log.info(
+                            "Migrated %d usage events into PostgreSQL from %s",
+                            imported,
+                            str(self._sqlite_usage_path),
+                        )
+            self._initialized = True
+
+    def record(self, event: dict[str, Any]) -> None:
+        self.initialize()
+        with self._connect() as conn:
+            with conn:
+                conn.execute(
+                    """
+                    INSERT INTO usage_events (
+                        created_at_ms,
+                        session_id,
+                        agent_id,
+                        owner_user_id,
+                        channel_id,
+                        channel_name,
+                        model,
+                        requested_model,
+                        provider,
+                        upstream_url,
+                        response_id,
+                        status,
+                        error,
+                        request_stream,
+                        input_tokens,
+                        output_tokens,
+                        reasoning_tokens,
+                        total_tokens,
+                        estimated_cost_usd
+                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    """,
+                    (
+                        _usage_int(event.get("createdAtMs")) or _now_ms(),
+                        str(event.get("sessionId") or "").strip() or None,
+                        str(event.get("agentId") or "").strip() or None,
+                        _usage_int(event.get("ownerUserId")) or None,
+                        str(event.get("channelId") or "").strip() or None,
+                        str(event.get("channelName") or "").strip() or None,
+                        str(event.get("model") or "").strip() or None,
+                        str(event.get("requestedModel") or "").strip() or None,
+                        str(event.get("provider") or "").strip() or None,
+                        str(event.get("upstreamUrl") or "").strip() or None,
+                        str(event.get("responseId") or "").strip() or None,
+                        str(event.get("status") or "").strip() or None,
+                        str(event.get("error") or "").strip() or None,
+                        bool(event.get("requestStream")),
+                        _usage_int(event.get("inputTokens")),
+                        _usage_int(event.get("outputTokens")),
+                        _usage_int(event.get("reasoningTokens")),
+                        _usage_int(event.get("totalTokens")),
+                        _usage_float(event.get("estimatedCostUsd")),
+                    ),
+                )
+
+    def summarize(
+        self,
+        *,
+        owner_user_id: Optional[int] = None,
+        agent_id: Optional[str] = None,
+        session_id: Optional[str] = None,
+        channel_id: Optional[str] = None,
+        since_ms: Optional[int] = None,
+    ) -> dict[str, Any]:
+        self.initialize()
+        where, args = self._build_filters(
+            owner_user_id=owner_user_id,
+            agent_id=agent_id,
+            session_id=session_id,
+            channel_id=channel_id,
+            since_ms=since_ms,
+        )
+        query = f"""
+            SELECT
+                COUNT(*) AS request_count,
+                SUM(CASE WHEN error IS NULL OR error = '' THEN 1 ELSE 0 END) AS ok_count,
+                SUM(CASE WHEN error IS NOT NULL AND error != '' THEN 1 ELSE 0 END) AS error_count,
+                COALESCE(SUM(input_tokens), 0) AS input_tokens,
+                COALESCE(SUM(output_tokens), 0) AS output_tokens,
+                COALESCE(SUM(reasoning_tokens), 0) AS reasoning_tokens,
+                COALESCE(SUM(total_tokens), 0) AS total_tokens,
+                COALESCE(SUM(estimated_cost_usd), 0) AS estimated_cost_usd,
+                MIN(created_at_ms) AS first_at_ms,
+                MAX(created_at_ms) AS last_at_ms
+            FROM usage_events
+            {where}
+        """
+        with self._connect() as conn:
+            row = conn.execute(query, args).fetchone()
+        if row is None:
+            return self._empty_summary()
+        return {
+            "requestCount": _usage_int(row["request_count"]),
+            "okCount": _usage_int(row["ok_count"]),
+            "errorCount": _usage_int(row["error_count"]),
+            "inputTokens": _usage_int(row["input_tokens"]),
+            "outputTokens": _usage_int(row["output_tokens"]),
+            "reasoningTokens": _usage_int(row["reasoning_tokens"]),
+            "totalTokens": _usage_int(row["total_tokens"]),
+            "estimatedCostUsd": _usage_float(row["estimated_cost_usd"]) or 0.0,
+            "firstAtMs": _usage_int(row["first_at_ms"]) or None,
+            "lastAtMs": _usage_int(row["last_at_ms"]) or None,
+        }
+
+    def list_events(
+        self,
+        *,
+        owner_user_id: Optional[int] = None,
+        agent_id: Optional[str] = None,
+        session_id: Optional[str] = None,
+        channel_id: Optional[str] = None,
+        since_ms: Optional[int] = None,
+        limit: int = 100,
+    ) -> list[dict[str, Any]]:
+        self.initialize()
+        clamped_limit = max(1, min(int(limit or 100), 500))
+        where, args = self._build_filters(
+            owner_user_id=owner_user_id,
+            agent_id=agent_id,
+            session_id=session_id,
+            channel_id=channel_id,
+            since_ms=since_ms,
+        )
+        query = f"""
+            SELECT
+                created_at_ms,
+                session_id,
+                agent_id,
+                owner_user_id,
+                channel_id,
+                channel_name,
+                model,
+                requested_model,
+                provider,
+                upstream_url,
+                response_id,
+                status,
+                error,
+                request_stream,
+                input_tokens,
+                output_tokens,
+                reasoning_tokens,
+                total_tokens,
+                estimated_cost_usd
+            FROM usage_events
+            {where}
+            ORDER BY created_at_ms DESC, id DESC
+            LIMIT %s
+        """
+        with self._connect() as conn:
+            rows = conn.execute(query, [*args, clamped_limit]).fetchall()
+        return [self._row_to_event(row) for row in rows]
+
+    def summarize_by_user(self, *, since_ms: Optional[int] = None) -> dict[int, dict[str, Any]]:
+        self.initialize()
+        where = "WHERE owner_user_id IS NOT NULL"
+        args: list[Any] = []
+        if since_ms is not None and since_ms > 0:
+            where += " AND created_at_ms >= %s"
+            args.append(int(since_ms))
+        query = f"""
+            SELECT
+                owner_user_id,
+                COUNT(*) AS request_count,
+                SUM(CASE WHEN error IS NULL OR error = '' THEN 1 ELSE 0 END) AS ok_count,
+                SUM(CASE WHEN error IS NOT NULL AND error != '' THEN 1 ELSE 0 END) AS error_count,
+                COALESCE(SUM(input_tokens), 0) AS input_tokens,
+                COALESCE(SUM(output_tokens), 0) AS output_tokens,
+                COALESCE(SUM(reasoning_tokens), 0) AS reasoning_tokens,
+                COALESCE(SUM(total_tokens), 0) AS total_tokens,
+                COALESCE(SUM(estimated_cost_usd), 0) AS estimated_cost_usd,
+                MAX(created_at_ms) AS last_at_ms
+            FROM usage_events
+            {where}
+            GROUP BY owner_user_id
+        """
+        with self._connect() as conn:
+            rows = conn.execute(query, args).fetchall()
+        out: dict[int, dict[str, Any]] = {}
+        for row in rows:
+            user_id = _usage_int(row["owner_user_id"])
+            if user_id <= 0:
+                continue
+            out[user_id] = {
+                "requestCount": _usage_int(row["request_count"]),
+                "okCount": _usage_int(row["ok_count"]),
+                "errorCount": _usage_int(row["error_count"]),
+                "inputTokens": _usage_int(row["input_tokens"]),
+                "outputTokens": _usage_int(row["output_tokens"]),
+                "reasoningTokens": _usage_int(row["reasoning_tokens"]),
+                "totalTokens": _usage_int(row["total_tokens"]),
+                "estimatedCostUsd": _usage_float(row["estimated_cost_usd"]) or 0.0,
+                "lastAtMs": _usage_int(row["last_at_ms"]) or None,
+            }
+        return out
+
+    def _initialize_schema(self, conn) -> None:
+        if self._initialized:
+            return
+        for statement in (
+            """
+            CREATE TABLE IF NOT EXISTS usage_events (
+                id BIGSERIAL PRIMARY KEY,
+                created_at_ms BIGINT NOT NULL,
+                session_id TEXT,
+                agent_id TEXT,
+                owner_user_id BIGINT,
+                channel_id TEXT,
+                channel_name TEXT,
+                model TEXT,
+                requested_model TEXT,
+                provider TEXT,
+                upstream_url TEXT,
+                response_id TEXT,
+                status TEXT,
+                error TEXT,
+                request_stream BOOLEAN NOT NULL DEFAULT FALSE,
+                input_tokens BIGINT NOT NULL DEFAULT 0,
+                output_tokens BIGINT NOT NULL DEFAULT 0,
+                reasoning_tokens BIGINT NOT NULL DEFAULT 0,
+                total_tokens BIGINT NOT NULL DEFAULT 0,
+                estimated_cost_usd DOUBLE PRECISION
+            )
+            """,
+            "CREATE INDEX IF NOT EXISTS idx_usage_events_created_at_ms ON usage_events(created_at_ms DESC)",
+            "CREATE INDEX IF NOT EXISTS idx_usage_events_owner_user_id_created_at ON usage_events(owner_user_id, created_at_ms DESC)",
+            "CREATE INDEX IF NOT EXISTS idx_usage_events_agent_id_created_at ON usage_events(agent_id, created_at_ms DESC)",
+            "CREATE INDEX IF NOT EXISTS idx_usage_events_session_id_created_at ON usage_events(session_id, created_at_ms DESC)",
+            "CREATE INDEX IF NOT EXISTS idx_usage_events_channel_id_created_at ON usage_events(channel_id, created_at_ms DESC)",
+        ):
+            conn.execute(statement)
+
+    def _count_events(self, conn) -> int:
+        row = conn.execute("SELECT COUNT(*) AS count FROM usage_events").fetchone()
+        if row is None:
+            return 0
+        return _usage_int(row["count"])
+
+    def _migrate_from_sqlite(self, conn) -> int:
+        rows = self._load_usage_events_from_sqlite()
+        if not rows:
+            return 0
+        with conn:
+            with conn.cursor() as cur:
+                cur.executemany(
+                    """
+                    INSERT INTO usage_events (
+                        created_at_ms,
+                        session_id,
+                        agent_id,
+                        owner_user_id,
+                        channel_id,
+                        channel_name,
+                        model,
+                        requested_model,
+                        provider,
+                        upstream_url,
+                        response_id,
+                        status,
+                        error,
+                        request_stream,
+                        input_tokens,
+                        output_tokens,
+                        reasoning_tokens,
+                        total_tokens,
+                        estimated_cost_usd
+                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    """,
+                    [
+                        (
+                            _usage_int(row.get("createdAtMs")) or _now_ms(),
+                            row.get("sessionId"),
+                            row.get("agentId"),
+                            _usage_int(row.get("ownerUserId")) or None,
+                            row.get("channelId"),
+                            row.get("channelName"),
+                            row.get("model"),
+                            row.get("requestedModel"),
+                            row.get("provider"),
+                            row.get("upstreamUrl"),
+                            row.get("responseId"),
+                            row.get("status"),
+                            row.get("error"),
+                            bool(row.get("requestStream")),
+                            _usage_int(row.get("inputTokens")),
+                            _usage_int(row.get("outputTokens")),
+                            _usage_int(row.get("reasoningTokens")),
+                            _usage_int(row.get("totalTokens")),
+                            _usage_float(row.get("estimatedCostUsd")),
+                        )
+                        for row in rows
+                    ],
+                )
+        return len(rows)
+
+    def _load_usage_events_from_sqlite(self) -> list[dict[str, Any]]:
+        path = self._sqlite_usage_path
+        if path is None or not path.exists():
+            return []
+        try:
+            conn = sqlite3.connect(str(path), timeout=30.0)
+            conn.row_factory = sqlite3.Row
+            try:
+                rows = conn.execute(
+                    """
+                    SELECT
+                        created_at_ms,
+                        session_id,
+                        agent_id,
+                        owner_user_id,
+                        channel_id,
+                        channel_name,
+                        model,
+                        requested_model,
+                        provider,
+                        upstream_url,
+                        response_id,
+                        status,
+                        error,
+                        request_stream,
+                        input_tokens,
+                        output_tokens,
+                        reasoning_tokens,
+                        total_tokens,
+                        estimated_cost_usd
+                    FROM usage_events
+                    ORDER BY id ASC
+                    """
+                ).fetchall()
+            finally:
+                conn.close()
+        except Exception:
+            log.exception("Failed to read sqlite usage ledger from %s", str(path))
+            return []
+        return [self._row_to_event(row) for row in rows]
+
+    def _empty_summary(self) -> dict[str, Any]:
+        return {
+            "requestCount": 0,
+            "okCount": 0,
+            "errorCount": 0,
+            "inputTokens": 0,
+            "outputTokens": 0,
+            "reasoningTokens": 0,
+            "totalTokens": 0,
+            "estimatedCostUsd": 0.0,
+            "firstAtMs": None,
+            "lastAtMs": None,
+        }
+
+    def _row_to_event(self, row: Any) -> dict[str, Any]:
+        return {
+            "createdAtMs": _usage_int(row["created_at_ms"]),
+            "sessionId": str(row["session_id"] or "").strip() or None,
+            "agentId": str(row["agent_id"] or "").strip() or None,
+            "ownerUserId": _usage_int(row["owner_user_id"]) or None,
+            "channelId": str(row["channel_id"] or "").strip() or None,
+            "channelName": str(row["channel_name"] or "").strip() or None,
+            "model": str(row["model"] or "").strip() or None,
+            "requestedModel": str(row["requested_model"] or "").strip() or None,
+            "provider": str(row["provider"] or "").strip() or None,
+            "upstreamUrl": str(row["upstream_url"] or "").strip() or None,
+            "responseId": str(row["response_id"] or "").strip() or None,
+            "status": str(row["status"] or "").strip() or None,
+            "error": str(row["error"] or "").strip() or None,
+            "requestStream": bool(row["request_stream"]),
+            "inputTokens": _usage_int(row["input_tokens"]),
+            "outputTokens": _usage_int(row["output_tokens"]),
+            "reasoningTokens": _usage_int(row["reasoning_tokens"]),
+            "totalTokens": _usage_int(row["total_tokens"]),
+            "estimatedCostUsd": _usage_float(row["estimated_cost_usd"]),
+        }
+
+    def _build_filters(
+        self,
+        *,
+        owner_user_id: Optional[int] = None,
+        agent_id: Optional[str] = None,
+        session_id: Optional[str] = None,
+        channel_id: Optional[str] = None,
+        since_ms: Optional[int] = None,
+    ) -> tuple[str, list[Any]]:
+        clauses: list[str] = []
+        args: list[Any] = []
+        if isinstance(owner_user_id, int) and owner_user_id > 0:
+            clauses.append("owner_user_id = %s")
+            args.append(owner_user_id)
+        if isinstance(agent_id, str) and agent_id.strip():
+            clauses.append("agent_id = %s")
+            args.append(agent_id.strip())
+        if isinstance(session_id, str) and session_id.strip():
+            clauses.append("session_id = %s")
+            args.append(session_id.strip())
+        if isinstance(channel_id, str) and channel_id.strip():
+            clauses.append("channel_id = %s")
+            args.append(channel_id.strip())
+        if isinstance(since_ms, int) and since_ms > 0:
+            clauses.append("created_at_ms >= %s")
+            args.append(since_ms)
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        return where, args
+
+    def _connect(self):
+        return _connect_postgres(self._database_url)
+
+
+class UsageLedgerStore:
+    def __init__(self, db_path: Path, *, database_url: Optional[str] = None) -> None:
+        normalized_database_url = _normalized_database_url(database_url)
+        if normalized_database_url is not None and not _is_postgres_database_url(normalized_database_url):
+            raise RuntimeError("ARGUS_DATABASE_URL currently only supports PostgreSQL DSNs")
+        self._backend: Any
+        if normalized_database_url:
+            self._backend = _PostgresUsageLedgerStore(
+                normalized_database_url,
+                sqlite_usage_path=db_path,
+            )
+        else:
+            self._backend = _SQLiteUsageLedgerStore(db_path)
+
+    def initialize(self) -> None:
+        self._backend.initialize()
+
+    def record(self, event: dict[str, Any]) -> None:
+        self._backend.record(event)
+
+    def summarize(
+        self,
+        *,
+        owner_user_id: Optional[int] = None,
+        agent_id: Optional[str] = None,
+        session_id: Optional[str] = None,
+        channel_id: Optional[str] = None,
+        since_ms: Optional[int] = None,
+    ) -> dict[str, Any]:
+        return self._backend.summarize(
+            owner_user_id=owner_user_id,
+            agent_id=agent_id,
+            session_id=session_id,
+            channel_id=channel_id,
+            since_ms=since_ms,
+        )
+
+    def list_events(
+        self,
+        *,
+        owner_user_id: Optional[int] = None,
+        agent_id: Optional[str] = None,
+        session_id: Optional[str] = None,
+        channel_id: Optional[str] = None,
+        since_ms: Optional[int] = None,
+        limit: int = 100,
+    ) -> list[dict[str, Any]]:
+        return self._backend.list_events(
+            owner_user_id=owner_user_id,
+            agent_id=agent_id,
+            session_id=session_id,
+            channel_id=channel_id,
+            since_ms=since_ms,
+            limit=limit,
+        )
+
+    def summarize_by_user(self, *, since_ms: Optional[int] = None) -> dict[int, dict[str, Any]]:
+        return self._backend.summarize_by_user(since_ms=since_ms)
 
 
 @dataclass
@@ -9252,21 +10399,41 @@ async def _startup():
 
     home_host_path = _configured_home_host_path()
     workspace_host_path = _configured_workspace_host_path()
+    database_url = _configured_database_url()
     if home_host_path:
-        state_path = Path(home_host_path) / "gateway" / "state.json"
-        usage_db_path = Path(home_host_path) / "gateway" / "usage.db"
+        gateway_state_dir = Path(home_host_path) / "gateway"
+        state_db_path = gateway_state_dir / "state.db"
+        legacy_state_path = gateway_state_dir / "state.json"
+        usage_db_path = gateway_state_dir / "usage.db"
     else:
-        state_path = Path("/tmp/argus-gateway-state.json")
+        state_db_path = Path("/tmp/argus-gateway-state.db")
+        legacy_state_path = Path("/tmp/argus-gateway-state.json")
         usage_db_path = Path("/tmp/argus-usage.db")
-        log.warning("ARGUS_HOME_HOST_PATH is not set; automation state will be stored at %s", str(state_path))
+        log.warning(
+            "ARGUS_HOME_HOST_PATH is not set; automation state will be stored at %s "
+            "(legacy JSON will be imported from %s if present)",
+            str(state_db_path),
+            str(legacy_state_path),
+        )
 
-    app.state.automation_store = AutomationStateStore(state_path)
+    app.state.automation_store = AutomationStateStore(
+        state_db_path,
+        legacy_state_path=legacy_state_path,
+        database_url=database_url,
+    )
     app.state.automation = AutomationManager(
         state_store=app.state.automation_store,
         home_host_path=home_host_path,
         workspace_host_path=workspace_host_path,
     )
-    app.state.usage_store = UsageLedgerStore(usage_db_path)
+    app.state.usage_store = UsageLedgerStore(
+        usage_db_path,
+        database_url=database_url,
+    )
+    log.info(
+        "Gateway persistence backend=%s",
+        "postgres" if _is_postgres_database_url(database_url) else "sqlite",
+    )
     app.state.usage_store.initialize()
     await app.state.automation.start()
 

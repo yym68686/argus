@@ -4,7 +4,7 @@ import React from "react";
 import { RefreshCw, Plus, KeyRound, Trash2, UserRoundCheck, Pencil, Bot, RadioTower } from "lucide-react";
 import { toast } from "sonner";
 
-import { Badge, EmptyState, Fact, InfoPill, InlineError, PanelCard, Skeleton, StatCard } from "@/components/console-primitives";
+import { Badge, EmptyState, Fact, InfoPill, InlineError, PanelCard, Skeleton } from "@/components/console-primitives";
 import { ConsoleShell } from "@/components/console-shell";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -575,41 +575,51 @@ export default function UsersPage() {
   return (
     <ConsoleShell
       title="Users"
-      subtitle="Manage Telegram-backed users, their agent fleets, API channels, and recent activity from one operator view."
+      subtitle="Manage Telegram-backed users, their agent fleets, upstream channels, and recent Requests API activity from one dense operator view."
       actions={
-        <div className="flex flex-col gap-2 md:items-end">
+        <div className="flex flex-col gap-2 xl:items-end">
+          <div className="argus-surface-label">Gateway endpoint</div>
           <div className="flex flex-wrap items-center gap-2">
             <Input
               value={wsUrl}
               onChange={(event) => setWsUrl(event.target.value)}
-              className="w-[320px]"
+              className="w-[min(30rem,100%)]"
               placeholder="Gateway wss://.../ws"
               spellCheck={false}
             />
             <Button type="button" variant="secondary" onClick={() => void refreshUsers()} disabled={usersBusy}>
-              <RefreshCw className={cn("mr-2 h-4 w-4", usersBusy && "animate-spin")} />
+              <RefreshCw className={cn("h-4 w-4", usersBusy ? "animate-spin" : null)} />
               Refresh
-            </Button>
-          </div>
-          <div className="flex flex-wrap items-center gap-2">
-            <Input
-              value={bootstrapUserId}
-              onChange={(event) => setBootstrapUserId(event.target.value)}
-              className="w-[160px]"
-              placeholder="Telegram user id"
-              spellCheck={false}
-            />
-            <Button type="button" onClick={() => void bootstrapUser()}>
-              <Plus className="mr-2 h-4 w-4" />
-              Bootstrap user
             </Button>
           </div>
         </div>
       }
     >
-      <div className="grid gap-6 xl:grid-cols-[360px_1fr]">
+      <div className="grid gap-4 xl:grid-cols-[320px_minmax(0,1fr)]">
         <section className="space-y-4">
-          <PanelCard eyebrow="Fleet roster" title="Users" subtitle={usersBusy ? "Refreshing…" : `${users.length} tracked users`}>
+          <PanelCard
+            eyebrow="Fleet roster"
+            title="Users"
+            subtitle={
+              usersBusy
+                ? "Refreshing the operator roster."
+                : `${users.length} tracked users with agents, channels, and gateway activity.`
+            }
+            action={
+              <div className="grid gap-2 md:grid-cols-[minmax(0,1fr)_auto]">
+                <Input
+                  value={bootstrapUserId}
+                  onChange={(event) => setBootstrapUserId(event.target.value)}
+                  placeholder="Telegram user id"
+                  spellCheck={false}
+                />
+                <Button type="button" onClick={() => void bootstrapUser()}>
+                  <Plus className="h-4 w-4" />
+                  Bootstrap user
+                </Button>
+              </div>
+            }
+          >
             {usersError ? <InlineError message={usersError} /> : null}
             <div className="space-y-2">
               {users.map((user) => {
@@ -620,24 +630,22 @@ export default function UsersPage() {
                     type="button"
                     onClick={() => selectUser(user.userId)}
                     className={cn(
-                      "w-full rounded-[22px] border px-4 py-4 text-left transition-colors",
-                      active
-                        ? "border-primary/25 bg-primary/10"
-                        : "border-border/60 bg-background/30 hover:border-border hover:bg-background/55"
+                      "argus-row-shell w-full rounded-[16px] px-4 py-3 text-left",
+                      active ? "border-primary/28 bg-primary/10" : "hover:border-border hover:bg-background/36",
                     )}
                   >
                     <div className="flex items-start justify-between gap-3">
                       <div className="min-w-0">
                         <div className="font-medium text-foreground">User {user.userId}</div>
-                        <div className="mt-1 text-xs text-muted-foreground">
+                        <div className="mt-1 text-xs leading-5 text-muted-foreground">
                           {user.currentChannel?.name || user.currentChannelId || "gateway"} · {user.currentModel || "gpt-5.4"}
                         </div>
                       </div>
-                      <span className="rounded-full border border-border/60 px-2 py-0.5 text-[11px] text-muted-foreground">
+                      <span className="rounded-md border border-border/70 px-2 py-1 text-[10px] font-medium uppercase tracking-[0.08em] text-muted-foreground">
                         {formatCompact(user.usage24h.totalTokens)} tok/24h
                       </span>
                     </div>
-                    <div className="mt-3 flex flex-wrap gap-2 text-[11px] text-muted-foreground">
+                    <div className="mt-3 flex flex-wrap gap-2">
                       <InfoPill label="agents" value={String(user.agentCount)} />
                       <InfoPill label="channels" value={String(user.channelCount)} />
                       <InfoPill label="last active" value={formatRelative(user.lastActiveMs)} />
@@ -654,7 +662,7 @@ export default function UsersPage() {
 
         <section className="space-y-6">
           {!selectedUserId ? (
-            <PanelCard title="User detail" subtitle="Select a user to inspect agents, channels, and usage.">
+            <PanelCard title="User detail" subtitle="Select a user to inspect agents, channels, default bindings, and recent gateway activity.">
               <EmptyState title="Nothing selected" body="Pick a user from the list on the left." />
             </PanelCard>
           ) : showDetailSkeleton ? (
@@ -665,235 +673,234 @@ export default function UsersPage() {
             </PanelCard>
           ) : detail ? (
             <>
-              <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-4">
-                <StatCard
-                  label="24h tokens"
-                  value={formatCompact(detail.user.usage24h.totalTokens)}
-                  tone="primary"
-                  hint="Rolling activity window for this operator-managed user."
-                />
-                <StatCard label="Total tokens" value={formatCompact(detail.user.usageTotal.totalTokens)} hint="All recorded requests for this user." />
-                <StatCard label="Agents" value={String(detail.user.agentCount)} hint="Dedicated runtime bindings or persistent personas." />
-                <StatCard label="Last active" value={formatRelative(detail.user.lastActiveMs)} hint="Most recent observed interaction." />
-              </div>
-
               <PanelCard
                 eyebrow="Selected user"
                 title={`User ${detail.user.userId}`}
                 subtitle={`Private chat ${detail.user.privateChatKey} · current channel ${detail.user.currentChannel?.name || detail.user.currentChannelId || "gateway"}`}
                 className="argus-data-grid"
+                action={
+                  <div className="flex flex-wrap gap-2">
+                    {detail.user.initialized ? <Badge tone="success">initialized</Badge> : <Badge tone="warning">pending</Badge>}
+                    <Badge tone="default">{detail.user.agentCount} agents</Badge>
+                    <Badge tone="default">{detail.user.channelCount} channels</Badge>
+                  </div>
+                }
               >
-                <div className="grid gap-4 lg:grid-cols-2">
+                <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-4">
+                  <Fact label="24h tokens" value={formatCompact(detail.user.usage24h.totalTokens)} mono />
+                  <Fact label="Total tokens" value={formatCompact(detail.user.usageTotal.totalTokens)} mono />
                   <Fact label="Current agent" value={detail.user.currentAgentId || "—"} mono />
                   <Fact label="Current session" value={detail.user.currentSessionId || "—"} mono />
-                  <Fact label="Ready channels" value={`${detail.user.readyChannelCount}/${detail.user.channelCount}`} />
+                  <Fact label="Current channel" value={detail.user.currentChannel?.name || detail.user.currentChannelId || "gateway"} />
                   <Fact label="Current model" value={detail.user.currentModel || "—"} mono />
+                  <Fact label="Ready channels" value={`${detail.user.readyChannelCount}/${detail.user.channelCount}`} />
+                  <Fact label="Last active" value={formatRelative(detail.user.lastActiveMs)} />
                 </div>
               </PanelCard>
 
-              <PanelCard
-                eyebrow="Agent fleet"
-                title="Agents"
-                subtitle="Create dedicated agents, move the user's default binding, and pin per-agent model defaults."
-                action={
-                  <div className="flex flex-wrap items-center gap-2">
-                    <Input
-                      value={newAgentName}
-                      onChange={(event) => setNewAgentName(event.target.value)}
-                      className="w-[180px]"
-                      placeholder="new-agent"
-                    />
-                    <Button type="button" onClick={() => void createAgent()}>
-                      <Plus className="mr-2 h-4 w-4" />
-                      Create agent
-                    </Button>
-                  </div>
-                }
-              >
-                <div className="grid gap-3">
-                  {detail.agents.map((agent) => (
-                    <div
-                      key={agent.agentId}
-                      className="rounded-[24px] border border-border/60 bg-background/30 p-4 shadow-[inset_0_1px_0_0_oklch(var(--foreground)/0.04)]"
-                    >
-                      <div className="flex flex-col gap-3 xl:flex-row xl:items-start xl:justify-between">
-                        <div className="min-w-0">
-                          <div className="flex flex-wrap items-center gap-2">
-                            <div className="font-medium text-foreground">{agent.shortName || agent.agentId}</div>
-                            {agent.isDefault ? <Badge tone="primary">main</Badge> : null}
-                            {detail.user.currentAgentId === agent.agentId ? <Badge tone="success">current</Badge> : null}
-                          </div>
-                          <div className="mt-2 text-xs text-muted-foreground">
-                            session <code className="font-mono">{agent.sessionId || "—"}</code> · created {formatWhen(agent.createdAtMs)}
-                          </div>
-                        </div>
-
-                        <div className="flex flex-wrap gap-2">
-                          <Button
-                            type="button"
-                            variant="secondary"
-                            disabled={Boolean(pendingActions[`agent-use:${agent.agentId}`])}
-                            onClick={() => void activateAgent(agent)}
-                          >
-                            <UserRoundCheck className="mr-2 h-4 w-4" />
-                            {pendingActions[`agent-use:${agent.agentId}`] ? "Switching…" : "Use"}
-                          </Button>
-                          <Button type="button" variant="secondary" onClick={() => void renameAgent(agent)}>
-                            <Pencil className="mr-2 h-4 w-4" />
-                            Rename
-                          </Button>
-                          {!agent.isDefault ? (
-                            <Button type="button" variant="destructive" onClick={() => void deleteAgent(agent)}>
-                              <Trash2 className="mr-2 h-4 w-4" />
-                              Delete
-                            </Button>
-                          ) : null}
-                        </div>
-                      </div>
-
-                      <div className="mt-4 flex flex-col gap-2 md:flex-row md:items-center">
-                        <select
-                          value={modelDraftByAgent[agent.agentId] ?? agent.model ?? ""}
-                          onChange={(event) =>
-                            setModelDraftByAgent((prev) => ({ ...prev, [agent.agentId]: event.target.value }))
-                          }
-                          className={cn(
-                            "h-11 min-w-[220px] rounded-2xl border border-border/60 bg-background/60 px-3 text-sm text-foreground outline-none",
-                            "focus:border-primary/40 focus:ring-4 focus:ring-ring/20"
-                          )}
-                        >
-                          {availableModels.length ? (
-                            availableModels.map((model) => (
-                              <option key={model} value={model}>
-                                {model}
-                              </option>
-                            ))
-                          ) : (
-                            <option value={agent.model || ""}>{agent.model || "gpt-5.4"}</option>
-                          )}
-                        </select>
-                        <Button type="button" onClick={() => void saveAgentModel(agent)}>
-                          <Bot className="mr-2 h-4 w-4" />
-                          Save model
-                        </Button>
-                      </div>
+              <div className="grid gap-4 xl:grid-cols-2">
+                <PanelCard
+                  eyebrow="Agent fleet"
+                  title="Agents"
+                  subtitle="Create dedicated agents, switch the active binding, and pin per-agent model defaults."
+                  action={
+                    <div className="grid gap-2 md:grid-cols-[minmax(0,1fr)_auto]">
+                      <Input
+                        value={newAgentName}
+                        onChange={(event) => setNewAgentName(event.target.value)}
+                        placeholder="new-agent"
+                      />
+                      <Button type="button" onClick={() => void createAgent()}>
+                        <Plus className="h-4 w-4" />
+                        Create agent
+                      </Button>
                     </div>
-                  ))}
-                </div>
-              </PanelCard>
-
-              <PanelCard
-                eyebrow="Upstreams"
-                title="Channels"
-                subtitle="Switch upstreams, rotate per-user keys, and explicitly allow or block the built-in gateway API."
-                action={
-                  <div className="grid gap-2 md:grid-cols-[160px_220px_220px_auto]">
-                    <Input
-                      value={newChannelName}
-                      onChange={(event) => setNewChannelName(event.target.value)}
-                      placeholder="channel name"
-                    />
-                    <Input
-                      value={newChannelBaseUrl}
-                      onChange={(event) => setNewChannelBaseUrl(event.target.value)}
-                      placeholder="https://provider/v1"
-                    />
-                    <Input
-                      value={newChannelApiKey}
-                      onChange={(event) => setNewChannelApiKey(event.target.value)}
-                      placeholder="api key"
-                      type="password"
-                    />
-                    <Button type="button" onClick={() => void createChannel()}>
-                      <Plus className="mr-2 h-4 w-4" />
-                      Create channel
-                    </Button>
-                  </div>
-                }
-              >
-                <div className="grid gap-3">
-                  {detail.channels.channels.map((channel) => (
-                    <div key={channel.channelId} className="rounded-[24px] border border-border/60 bg-background/30 p-4 shadow-[inset_0_1px_0_0_oklch(var(--foreground)/0.04)]">
-                      <div className="flex flex-col gap-3 xl:flex-row xl:items-start xl:justify-between">
-                        <div className="min-w-0">
-                          <div className="flex flex-wrap items-center gap-2">
-                            <div className="font-medium text-foreground">{channel.name}</div>
-                            {channel.selected ? <Badge tone="primary">selected</Badge> : null}
-                            {channel.disabledByAdmin ? (
-                              <Badge tone="warning">blocked</Badge>
-                            ) : channel.ready ? (
-                              <Badge tone="success">ready</Badge>
-                            ) : (
-                              <Badge tone="warning">needs setup</Badge>
-                            )}
-                            {channel.isBuiltin ? <Badge tone="default">{channel.builtinKind || "builtin"}</Badge> : null}
+                  }
+                >
+                  <div className="grid gap-3">
+                    {detail.agents.map((agent) => (
+                      <div key={agent.agentId} className="argus-row-shell rounded-[16px] px-4 py-3.5">
+                        <div className="flex flex-col gap-3 xl:flex-row xl:items-start xl:justify-between">
+                          <div className="min-w-0">
+                            <div className="flex flex-wrap items-center gap-2">
+                              <div className="font-medium text-foreground">{agent.shortName || agent.agentId}</div>
+                              {agent.isDefault ? <Badge tone="primary">main</Badge> : null}
+                              {detail.user.currentAgentId === agent.agentId ? <Badge tone="success">current</Badge> : null}
+                            </div>
+                            <div className="mt-2 text-xs leading-5 text-muted-foreground">
+                              session <code className="font-mono">{agent.sessionId || "—"}</code> · created {formatWhen(agent.createdAtMs)}
+                            </div>
                           </div>
-                          <div className="mt-2 truncate text-xs text-muted-foreground">
-                            {channel.baseUrl || "Gateway-managed channel"} {channel.apiKeyMasked ? `· key ${channel.apiKeyMasked}` : ""}
-                          </div>
-                          {!channel.ready && channel.reason ? (
-                            <div className="mt-2 text-xs text-amber-400">{channel.reason}</div>
-                          ) : null}
-                        </div>
 
-                        <div className="flex flex-wrap gap-2">
-                          <Button
-                            type="button"
-                            variant="secondary"
-                            disabled={channel.selected || !channel.ready || Boolean(pendingActions[`channel-select:${channel.channelId}`])}
-                            onClick={() => void selectChannel(channel)}
-                          >
-                            <RadioTower className="mr-2 h-4 w-4" />
-                            {pendingActions[`channel-select:${channel.channelId}`] ? "Switching…" : "Select"}
-                          </Button>
-                          {channel.canAdminToggleAccess ? (
+                          <div className="flex flex-wrap gap-2">
                             <Button
                               type="button"
-                              variant={channel.enabledForUser === false ? "secondary" : "destructive"}
-                              disabled={Boolean(pendingActions[`channel-access:${channel.channelId}`])}
-                              onClick={() => void setBuiltinChannelAccess(channel, channel.enabledForUser === false)}
+                              size="sm"
+                              variant="secondary"
+                              disabled={Boolean(pendingActions[`agent-use:${agent.agentId}`])}
+                              onClick={() => void activateAgent(agent)}
                             >
-                              {pendingActions[`channel-access:${channel.channelId}`]
-                                ? "Saving…"
-                                : channel.enabledForUser === false
-                                  ? "Enable gateway API"
-                                  : "Block gateway API"}
+                              <UserRoundCheck className="h-4 w-4" />
+                              {pendingActions[`agent-use:${agent.agentId}`] ? "Switching…" : "Use"}
                             </Button>
-                          ) : null}
-                          {channel.canRename ? (
-                            <Button type="button" variant="secondary" onClick={() => void renameChannel(channel)}>
-                              <Pencil className="mr-2 h-4 w-4" />
+                            <Button type="button" size="sm" variant="secondary" onClick={() => void renameAgent(agent)}>
+                              <Pencil className="h-4 w-4" />
                               Rename
                             </Button>
-                          ) : null}
-                          {channel.canSetKey ? (
-                            <Button type="button" variant="secondary" onClick={() => void setChannelKey(channel)}>
-                              <KeyRound className="mr-2 h-4 w-4" />
-                              Set key
-                            </Button>
-                          ) : null}
-                          {channel.canClearKey ? (
-                            <Button type="button" variant="secondary" onClick={() => void clearChannelKey(channel)}>
-                              Clear key
-                            </Button>
-                          ) : null}
-                          {channel.canDelete ? (
-                            <Button type="button" variant="destructive" onClick={() => void deleteChannel(channel)}>
-                              <Trash2 className="mr-2 h-4 w-4" />
-                              Delete
-                            </Button>
-                          ) : null}
+                            {!agent.isDefault ? (
+                              <Button type="button" size="sm" variant="destructive" onClick={() => void deleteAgent(agent)}>
+                                <Trash2 className="h-4 w-4" />
+                                Delete
+                              </Button>
+                            ) : null}
+                          </div>
+                        </div>
+
+                        <div className="mt-4 grid gap-2 md:grid-cols-[minmax(0,1fr)_auto]">
+                          <select
+                            value={modelDraftByAgent[agent.agentId] ?? agent.model ?? ""}
+                            onChange={(event) =>
+                              setModelDraftByAgent((prev) => ({ ...prev, [agent.agentId]: event.target.value }))
+                            }
+                            className="argus-select"
+                          >
+                            {availableModels.length ? (
+                              availableModels.map((model) => (
+                                <option key={model} value={model}>
+                                  {model}
+                                </option>
+                              ))
+                            ) : (
+                              <option value={agent.model || ""}>{agent.model || "gpt-5.4"}</option>
+                            )}
+                          </select>
+                          <Button type="button" size="sm" onClick={() => void saveAgentModel(agent)}>
+                            <Bot className="h-4 w-4" />
+                            Save model
+                          </Button>
                         </div>
                       </div>
+                    ))}
+                  </div>
+                </PanelCard>
+
+                <PanelCard
+                  eyebrow="Upstreams"
+                  title="Channels"
+                  subtitle="Switch upstreams, rotate per-user keys, and explicitly allow or block the built-in gateway API."
+                  action={
+                    <div className="grid gap-2 md:grid-cols-2">
+                      <Input
+                        value={newChannelName}
+                        onChange={(event) => setNewChannelName(event.target.value)}
+                        placeholder="channel name"
+                      />
+                      <Input
+                        value={newChannelBaseUrl}
+                        onChange={(event) => setNewChannelBaseUrl(event.target.value)}
+                        placeholder="https://provider/v1"
+                      />
+                      <Input
+                        value={newChannelApiKey}
+                        onChange={(event) => setNewChannelApiKey(event.target.value)}
+                        placeholder="api key"
+                        type="password"
+                        className="md:col-span-2"
+                      />
+                      <Button type="button" onClick={() => void createChannel()} className="md:col-span-2">
+                        <Plus className="h-4 w-4" />
+                        Create channel
+                      </Button>
                     </div>
-                  ))}
-                </div>
-              </PanelCard>
+                  }
+                >
+                  <div className="grid gap-3">
+                    {detail.channels.channels.map((channel) => (
+                      <div key={channel.channelId} className="argus-row-shell rounded-[16px] px-4 py-3.5">
+                        <div className="flex flex-col gap-3 xl:flex-row xl:items-start xl:justify-between">
+                          <div className="min-w-0">
+                            <div className="flex flex-wrap items-center gap-2">
+                              <div className="font-medium text-foreground">{channel.name}</div>
+                              {channel.selected ? <Badge tone="primary">selected</Badge> : null}
+                              {channel.disabledByAdmin ? (
+                                <Badge tone="warning">blocked</Badge>
+                              ) : channel.ready ? (
+                                <Badge tone="success">ready</Badge>
+                              ) : (
+                                <Badge tone="warning">needs setup</Badge>
+                              )}
+                              {channel.isBuiltin ? <Badge tone="default">{channel.builtinKind || "builtin"}</Badge> : null}
+                            </div>
+                            <div className="mt-2 text-xs leading-5 text-muted-foreground">
+                              {channel.baseUrl || "Gateway-managed channel"}
+                              {channel.apiKeyMasked ? ` · key ${channel.apiKeyMasked}` : ""}
+                            </div>
+                            {!channel.ready && channel.reason ? (
+                              <div className="mt-2 text-xs leading-5 text-amber-300">{channel.reason}</div>
+                            ) : null}
+                          </div>
+
+                          <div className="flex flex-wrap gap-2">
+                            <Button
+                              type="button"
+                              size="sm"
+                              variant="secondary"
+                              disabled={channel.selected || !channel.ready || Boolean(pendingActions[`channel-select:${channel.channelId}`])}
+                              onClick={() => void selectChannel(channel)}
+                            >
+                              <RadioTower className="h-4 w-4" />
+                              {pendingActions[`channel-select:${channel.channelId}`] ? "Switching…" : "Select"}
+                            </Button>
+                            {channel.canAdminToggleAccess ? (
+                              <Button
+                                type="button"
+                                size="sm"
+                                variant={channel.enabledForUser === false ? "secondary" : "destructive"}
+                                disabled={Boolean(pendingActions[`channel-access:${channel.channelId}`])}
+                                onClick={() => void setBuiltinChannelAccess(channel, channel.enabledForUser === false)}
+                              >
+                                {pendingActions[`channel-access:${channel.channelId}`]
+                                  ? "Saving…"
+                                  : channel.enabledForUser === false
+                                    ? "Enable gateway API"
+                                    : "Block gateway API"}
+                              </Button>
+                            ) : null}
+                            {channel.canRename ? (
+                              <Button type="button" size="sm" variant="secondary" onClick={() => void renameChannel(channel)}>
+                                <Pencil className="h-4 w-4" />
+                                Rename
+                              </Button>
+                            ) : null}
+                            {channel.canSetKey ? (
+                              <Button type="button" size="sm" variant="secondary" onClick={() => void setChannelKey(channel)}>
+                                <KeyRound className="h-4 w-4" />
+                                Set key
+                              </Button>
+                            ) : null}
+                            {channel.canClearKey ? (
+                              <Button type="button" size="sm" variant="secondary" onClick={() => void clearChannelKey(channel)}>
+                                Clear key
+                              </Button>
+                            ) : null}
+                            {channel.canDelete ? (
+                              <Button type="button" size="sm" variant="destructive" onClick={() => void deleteChannel(channel)}>
+                                <Trash2 className="h-4 w-4" />
+                                Delete
+                              </Button>
+                            ) : null}
+                          </div>
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                </PanelCard>
+              </div>
 
               <PanelCard eyebrow="Ledger" title="Recent usage" subtitle="Last 100 Responses calls attributed to this user.">
-                <div className="argus-table-shell rounded-[24px]">
+                <div className="argus-table-shell rounded-[20px]">
                   <table className="w-full border-collapse text-sm">
-                    <thead className="argus-table-head text-left text-xs uppercase tracking-[0.22em] text-muted-foreground">
+                    <thead className="argus-table-head text-left text-[10px] uppercase tracking-[0.12em] text-muted-foreground">
                       <tr>
                         <th className="px-4 py-3">When</th>
                         <th className="px-4 py-3">Agent</th>
@@ -917,14 +924,14 @@ export default function UsersPage() {
                           className="border-t border-border/60"
                         >
                           <td className="px-4 py-3 text-muted-foreground">{formatWhen(entry.createdAtMs)}</td>
-                          <td className="px-4 py-3 font-mono text-[13px]">{entry.agentId || "—"}</td>
+                          <td className="px-4 py-3 font-mono text-[12.5px]">{entry.agentId || "—"}</td>
                           <td className="px-4 py-3">{entry.channelName || entry.channelId || "—"}</td>
-                          <td className="px-4 py-3 font-mono text-[13px]">{entry.model || entry.requestedModel || "—"}</td>
+                          <td className="px-4 py-3 font-mono text-[12.5px]">{entry.model || entry.requestedModel || "—"}</td>
                           <td className="px-4 py-3 text-right font-medium">{formatInt(entry.totalTokens)}</td>
                           <td className="px-4 py-3">
                             <span className={cn(
-                              "rounded-full border px-2 py-1 text-[11px]",
-                              entry.error ? "border-destructive/40 bg-destructive/10 text-destructive" : "border-emerald-500/30 bg-emerald-500/10 text-emerald-400"
+                              "inline-flex items-center rounded-md border px-2 py-1 text-[10px] font-semibold uppercase tracking-[0.08em]",
+                              entry.error ? "border-destructive/36 bg-destructive/10 text-destructive" : "border-emerald-500/28 bg-emerald-500/10 text-emerald-400"
                             )}>
                               {entry.error ? "error" : entry.status || "ok"}
                             </span>
@@ -949,27 +956,17 @@ export default function UsersPage() {
 function UserDetailSkeleton({ userId }: { userId: number }) {
   return (
     <>
-      <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-4">
-        {Array.from({ length: 4 }).map((_, index) => (
-          <div key={index} className="argus-metric-card rounded-[26px] p-5 md:p-6">
-            <Skeleton className="h-4 w-24 rounded-full" />
-            <Skeleton className="mt-4 h-10 w-32" />
-            <Skeleton className="mt-3 h-3 w-40" />
-          </div>
-        ))}
-      </div>
-
       <PanelCard
         eyebrow="Selected user"
         title={`Loading user ${userId}`}
         subtitle="Preparing agents, channels, and recent usage."
         className="argus-data-grid"
       >
-        <div className="grid gap-4 lg:grid-cols-2">
-          {Array.from({ length: 4 }).map((_, index) => (
+        <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-4">
+          {Array.from({ length: 8 }).map((_, index) => (
             <div
               key={index}
-              className="rounded-[22px] border border-border/60 bg-background/30 px-4 py-3.5 shadow-[inset_0_1px_0_0_oklch(var(--foreground)/0.04)]"
+              className="rounded-[16px] border border-border/70 bg-background/24 px-3.5 py-3"
             >
               <Skeleton className="h-3 w-24 rounded-full" />
               <Skeleton className="mt-3 h-5 w-40" />
@@ -978,46 +975,48 @@ function UserDetailSkeleton({ userId }: { userId: number }) {
         </div>
       </PanelCard>
 
-      <PanelCard eyebrow="Agent fleet" title="Agents" subtitle="Loading agent bindings and model defaults.">
-        <div className="grid gap-3">
-          {Array.from({ length: 2 }).map((_, index) => (
-            <div
-              key={index}
-              className="rounded-[24px] border border-border/60 bg-background/30 p-4 shadow-[inset_0_1px_0_0_oklch(var(--foreground)/0.04)]"
-            >
-              <Skeleton className="h-5 w-40" />
-              <Skeleton className="mt-3 h-3 w-56" />
-              <div className="mt-4 flex flex-col gap-2 md:flex-row">
-                <Skeleton className="h-11 min-w-[220px]" />
-                <Skeleton className="h-11 w-32" />
+      <div className="grid gap-4 xl:grid-cols-2">
+        <PanelCard eyebrow="Agent fleet" title="Agents" subtitle="Loading agent bindings and model defaults.">
+          <div className="grid gap-3">
+            {Array.from({ length: 2 }).map((_, index) => (
+              <div
+                key={index}
+                className="rounded-[16px] border border-border/70 bg-background/24 px-4 py-3.5"
+              >
+                <Skeleton className="h-5 w-40" />
+                <Skeleton className="mt-3 h-3 w-56" />
+                <div className="mt-4 grid gap-2 md:grid-cols-[minmax(0,1fr)_7rem]">
+                  <Skeleton className="h-10 w-full" />
+                  <Skeleton className="h-10 w-full" />
+                </div>
               </div>
-            </div>
-          ))}
-        </div>
-      </PanelCard>
+            ))}
+          </div>
+        </PanelCard>
 
-      <PanelCard eyebrow="Upstreams" title="Channels" subtitle="Loading channel readiness and access policy.">
-        <div className="grid gap-3">
-          {Array.from({ length: 3 }).map((_, index) => (
-            <div
-              key={index}
-              className="rounded-[24px] border border-border/60 bg-background/30 p-4 shadow-[inset_0_1px_0_0_oklch(var(--foreground)/0.04)]"
-            >
-              <Skeleton className="h-5 w-32" />
-              <Skeleton className="mt-3 h-3 w-64" />
-              <div className="mt-4 flex flex-wrap gap-2">
-                <Skeleton className="h-10 w-24" />
-                <Skeleton className="h-10 w-36" />
+        <PanelCard eyebrow="Upstreams" title="Channels" subtitle="Loading channel readiness and access policy.">
+          <div className="grid gap-3">
+            {Array.from({ length: 3 }).map((_, index) => (
+              <div
+                key={index}
+                className="rounded-[16px] border border-border/70 bg-background/24 px-4 py-3.5"
+              >
+                <Skeleton className="h-5 w-32" />
+                <Skeleton className="mt-3 h-3 w-64" />
+                <div className="mt-4 flex flex-wrap gap-2">
+                  <Skeleton className="h-8 w-24" />
+                  <Skeleton className="h-8 w-36" />
+                </div>
               </div>
-            </div>
-          ))}
-        </div>
-      </PanelCard>
+            ))}
+          </div>
+        </PanelCard>
+      </div>
 
       <PanelCard eyebrow="Ledger" title="Recent usage" subtitle="Loading the latest Requests API events for this user.">
         <div className="space-y-3">
           {Array.from({ length: 6 }).map((_, index) => (
-            <div key={index} className="grid gap-3 rounded-[22px] border border-border/60 bg-background/30 px-4 py-4 md:grid-cols-[1.1fr_0.9fr_0.9fr_1fr_0.6fr]">
+            <div key={index} className="grid gap-3 rounded-[16px] border border-border/70 bg-background/24 px-4 py-3 md:grid-cols-[1.1fr_0.9fr_0.9fr_1fr_0.6fr]">
               <Skeleton className="h-4 w-full" />
               <Skeleton className="h-4 w-full" />
               <Skeleton className="h-4 w-full" />

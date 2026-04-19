@@ -1,8 +1,9 @@
 "use client";
 
 import * as React from "react";
-import Link from "next/link";
 
+import { Badge, EmptyState, Fact, InlineError, PanelCard } from "@/components/console-primitives";
+import { ConsoleShell } from "@/components/console-shell";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Textarea } from "@/components/ui/textarea";
@@ -84,6 +85,11 @@ function splitKeys(text: string): string[] {
     .filter(Boolean);
 }
 
+function formatStamp(value?: number | null): string {
+  if (!value || !Number.isFinite(value)) return "—";
+  return new Date(value).toLocaleString();
+}
+
 export default function NodesPage() {
   const storedWsUrl = useStoredGatewayWsUrl();
   const [wsUrl, setWsUrl] = React.useState<string | null>(null);
@@ -120,6 +126,13 @@ export default function NodesPage() {
     if (derived) setHttpBase(derived);
     setToken(extractTokenFromWsUrl(nextWsUrl));
   }
+
+  React.useEffect(() => {
+    if (!effectiveHttpBase) return;
+    void refreshNodes();
+    // Intentionally keyed to the derived connection target rather than the function identity.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [effectiveHttpBase, effectiveToken]);
 
   async function refreshNodes(): Promise<void> {
     setLoading(true);
@@ -207,125 +220,138 @@ export default function NodesPage() {
   const selected = nodes.find((node) => node.nodeId === nodePick) ?? null;
 
   return (
-    <main className="min-h-dvh bg-background text-foreground">
-      <div className="mx-auto w-full max-w-5xl px-6 py-8">
-        <div className="flex flex-col gap-2">
-          <h1 className="text-2xl font-semibold tracking-tight">Nodes</h1>
-          <p className="text-sm text-muted-foreground">
-            Minimal node management + invoke tester. The web UI talks to the gateway through{" "}
-            <code className="rounded bg-muted px-1 py-0.5">/api/nodes</code>.
-          </p>
+    <ConsoleShell
+      title="Nodes"
+      subtitle="Inspect node-host peers, override transport wiring, and invoke remote commands without leaving the control plane."
+      actions={
+        <div className="flex flex-col gap-2 xl:items-end">
+          <div className="argus-surface-label">Gateway endpoint</div>
+          <div className="flex flex-wrap items-center gap-2">
+            <Input
+              value={effectiveWsUrl}
+              onChange={(event) => syncFromWsUrl(event.target.value)}
+              className="w-[min(30rem,100%)]"
+              placeholder="Gateway wss://.../ws"
+            />
+            <Button type="button" variant="secondary" onClick={refreshNodes} disabled={loading || !effectiveHttpBase}>
+              {loading ? "Loading…" : "Refresh nodes"}
+            </Button>
+          </div>
         </div>
+      }
+    >
+      {error ? <InlineError message={error} /> : null}
 
-        <div className="mt-6 grid gap-4">
-          <div className="rounded-2xl border border-border bg-background/50 p-4">
-            <div className="grid gap-3">
-              <label className="text-sm font-medium">WebSocket URL (for deriving base + token)</label>
-              <Input value={effectiveWsUrl} onChange={(event) => syncFromWsUrl(event.target.value)} />
-
-              <div className="grid grid-cols-1 gap-3 md:grid-cols-2">
-                <div className="grid gap-2">
-                  <label className="text-sm font-medium">HTTP Base</label>
-                  <Input value={effectiveHttpBase} onChange={(event) => setHttpBase(event.target.value)} />
-                </div>
-                <div className="grid gap-2">
-                  <label className="text-sm font-medium">Token (optional)</label>
-                  <Input value={effectiveToken} onChange={(event) => setToken(event.target.value)} />
-                </div>
-              </div>
-
-              <div className="flex flex-wrap items-center gap-2">
-                <Button type="button" onClick={refreshNodes} disabled={loading || !effectiveHttpBase}>
-                  {loading ? "Loading…" : "Refresh nodes"}
-                </Button>
-                <Link
-                  href="/"
-                  className={cn(
-                    "text-sm text-muted-foreground underline underline-offset-4 hover:text-foreground"
-                  )}
-                >
-                  Back to chat
-                </Link>
-                {error ? <span className="text-sm text-destructive">{error}</span> : null}
-              </div>
-            </div>
-          </div>
-
-          <div className="rounded-2xl border border-border bg-background/50 p-4">
-            <div className="grid gap-3">
-              <div className="flex flex-wrap items-center justify-between gap-2">
-                <h2 className="text-base font-semibold">Connected nodes</h2>
-                <span className="text-sm text-muted-foreground">{nodes.length} total</span>
-              </div>
-              {nodes.length ? (
-                <div className="grid gap-2">
-                  {nodes.map((node) => (
-                    <button
-                      key={node.nodeId}
-                      type="button"
-                      className={cn(
-                        "flex w-full items-start justify-between gap-3 rounded-xl border border-border/60 bg-background/60 p-3 text-left",
-                        "transition-colors hover:border-border hover:bg-background/70",
-                        nodePick === node.nodeId ? "border-primary/40 bg-background/80" : ""
-                      )}
-                      onClick={() => setNodePick(node.nodeId)}
-                    >
-                      <div className="min-w-0">
-                        <div className="truncate text-sm font-medium">
-                          {node.displayName || node.nodeId}
-                        </div>
-                        <div className="truncate text-xs text-muted-foreground">
-                          {node.nodeId}
-                          {node.platform ? ` • ${node.platform}` : ""}
-                          {node.version ? ` • v${node.version}` : ""}
-                        </div>
+      <div className="grid gap-4 xl:grid-cols-[320px_minmax(0,1fr)]">
+        <section className="space-y-4">
+          <PanelCard
+            eyebrow="Inventory"
+            title="Connected nodes"
+            subtitle={nodes.length ? `${nodes.length} node-host peers are currently visible.` : "No node-host peers are currently visible."}
+          >
+            {nodes.length ? (
+              <div className="space-y-2">
+                {nodes.map((node) => (
+                  <button
+                    key={node.nodeId}
+                    type="button"
+                    className={cn(
+                      "argus-row-shell flex w-full items-start justify-between gap-3 rounded-[16px] px-4 py-3 text-left",
+                      nodePick === node.nodeId ? "border-primary/28 bg-primary/10" : "hover:border-border hover:bg-background/36",
+                    )}
+                    onClick={() => setNodePick(node.nodeId)}
+                  >
+                    <div className="min-w-0">
+                      <div className="truncate text-sm font-medium text-foreground">
+                        {node.displayName || node.nodeId}
                       </div>
-                      <div className="shrink-0 text-xs text-muted-foreground">
-                        {(node.commands || []).length} cmds
+                      <div className="mt-1 truncate text-xs leading-5 text-muted-foreground">
+                        {node.nodeId}
+                        {node.platform ? ` · ${node.platform}` : ""}
+                        {node.version ? ` · v${node.version}` : ""}
                       </div>
-                    </button>
-                  ))}
-                </div>
-              ) : (
-                <p className="text-sm text-muted-foreground">
-                  No nodes connected. Start node-host on your Mac and refresh.
-                </p>
-              )}
-            </div>
-          </div>
-
-          <div className="rounded-2xl border border-border bg-background/50 p-4">
-            <div className="grid gap-3">
-              <div className="flex flex-wrap items-center justify-between gap-2">
-                <h2 className="text-base font-semibold">Invoke</h2>
-                <span className="text-xs text-muted-foreground">
-                  Interactive tip: use <code>pty: true</code> + <code>yieldMs: 0</code>
-                </span>
+                    </div>
+                    <div className="shrink-0 text-[10px] font-semibold uppercase tracking-[0.08em] text-muted-foreground">
+                      {(node.commands || []).length} cmds
+                    </div>
+                  </button>
+                ))}
               </div>
+            ) : (
+              <EmptyState title="No nodes connected" body="Start node-host on a machine, then refresh this page to discover it." />
+            )}
+          </PanelCard>
 
+          <PanelCard
+            eyebrow="Selected peer"
+            title={selected?.displayName || selected?.nodeId || "No node selected"}
+            subtitle="Quick identity snapshot for the currently selected node."
+          >
+            {selected ? (
+              <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-1">
+                <Fact label="Node id" value={selected.nodeId} mono />
+                <Fact label="Platform" value={selected.platform || "—"} />
+                <Fact label="Version" value={selected.version || "—"} />
+                <Fact label="Connected at" value={formatStamp(selected.connectedAtMs)} />
+                <Fact label="Last seen" value={formatStamp(selected.lastSeenMs)} />
+                <Fact label="Commands" value={String((selected.commands || []).length)} />
+              </div>
+            ) : (
+              <EmptyState title="Nothing selected" body="Pick a node from the inventory to inspect metadata and target commands." />
+            )}
+          </PanelCard>
+        </section>
+
+        <section className="space-y-4">
+          <PanelCard
+            eyebrow="Transport"
+            title="Node API wiring"
+            subtitle="The browser derives the REST base and bearer token from the saved gateway WebSocket URL. Override either field if the node proxy lives elsewhere."
+            className="argus-data-grid"
+          >
+            <div className="grid gap-4 lg:grid-cols-2">
               <div className="grid gap-2">
-                <label className="text-sm font-medium">Node</label>
-                <select
-                  className={cn(
-                    "h-10 w-full rounded-xl border border-input bg-background/70 px-3 text-sm",
-                    "shadow-[inset_0_1px_0_0_oklch(var(--foreground)/0.06)]",
-                    "outline-none focus-visible:ring-4 focus-visible:ring-ring/25"
-                  )}
-                  value={nodePick}
-                  onChange={(event) => setNodePick(event.target.value)}
-                  disabled={!nodes.length}
-                >
-                  {nodes.map((node) => (
-                    <option key={node.nodeId} value={node.nodeId}>
-                      {node.displayName || node.nodeId}
-                    </option>
-                  ))}
-                </select>
+                <label className="argus-surface-label">HTTP base</label>
+                <Input value={effectiveHttpBase} onChange={(event) => setHttpBase(event.target.value)} />
               </div>
+              <div className="grid gap-2">
+                <label className="argus-surface-label">Token (optional)</label>
+                <Input value={effectiveToken} onChange={(event) => setToken(event.target.value)} />
+              </div>
+            </div>
+          </PanelCard>
 
-              <div className="grid grid-cols-1 gap-3 md:grid-cols-2">
+          <div className="grid gap-4 xl:grid-cols-[1.1fr_0.9fr]">
+            <PanelCard
+              eyebrow="Invoke"
+              title="Remote command"
+              subtitle="Send one-off requests to the selected peer. For interactive flows, start with pty=true and yieldMs=0."
+            >
+              <div className="grid gap-4">
+                <div className="grid gap-3 md:grid-cols-[minmax(0,1fr)_120px]">
+                  <div className="grid gap-2">
+                    <label className="argus-surface-label">Node</label>
+                    <select
+                      className="argus-select"
+                      value={nodePick}
+                      onChange={(event) => setNodePick(event.target.value)}
+                      disabled={!nodes.length}
+                    >
+                      {nodes.map((node) => (
+                        <option key={node.nodeId} value={node.nodeId}>
+                          {node.displayName || node.nodeId}
+                        </option>
+                      ))}
+                    </select>
+                  </div>
+                  <div className="grid gap-2">
+                    <label className="argus-surface-label">Timeout (ms)</label>
+                    <Input value={timeoutMs} onChange={(event) => setTimeoutMs(event.target.value)} />
+                  </div>
+                </div>
+
                 <div className="grid gap-2">
-                  <label className="text-sm font-medium">Command</label>
+                  <label className="argus-surface-label">Command</label>
                   <Input value={command} onChange={(event) => setCommand(event.target.value)} />
                   {selected?.commands?.length ? (
                     <div className="flex flex-wrap gap-2">
@@ -333,7 +359,7 @@ export default function NodesPage() {
                         <button
                           key={item}
                           type="button"
-                          className="rounded-lg border border-border/60 bg-background/60 px-2 py-1 text-xs text-muted-foreground hover:text-foreground"
+                          className="rounded-md border border-border/70 bg-background/28 px-2 py-1 text-[10px] font-semibold uppercase tracking-[0.08em] text-muted-foreground hover:border-primary/28 hover:text-foreground"
                           onClick={() => setCommand(item)}
                         >
                           {item}
@@ -342,142 +368,155 @@ export default function NodesPage() {
                     </div>
                   ) : null}
                 </div>
+
                 <div className="grid gap-2">
-                  <label className="text-sm font-medium">Timeout (ms)</label>
-                  <Input value={timeoutMs} onChange={(event) => setTimeoutMs(event.target.value)} />
+                  <label className="argus-surface-label">Params (JSON)</label>
+                  <Textarea value={paramsText} onChange={(event) => setParamsText(event.target.value)} className="min-h-[16rem]" />
+                </div>
+
+                <div className="flex flex-wrap items-center gap-2">
+                  <Button type="button" onClick={invoke} disabled={loading || !nodePick || !command.trim()}>
+                    {loading ? "Invoking…" : "Invoke"}
+                  </Button>
+                  <Button
+                    type="button"
+                    variant="secondary"
+                    onClick={() => {
+                      setCommand("system.run");
+                      setParamsText(
+                        JSON.stringify(
+                          {
+                            argv: ["bash", "-lc", "read -p 'type agree: ' answer; echo answer=$answer"],
+                            pty: true,
+                            yieldMs: 0,
+                          },
+                          null,
+                          2,
+                        ),
+                      );
+                    }}
+                    disabled={loading}
+                  >
+                    Load interactive example
+                  </Button>
                 </div>
               </div>
+            </PanelCard>
 
-              <div className="grid gap-2">
-                <label className="text-sm font-medium">Params (JSON)</label>
-                <Textarea value={paramsText} onChange={(event) => setParamsText(event.target.value)} />
-              </div>
-
-              <div className="flex flex-wrap items-center gap-2">
-                <Button type="button" onClick={invoke} disabled={loading || !nodePick || !command.trim()}>
-                  {loading ? "Invoking…" : "Invoke"}
-                </Button>
-                <Button
-                  type="button"
-                  variant="outline"
-                  onClick={() => {
-                    setCommand("system.run");
-                    setParamsText(
-                      JSON.stringify(
-                        {
-                          argv: [
-                            "bash",
-                            "-lc",
-                            "read -p 'type agree: ' answer; echo answer=$answer"
-                          ],
-                          pty: true,
-                          yieldMs: 0
-                        },
-                        null,
-                        2
-                      )
-                    );
-                  }}
-                  disabled={loading}
-                >
-                  Load interactive example
-                </Button>
-              </div>
-
-              <div className="grid gap-2">
-                <label className="text-sm font-medium">Result</label>
-                <Textarea value={invokeOut} readOnly className="min-h-40 font-mono text-xs" />
-              </div>
-            </div>
+            <PanelCard eyebrow="Result" title="Latest response" subtitle="Raw invoke output from the node proxy.">
+              <Textarea value={invokeOut} readOnly className="min-h-[28rem] font-mono text-xs" />
+            </PanelCard>
           </div>
 
-          <div className="rounded-2xl border border-border bg-background/50 p-4">
+          <PanelCard
+            eyebrow="Interactive helpers"
+            title="Reuse the returned jobId"
+            subtitle="Fetch logs, send more input, or terminate the remote process once a command has been started."
+          >
             <div className="grid gap-4">
-              <div className="flex flex-wrap items-center justify-between gap-2">
-                <div>
-                  <h2 className="text-base font-semibold">Interactive helpers</h2>
-                  <p className="text-sm text-muted-foreground">
-                    Reuse the returned <code>jobId</code> to fetch logs or send more input.
-                  </p>
-                </div>
-              </div>
-
-              <div className="grid grid-cols-1 gap-3 md:grid-cols-2">
+              <div className="grid gap-3 md:grid-cols-2">
                 <div className="grid gap-2">
-                  <label className="text-sm font-medium">Job ID</label>
+                  <label className="argus-surface-label">Job ID</label>
                   <Input value={jobId} onChange={(event) => setJobId(event.target.value)} />
                 </div>
                 <div className="grid gap-2">
-                  <label className="text-sm font-medium">Logs tail bytes</label>
+                  <label className="argus-surface-label">Logs tail bytes</label>
                   <Input value={tailBytes} onChange={(event) => setTailBytes(event.target.value)} />
                 </div>
               </div>
 
               <div className="flex flex-wrap items-center gap-2">
-                <Button type="button" variant="outline" onClick={() => invokeForJob("process.get")} disabled={loading || !jobId.trim()}>
+                <Button type="button" variant="secondary" onClick={() => invokeForJob("process.get")} disabled={loading || !jobId.trim()}>
                   Get
                 </Button>
                 <Button
                   type="button"
-                  variant="outline"
+                  variant="secondary"
                   onClick={() => {
                     const nextTailBytes = Number(tailBytes);
                     void invokeForJob(
                       "process.logs",
-                      Number.isFinite(nextTailBytes) ? { tailBytes: nextTailBytes } : undefined
+                      Number.isFinite(nextTailBytes) ? { tailBytes: nextTailBytes } : undefined,
                     );
                   }}
                   disabled={loading || !jobId.trim()}
                 >
                   Logs
                 </Button>
-                <Button type="button" variant="outline" onClick={() => invokeForJob("process.submit")} disabled={loading || !jobId.trim()}>
+                <Button type="button" variant="secondary" onClick={() => invokeForJob("process.submit")} disabled={loading || !jobId.trim()}>
                   Submit
                 </Button>
-                <Button type="button" variant="outline" onClick={() => invokeForJob("process.kill")} disabled={loading || !jobId.trim()}>
+                <Button type="button" variant="destructive" onClick={() => invokeForJob("process.kill")} disabled={loading || !jobId.trim()}>
                   Kill
                 </Button>
               </div>
 
-              <div className="grid gap-2">
-                <label className="text-sm font-medium">Write data</label>
-                <Textarea
-                  value={writeData}
-                  onChange={(event) => setWriteData(event.target.value)}
-                  className="min-h-24"
-                />
-                <div>
-                  <Button
-                    type="button"
-                    variant="outline"
-                    onClick={() => invokeForJob("process.write", { data: writeData })}
-                    disabled={loading || !jobId.trim() || !writeData}
-                  >
-                    Write
-                  </Button>
+              <div className="grid gap-4 xl:grid-cols-2">
+                <div className="grid gap-2">
+                  <label className="argus-surface-label">Write data</label>
+                  <Textarea value={writeData} onChange={(event) => setWriteData(event.target.value)} className="min-h-[7rem]" />
+                  <div>
+                    <Button
+                      type="button"
+                      variant="secondary"
+                      onClick={() => invokeForJob("process.write", { data: writeData })}
+                      disabled={loading || !jobId.trim() || !writeData}
+                    >
+                      Write
+                    </Button>
+                  </div>
+                </div>
+
+                <div className="grid gap-2">
+                  <label className="argus-surface-label">Paste text</label>
+                  <Textarea value={pasteText} onChange={(event) => setPasteText(event.target.value)} className="min-h-[7rem]" />
+                  <label className="flex items-center gap-2 text-sm text-muted-foreground">
+                    <input
+                      type="checkbox"
+                      checked={pasteBracketed}
+                      onChange={(event) => setPasteBracketed(event.target.checked)}
+                    />
+                    Use bracketed paste markers
+                  </label>
+                  <div>
+                    <Button
+                      type="button"
+                      variant="secondary"
+                      onClick={() => invokeForJob("process.paste", { text: pasteText, bracketed: pasteBracketed })}
+                      disabled={loading || !jobId.trim() || !pasteText}
+                    >
+                      Paste
+                    </Button>
+                  </div>
                 </div>
               </div>
 
-              <div className="grid grid-cols-1 gap-3 md:grid-cols-2">
+              <div className="grid gap-3 md:grid-cols-2">
                 <div className="grid gap-2">
-                  <label className="text-sm font-medium">Send keys (comma separated)</label>
+                  <label className="argus-surface-label">Send keys (comma separated)</label>
                   <Input value={sendKeys} onChange={(event) => setSendKeys(event.target.value)} />
                 </div>
                 <div className="grid gap-2">
-                  <label className="text-sm font-medium">Literal text</label>
+                  <label className="argus-surface-label">Literal text</label>
                   <Input value={sendLiteral} onChange={(event) => setSendLiteral(event.target.value)} />
                 </div>
+              </div>
+
+              <div className="flex flex-wrap gap-2">
+                <Badge tone="default">process.write</Badge>
+                <Badge tone="default">process.send_keys</Badge>
+                <Badge tone="default">process.paste</Badge>
               </div>
 
               <div>
                 <Button
                   type="button"
-                  variant="outline"
+                  variant="secondary"
                   onClick={() => {
                     const keys = splitKeys(sendKeys);
                     void invokeForJob("process.send_keys", {
                       ...(keys.length ? { keys } : {}),
-                      ...(sendLiteral ? { literal: sendLiteral } : {})
+                      ...(sendLiteral ? { literal: sendLiteral } : {}),
                     });
                   }}
                   disabled={loading || !jobId.trim() || (!sendKeys.trim() && !sendLiteral)}
@@ -485,37 +524,10 @@ export default function NodesPage() {
                   Send keys
                 </Button>
               </div>
-
-              <div className="grid gap-2">
-                <label className="text-sm font-medium">Paste text</label>
-                <Textarea
-                  value={pasteText}
-                  onChange={(event) => setPasteText(event.target.value)}
-                  className="min-h-24"
-                />
-                <label className="flex items-center gap-2 text-sm text-muted-foreground">
-                  <input
-                    type="checkbox"
-                    checked={pasteBracketed}
-                    onChange={(event) => setPasteBracketed(event.target.checked)}
-                  />
-                  Use bracketed paste markers
-                </label>
-                <div>
-                  <Button
-                    type="button"
-                    variant="outline"
-                    onClick={() => invokeForJob("process.paste", { text: pasteText, bracketed: pasteBracketed })}
-                    disabled={loading || !jobId.trim() || !pasteText}
-                  >
-                    Paste
-                  </Button>
-                </div>
-              </div>
             </div>
-          </div>
-        </div>
+          </PanelCard>
+        </section>
       </div>
-    </main>
+    </ConsoleShell>
   );
 }
