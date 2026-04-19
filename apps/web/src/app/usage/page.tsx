@@ -4,7 +4,7 @@ import React from "react";
 import { RefreshCw } from "lucide-react";
 import { toast } from "sonner";
 
-import { Badge, EmptyState, Fact, InlineError, PanelCard, StatCard } from "@/components/console-primitives";
+import { Badge, EmptyState, Fact, InlineError, PanelCard, Skeleton, StatCard } from "@/components/console-primitives";
 import { ConsoleShell } from "@/components/console-shell";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -71,6 +71,8 @@ export default function UsagePage() {
   }, [selectedUserId, users]);
 
   const filteredSummary = usage?.summary;
+  const showFleetSkeleton = loading && !overview;
+  const showUsageSkeleton = loading && !usage;
 
   return (
     <ConsoleShell
@@ -94,7 +96,12 @@ export default function UsagePage() {
           <div className="flex flex-wrap items-center gap-2">
             <select
               value={selectedUserId}
-              onChange={(event) => setSelectedUserId(event.target.value)}
+              onChange={(event) => {
+                setSelectedUserId(event.target.value);
+                setUsage(null);
+                setError(null);
+                setLoading(true);
+              }}
               className={cn(
                 "h-10 min-w-[180px] rounded-xl border border-border/60 bg-background/60 px-3 text-sm text-foreground outline-none",
                 "focus:border-primary/40 focus:ring-4 focus:ring-ring/20",
@@ -122,17 +129,29 @@ export default function UsagePage() {
             title="Fleet"
             subtitle={overview ? `Version ${overview.version}` : "Gateway-wide activity across all tracked users."}
           >
-            <div className="grid gap-4 sm:grid-cols-2 xl:grid-cols-1">
-              <StatCard
-                label="24h tokens"
-                value={formatCompact(overview?.usage24h.totalTokens)}
-                tone="primary"
-                hint="Total traffic recorded by the gateway ledger over the last rolling 24 hours."
-              />
-              <StatCard label="24h requests" value={formatInt(overview?.usage24h.requestCount)} hint="Successful and failed Responses calls." />
-              <StatCard label="Tracked users" value={formatInt(overview?.totals.userCount)} hint="Users with observable traffic or managed state." />
-              <StatCard label="Live sessions" value={formatInt(overview?.totals.sessionCount)} hint="Currently listed runtime sessions." />
-            </div>
+            {showFleetSkeleton ? (
+              <div className="grid gap-4 sm:grid-cols-2 xl:grid-cols-1">
+                {Array.from({ length: 4 }).map((_, index) => (
+                  <div key={index} className="argus-metric-card rounded-[26px] p-5 md:p-6">
+                    <Skeleton className="h-4 w-24 rounded-full" />
+                    <Skeleton className="mt-4 h-10 w-32" />
+                    <Skeleton className="mt-3 h-3 w-40" />
+                  </div>
+                ))}
+              </div>
+            ) : (
+              <div className="grid gap-4 sm:grid-cols-2 xl:grid-cols-1">
+                <StatCard
+                  label="24h tokens"
+                  value={formatCompact(overview?.usage24h.totalTokens)}
+                  tone="primary"
+                  hint="Total traffic recorded by the gateway ledger over the last rolling 24 hours."
+                />
+                <StatCard label="24h requests" value={formatInt(overview?.usage24h.requestCount)} hint="Successful and failed Responses calls." />
+                <StatCard label="Tracked users" value={formatInt(overview?.totals.userCount)} hint="Users with observable traffic or managed state." />
+                <StatCard label="Live sessions" value={formatInt(overview?.totals.sessionCount)} hint="Currently listed runtime sessions." />
+              </div>
+            )}
           </PanelCard>
 
           <PanelCard eyebrow="Operators" title="Top users" subtitle="Sorted by 24h token usage from the same ledger.">
@@ -141,7 +160,12 @@ export default function UsagePage() {
                 <button
                   key={user.userId}
                   type="button"
-                  onClick={() => setSelectedUserId(String(user.userId))}
+                  onClick={() => {
+                    setSelectedUserId(String(user.userId));
+                    setUsage(null);
+                    setError(null);
+                    setLoading(true);
+                  }}
                     className={cn(
                     "w-full rounded-[22px] border px-4 py-4 text-left transition-colors",
                     String(user.userId) === selectedUserId
@@ -175,101 +199,146 @@ export default function UsagePage() {
         </section>
 
         <section className="space-y-6">
-          <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-4">
-            <StatCard
-              label="Filtered tokens"
-              value={formatCompact(filteredSummary?.totalTokens)}
-              tone="primary"
-              hint={selectedUser ? `Scoped to user ${selectedUser.userId}` : "Current global filter window"}
-              className="md:col-span-2 xl:col-span-1"
-            />
-            <StatCard label="Filtered requests" value={formatInt(filteredSummary?.requestCount)} hint="Rows that matched the filter window." />
-            <StatCard
-              label="Input / output"
-              value={`${formatCompact(filteredSummary?.inputTokens)} / ${formatCompact(filteredSummary?.outputTokens)}`}
-              hint="Input first, output second."
-            />
-            <StatCard label="Est. cost" value={formatUsd(filteredSummary?.estimatedCostUsd)} hint="Derived from recorded upstream usage." />
-          </div>
+          {showUsageSkeleton ? (
+            <>
+              <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-4">
+                {Array.from({ length: 4 }).map((_, index) => (
+                  <div key={index} className="argus-metric-card rounded-[26px] p-5 md:p-6">
+                    <Skeleton className="h-4 w-24 rounded-full" />
+                    <Skeleton className="mt-4 h-10 w-32" />
+                    <Skeleton className="mt-3 h-3 w-40" />
+                  </div>
+                ))}
+              </div>
 
-          <PanelCard
-            eyebrow="Current lens"
-            title={selectedUser ? `User ${selectedUser.userId}` : "Current filter"}
-            subtitle={selectedUser ? "The panels below are scoped to the selected user and time range." : "Use the filter bar to narrow the usage ledger."}
-            className="argus-data-grid"
-          >
-            <div className="grid gap-4 lg:grid-cols-2">
-              <Fact label="Time window" value={hours.trim() ? `Last ${hours.trim()} hours` : "Full history"} />
-              <Fact label="Rows loaded" value={formatInt(usage?.events.length)} />
-              <Fact label="Last request" value={formatWhen(filteredSummary?.lastAtMs)} />
-              <Fact label="Last active" value={selectedUser ? formatRelative(selectedUser.lastActiveMs) : formatRelative(filteredSummary?.lastAtMs)} />
-            </div>
-          </PanelCard>
-
-          <PanelCard
-            eyebrow="Ledger"
-            title="Recent calls"
-            subtitle="Newest usage events first, as observed by the gateway proxy."
-            contentClassName="space-y-4"
-          >
-            <div className="flex flex-wrap items-center gap-2 text-xs text-muted-foreground">
-              <Badge tone="default">{selectedUser ? `user ${selectedUser.userId}` : "all users"}</Badge>
-              <Badge tone="default">{hours.trim() ? `${hours.trim()}h window` : "full history"}</Badge>
-              <Badge tone="default">{formatInt(usage?.events.length)} rows</Badge>
-            </div>
-
-            <div className="argus-table-shell rounded-[24px]">
-              <table className="w-full border-collapse text-sm">
-                <thead className="argus-table-head text-left text-xs uppercase tracking-[0.22em] text-muted-foreground">
-                  <tr>
-                    <th className="px-4 py-3">When</th>
-                    <th className="px-4 py-3">User</th>
-                    <th className="px-4 py-3">Agent</th>
-                    <th className="px-4 py-3">Channel</th>
-                    <th className="px-4 py-3">Model</th>
-                    <th className="px-4 py-3 text-right">Tokens</th>
-                    <th className="px-4 py-3">Status</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {usage?.events.map((event) => (
-                    <tr
-                      key={[
-                        event.createdAtMs,
-                        event.responseId || "",
-                        event.sessionId || "",
-                        event.agentId || "",
-                        event.channelId || "",
-                      ].join(":")}
-                      className="border-t border-border/60"
+              <PanelCard
+                eyebrow="Current lens"
+                title={selectedUser ? `User ${selectedUser.userId}` : "Current filter"}
+                subtitle="Preparing the filtered ledger view."
+                className="argus-data-grid"
+              >
+                <div className="grid gap-4 lg:grid-cols-2">
+                  {Array.from({ length: 4 }).map((_, index) => (
+                    <div
+                      key={index}
+                      className="rounded-[22px] border border-border/60 bg-background/30 px-4 py-3.5 shadow-[inset_0_1px_0_0_oklch(var(--foreground)/0.04)]"
                     >
-                      <td className="px-4 py-3 text-muted-foreground">{formatWhen(event.createdAtMs)}</td>
-                      <td className="px-4 py-3">{event.ownerUserId || "—"}</td>
-                      <td className="px-4 py-3 font-mono text-[13px]">{event.agentId || "—"}</td>
-                      <td className="px-4 py-3">{event.channelName || event.channelId || "—"}</td>
-                      <td className="px-4 py-3 font-mono text-[13px]">{event.model || event.requestedModel || "—"}</td>
-                      <td className="px-4 py-3 text-right font-medium">{formatInt(event.totalTokens)}</td>
-                      <td className="px-4 py-3">
-                        <span
-                          className={cn(
-                            "rounded-full border px-2 py-1 text-[11px]",
-                            event.error
-                              ? "border-destructive/40 bg-destructive/10 text-destructive"
-                              : "border-emerald-500/30 bg-emerald-500/10 text-emerald-400"
-                          )}
-                        >
-                          {event.error ? event.error : event.status || "ok"}
-                        </span>
-                      </td>
-                    </tr>
+                      <Skeleton className="h-3 w-24 rounded-full" />
+                      <Skeleton className="mt-3 h-5 w-40" />
+                    </div>
                   ))}
-                </tbody>
-              </table>
-              {!usage?.events.length ? (
-                <div className="px-4 py-8 text-center text-sm text-muted-foreground">No usage records match the current filter.</div>
-              ) : null}
-            </div>
-          </PanelCard>
+                </div>
+              </PanelCard>
+
+              <PanelCard eyebrow="Ledger" title="Recent calls" subtitle="Loading the latest gateway usage rows." contentClassName="space-y-3">
+                {Array.from({ length: 6 }).map((_, index) => (
+                  <div key={index} className="grid gap-3 rounded-[22px] border border-border/60 bg-background/30 px-4 py-4 md:grid-cols-[1.1fr_0.7fr_0.9fr_0.9fr_0.9fr_0.6fr_0.6fr]">
+                    {Array.from({ length: 7 }).map((__, cellIndex) => (
+                      <Skeleton key={cellIndex} className="h-4 w-full" />
+                    ))}
+                  </div>
+                ))}
+              </PanelCard>
+            </>
+          ) : (
+            <>
+              <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-4">
+                <StatCard
+                  label="Filtered tokens"
+                  value={formatCompact(filteredSummary?.totalTokens)}
+                  tone="primary"
+                  hint={selectedUser ? `Scoped to user ${selectedUser.userId}` : "Current global filter window"}
+                  className="md:col-span-2 xl:col-span-1"
+                />
+                <StatCard label="Filtered requests" value={formatInt(filteredSummary?.requestCount)} hint="Rows that matched the filter window." />
+                <StatCard
+                  label="Input / output"
+                  value={`${formatCompact(filteredSummary?.inputTokens)} / ${formatCompact(filteredSummary?.outputTokens)}`}
+                  hint="Input first, output second."
+                />
+                <StatCard label="Est. cost" value={formatUsd(filteredSummary?.estimatedCostUsd)} hint="Derived from recorded upstream usage." />
+              </div>
+
+              <PanelCard
+                eyebrow="Current lens"
+                title={selectedUser ? `User ${selectedUser.userId}` : "Current filter"}
+                subtitle={selectedUser ? "The panels below are scoped to the selected user and time range." : "Use the filter bar to narrow the usage ledger."}
+                className="argus-data-grid"
+              >
+                <div className="grid gap-4 lg:grid-cols-2">
+                  <Fact label="Time window" value={hours.trim() ? `Last ${hours.trim()} hours` : "Full history"} />
+                  <Fact label="Rows loaded" value={formatInt(usage?.events.length)} />
+                  <Fact label="Last request" value={formatWhen(filteredSummary?.lastAtMs)} />
+                  <Fact label="Last active" value={selectedUser ? formatRelative(selectedUser.lastActiveMs) : formatRelative(filteredSummary?.lastAtMs)} />
+                </div>
+              </PanelCard>
+
+              <PanelCard
+                eyebrow="Ledger"
+                title="Recent calls"
+                subtitle="Newest usage events first, as observed by the gateway proxy."
+                contentClassName="space-y-4"
+              >
+                <div className="flex flex-wrap items-center gap-2 text-xs text-muted-foreground">
+                  <Badge tone="default">{selectedUser ? `user ${selectedUser.userId}` : "all users"}</Badge>
+                  <Badge tone="default">{hours.trim() ? `${hours.trim()}h window` : "full history"}</Badge>
+                  <Badge tone="default">{formatInt(usage?.events.length)} rows</Badge>
+                </div>
+
+                <div className="argus-table-shell rounded-[24px]">
+                  <table className="w-full border-collapse text-sm">
+                    <thead className="argus-table-head text-left text-xs uppercase tracking-[0.22em] text-muted-foreground">
+                      <tr>
+                        <th className="px-4 py-3">When</th>
+                        <th className="px-4 py-3">User</th>
+                        <th className="px-4 py-3">Agent</th>
+                        <th className="px-4 py-3">Channel</th>
+                        <th className="px-4 py-3">Model</th>
+                        <th className="px-4 py-3 text-right">Tokens</th>
+                        <th className="px-4 py-3">Status</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {usage?.events.map((event) => (
+                        <tr
+                          key={[
+                            event.createdAtMs,
+                            event.responseId || "",
+                            event.sessionId || "",
+                            event.agentId || "",
+                            event.channelId || "",
+                          ].join(":")}
+                          className="border-t border-border/60"
+                        >
+                          <td className="px-4 py-3 text-muted-foreground">{formatWhen(event.createdAtMs)}</td>
+                          <td className="px-4 py-3">{event.ownerUserId || "—"}</td>
+                          <td className="px-4 py-3 font-mono text-[13px]">{event.agentId || "—"}</td>
+                          <td className="px-4 py-3">{event.channelName || event.channelId || "—"}</td>
+                          <td className="px-4 py-3 font-mono text-[13px]">{event.model || event.requestedModel || "—"}</td>
+                          <td className="px-4 py-3 text-right font-medium">{formatInt(event.totalTokens)}</td>
+                          <td className="px-4 py-3">
+                            <span
+                              className={cn(
+                                "rounded-full border px-2 py-1 text-[11px]",
+                                event.error
+                                  ? "border-destructive/40 bg-destructive/10 text-destructive"
+                                  : "border-emerald-500/30 bg-emerald-500/10 text-emerald-400"
+                              )}
+                            >
+                              {event.error ? event.error : event.status || "ok"}
+                            </span>
+                          </td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                  {!usage?.events.length ? (
+                    <div className="px-4 py-8 text-center text-sm text-muted-foreground">No usage records match the current filter.</div>
+                  ) : null}
+                </div>
+              </PanelCard>
+            </>
+          )}
         </section>
       </div>
     </ConsoleShell>

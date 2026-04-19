@@ -91,6 +91,10 @@ export function EmptyState({ title, body }: { title: string; body: string }) {
   );
 }
 
+export function Skeleton({ className }: { className?: string }) {
+  return <div aria-hidden className={cn("argus-skeleton rounded-2xl", className)} />;
+}
+
 export function InlineError({ message }: { message: string }) {
   return (
     <div className="rounded-[22px] border border-destructive/40 bg-destructive/10 px-4 py-3.5 text-sm leading-6 text-destructive shadow-[inset_0_1px_0_0_oklch(var(--foreground)/0.04)]">

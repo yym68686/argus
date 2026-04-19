@@ -150,6 +150,10 @@
     html.dark::view-transition-old(root) {
       animation: none;
     }
+    .argus-skeleton {
+      animation: none;
+      background-position: 50% 0;
+    }
   }
 }
 
@@ -258,6 +262,28 @@
     opacity: 0.14;
     animation: argus-noise-drift 9.5s linear infinite;
     will-change: transform;
+  }
+
+  @keyframes argus-skeleton-shimmer {
+    0% {
+      background-position: 100% 0;
+    }
+    100% {
+      background-position: -100% 0;
+    }
+  }
+
+  .argus-skeleton {
+    background:
+      linear-gradient(
+        90deg,
+        oklch(var(--foreground) / 0.04) 0%,
+        oklch(var(--foreground) / 0.08) 38%,
+        oklch(var(--foreground) / 0.04) 72%
+      ),
+      oklch(var(--background) / 0.48);
+    background-size: 220% 100%;
+    animation: argus-skeleton-shimmer 1.35s linear infinite;
   }
 
   .argus-landing-blob {

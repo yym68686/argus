@@ -4,7 +4,7 @@ import React from "react";
 import { RefreshCw, Plus, KeyRound, Trash2, UserRoundCheck, Pencil, Bot, RadioTower } from "lucide-react";
 import { toast } from "sonner";
 
-import { Badge, EmptyState, Fact, InfoPill, InlineError, PanelCard, StatCard } from "@/components/console-primitives";
+import { Badge, EmptyState, Fact, InfoPill, InlineError, PanelCard, Skeleton, StatCard } from "@/components/console-primitives";
 import { ConsoleShell } from "@/components/console-shell";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -35,6 +35,7 @@ export default function UsersPage() {
   const [newChannelBaseUrl, setNewChannelBaseUrl] = React.useState("");
   const [newChannelApiKey, setNewChannelApiKey] = React.useState("");
   const [modelDraftByAgent, setModelDraftByAgent] = React.useState<Record<string, string>>({});
+  const [pendingActions, setPendingActions] = React.useState<Record<string, boolean>>({});
 
   const refreshUsers = React.useCallback(
     async (opts?: { preserveSelection?: boolean }) => {
@@ -60,8 +61,34 @@ export default function UsersPage() {
     [wsUrl],
   );
 
+  const setPendingAction = React.useCallback((key: string, nextValue: boolean) => {
+    setPendingActions((prev) => {
+      if (nextValue) {
+        return { ...prev, [key]: true };
+      }
+      if (!prev[key]) return prev;
+      const next = { ...prev };
+      delete next[key];
+      return next;
+    });
+  }, []);
+
+  const updateUserSummary = React.useCallback((userId: number, updater: (user: AdminUserSummary) => AdminUserSummary) => {
+    setUsers((prev) => prev.map((user) => (user.userId === userId ? updater(user) : user)));
+  }, []);
+
+  const updateUserDetail = React.useCallback(
+    (userId: number, updater: (value: AdminUserDetailResponse) => AdminUserDetailResponse) => {
+      setDetail((prev) => {
+        if (!prev || prev.user.userId !== userId) return prev;
+        return updater(prev);
+      });
+    },
+    [],
+  );
+
   const refreshDetail = React.useCallback(
-    async (userId: number | null) => {
+    async (userId: number | null, opts?: { keepVisible?: boolean }) => {
       if (!userId || userId <= 0) {
         setDetail(null);
         setDetailError(null);
@@ -69,6 +96,9 @@ export default function UsersPage() {
       }
       setDetailBusy(true);
       setDetailError(null);
+      if (!opts?.keepVisible) {
+        setDetail(null);
+      }
       try {
         const response = await fetchAdminUserDetail(wsUrl, userId);
         setDetail(response);
@@ -89,6 +119,28 @@ export default function UsersPage() {
     [wsUrl],
   );
 
+  const selectUser = React.useCallback(
+    (userId: number) => {
+      if (selectedUserId === userId && detail?.user.userId === userId) {
+        return;
+      }
+      setSelectedUserId(userId);
+      setDetailError(null);
+      setDetailBusy(true);
+      setDetail(null);
+    },
+    [detail, selectedUserId],
+  );
+
+  const getFallbackChannel = React.useCallback((channels: AdminChannelEntry[]) => {
+    return (
+      channels.find((channel) => channel.ready && channel.enabledForUser !== false && channel.channelId !== "gateway") ??
+      channels.find((channel) => channel.ready && channel.enabledForUser !== false) ??
+      channels[0] ??
+      null
+    );
+  }, []);
+
   React.useEffect(() => {
     if (!wsUrl.trim()) return;
     const run = async () => {
@@ -101,7 +153,7 @@ export default function UsersPage() {
   React.useEffect(() => {
     const run = async () => {
       await Promise.resolve();
-      await refreshDetail(selectedUserId);
+      await refreshDetail(selectedUserId, { keepVisible: false });
     };
     void run();
   }, [selectedUserId, refreshDetail]);
@@ -119,9 +171,8 @@ export default function UsersPage() {
       });
       toast.success(`User ${userId} initialized`);
       setBootstrapUserId("");
-      setSelectedUserId(userId);
+      selectUser(userId);
       await refreshUsers({ preserveSelection: true });
-      await refreshDetail(userId);
     } catch (error) {
       toast.error((error as Error)?.message || String(error));
     }
@@ -143,8 +194,10 @@ export default function UsersPage() {
       });
       toast.success("Agent created");
       setNewAgentName("");
-      await refreshUsers({ preserveSelection: true });
-      await refreshDetail(selectedUserId);
+      await Promise.all([
+        refreshUsers({ preserveSelection: true }),
+        refreshDetail(selectedUserId, { keepVisible: true }),
+      ]);
     } catch (error) {
       toast.error((error as Error)?.message || String(error));
     }
@@ -160,8 +213,10 @@ export default function UsersPage() {
         body: JSON.stringify({ newName: nextName.trim() }),
       });
       toast.success("Agent renamed");
-      await refreshUsers({ preserveSelection: true });
-      await refreshDetail(selectedUserId);
+      await Promise.all([
+        refreshUsers({ preserveSelection: true }),
+        refreshDetail(selectedUserId, { keepVisible: true }),
+      ]);
     } catch (error) {
       toast.error((error as Error)?.message || String(error));
     }
@@ -169,15 +224,42 @@ export default function UsersPage() {
 
   async function activateAgent(agent: AdminAgentEntry): Promise<void> {
     if (!selectedUserId) return;
+    const actionKey = `agent-use:${agent.agentId}`;
+    const previousUsers = users;
+    const previousDetail = detail;
+    const nextModel = modelDraftByAgent[agent.agentId]?.trim() || agent.model || detail?.user.currentModel || null;
+    const nextSessionId = agent.sessionId || detail?.user.currentSessionId || null;
+    setPendingAction(actionKey, true);
+    updateUserSummary(selectedUserId, (user) => ({
+      ...user,
+      currentAgentId: agent.agentId,
+      currentSessionId: nextSessionId,
+      currentModel: nextModel,
+    }));
+    updateUserDetail(selectedUserId, (current) => ({
+      ...current,
+      user: {
+        ...current.user,
+        currentAgentId: agent.agentId,
+        currentSessionId: nextSessionId,
+        currentModel: nextModel,
+      },
+    }));
     try {
       await gatewayFetchJson(wsUrl, `/admin/users/${selectedUserId}/agents/${encodeURIComponent(agent.agentId)}/use`, {
         method: "POST",
       });
       toast.success("Current agent updated");
-      await refreshUsers({ preserveSelection: true });
-      await refreshDetail(selectedUserId);
+      await Promise.all([
+        refreshUsers({ preserveSelection: true }),
+        refreshDetail(selectedUserId, { keepVisible: true }),
+      ]);
     } catch (error) {
+      setUsers(previousUsers);
+      setDetail(previousDetail);
       toast.error((error as Error)?.message || String(error));
+    } finally {
+      setPendingAction(actionKey, false);
     }
   }
 
@@ -189,8 +271,10 @@ export default function UsersPage() {
         method: "DELETE",
       });
       toast.success("Agent deleted");
-      await refreshUsers({ preserveSelection: true });
-      await refreshDetail(selectedUserId);
+      await Promise.all([
+        refreshUsers({ preserveSelection: true }),
+        refreshDetail(selectedUserId, { keepVisible: true }),
+      ]);
     } catch (error) {
       toast.error((error as Error)?.message || String(error));
     }
@@ -209,8 +293,10 @@ export default function UsersPage() {
         body: JSON.stringify({ model }),
       });
       toast.success("Model updated");
-      await refreshUsers({ preserveSelection: true });
-      await refreshDetail(selectedUserId);
+      await Promise.all([
+        refreshUsers({ preserveSelection: true }),
+        refreshDetail(selectedUserId, { keepVisible: true }),
+      ]);
     } catch (error) {
       toast.error((error as Error)?.message || String(error));
     }
@@ -238,8 +324,10 @@ export default function UsersPage() {
       setNewChannelName("");
       setNewChannelBaseUrl("");
       setNewChannelApiKey("");
-      await refreshUsers({ preserveSelection: true });
-      await refreshDetail(selectedUserId);
+      await Promise.all([
+        refreshUsers({ preserveSelection: true }),
+        refreshDetail(selectedUserId, { keepVisible: true }),
+      ]);
     } catch (error) {
       toast.error((error as Error)?.message || String(error));
     }
@@ -247,6 +335,32 @@ export default function UsersPage() {
 
   async function selectChannel(channel: AdminChannelEntry): Promise<void> {
     if (!selectedUserId) return;
+    const actionKey = `channel-select:${channel.channelId}`;
+    const previousUsers = users;
+    const previousDetail = detail;
+    setPendingAction(actionKey, true);
+    updateUserSummary(selectedUserId, (user) => ({
+      ...user,
+      currentChannelId: channel.channelId,
+      currentChannel: { ...(channel as AdminChannelEntry), selected: true },
+    }));
+    updateUserDetail(selectedUserId, (current) => ({
+      ...current,
+      user: {
+        ...current.user,
+        currentChannelId: channel.channelId,
+        currentChannel: { ...(channel as AdminChannelEntry), selected: true },
+      },
+      channels: {
+        ...current.channels,
+        currentChannelId: channel.channelId,
+        currentChannel: { ...(channel as AdminChannelEntry), selected: true },
+        channels: current.channels.channels.map((entry) => ({
+          ...entry,
+          selected: entry.channelId === channel.channelId,
+        })),
+      },
+    }));
     try {
       await gatewayFetchJson(
         wsUrl,
@@ -254,10 +368,16 @@ export default function UsersPage() {
         { method: "POST" },
       );
       toast.success("Channel selected");
-      await refreshUsers({ preserveSelection: true });
-      await refreshDetail(selectedUserId);
+      await Promise.all([
+        refreshUsers({ preserveSelection: true }),
+        refreshDetail(selectedUserId, { keepVisible: true }),
+      ]);
     } catch (error) {
+      setUsers(previousUsers);
+      setDetail(previousDetail);
       toast.error((error as Error)?.message || String(error));
+    } finally {
+      setPendingAction(actionKey, false);
     }
   }
 
@@ -275,8 +395,10 @@ export default function UsersPage() {
         },
       );
       toast.success("Channel renamed");
-      await refreshUsers({ preserveSelection: true });
-      await refreshDetail(selectedUserId);
+      await Promise.all([
+        refreshUsers({ preserveSelection: true }),
+        refreshDetail(selectedUserId, { keepVisible: true }),
+      ]);
     } catch (error) {
       toast.error((error as Error)?.message || String(error));
     }
@@ -292,8 +414,10 @@ export default function UsersPage() {
         { method: "DELETE" },
       );
       toast.success("Channel deleted");
-      await refreshUsers({ preserveSelection: true });
-      await refreshDetail(selectedUserId);
+      await Promise.all([
+        refreshUsers({ preserveSelection: true }),
+        refreshDetail(selectedUserId, { keepVisible: true }),
+      ]);
     } catch (error) {
       toast.error((error as Error)?.message || String(error));
     }
@@ -313,8 +437,10 @@ export default function UsersPage() {
         },
       );
       toast.success("Key updated");
-      await refreshUsers({ preserveSelection: true });
-      await refreshDetail(selectedUserId);
+      await Promise.all([
+        refreshUsers({ preserveSelection: true }),
+        refreshDetail(selectedUserId, { keepVisible: true }),
+      ]);
     } catch (error) {
       toast.error((error as Error)?.message || String(error));
     }
@@ -330,8 +456,10 @@ export default function UsersPage() {
         { method: "DELETE" },
       );
       toast.success("Key cleared");
-      await refreshUsers({ preserveSelection: true });
-      await refreshDetail(selectedUserId);
+      await Promise.all([
+        refreshUsers({ preserveSelection: true }),
+        refreshDetail(selectedUserId, { keepVisible: true }),
+      ]);
     } catch (error) {
       toast.error((error as Error)?.message || String(error));
     }
@@ -339,6 +467,75 @@ export default function UsersPage() {
 
   async function setBuiltinChannelAccess(channel: AdminChannelEntry, enabled: boolean): Promise<void> {
     if (!selectedUserId) return;
+    const actionKey = `channel-access:${channel.channelId}`;
+    const previousUsers = users;
+    const previousDetail = detail;
+    const nextGatewayChannels =
+      previousDetail?.user.userId === selectedUserId
+        ? previousDetail.channels.channels.map((entry) =>
+            entry.channelId !== channel.channelId
+              ? entry
+              : {
+                  ...entry,
+                  enabledForUser: enabled,
+                  disabledByAdmin: !enabled,
+                  ready: enabled && Boolean(entry.hasApiKey),
+                  reason: enabled
+                    ? entry.hasApiKey
+                      ? null
+                      : "Gateway OPENAI_API_KEY is not configured"
+                    : "Disabled by admin",
+                },
+          )
+        : null;
+    const summaryFallbackChannel = nextGatewayChannels ? getFallbackChannel(nextGatewayChannels) : null;
+    setPendingAction(actionKey, true);
+    updateUserDetail(selectedUserId, (current) => {
+      const nextChannels = current.channels.channels.map((entry) =>
+        entry.channelId !== channel.channelId
+          ? entry
+          : {
+              ...entry,
+              enabledForUser: enabled,
+              disabledByAdmin: !enabled,
+              ready: enabled && Boolean(entry.hasApiKey),
+              reason: enabled ? (entry.hasApiKey ? null : entry.reason || "Gateway OPENAI_API_KEY is not configured") : "Disabled by admin",
+            },
+      );
+      const fallbackChannel = getFallbackChannel(nextChannels);
+      const isCurrent = current.user.currentChannelId === channel.channelId;
+      const nextCurrentChannel =
+        isCurrent && !enabled
+          ? fallbackChannel
+          : nextChannels.find((entry) => entry.channelId === current.user.currentChannelId) || fallbackChannel;
+      return {
+        ...current,
+        user: {
+          ...current.user,
+          currentChannelId: nextCurrentChannel?.channelId || current.user.currentChannelId,
+          currentChannel: nextCurrentChannel || current.user.currentChannel,
+        },
+        channels: {
+          ...current.channels,
+          currentChannelId: nextCurrentChannel?.channelId || current.channels.currentChannelId,
+          currentChannel: nextCurrentChannel || current.channels.currentChannel,
+          channels: nextChannels,
+        },
+      };
+    });
+    updateUserSummary(selectedUserId, (user) => {
+      const nextCurrentChannel =
+        user.currentChannelId === channel.channelId && !enabled
+          ? summaryFallbackChannel
+          : user.currentChannelId === channel.channelId
+            ? { ...(user.currentChannel || channel), enabledForUser: enabled, disabledByAdmin: !enabled }
+            : user.currentChannel;
+      return {
+        ...user,
+        currentChannelId: nextCurrentChannel?.channelId || user.currentChannelId,
+        currentChannel: nextCurrentChannel || user.currentChannel,
+      };
+    });
     try {
       await gatewayFetchJson(
         wsUrl,
@@ -353,10 +550,16 @@ export default function UsersPage() {
           ? `${channel.name || channel.channelId} enabled for this user`
           : `${channel.name || channel.channelId} blocked for this user`,
       );
-      await refreshUsers({ preserveSelection: true });
-      await refreshDetail(selectedUserId);
+      await Promise.all([
+        refreshUsers({ preserveSelection: true }),
+        refreshDetail(selectedUserId, { keepVisible: true }),
+      ]);
     } catch (error) {
+      setUsers(previousUsers);
+      setDetail(previousDetail);
       toast.error((error as Error)?.message || String(error));
+    } finally {
+      setPendingAction(actionKey, false);
     }
   }
 
@@ -366,6 +569,8 @@ export default function UsersPage() {
     const fromObjects = detail?.models?.map((item) => String(item.id || "").trim()).filter(Boolean) ?? [];
     return fromObjects;
   }, [detail]);
+
+  const showDetailSkeleton = Boolean(selectedUserId && detailBusy && !detail);
 
   return (
     <ConsoleShell
@@ -413,7 +618,7 @@ export default function UsersPage() {
                   <button
                     key={user.userId}
                     type="button"
-                    onClick={() => setSelectedUserId(user.userId)}
+                    onClick={() => selectUser(user.userId)}
                     className={cn(
                       "w-full rounded-[22px] border px-4 py-4 text-left transition-colors",
                       active
@@ -452,10 +657,8 @@ export default function UsersPage() {
             <PanelCard title="User detail" subtitle="Select a user to inspect agents, channels, and usage.">
               <EmptyState title="Nothing selected" body="Pick a user from the list on the left." />
             </PanelCard>
-          ) : detailBusy && !detail ? (
-            <PanelCard title="Loading user" subtitle={`Fetching ${selectedUserId}…`}>
-              <EmptyState title="Loading…" body="Fetching user detail and recent usage." />
-            </PanelCard>
+          ) : showDetailSkeleton ? (
+            <UserDetailSkeleton userId={selectedUserId} />
           ) : detailError ? (
             <PanelCard title="User detail" subtitle={`User ${selectedUserId}`}>
               <InlineError message={detailError} />
@@ -526,9 +729,14 @@ export default function UsersPage() {
                         </div>
 
                         <div className="flex flex-wrap gap-2">
-                          <Button type="button" variant="secondary" onClick={() => void activateAgent(agent)}>
+                          <Button
+                            type="button"
+                            variant="secondary"
+                            disabled={Boolean(pendingActions[`agent-use:${agent.agentId}`])}
+                            onClick={() => void activateAgent(agent)}
+                          >
                             <UserRoundCheck className="mr-2 h-4 w-4" />
-                            Use
+                            {pendingActions[`agent-use:${agent.agentId}`] ? "Switching…" : "Use"}
                           </Button>
                           <Button type="button" variant="secondary" onClick={() => void renameAgent(agent)}>
                             <Pencil className="mr-2 h-4 w-4" />
@@ -632,19 +840,24 @@ export default function UsersPage() {
                           <Button
                             type="button"
                             variant="secondary"
-                            disabled={channel.selected || !channel.ready}
+                            disabled={channel.selected || !channel.ready || Boolean(pendingActions[`channel-select:${channel.channelId}`])}
                             onClick={() => void selectChannel(channel)}
                           >
                             <RadioTower className="mr-2 h-4 w-4" />
-                            Select
+                            {pendingActions[`channel-select:${channel.channelId}`] ? "Switching…" : "Select"}
                           </Button>
                           {channel.canAdminToggleAccess ? (
                             <Button
                               type="button"
                               variant={channel.enabledForUser === false ? "secondary" : "destructive"}
+                              disabled={Boolean(pendingActions[`channel-access:${channel.channelId}`])}
                               onClick={() => void setBuiltinChannelAccess(channel, channel.enabledForUser === false)}
                             >
-                              {channel.enabledForUser === false ? "Enable gateway API" : "Block gateway API"}
+                              {pendingActions[`channel-access:${channel.channelId}`]
+                                ? "Saving…"
+                                : channel.enabledForUser === false
+                                  ? "Enable gateway API"
+                                  : "Block gateway API"}
                             </Button>
                           ) : null}
                           {channel.canRename ? (
@@ -730,5 +943,90 @@ export default function UsersPage() {
         </section>
       </div>
     </ConsoleShell>
+  );
+}
+
+function UserDetailSkeleton({ userId }: { userId: number }) {
+  return (
+    <>
+      <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-4">
+        {Array.from({ length: 4 }).map((_, index) => (
+          <div key={index} className="argus-metric-card rounded-[26px] p-5 md:p-6">
+            <Skeleton className="h-4 w-24 rounded-full" />
+            <Skeleton className="mt-4 h-10 w-32" />
+            <Skeleton className="mt-3 h-3 w-40" />
+          </div>
+        ))}
+      </div>
+
+      <PanelCard
+        eyebrow="Selected user"
+        title={`Loading user ${userId}`}
+        subtitle="Preparing agents, channels, and recent usage."
+        className="argus-data-grid"
+      >
+        <div className="grid gap-4 lg:grid-cols-2">
+          {Array.from({ length: 4 }).map((_, index) => (
+            <div
+              key={index}
+              className="rounded-[22px] border border-border/60 bg-background/30 px-4 py-3.5 shadow-[inset_0_1px_0_0_oklch(var(--foreground)/0.04)]"
+            >
+              <Skeleton className="h-3 w-24 rounded-full" />
+              <Skeleton className="mt-3 h-5 w-40" />
+            </div>
+          ))}
+        </div>
+      </PanelCard>
+
+      <PanelCard eyebrow="Agent fleet" title="Agents" subtitle="Loading agent bindings and model defaults.">
+        <div className="grid gap-3">
+          {Array.from({ length: 2 }).map((_, index) => (
+            <div
+              key={index}
+              className="rounded-[24px] border border-border/60 bg-background/30 p-4 shadow-[inset_0_1px_0_0_oklch(var(--foreground)/0.04)]"
+            >
+              <Skeleton className="h-5 w-40" />
+              <Skeleton className="mt-3 h-3 w-56" />
+              <div className="mt-4 flex flex-col gap-2 md:flex-row">
+                <Skeleton className="h-11 min-w-[220px]" />
+                <Skeleton className="h-11 w-32" />
+              </div>
+            </div>
+          ))}
+        </div>
+      </PanelCard>
+
+      <PanelCard eyebrow="Upstreams" title="Channels" subtitle="Loading channel readiness and access policy.">
+        <div className="grid gap-3">
+          {Array.from({ length: 3 }).map((_, index) => (
+            <div
+              key={index}
+              className="rounded-[24px] border border-border/60 bg-background/30 p-4 shadow-[inset_0_1px_0_0_oklch(var(--foreground)/0.04)]"
+            >
+              <Skeleton className="h-5 w-32" />
+              <Skeleton className="mt-3 h-3 w-64" />
+              <div className="mt-4 flex flex-wrap gap-2">
+                <Skeleton className="h-10 w-24" />
+                <Skeleton className="h-10 w-36" />
+              </div>
+            </div>
+          ))}
+        </div>
+      </PanelCard>
+
+      <PanelCard eyebrow="Ledger" title="Recent usage" subtitle="Loading the latest Requests API events for this user.">
+        <div className="space-y-3">
+          {Array.from({ length: 6 }).map((_, index) => (
+            <div key={index} className="grid gap-3 rounded-[22px] border border-border/60 bg-background/30 px-4 py-4 md:grid-cols-[1.1fr_0.9fr_0.9fr_1fr_0.6fr]">
+              <Skeleton className="h-4 w-full" />
+              <Skeleton className="h-4 w-full" />
+              <Skeleton className="h-4 w-full" />
+              <Skeleton className="h-4 w-full" />
+              <Skeleton className="h-4 w-20" />
+            </div>
+          ))}
+        </div>
+      </PanelCard>
+    </>
   );
 }

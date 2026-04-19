@@ -4,7 +4,7 @@ import React from "react";
 import { CheckCircle2, RefreshCw, XCircle } from "lucide-react";
 import { toast } from "sonner";
 
-import { EmptyState, Fact, InlineError, PanelCard, StatCard } from "@/components/console-primitives";
+import { EmptyState, Fact, InlineError, PanelCard, Skeleton, StatCard } from "@/components/console-primitives";
 import { ConsoleShell } from "@/components/console-shell";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -23,6 +23,7 @@ export default function SettingsPage() {
   const [health, setHealth] = React.useState<GatewayHealth | null>(null);
   const [loading, setLoading] = React.useState(false);
   const [error, setError] = React.useState<string | null>(null);
+  const showSkeleton = loading && !overview && !health;
 
   const refresh = React.useCallback(async () => {
     if (!wsUrl.trim()) return;
@@ -79,16 +80,28 @@ export default function SettingsPage() {
 
       <div className="grid gap-6 xl:grid-cols-[1.15fr_0.85fr]">
         <section className="space-y-6">
-          <div className="grid gap-4 md:grid-cols-3">
-            <StatCard
-              label="Gateway health"
-              value={health?.ok ? "Healthy" : "Unknown"}
-              tone={health?.ok ? "primary" : "default"}
-              hint={health?.ok ? "Public health probe is returning ok." : "The browser has not observed a healthy response yet."}
-            />
-            <StatCard label="Tracked users" value={formatInt(overview?.totals.userCount)} hint="Users currently visible to the operator console." />
-            <StatCard label="Live sessions" value={formatInt(overview?.totals.sessionCount)} hint="Current runtime sessions on the connected gateway." />
-          </div>
+          {showSkeleton ? (
+            <div className="grid gap-4 md:grid-cols-3">
+              {Array.from({ length: 3 }).map((_, index) => (
+                <div key={index} className="argus-metric-card rounded-[26px] p-5 md:p-6">
+                  <Skeleton className="h-4 w-24 rounded-full" />
+                  <Skeleton className="mt-4 h-10 w-32" />
+                  <Skeleton className="mt-3 h-3 w-40" />
+                </div>
+              ))}
+            </div>
+          ) : (
+            <div className="grid gap-4 md:grid-cols-3">
+              <StatCard
+                label="Gateway health"
+                value={health?.ok ? "Healthy" : "Unknown"}
+                tone={health?.ok ? "primary" : "default"}
+                hint={health?.ok ? "Public health probe is returning ok." : "The browser has not observed a healthy response yet."}
+              />
+              <StatCard label="Tracked users" value={formatInt(overview?.totals.userCount)} hint="Users currently visible to the operator console." />
+              <StatCard label="Live sessions" value={formatInt(overview?.totals.sessionCount)} hint="Current runtime sessions on the connected gateway." />
+            </div>
+          )}
 
           <PanelCard
             eyebrow="Connection state"
@@ -96,12 +109,26 @@ export default function SettingsPage() {
             subtitle="This browser stores the shared gateway WebSocket URL in localStorage and reuses it across the operator console."
             className="argus-data-grid"
           >
-            <div className="grid gap-4 lg:grid-cols-2">
-              <Fact label="Saved WebSocket URL" value={wsUrl || "not configured"} mono />
-              <Fact label="Gateway version" value={overview?.version || "unknown"} />
-              <Fact label="Auth model" value="Admin bearer token stored in the browser and attached automatically" />
-              <Fact label="Health probe" value={health?.ok ? "GET /healthz returned ok" : "No healthy response yet"} />
-            </div>
+            {showSkeleton ? (
+              <div className="grid gap-4 lg:grid-cols-2">
+                {Array.from({ length: 4 }).map((_, index) => (
+                  <div
+                    key={index}
+                    className="rounded-[22px] border border-border/60 bg-background/30 px-4 py-3.5 shadow-[inset_0_1px_0_0_oklch(var(--foreground)/0.04)]"
+                  >
+                    <Skeleton className="h-3 w-24 rounded-full" />
+                    <Skeleton className="mt-3 h-5 w-full" />
+                  </div>
+                ))}
+              </div>
+            ) : (
+              <div className="grid gap-4 lg:grid-cols-2">
+                <Fact label="Saved WebSocket URL" value={wsUrl || "not configured"} mono />
+                <Fact label="Gateway version" value={overview?.version || "unknown"} />
+                <Fact label="Auth model" value="Admin bearer token stored in the browser and attached automatically" />
+                <Fact label="Health probe" value={health?.ok ? "GET /healthz returned ok" : "No healthy response yet"} />
+              </div>
+            )}
           </PanelCard>
 
           <PanelCard eyebrow="Runbook" title="Operator notes" subtitle="This page documents what the refactored console assumes about the Argus control plane.">
@@ -136,7 +163,19 @@ export default function SettingsPage() {
           </PanelCard>
 
           <PanelCard eyebrow="Current deploy" title="Current state" subtitle="The current deploy should expose web, gateway, runtime, and Telegram bot behind one project.">
-            {overview ? (
+            {showSkeleton ? (
+              <div className="grid gap-4">
+                {Array.from({ length: 3 }).map((_, index) => (
+                  <div
+                    key={index}
+                    className="rounded-[22px] border border-border/60 bg-background/30 px-4 py-3.5 shadow-[inset_0_1px_0_0_oklch(var(--foreground)/0.04)]"
+                  >
+                    <Skeleton className="h-3 w-24 rounded-full" />
+                    <Skeleton className="mt-3 h-5 w-40" />
+                  </div>
+                ))}
+              </div>
+            ) : overview ? (
               <div className="grid gap-4">
                 <Fact label="Tracked agents" value={formatInt(overview.totals.agentCount)} />
                 <Fact label="Channels" value={formatInt(overview.totals.channelCount)} />
