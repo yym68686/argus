@@ -8,6 +8,7 @@ import json
 import logging
 import os
 import re
+import shlex
 import sqlite3
 import threading
 import time
@@ -24,7 +25,7 @@ from typing import Any, Awaitable, Callable, Optional
 import requests
 from fastapi import Body, FastAPI, HTTPException, Request, Response, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, PlainTextResponse, StreamingResponse
+from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse, StreamingResponse
 from starlette.websockets import WebSocketState
 
 from croniter import croniter
@@ -116,6 +117,12 @@ HOST_AGENT_ENROLL_TOKEN_PREFIX = "argus-host-enroll-v1"
 HOST_AGENT_DEVICE_TOKEN_PREFIX = "argus-host-agent-v1"
 DEFAULT_HOST_AGENT_ENROLL_TTL_S = 15 * 60
 MAX_HOST_AGENT_ENROLL_TTL_S = 7 * 24 * 60 * 60
+HOST_AGENT_BINARY_TARGETS: dict[str, dict[str, str]] = {
+    "darwin-amd64": {"filename": "argus-darwin-amd64", "download_name": "argus"},
+    "darwin-arm64": {"filename": "argus-darwin-arm64", "download_name": "argus"},
+    "windows-amd64": {"filename": "argus-windows-amd64.exe", "download_name": "argus.exe"},
+    "windows-arm64": {"filename": "argus-windows-arm64.exe", "download_name": "argus.exe"},
+}
 
 
 def _event_iso_now() -> str:
@@ -319,6 +326,149 @@ def _public_gateway_base_url() -> str:
     if not raw:
         raise RuntimeError("ARGUS_PUBLIC_BASE_URL is required for native runtime sessions")
     return raw
+
+
+def _host_agent_dist_dir() -> Path:
+    raw = (os.getenv("ARGUS_HOST_AGENT_DIST_DIR") or "").strip()
+    return Path(raw) if raw else Path("/app/host-agent-dist")
+
+
+def _normalize_host_agent_download_target(raw: Any) -> str:
+    value = str(raw or "").strip().lower().replace("_", "-")
+    aliases = {
+        "mac": "darwin-arm64",
+        "macos": "darwin-arm64",
+        "darwin": "darwin-arm64",
+        "darwin-x64": "darwin-amd64",
+        "darwin-x86-64": "darwin-amd64",
+        "darwin-amd64": "darwin-amd64",
+        "darwin-arm64": "darwin-arm64",
+        "windows": "windows-amd64",
+        "windows-x64": "windows-amd64",
+        "windows-x86-64": "windows-amd64",
+        "windows-amd64": "windows-amd64",
+        "windows-arm64": "windows-arm64",
+        "win": "windows-amd64",
+        "win32": "windows-amd64",
+        "win64": "windows-amd64",
+    }
+    return aliases.get(value, value if value in HOST_AGENT_BINARY_TARGETS else "")
+
+
+def _host_agent_binary_spec(target: Any) -> Optional[dict[str, str]]:
+    normalized = _normalize_host_agent_download_target(target)
+    spec = HOST_AGENT_BINARY_TARGETS.get(normalized)
+    return dict(spec) if isinstance(spec, dict) else None
+
+
+def _host_agent_binary_path(target: Any) -> Optional[Path]:
+    spec = _host_agent_binary_spec(target)
+    if spec is None:
+        return None
+    path = (_host_agent_dist_dir() / spec["filename"]).resolve()
+    try:
+        if not path.is_file():
+            return None
+    except OSError:
+        return None
+    return path
+
+
+def _shell_quote(raw: str) -> str:
+    return shlex.quote(str(raw))
+
+
+def _powershell_quote(raw: str) -> str:
+    return "'" + str(raw).replace("'", "''") + "'"
+
+
+def _render_host_agent_install_sh(enroll_token: str) -> str:
+    gateway_base = _public_gateway_base_url()
+    return f"""#!/usr/bin/env bash
+set -euo pipefail
+
+ARGUS_GATEWAY_BASE={_shell_quote(gateway_base)}
+ARGUS_ENROLL_TOKEN={_shell_quote(enroll_token)}
+
+ARCH="$(uname -m 2>/dev/null || echo unknown)"
+case "$ARCH" in
+  arm64|aarch64)
+    TARGET="darwin-arm64"
+    ;;
+  x86_64|amd64)
+    TARGET="darwin-amd64"
+    ;;
+  *)
+    echo "Unsupported macOS architecture: $ARCH" >&2
+    exit 1
+    ;;
+esac
+
+BIN_DIR="${{HOME}}/.argus/bin"
+BIN_PATH="${{BIN_DIR}}/argus"
+DESKTOP_DIR="${{HOME}}/Desktop"
+
+mkdir -p "$BIN_DIR" "$DESKTOP_DIR"
+curl -fsSL "${{ARGUS_GATEWAY_BASE}}/host-agent/download/${{TARGET}}" -o "$BIN_PATH"
+chmod +x "$BIN_PATH"
+
+if ! command -v codex >/dev/null 2>&1; then
+  if command -v npm >/dev/null 2>&1; then
+    npm i -g @openai/codex
+  else
+    echo "codex is not installed and npm is not available" >&2
+    exit 1
+  fi
+fi
+
+exec "$BIN_PATH" connect --gateway "$ARGUS_GATEWAY_BASE" --enroll-token "$ARGUS_ENROLL_TOKEN" --workspace-base "$DESKTOP_DIR"
+"""
+
+
+def _render_host_agent_install_ps1(enroll_token: str) -> str:
+    gateway_base = _public_gateway_base_url()
+    return f"""$ErrorActionPreference = "Stop"
+
+$GatewayBaseUrl = {_powershell_quote(gateway_base)}
+$EnrollToken = {_powershell_quote(enroll_token)}
+
+$Arch = $env:PROCESSOR_ARCHITECTURE
+if ([string]::IsNullOrWhiteSpace($Arch)) {{
+  $Arch = [System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture.ToString()
+}}
+
+switch -Regex ($Arch.ToUpperInvariant()) {{
+  "ARM64|AARCH64" {{ $Target = "windows-arm64" }}
+  "AMD64|X64|X86_64" {{ $Target = "windows-amd64" }}
+  default {{ throw "Unsupported Windows architecture: $Arch" }}
+}}
+
+$BinDir = Join-Path $HOME ".argus\\bin"
+$BinPath = Join-Path $BinDir "argus.exe"
+$DesktopDir = [Environment]::GetFolderPath("Desktop")
+if ([string]::IsNullOrWhiteSpace($DesktopDir)) {{
+  $DesktopDir = Join-Path $HOME "Desktop"
+}}
+
+New-Item -ItemType Directory -Force -Path $BinDir | Out-Null
+if (-not (Test-Path $DesktopDir)) {{
+  New-Item -ItemType Directory -Force -Path $DesktopDir | Out-Null
+}}
+
+Invoke-WebRequest -UseBasicParsing -Uri "$GatewayBaseUrl/host-agent/download/$Target" -OutFile $BinPath
+
+$Codex = Get-Command codex -ErrorAction SilentlyContinue
+if (-not $Codex) {{
+  $Npm = Get-Command npm -ErrorAction SilentlyContinue
+  if (-not $Npm) {{
+    throw "codex is not installed and npm is not available"
+  }}
+  & $Npm.Source install -g @openai/codex
+}}
+
+& $BinPath connect --gateway $GatewayBaseUrl --enroll-token $EnrollToken --workspace-base $DesktopDir
+exit $LASTEXITCODE
+"""
 
 
 def _default_native_workspace_path(session_id: str) -> Optional[str]:
@@ -16468,6 +16618,41 @@ async def host_agent_enroll_token(request: Request):
         "expiresAtMs": pending.expires_at_ms,
         "command": command,
     }
+
+
+@app.get("/host-agent/download/{target}")
+async def host_agent_download_binary(target: str):
+    spec = _host_agent_binary_spec(target)
+    if spec is None:
+        raise HTTPException(status_code=404, detail="Unknown host-agent target")
+    path = _host_agent_binary_path(target)
+    if path is None:
+        raise HTTPException(status_code=503, detail="Host-agent binary is not available on this gateway")
+    return FileResponse(path, media_type="application/octet-stream", filename=spec["download_name"])
+
+
+@app.get("/host-agent/install.sh")
+async def host_agent_install_sh(token: Optional[str] = None):
+    enroll_token = str(token or "").strip()
+    if not enroll_token:
+        raise HTTPException(status_code=400, detail="Missing 'token'")
+    return PlainTextResponse(
+        _render_host_agent_install_sh(enroll_token),
+        media_type="text/x-shellscript",
+        headers={"Cache-Control": "no-store, max-age=0"},
+    )
+
+
+@app.get("/host-agent/install.ps1")
+async def host_agent_install_ps1(token: Optional[str] = None):
+    enroll_token = str(token or "").strip()
+    if not enroll_token:
+        raise HTTPException(status_code=400, detail="Missing 'token'")
+    return PlainTextResponse(
+        _render_host_agent_install_ps1(enroll_token),
+        media_type="text/plain",
+        headers={"Cache-Control": "no-store, max-age=0"},
+    )
 
 
 @app.post("/host-agent/claim")

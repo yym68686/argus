@@ -2,7 +2,13 @@ FROM golang:1.26-trixie AS node-host-builder
 
 WORKDIR /src/apps/node-host
 COPY apps/node-host/ ./
-RUN CGO_ENABLED=0 go build -trimpath -ldflags "-s -w" -o /out/argus ./cmd/argus
+RUN set -eu; \
+    mkdir -p /out/host-agent-dist; \
+    CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -ldflags "-s -w" -o /out/argus ./cmd/argus; \
+    CGO_ENABLED=0 GOOS=darwin GOARCH=amd64 go build -trimpath -ldflags "-s -w" -o /out/host-agent-dist/argus-darwin-amd64 ./cmd/argus; \
+    CGO_ENABLED=0 GOOS=darwin GOARCH=arm64 go build -trimpath -ldflags "-s -w" -o /out/host-agent-dist/argus-darwin-arm64 ./cmd/argus; \
+    CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build -trimpath -ldflags "-s -w" -o /out/host-agent-dist/argus-windows-amd64.exe ./cmd/argus; \
+    CGO_ENABLED=0 GOOS=windows GOARCH=arm64 go build -trimpath -ldflags "-s -w" -o /out/host-agent-dist/argus-windows-arm64.exe ./cmd/argus
 
 FROM node:22-trixie-slim
 
@@ -34,8 +40,9 @@ COPY docs/templates /app/docs/templates
 COPY run_app_server.sh /app/run_app_server.sh
 RUN chmod +x /app/run_app_server.sh
 
-RUN mkdir -p /app/node-host
+RUN mkdir -p /app/node-host /app/host-agent-dist
 COPY --from=node-host-builder /out/argus /app/node-host/argus
+COPY --from=node-host-builder /out/host-agent-dist/ /app/host-agent-dist/
 
 WORKDIR /workspace
 

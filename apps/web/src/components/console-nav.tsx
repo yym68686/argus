@@ -2,7 +2,7 @@
 
 import Link from "next/link";
 import { usePathname } from "next/navigation";
-import { Gauge, MessagesSquare, RadioTower, Settings2, Users2 } from "lucide-react";
+import { Gauge, KeyRound, MessagesSquare, RadioTower, Settings2, Users2 } from "lucide-react";
 
 import { cn } from "@/lib/utils";
 
@@ -10,6 +10,7 @@ const NAV_ITEMS = [
   { href: "/", label: "Workbench", icon: MessagesSquare },
   { href: "/users", label: "Users", icon: Users2 },
   { href: "/usage", label: "Usage", icon: Gauge },
+  { href: "/api-keys", label: "API Key", icon: KeyRound },
   { href: "/nodes", label: "Nodes", icon: RadioTower },
   { href: "/settings", label: "Settings", icon: Settings2 },
 ];

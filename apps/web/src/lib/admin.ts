@@ -142,6 +142,43 @@ export interface AdminUsageResponse {
   events: UsageEventEntry[];
 }
 
+export interface HostAgentEnrollTokenResponse {
+  ok: true;
+  token: string;
+  tokenId: string;
+  hostIdHint?: string | null;
+  scopeType?: string | null;
+  scopeId?: string | null;
+  workspaceBasePath?: string | null;
+  expiresAtMs?: number | null;
+  command?: string | null;
+}
+
+export interface HostAgentSummary {
+  hostId: string;
+  displayName?: string | null;
+  platform?: string | null;
+  version?: string | null;
+  tokenPreview?: string | null;
+  claimed?: boolean;
+  connected?: boolean;
+  runtimeConnected?: boolean;
+  nodeConnected?: boolean;
+  workspaceBasePath?: string | null;
+  codexProfileMode?: string | null;
+  createdAtMs?: number | null;
+  updatedAtMs?: number | null;
+  claimedAtMs?: number | null;
+  revokedAtMs?: number | null;
+  lastConnectedAtMs?: number | null;
+  lastSeenAtMs?: number | null;
+  lastDisconnectedAtMs?: number | null;
+}
+
+export interface HostAgentListResponse {
+  hosts: HostAgentSummary[];
+}
+
 export async function fetchAdminOverview(wsUrl: string): Promise<AdminOverviewResponse> {
   return gatewayFetchJson<AdminOverviewResponse>(wsUrl, "/admin/overview");
 }
@@ -157,4 +194,25 @@ export async function fetchAdminUserDetail(wsUrl: string, userId: number): Promi
 export async function fetchAdminUsage(wsUrl: string, query?: URLSearchParams): Promise<AdminUsageResponse> {
   const suffix = query && query.toString() ? `?${query.toString()}` : "";
   return gatewayFetchJson<AdminUsageResponse>(wsUrl, `/admin/usage${suffix}`);
+}
+
+export async function issueHostAgentEnrollToken(
+  wsUrl: string,
+  body: {
+    ttlSec?: number;
+    hostId?: string;
+    hostIdHint?: string;
+    scopeType?: string;
+    scopeId?: string;
+    workspaceBasePath?: string;
+  }
+): Promise<HostAgentEnrollTokenResponse> {
+  return gatewayFetchJson<HostAgentEnrollTokenResponse>(wsUrl, "/host-agent/enroll-token", {
+    method: "POST",
+    body: JSON.stringify(body),
+  });
+}
+
+export async function fetchHostAgents(wsUrl: string): Promise<HostAgentListResponse> {
+  return gatewayFetchJson<HostAgentListResponse>(wsUrl, "/host-agents");
 }
