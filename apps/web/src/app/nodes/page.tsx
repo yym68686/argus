@@ -98,7 +98,8 @@ export default function NodesPage() {
 
   const [loading, setLoading] = React.useState(false);
   const [nodes, setNodes] = React.useState<NodeInfo[]>([]);
-  const [error, setError] = React.useState<string | null>(null);
+  const [inventoryError, setInventoryError] = React.useState<string | null>(null);
+  const [invokeError, setInvokeError] = React.useState<string | null>(null);
 
   const [nodePick, setNodePick] = React.useState<string>("");
   const [command, setCommand] = React.useState<string>("system.run");
@@ -136,7 +137,7 @@ export default function NodesPage() {
 
   async function refreshNodes(): Promise<void> {
     setLoading(true);
-    setError(null);
+    setInventoryError(null);
     try {
       const url = nodeApiUrl(effectiveHttpBase, "");
       if (effectiveToken) url.searchParams.set("token", effectiveToken);
@@ -148,7 +149,7 @@ export default function NodesPage() {
       setNodes(nextNodes);
       if (!nodePick && nextNodes.length) setNodePick(nextNodes[0].nodeId);
     } catch (event) {
-      setError((event as Error)?.message || String(event));
+      setInventoryError((event as Error)?.message || String(event));
     } finally {
       setLoading(false);
     }
@@ -156,19 +157,19 @@ export default function NodesPage() {
 
   async function invokeRequest(nextCommand: string, nextParams: unknown): Promise<void> {
     setInvokeOut("");
-    setError(null);
+    setInvokeError(null);
     setCommand(nextCommand);
 
     const trimmedCommand = nextCommand.trim();
     if (!trimmedCommand) {
-      setError("Command is required");
+      setInvokeError("Command is required");
       return;
     }
 
     const body: Record<string, unknown> = {
       node: nodePick,
       command: trimmedCommand,
-      params: nextParams
+      params: nextParams,
     };
     const timeoutNum = Number(timeoutMs);
     if (Number.isFinite(timeoutNum)) {
@@ -182,7 +183,7 @@ export default function NodesPage() {
       const res = await fetch(url.toString(), {
         method: "POST",
         headers: { "content-type": "application/json" },
-        body: JSON.stringify(body)
+        body: JSON.stringify(body),
       });
       const text = await res.text();
       setInvokeOut(text);
@@ -194,7 +195,7 @@ export default function NodesPage() {
 
       if (!res.ok) throw new Error(summarizeHttpFailure(res, text, "Node invoke request"));
     } catch (event) {
-      setError((event as Error)?.message || String(event));
+      setInvokeError((event as Error)?.message || String(event));
     } finally {
       setLoading(false);
     }
@@ -203,7 +204,7 @@ export default function NodesPage() {
   async function invoke(): Promise<void> {
     const parsedParams = safeParseJson(paramsText);
     if (paramsText.trim() && parsedParams === null) {
-      setError("Params must be valid JSON");
+      setInvokeError("Params must be valid JSON");
       return;
     }
     await invokeRequest(command, paramsText.trim() ? parsedParams : null);
@@ -212,7 +213,7 @@ export default function NodesPage() {
   async function invokeForJob(nextCommand: string, extraParams?: Record<string, unknown>): Promise<void> {
     const trimmedJobId = jobId.trim();
     if (!trimmedJobId) {
-      setError("jobId is required");
+      setInvokeError("jobId is required");
       return;
     }
     await invokeRequest(nextCommand, { jobId: trimmedJobId, ...(extraParams ?? {}) });
@@ -241,8 +242,6 @@ export default function NodesPage() {
         </div>
       }
     >
-      {error ? <InlineError message={error} /> : null}
-
       <div className="grid gap-4 xl:grid-cols-[320px_minmax(0,1fr)]">
         <section className="space-y-4">
           <PanelCard
@@ -250,7 +249,8 @@ export default function NodesPage() {
             title="Connected nodes"
             subtitle={nodes.length ? `${nodes.length} node-host peers are currently visible.` : "No node-host peers are currently visible."}
           >
-            {nodes.length ? (
+            {inventoryError ? <InlineError message={inventoryError} /> : null}
+            {inventoryError && !nodes.length ? null : nodes.length ? (
               <div className="space-y-2">
                 {nodes.map((node) => (
                   <button
@@ -297,6 +297,8 @@ export default function NodesPage() {
                 <Fact label="Last seen" value={formatStamp(selected.lastSeenMs)} />
                 <Fact label="Commands" value={String((selected.commands || []).length)} />
               </div>
+            ) : inventoryError ? (
+              <EmptyState title="Inventory unavailable" body="Refresh once the gateway node API is responding again." />
             ) : (
               <EmptyState title="Nothing selected" body="Pick a node from the inventory to inspect metadata and target commands." />
             )}
@@ -404,7 +406,8 @@ export default function NodesPage() {
               </div>
             </PanelCard>
 
-            <PanelCard eyebrow="Result" title="Latest response" subtitle="Raw invoke output from the node proxy.">
+            <PanelCard eyebrow="Result" title="Latest response" subtitle="Raw invoke output from the node proxy." contentClassName="space-y-3">
+              {invokeError ? <InlineError message={invokeError} /> : null}
               <Textarea value={invokeOut} readOnly className="min-h-[28rem] font-mono text-xs" />
             </PanelCard>
           </div>

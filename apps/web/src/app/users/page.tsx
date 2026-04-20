@@ -38,7 +38,7 @@ export default function UsersPage() {
   const [pendingActions, setPendingActions] = React.useState<Record<string, boolean>>({});
 
   const refreshUsers = React.useCallback(
-    async (opts?: { preserveSelection?: boolean }) => {
+    async (opts?: { preserveSelection?: boolean; notify?: boolean }) => {
       setUsersBusy(true);
       setUsersError(null);
       try {
@@ -53,7 +53,9 @@ export default function UsersPage() {
       } catch (error) {
         const message = (error as Error)?.message || String(error);
         setUsersError(message);
-        toast.error(message);
+        if (opts?.notify) {
+          toast.error(message);
+        }
       } finally {
         setUsersBusy(false);
       }
@@ -145,7 +147,7 @@ export default function UsersPage() {
     if (!wsUrl.trim()) return;
     const run = async () => {
       await Promise.resolve();
-      await refreshUsers();
+      await refreshUsers({ notify: false });
     };
     void run();
   }, [wsUrl, refreshUsers]);
@@ -592,7 +594,7 @@ export default function UsersPage() {
               placeholder="Gateway wss://.../ws"
               spellCheck={false}
             />
-            <Button type="button" variant="secondary" onClick={() => void refreshUsers()} disabled={usersBusy}>
+            <Button type="button" variant="secondary" onClick={() => void refreshUsers({ notify: true })} disabled={usersBusy}>
               <RefreshCw className={cn("h-4 w-4", usersBusy ? "animate-spin" : null)} />
               Refresh
             </Button>

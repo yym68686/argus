@@ -3540,35 +3540,24 @@ class _PostgresAutomationStateStore:
 
     async def load(self) -> PersistedGatewayAutomationState:
         async with self._lock:
-            try:
-                state, loaded_ok, migrated_from = await asyncio.to_thread(self._load_sync)
-                self._state = state
-                self._loaded_from_disk_ok = loaded_ok
-                if migrated_from is not None:
-                    log.info(
-                        "Migrated gateway automation state into PostgreSQL from %s",
-                        str(migrated_from),
-                    )
-            except Exception:
-                log.exception("Failed to load automation state from PostgreSQL")
-                self._state = PersistedGatewayAutomationState()
-                self._loaded_from_disk_ok = False
+            state, loaded_ok, migrated_from = await asyncio.to_thread(self._load_sync)
+            self._state = state
+            self._loaded_from_disk_ok = loaded_ok
+            if migrated_from is not None:
+                log.info(
+                    "Migrated gateway automation state into PostgreSQL from %s",
+                    str(migrated_from),
+                )
             return self._state
 
     async def save(self) -> None:
         async with self._lock:
-            try:
-                await asyncio.to_thread(self._write_state_sync, self._state)
-            except Exception:
-                log.exception("Failed to save automation state to PostgreSQL")
+            await asyncio.to_thread(self._write_state_sync, self._state)
 
     async def update(self, fn) -> PersistedGatewayAutomationState:
         async with self._lock:
             fn(self._state)
-            try:
-                await asyncio.to_thread(self._write_state_sync, self._state)
-            except Exception:
-                log.exception("Failed to save automation state to PostgreSQL")
+            await asyncio.to_thread(self._write_state_sync, self._state)
             return self._state
 
     def _load_sync(self) -> tuple[PersistedGatewayAutomationState, bool, Optional[Path]]:
@@ -3820,6 +3809,8 @@ class AutomationStateStore:
         normalized_database_url = _normalized_database_url(database_url)
         if normalized_database_url is not None and not _is_postgres_database_url(normalized_database_url):
             raise RuntimeError("ARGUS_DATABASE_URL currently only supports PostgreSQL DSNs")
+        self._db_path = db_path
+        self._legacy_state_path = legacy_state_path
         self._backend: Any
         if normalized_database_url:
             self._backend = _PostgresAutomationStateStore(
@@ -3830,6 +3821,29 @@ class AutomationStateStore:
         else:
             self._backend = _SQLiteAutomationStateStore(db_path, legacy_state_path=legacy_state_path)
 
+    def _fallback_to_sqlite(
+        self,
+        *,
+        state: Optional[PersistedGatewayAutomationState] = None,
+        loaded_from_disk_ok: Optional[bool] = None,
+    ) -> None:
+        if isinstance(self._backend, _SQLiteAutomationStateStore):
+            if state is not None:
+                self._backend._state = state
+            if loaded_from_disk_ok is not None:
+                self._backend._loaded_from_disk_ok = loaded_from_disk_ok
+            return
+        next_backend = _SQLiteAutomationStateStore(self._db_path, legacy_state_path=self._legacy_state_path)
+        if state is not None:
+            next_backend._state = state
+        if loaded_from_disk_ok is not None:
+            next_backend._loaded_from_disk_ok = loaded_from_disk_ok
+        self._backend = next_backend
+        log.warning(
+            "Automation state store falling back to sqlite at %s after PostgreSQL became unavailable",
+            str(self._db_path),
+        )
+
     @property
     def state(self) -> PersistedGatewayAutomationState:
         return self._backend.state
@@ -3839,13 +3853,44 @@ class AutomationStateStore:
         return self._backend.loaded_from_disk_ok
 
     async def load(self) -> PersistedGatewayAutomationState:
-        return await self._backend.load()
+        try:
+            return await self._backend.load()
+        except Exception:
+            if not isinstance(self._backend, _PostgresAutomationStateStore):
+                raise
+            log.exception("Failed to load automation state from PostgreSQL")
+            self._fallback_to_sqlite(
+                state=getattr(self._backend, "state", PersistedGatewayAutomationState()),
+                loaded_from_disk_ok=getattr(self._backend, "loaded_from_disk_ok", False),
+            )
+            return await self._backend.load()
 
     async def save(self) -> None:
-        await self._backend.save()
+        try:
+            await self._backend.save()
+        except Exception:
+            if not isinstance(self._backend, _PostgresAutomationStateStore):
+                raise
+            log.exception("Failed to save automation state to PostgreSQL")
+            self._fallback_to_sqlite(
+                state=getattr(self._backend, "state", PersistedGatewayAutomationState()),
+                loaded_from_disk_ok=getattr(self._backend, "loaded_from_disk_ok", False),
+            )
+            await self._backend.save()
 
     async def update(self, fn) -> PersistedGatewayAutomationState:
-        return await self._backend.update(fn)
+        try:
+            return await self._backend.update(fn)
+        except Exception:
+            if not isinstance(self._backend, _PostgresAutomationStateStore):
+                raise
+            log.exception("Failed to save automation state to PostgreSQL")
+            self._fallback_to_sqlite(
+                state=getattr(self._backend, "state", PersistedGatewayAutomationState()),
+                loaded_from_disk_ok=getattr(self._backend, "loaded_from_disk_ok", False),
+            )
+            await self._backend.save()
+            return self._backend.state
 
 
 class _PostgresUsageLedgerStore:
@@ -4278,6 +4323,7 @@ class UsageLedgerStore:
         normalized_database_url = _normalized_database_url(database_url)
         if normalized_database_url is not None and not _is_postgres_database_url(normalized_database_url):
             raise RuntimeError("ARGUS_DATABASE_URL currently only supports PostgreSQL DSNs")
+        self._db_path = db_path
         self._backend: Any
         if normalized_database_url:
             self._backend = _PostgresUsageLedgerStore(
@@ -4287,11 +4333,31 @@ class UsageLedgerStore:
         else:
             self._backend = _SQLiteUsageLedgerStore(db_path)
 
+    def _fallback_to_sqlite(self) -> None:
+        if isinstance(self._backend, _SQLiteUsageLedgerStore):
+            return
+        self._backend = _SQLiteUsageLedgerStore(self._db_path)
+        log.warning(
+            "Usage ledger falling back to sqlite at %s after PostgreSQL became unavailable",
+            str(self._db_path),
+        )
+
+    def _call_with_fallback(self, method_name: str, *args: Any, **kwargs: Any) -> Any:
+        method = getattr(self._backend, method_name)
+        try:
+            return method(*args, **kwargs)
+        except Exception:
+            if not isinstance(self._backend, _PostgresUsageLedgerStore):
+                raise
+            log.exception("Usage ledger PostgreSQL backend failed during %s", method_name)
+            self._fallback_to_sqlite()
+            return getattr(self._backend, method_name)(*args, **kwargs)
+
     def initialize(self) -> None:
-        self._backend.initialize()
+        self._call_with_fallback("initialize")
 
     def record(self, event: dict[str, Any]) -> None:
-        self._backend.record(event)
+        self._call_with_fallback("record", event)
 
     def summarize(
         self,
@@ -4302,7 +4368,8 @@ class UsageLedgerStore:
         channel_id: Optional[str] = None,
         since_ms: Optional[int] = None,
     ) -> dict[str, Any]:
-        return self._backend.summarize(
+        return self._call_with_fallback(
+            "summarize",
             owner_user_id=owner_user_id,
             agent_id=agent_id,
             session_id=session_id,
@@ -4320,7 +4387,8 @@ class UsageLedgerStore:
         since_ms: Optional[int] = None,
         limit: int = 100,
     ) -> list[dict[str, Any]]:
-        return self._backend.list_events(
+        return self._call_with_fallback(
+            "list_events",
             owner_user_id=owner_user_id,
             agent_id=agent_id,
             session_id=session_id,
@@ -4330,7 +4398,7 @@ class UsageLedgerStore:
         )
 
     def summarize_by_user(self, *, since_ms: Optional[int] = None) -> dict[int, dict[str, Any]]:
-        return self._backend.summarize_by_user(since_ms=since_ms)
+        return self._call_with_fallback("summarize_by_user", since_ms=since_ms)
 
 
 @dataclass
