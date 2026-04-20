@@ -105,9 +105,9 @@
   body {
     position: relative;
     background:
-      radial-gradient(circle at 10% -8%, oklch(var(--primary) / 0.18), transparent 28%),
-      radial-gradient(circle at 100% 0%, oklch(var(--primary) / 0.09), transparent 24%),
-      linear-gradient(180deg, oklch(var(--surface-2)) 0%, oklch(var(--surface-1)) 18%, oklch(var(--background)) 100%);
+      radial-gradient(circle at 0% 0%, oklch(var(--primary) / 0.1), transparent 24%),
+      radial-gradient(circle at 100% 0%, oklch(var(--foreground) / 0.03), transparent 18%),
+      linear-gradient(180deg, oklch(var(--surface-2)) 0%, oklch(var(--surface-1)) 14%, oklch(var(--background)) 100%);
     color: oklch(var(--foreground));
     font-feature-settings: "rlig" 1, "calt" 1, "cv11" 1;
     text-rendering: optimizeLegibility;
@@ -443,6 +443,24 @@
       linear-gradient(90deg, oklch(var(--foreground) / 0.022) 1px, transparent 1px);
     background-size: 24px 24px;
     background-position: center;
+  }
+
+  .argus-sidebar-surface {
+    background:
+      linear-gradient(180deg, oklch(var(--surface-2) / 0.98) 0%, oklch(var(--surface-1) / 1) 100%);
+    box-shadow: inset -1px 0 0 oklch(var(--foreground) / 0.02);
+  }
+
+  .argus-subrail-surface {
+    background:
+      linear-gradient(180deg, oklch(var(--surface-2) / 0.84) 0%, oklch(var(--surface-1) / 0.96) 100%);
+    box-shadow: inset -1px 0 0 oklch(var(--foreground) / 0.02);
+  }
+
+  .argus-page-surface {
+    background:
+      radial-gradient(circle at top left, oklch(var(--primary) / 0.06), transparent 24%),
+      linear-gradient(180deg, oklch(var(--background)) 0%, oklch(var(--surface-1) / 0.72) 100%);
   }
 
   .argus-metric-card {
