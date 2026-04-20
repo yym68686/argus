@@ -19,7 +19,7 @@ from collections import deque
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Awaitable, Callable, Optional
 
 import requests
 from fastapi import Body, FastAPI, HTTPException, Request, Response, WebSocket, WebSocketDisconnect
@@ -72,7 +72,50 @@ ARGUS_VERSION = _load_argus_version()
 
 RUNTIME_LAYOUT = "root_argus_v1"
 RUNTIME_SESSION_ID_RE = re.compile(r"^[a-f0-9]{12}$")
+RUNTIME_HOST_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
 KUBERNETES_SERVICEACCOUNT_TOKEN_PATH = "/var/run/secrets/kubernetes.io/serviceaccount/token"
+
+SESSION_PLACEMENT_KIND_STATIC = "static"
+SESSION_PLACEMENT_KIND_DOCKER = "docker"
+SESSION_PLACEMENT_KIND_FUGUE = "fugue"
+SESSION_PLACEMENT_KIND_NATIVE = "native"
+SESSION_PLACEMENT_KINDS = {
+    SESSION_PLACEMENT_KIND_STATIC,
+    SESSION_PLACEMENT_KIND_DOCKER,
+    SESSION_PLACEMENT_KIND_FUGUE,
+    SESSION_PLACEMENT_KIND_NATIVE,
+}
+SESSION_WORKSPACE_MODE_GATEWAY_MANAGED = "gateway_managed"
+SESSION_WORKSPACE_MODE_HOST_LOCAL = "host_local"
+SESSION_WORKSPACE_MODES = {
+    SESSION_WORKSPACE_MODE_GATEWAY_MANAGED,
+    SESSION_WORKSPACE_MODE_HOST_LOCAL,
+}
+SESSION_CODEX_PROFILE_MODE_ISOLATED = "isolated"
+SESSION_CODEX_PROFILE_MODE_INHERIT_PATCH = "inherit_patch"
+SESSION_CODEX_PROFILE_MODES = {
+    SESSION_CODEX_PROFILE_MODE_ISOLATED,
+    SESSION_CODEX_PROFILE_MODE_INHERIT_PATCH,
+}
+SESSION_FALLBACK_NONE = "none"
+SESSION_FALLBACK_DEFAULT_CLOUD = "default_cloud"
+SESSION_FALLBACK_POLICIES = {
+    SESSION_FALLBACK_NONE,
+    SESSION_FALLBACK_DEFAULT_CLOUD,
+}
+
+HOST_BINDING_SCOPE_GLOBAL = "global"
+HOST_BINDING_SCOPE_USER = "user"
+HOST_BINDING_SCOPE_AGENT = "agent"
+HOST_BINDING_SCOPES = {
+    HOST_BINDING_SCOPE_GLOBAL,
+    HOST_BINDING_SCOPE_USER,
+    HOST_BINDING_SCOPE_AGENT,
+}
+HOST_AGENT_ENROLL_TOKEN_PREFIX = "argus-host-enroll-v1"
+HOST_AGENT_DEVICE_TOKEN_PREFIX = "argus-host-agent-v1"
+DEFAULT_HOST_AGENT_ENROLL_TTL_S = 15 * 60
+MAX_HOST_AGENT_ENROLL_TTL_S = 7 * 24 * 60 * 60
 
 
 def _event_iso_now() -> str:
@@ -136,6 +179,332 @@ def _text_hash(raw: Any) -> Optional[str]:
 
 class UpstreamSessionClosedError(RuntimeError):
     pass
+
+
+def _normalize_runtime_host_id(raw: Any) -> str:
+    text = str(raw or "").strip()
+    if not text or not RUNTIME_HOST_ID_RE.match(text):
+        return ""
+    return text
+
+
+def _normalize_session_placement_kind(raw: Any) -> str:
+    text = str(raw or "").strip().lower()
+    if text not in SESSION_PLACEMENT_KINDS:
+        return ""
+    return text
+
+
+def _normalize_session_workspace_mode(raw: Any) -> str:
+    text = str(raw or "").strip().lower()
+    if text not in SESSION_WORKSPACE_MODES:
+        return ""
+    return text
+
+
+def _normalize_session_codex_profile_mode(raw: Any) -> str:
+    text = str(raw or "").strip().lower()
+    if text not in SESSION_CODEX_PROFILE_MODES:
+        return ""
+    return text
+
+
+def _normalize_session_fallback_policy(raw: Any) -> str:
+    text = str(raw or "").strip().lower()
+    if text not in SESSION_FALLBACK_POLICIES:
+        return ""
+    return text
+
+
+def _normalize_host_binding_scope_type(raw: Any) -> str:
+    text = str(raw or "").strip().lower()
+    if text not in HOST_BINDING_SCOPES:
+        return ""
+    return text
+
+
+def _normalize_host_binding_scope_id(scope_type: str, raw: Any) -> Optional[str]:
+    scope = _normalize_host_binding_scope_type(scope_type)
+    if not scope:
+        return None
+    if scope == HOST_BINDING_SCOPE_GLOBAL:
+        return "default"
+    if scope == HOST_BINDING_SCOPE_AGENT:
+        value = _normalize_agent_id(raw)
+        return value or None
+    try:
+        user_id = int(raw)
+    except Exception:
+        return None
+    return str(user_id) if user_id > 0 else None
+
+
+def _normalize_abs_host_path(raw: Any) -> Optional[str]:
+    text = str(raw or "").strip()
+    if not text or not os.path.isabs(text):
+        return None
+    return str(Path(text).resolve())
+
+
+def _host_binding_storage_key(scope_type: str, scope_id: Optional[str]) -> str:
+    scope = _normalize_host_binding_scope_type(scope_type)
+    if not scope:
+        return ""
+    normalized_scope_id = _normalize_host_binding_scope_id(scope, scope_id)
+    if normalized_scope_id is None:
+        return ""
+    return f"{scope}:{normalized_scope_id}"
+
+
+def _hash_host_agent_secret(secret: str) -> str:
+    return hashlib.sha256(str(secret or "").encode("utf-8")).hexdigest()
+
+
+def _mint_host_agent_secret(num_bytes: int = 24) -> str:
+    return _b64url_no_pad(os.urandom(max(int(num_bytes), 16)))
+
+
+def _parse_prefixed_token(token: Any, prefix: str) -> tuple[Optional[str], Optional[str]]:
+    raw = str(token or "").strip()
+    if not raw:
+        return None, None
+    parts = raw.split(".", 2)
+    if len(parts) != 3 or parts[0] != prefix:
+        return None, None
+    ident = parts[1].strip()
+    secret = parts[2].strip()
+    if not ident or not secret:
+        return None, None
+    return ident, secret
+
+
+def _mint_host_agent_enroll_token(token_id: str) -> tuple[str, str]:
+    tid = _normalize_runtime_host_id(token_id)
+    if not tid:
+        raise ValueError("invalid token id")
+    secret = _mint_host_agent_secret()
+    return f"{HOST_AGENT_ENROLL_TOKEN_PREFIX}.{tid}.{secret}", _hash_host_agent_secret(secret)
+
+
+def _mint_host_agent_device_token(host_id: str) -> tuple[str, str]:
+    hid = _normalize_runtime_host_id(host_id)
+    if not hid:
+        raise ValueError("invalid host id")
+    secret = _mint_host_agent_secret()
+    return f"{HOST_AGENT_DEVICE_TOKEN_PREFIX}.{hid}.{secret}", _hash_host_agent_secret(secret)
+
+
+def _host_workspace_path_from_base(base_path: Optional[str], session_id: str) -> Optional[str]:
+    base = _normalize_abs_host_path(base_path)
+    sid = _normalize_runtime_session_id(session_id)
+    if not base or not sid:
+        return None
+    return str((Path(base) / f"sess-{sid}").resolve())
+
+
+def _configured_native_workspace_base_path() -> Optional[str]:
+    raw = (os.getenv("ARGUS_NATIVE_WORKSPACE_BASE_PATH") or "").strip()
+    if not raw:
+        return None
+    return raw if os.path.isabs(raw) else None
+
+
+def _configured_native_runtime_host_id() -> Optional[str]:
+    host_id = _normalize_runtime_host_id(os.getenv("ARGUS_NATIVE_RUNTIME_HOST_ID"))
+    return host_id or None
+
+
+def _public_gateway_base_url() -> str:
+    raw = (os.getenv("ARGUS_PUBLIC_BASE_URL") or "").strip().rstrip("/")
+    if not raw:
+        raise RuntimeError("ARGUS_PUBLIC_BASE_URL is required for native runtime sessions")
+    return raw
+
+
+def _default_native_workspace_path(session_id: str) -> Optional[str]:
+    sid = _normalize_runtime_session_id(session_id)
+    if not sid:
+        return None
+    base = _configured_native_workspace_base_path()
+    if not base:
+        base = "/tmp/argus-native"
+    return str((Path(base) / f"sess-{sid}").resolve())
+
+
+@dataclass(frozen=True)
+class SessionPlacement:
+    kind: str
+    target_host_id: Optional[str] = None
+    workspace_mode: str = SESSION_WORKSPACE_MODE_GATEWAY_MANAGED
+    workspace_path: Optional[str] = None
+    codex_profile_mode: str = SESSION_CODEX_PROFILE_MODE_ISOLATED
+    fallback: str = SESSION_FALLBACK_NONE
+
+    def normalized(self, *, session_id: Optional[str] = None) -> "SessionPlacement":
+        kind = _normalize_session_placement_kind(self.kind) or SESSION_PLACEMENT_KIND_STATIC
+        target_host_id = _normalize_runtime_host_id(self.target_host_id) or None
+        workspace_mode = _normalize_session_workspace_mode(self.workspace_mode)
+        workspace_path = str(self.workspace_path or "").strip() or None
+        codex_profile_mode = _normalize_session_codex_profile_mode(self.codex_profile_mode)
+        fallback = _normalize_session_fallback_policy(self.fallback) or SESSION_FALLBACK_NONE
+
+        if kind == SESSION_PLACEMENT_KIND_NATIVE:
+            if not workspace_mode:
+                workspace_mode = SESSION_WORKSPACE_MODE_HOST_LOCAL
+            if not codex_profile_mode:
+                codex_profile_mode = SESSION_CODEX_PROFILE_MODE_INHERIT_PATCH
+            if not workspace_path and session_id and workspace_mode != SESSION_WORKSPACE_MODE_HOST_LOCAL:
+                workspace_path = _default_native_workspace_path(session_id)
+        else:
+            if not workspace_mode:
+                workspace_mode = SESSION_WORKSPACE_MODE_GATEWAY_MANAGED
+            if not codex_profile_mode:
+                codex_profile_mode = SESSION_CODEX_PROFILE_MODE_ISOLATED
+            target_host_id = None
+
+        if workspace_path and not os.path.isabs(workspace_path):
+            workspace_path = None
+
+        return SessionPlacement(
+            kind=kind,
+            target_host_id=target_host_id,
+            workspace_mode=workspace_mode,
+            workspace_path=workspace_path,
+            codex_profile_mode=codex_profile_mode,
+            fallback=fallback,
+        )
+
+    def to_json(self) -> dict[str, Any]:
+        out: dict[str, Any] = {"kind": self.kind}
+        if self.target_host_id:
+            out["targetHostId"] = self.target_host_id
+        if self.workspace_mode:
+            out["workspaceMode"] = self.workspace_mode
+        if self.workspace_path:
+            out["workspacePath"] = self.workspace_path
+        if self.codex_profile_mode:
+            out["codexProfileMode"] = self.codex_profile_mode
+        if self.fallback:
+            out["fallback"] = self.fallback
+        return out
+
+    @staticmethod
+    def from_json(obj: Any, *, session_id: Optional[str] = None) -> Optional["SessionPlacement"]:
+        if not isinstance(obj, dict):
+            return None
+        kind = _normalize_session_placement_kind(obj.get("kind"))
+        if not kind:
+            return None
+        placement = SessionPlacement(
+            kind=kind,
+            target_host_id=_normalize_runtime_host_id(obj.get("targetHostId")) or None,
+            workspace_mode=_normalize_session_workspace_mode(obj.get("workspaceMode"))
+            or SESSION_WORKSPACE_MODE_GATEWAY_MANAGED,
+            workspace_path=str(obj.get("workspacePath") or "").strip() or None,
+            codex_profile_mode=_normalize_session_codex_profile_mode(obj.get("codexProfileMode"))
+            or SESSION_CODEX_PROFILE_MODE_ISOLATED,
+            fallback=_normalize_session_fallback_policy(obj.get("fallback")) or SESSION_FALLBACK_NONE,
+        )
+        return placement.normalized(session_id=session_id)
+
+
+def _default_session_placement(session_id: str) -> SessionPlacement:
+    automation: Optional[AutomationManager] = getattr(app.state, "automation", None)
+    if automation is not None:
+        try:
+            placement = automation.default_host_placement_for_session(session_id)
+        except Exception:
+            placement = None
+        if isinstance(placement, SessionPlacement):
+            return placement.normalized(session_id=session_id)
+    kind = _normalize_session_placement_kind(_provision_mode()) or SESSION_PLACEMENT_KIND_STATIC
+    placement = SessionPlacement(
+        kind=kind,
+        target_host_id=_configured_native_runtime_host_id(),
+    )
+    return placement.normalized(session_id=session_id)
+
+
+class RelayRuntimeReader:
+    def __init__(self) -> None:
+        self._queue: asyncio.Queue[Optional[bytes]] = asyncio.Queue()
+        self._buffer = bytearray()
+        self._closed = False
+
+    def feed_text(self, text: str) -> None:
+        if self._closed:
+            return
+        data = text.encode("utf-8")
+        if not data.endswith(b"\n"):
+            data += b"\n"
+        self._queue.put_nowait(data)
+
+    def feed_eof(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        self._queue.put_nowait(None)
+
+    async def read(self, n: int = -1) -> bytes:
+        if n == 0:
+            return b""
+        while not self._buffer and not self._closed:
+            item = await self._queue.get()
+            if item is None:
+                self._closed = True
+                break
+            self._buffer.extend(item)
+        if not self._buffer:
+            return b""
+        if n < 0 or n >= len(self._buffer):
+            out = bytes(self._buffer)
+            self._buffer.clear()
+            return out
+        out = bytes(self._buffer[:n])
+        del self._buffer[:n]
+        return out
+
+
+class RelayRuntimeWriter:
+    def __init__(
+        self,
+        *,
+        send_line: Callable[[str], Awaitable[None]],
+        close_cb: Optional[Callable[[], Awaitable[None]]] = None,
+    ) -> None:
+        self._send_line = send_line
+        self._close_cb = close_cb
+        self._pending = bytearray()
+        self._closed = False
+
+    def is_closing(self) -> bool:
+        return self._closed
+
+    def write(self, data: bytes) -> None:
+        if self._closed:
+            raise RuntimeError("relay writer is closed")
+        self._pending.extend(data)
+
+    async def drain(self) -> None:
+        if self._closed:
+            raise RuntimeError("relay writer is closed")
+        while True:
+            idx = self._pending.find(b"\n")
+            if idx < 0:
+                break
+            line = bytes(self._pending[:idx])
+            del self._pending[: idx + 1]
+            await self._send_line(line.decode("utf-8", errors="replace").rstrip("\r"))
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        if self._close_cb is not None:
+            try:
+                asyncio.get_running_loop().create_task(self._close_cb())
+            except Exception:
+                pass
 
 
 @dataclass(frozen=True)
@@ -228,6 +597,7 @@ class LiveRuntimeSession:
 
     turn_owners_by_thread: dict[str, WebSocket]
     non_json_lines_dropped: int = 0
+    metadata: dict[str, Any] = field(default_factory=dict)
 
     closed: bool = False
 
@@ -1180,6 +1550,38 @@ def _telegram_download_file_to_path_sync(token: str, file_path: str, dest: Path,
         raise RuntimeError(f"Telegram file download failed: {e}") from e
 
 
+def _telegram_download_file_bytes_sync(token: str, file_path: str, *, max_bytes: int) -> bytes:
+    if not isinstance(token, str) or not token.strip():
+        raise RuntimeError("Missing TELEGRAM_BOT_TOKEN")
+    if not isinstance(file_path, str) or not file_path.strip():
+        raise RuntimeError("Missing Telegram file_path")
+
+    url = f"https://api.telegram.org/file/bot{token.strip()}/{file_path.lstrip('/')}"
+    req = urllib.request.Request(url, method="GET")
+    total = 0
+    chunks: list[bytes] = []
+
+    try:
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            while True:
+                chunk = resp.read(1024 * 64)
+                if not chunk:
+                    break
+                total += len(chunk)
+                if total > max_bytes:
+                    raise RuntimeError(f"Telegram file too large (> {max_bytes} bytes)")
+                chunks.append(chunk)
+            return b"".join(chunks)
+    except urllib.error.HTTPError as e:
+        try:
+            raw = e.read().decode("utf-8", errors="replace")
+        except Exception:
+            raw = ""
+        raise RuntimeError(f"Telegram file download failed: HTTP {e.code} {raw}".strip()) from e
+    except Exception as e:
+        raise RuntimeError(f"Telegram file download failed: {e}") from e
+
+
 def _telegram_api_call_multipart_sync(
     token: str,
     method: str,
@@ -1861,7 +2263,7 @@ class PersistedStagedAttachment:
 AGENT_ID_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9_-]{0,63}$")
 CHANNEL_ID_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,63}$")
 TELEGRAM_PRIVATE_CHAT_ID_RE = re.compile(r"^[1-9]\d{0,19}$")
-AUTOMATION_STATE_VERSION = 7
+AUTOMATION_STATE_VERSION = 8
 ARGUS_AGENT_MODEL_DEFAULT = "gpt-5.4"
 ARGUS_GATEWAY_AGENT_MODELS = ("gpt-5.2", "gpt-5.4")
 ARGUS_GATEWAY_AGENT_MODELS_SET = frozenset(ARGUS_GATEWAY_AGENT_MODELS)
@@ -2291,6 +2693,7 @@ class PersistedAgentRuntime:
 @dataclass
 class PersistedSessionAutomation:
     main_thread_id: Optional[str] = None
+    placement: Optional[SessionPlacement] = None
     cron_jobs: list[PersistedCronJob] = field(default_factory=list)
     cron_runs_by_job: dict[str, list[PersistedCronRunMeta]] = field(default_factory=dict)
     system_event_queues: dict[str, list[PersistedSystemEvent]] = field(default_factory=dict)
@@ -2345,6 +2748,7 @@ class PersistedSessionAutomation:
                 cron_runs[jid.strip()] = out_runs
         return {
             "mainThreadId": self.main_thread_id,
+            "placement": self.placement.to_json() if isinstance(self.placement, SessionPlacement) else None,
             "cronJobs": [j.to_json() for j in self.cron_jobs],
             "cronRunsByJob": cron_runs,
             "systemEventQueues": queues,
@@ -2360,6 +2764,7 @@ class PersistedSessionAutomation:
         main_thread_id = obj.get("mainThreadId")
         if not isinstance(main_thread_id, str) or not main_thread_id.strip():
             main_thread_id = None
+        placement = SessionPlacement.from_json(obj.get("placement"))
         cron_jobs_raw = obj.get("cronJobs")
         cron_jobs: list[PersistedCronJob] = []
         if isinstance(cron_jobs_raw, list):
@@ -2435,6 +2840,7 @@ class PersistedSessionAutomation:
                 paused_node_ids.append(node_id_norm)
         return PersistedSessionAutomation(
             main_thread_id=main_thread_id.strip() if isinstance(main_thread_id, str) else None,
+            placement=placement,
             cron_jobs=cron_jobs,
             cron_runs_by_job=cron_runs_by_job,
             system_event_queues=queues,
@@ -2442,6 +2848,240 @@ class PersistedSessionAutomation:
             pending_telegram_attachments_by_chat=pending_telegram_attachments_by_chat,
             paused_node_ids=paused_node_ids,
         )
+
+
+@dataclass
+class PersistedHostEnrollment:
+    host_id: str
+    display_name: Optional[str] = None
+    platform: Optional[str] = None
+    version: Optional[str] = None
+    device_token_hash: Optional[str] = None
+    token_preview: Optional[str] = None
+    created_at_ms: int = field(default_factory=_now_ms)
+    updated_at_ms: int = field(default_factory=_now_ms)
+    claimed_at_ms: Optional[int] = None
+    revoked_at_ms: Optional[int] = None
+    last_connected_at_ms: Optional[int] = None
+    last_seen_at_ms: Optional[int] = None
+    last_disconnected_at_ms: Optional[int] = None
+
+    def to_json(self, *, redact_secrets: bool = True) -> dict[str, Any]:
+        return {
+            "hostId": self.host_id,
+            "displayName": self.display_name,
+            "platform": self.platform,
+            "version": self.version,
+            "deviceToken": self.token_preview if redact_secrets else self.token_preview,
+            "deviceTokenHash": None if redact_secrets else self.device_token_hash,
+            "tokenPreview": self.token_preview,
+            "createdAtMs": int(self.created_at_ms or 0),
+            "updatedAtMs": int(self.updated_at_ms or 0),
+            "claimedAtMs": int(self.claimed_at_ms) if self.claimed_at_ms is not None else None,
+            "revokedAtMs": int(self.revoked_at_ms) if self.revoked_at_ms is not None else None,
+            "lastConnectedAtMs": int(self.last_connected_at_ms) if self.last_connected_at_ms is not None else None,
+            "lastSeenAtMs": int(self.last_seen_at_ms) if self.last_seen_at_ms is not None else None,
+            "lastDisconnectedAtMs": int(self.last_disconnected_at_ms) if self.last_disconnected_at_ms is not None else None,
+        }
+
+    @staticmethod
+    def from_json(obj: Any) -> Optional["PersistedHostEnrollment"]:
+        if not isinstance(obj, dict):
+            return None
+        host_id = _normalize_runtime_host_id(obj.get("hostId") or obj.get("id"))
+        if not host_id:
+            return None
+        now_ms = _now_ms()
+        try:
+            created_at_ms = int(obj.get("createdAtMs")) if obj.get("createdAtMs") is not None else now_ms
+        except Exception:
+            created_at_ms = now_ms
+        try:
+            updated_at_ms = int(obj.get("updatedAtMs")) if obj.get("updatedAtMs") is not None else created_at_ms
+        except Exception:
+            updated_at_ms = created_at_ms
+        def _opt_int(name: str) -> Optional[int]:
+            try:
+                value = obj.get(name)
+                return int(value) if value is not None else None
+            except Exception:
+                return None
+        token_hash = str(obj.get("deviceTokenHash") or "").strip() or None
+        token_preview = str(obj.get("tokenPreview") or obj.get("deviceToken") or "").strip() or None
+        return PersistedHostEnrollment(
+            host_id=host_id,
+            display_name=(str(obj.get("displayName")) if obj.get("displayName") is not None else None) or None,
+            platform=(str(obj.get("platform")) if obj.get("platform") is not None else None) or None,
+            version=(str(obj.get("version")) if obj.get("version") is not None else None) or None,
+            device_token_hash=token_hash,
+            token_preview=token_preview,
+            created_at_ms=created_at_ms,
+            updated_at_ms=updated_at_ms,
+            claimed_at_ms=_opt_int("claimedAtMs"),
+            revoked_at_ms=_opt_int("revokedAtMs"),
+            last_connected_at_ms=_opt_int("lastConnectedAtMs"),
+            last_seen_at_ms=_opt_int("lastSeenAtMs"),
+            last_disconnected_at_ms=_opt_int("lastDisconnectedAtMs"),
+        )
+
+
+@dataclass
+class PersistedHostBinding:
+    scope_type: str
+    scope_id: str
+    host_id: str
+    workspace_base_path: Optional[str] = None
+    codex_profile_mode: str = SESSION_CODEX_PROFILE_MODE_INHERIT_PATCH
+    created_at_ms: int = field(default_factory=_now_ms)
+    updated_at_ms: int = field(default_factory=_now_ms)
+
+    def normalized(self) -> Optional["PersistedHostBinding"]:
+        scope_type = _normalize_host_binding_scope_type(self.scope_type)
+        scope_id = _normalize_host_binding_scope_id(scope_type, self.scope_id)
+        host_id = _normalize_runtime_host_id(self.host_id)
+        codex_profile_mode = _normalize_session_codex_profile_mode(self.codex_profile_mode) or SESSION_CODEX_PROFILE_MODE_INHERIT_PATCH
+        if not scope_type or scope_id is None or not host_id:
+            return None
+        return PersistedHostBinding(
+            scope_type=scope_type,
+            scope_id=scope_id,
+            host_id=host_id,
+            workspace_base_path=_normalize_abs_host_path(self.workspace_base_path),
+            codex_profile_mode=codex_profile_mode,
+            created_at_ms=int(self.created_at_ms or _now_ms()),
+            updated_at_ms=int(self.updated_at_ms or _now_ms()),
+        )
+
+    def storage_key(self) -> str:
+        normalized = self.normalized()
+        if normalized is None:
+            return ""
+        return _host_binding_storage_key(normalized.scope_type, normalized.scope_id)
+
+    def workspace_path_for_session(self, session_id: str) -> Optional[str]:
+        normalized = self.normalized()
+        if normalized is None:
+            return None
+        return _host_workspace_path_from_base(normalized.workspace_base_path, session_id)
+
+    def to_json(self) -> dict[str, Any]:
+        normalized = self.normalized() or self
+        return {
+            "scopeType": normalized.scope_type,
+            "scopeId": normalized.scope_id,
+            "hostId": normalized.host_id,
+            "workspaceBasePath": normalized.workspace_base_path,
+            "codexProfileMode": normalized.codex_profile_mode,
+            "createdAtMs": int(normalized.created_at_ms or 0),
+            "updatedAtMs": int(normalized.updated_at_ms or 0),
+        }
+
+    @staticmethod
+    def from_json(obj: Any) -> Optional["PersistedHostBinding"]:
+        if not isinstance(obj, dict):
+            return None
+        now_ms = _now_ms()
+        try:
+            created_at_ms = int(obj.get("createdAtMs")) if obj.get("createdAtMs") is not None else now_ms
+        except Exception:
+            created_at_ms = now_ms
+        try:
+            updated_at_ms = int(obj.get("updatedAtMs")) if obj.get("updatedAtMs") is not None else created_at_ms
+        except Exception:
+            updated_at_ms = created_at_ms
+        binding = PersistedHostBinding(
+            scope_type=str(obj.get("scopeType") or ""),
+            scope_id=str(obj.get("scopeId") or ""),
+            host_id=str(obj.get("hostId") or ""),
+            workspace_base_path=str(obj.get("workspaceBasePath") or "").strip() or None,
+            codex_profile_mode=str(obj.get("codexProfileMode") or ""),
+            created_at_ms=created_at_ms,
+            updated_at_ms=updated_at_ms,
+        )
+        return binding.normalized()
+
+
+@dataclass
+class PersistedHostEnrollToken:
+    token_id: str
+    secret_hash: str
+    host_id_hint: Optional[str] = None
+    scope_type: Optional[str] = None
+    scope_id: Optional[str] = None
+    workspace_base_path: Optional[str] = None
+    expires_at_ms: int = field(default_factory=lambda: _now_ms() + DEFAULT_HOST_AGENT_ENROLL_TTL_S * 1000)
+    created_at_ms: int = field(default_factory=_now_ms)
+    consumed_at_ms: Optional[int] = None
+
+    def normalized(self) -> Optional["PersistedHostEnrollToken"]:
+        token_id = _normalize_runtime_host_id(self.token_id)
+        if not token_id:
+            return None
+        secret_hash = str(self.secret_hash or "").strip()
+        if not secret_hash:
+            return None
+        scope_type = _normalize_host_binding_scope_type(self.scope_type) if self.scope_type is not None else None
+        scope_id = _normalize_host_binding_scope_id(scope_type, self.scope_id) if scope_type else None
+        host_id_hint = _normalize_runtime_host_id(self.host_id_hint) or None
+        return PersistedHostEnrollToken(
+            token_id=token_id,
+            secret_hash=secret_hash,
+            host_id_hint=host_id_hint,
+            scope_type=scope_type,
+            scope_id=scope_id,
+            workspace_base_path=_normalize_abs_host_path(self.workspace_base_path),
+            expires_at_ms=int(self.expires_at_ms or (_now_ms() + DEFAULT_HOST_AGENT_ENROLL_TTL_S * 1000)),
+            created_at_ms=int(self.created_at_ms or _now_ms()),
+            consumed_at_ms=int(self.consumed_at_ms) if self.consumed_at_ms is not None else None,
+        )
+
+    def to_json(self, *, redact_secrets: bool = True) -> dict[str, Any]:
+        normalized = self.normalized() or self
+        return {
+            "tokenId": normalized.token_id,
+            "secretHash": None if redact_secrets else normalized.secret_hash,
+            "hostIdHint": normalized.host_id_hint,
+            "scopeType": normalized.scope_type,
+            "scopeId": normalized.scope_id,
+            "workspaceBasePath": normalized.workspace_base_path,
+            "expiresAtMs": int(normalized.expires_at_ms or 0),
+            "createdAtMs": int(normalized.created_at_ms or 0),
+            "consumedAtMs": int(normalized.consumed_at_ms) if normalized.consumed_at_ms is not None else None,
+        }
+
+    @staticmethod
+    def from_json(obj: Any) -> Optional["PersistedHostEnrollToken"]:
+        if not isinstance(obj, dict):
+            return None
+        token_id = _normalize_runtime_host_id(obj.get("tokenId") or obj.get("id"))
+        secret_hash = str(obj.get("secretHash") or "").strip()
+        if not token_id or not secret_hash:
+            return None
+        now_ms = _now_ms()
+        try:
+            expires_at_ms = int(obj.get("expiresAtMs")) if obj.get("expiresAtMs") is not None else now_ms
+        except Exception:
+            expires_at_ms = now_ms
+        try:
+            created_at_ms = int(obj.get("createdAtMs")) if obj.get("createdAtMs") is not None else now_ms
+        except Exception:
+            created_at_ms = now_ms
+        try:
+            consumed_at_ms = int(obj.get("consumedAtMs")) if obj.get("consumedAtMs") is not None else None
+        except Exception:
+            consumed_at_ms = None
+        token = PersistedHostEnrollToken(
+            token_id=token_id,
+            secret_hash=secret_hash,
+            host_id_hint=str(obj.get("hostIdHint") or "").strip() or None,
+            scope_type=str(obj.get("scopeType") or "").strip() or None,
+            scope_id=str(obj.get("scopeId") or "").strip() or None,
+            workspace_base_path=str(obj.get("workspaceBasePath") or "").strip() or None,
+            expires_at_ms=expires_at_ms,
+            created_at_ms=created_at_ms,
+            consumed_at_ms=consumed_at_ms,
+        )
+        return token.normalized()
 
 
 @dataclass
@@ -2588,6 +3228,9 @@ class PersistedGatewayAutomationState:
     agents: dict[str, PersistedAgentRuntime] = field(default_factory=dict)
     chat_bindings: dict[str, str] = field(default_factory=dict)
     user_channels: dict[str, PersistedUserChannelState] = field(default_factory=dict)
+    host_enrollments: dict[str, PersistedHostEnrollment] = field(default_factory=dict)
+    host_bindings: dict[str, PersistedHostBinding] = field(default_factory=dict)
+    host_enroll_tokens: dict[str, PersistedHostEnrollToken] = field(default_factory=dict)
 
     def to_json(self, *, redact_secrets: bool = False) -> dict[str, Any]:
         return {
@@ -2599,6 +3242,21 @@ class PersistedGatewayAutomationState:
                 user_id: channel_state.to_json(redact_secrets=redact_secrets)
                 for user_id, channel_state in (self.user_channels or {}).items()
                 if isinstance(user_id, str) and user_id.strip() and isinstance(channel_state, PersistedUserChannelState)
+            },
+            "hostEnrollments": {
+                host_id: enrollment.to_json(redact_secrets=redact_secrets)
+                for host_id, enrollment in (self.host_enrollments or {}).items()
+                if isinstance(host_id, str) and host_id.strip() and isinstance(enrollment, PersistedHostEnrollment)
+            },
+            "hostBindings": {
+                key: binding.to_json()
+                for key, binding in (self.host_bindings or {}).items()
+                if isinstance(key, str) and key.strip() and isinstance(binding, PersistedHostBinding)
+            },
+            "hostEnrollTokens": {
+                token_id: token.to_json(redact_secrets=redact_secrets)
+                for token_id, token in (self.host_enroll_tokens or {}).items()
+                if isinstance(token_id, str) and token_id.strip() and isinstance(token, PersistedHostEnrollToken)
             },
         }
 
@@ -2657,12 +3315,50 @@ class PersistedGatewayAutomationState:
                     continue
                 user_channels[str(user_id_int)] = PersistedUserChannelState.from_json(raw_state)
 
+        host_enrollments_raw = obj.get("hostEnrollments")
+        host_enrollments: dict[str, PersistedHostEnrollment] = {}
+        if isinstance(host_enrollments_raw, dict):
+            for raw_host_id, raw_enrollment in host_enrollments_raw.items():
+                host_id = _normalize_runtime_host_id(raw_host_id)
+                enrollment = PersistedHostEnrollment.from_json(raw_enrollment)
+                if enrollment is None:
+                    continue
+                key = host_id or enrollment.host_id
+                if key:
+                    host_enrollments[key] = enrollment
+
+        host_bindings_raw = obj.get("hostBindings")
+        host_bindings: dict[str, PersistedHostBinding] = {}
+        if isinstance(host_bindings_raw, dict):
+            for raw_key, raw_binding in host_bindings_raw.items():
+                binding = PersistedHostBinding.from_json(raw_binding)
+                if binding is None:
+                    continue
+                key = (str(raw_key).strip() if isinstance(raw_key, str) else "") or binding.storage_key()
+                if key:
+                    host_bindings[key] = binding
+
+        host_tokens_raw = obj.get("hostEnrollTokens")
+        host_enroll_tokens: dict[str, PersistedHostEnrollToken] = {}
+        if isinstance(host_tokens_raw, dict):
+            for raw_token_id, raw_token in host_tokens_raw.items():
+                token = PersistedHostEnrollToken.from_json(raw_token)
+                token_id = _normalize_runtime_host_id(raw_token_id)
+                if token is None:
+                    continue
+                key = token_id or token.token_id
+                if key:
+                    host_enroll_tokens[key] = token
+
         return PersistedGatewayAutomationState(
             version=version_int,
             sessions=sessions,
             agents=agents,
             chat_bindings=chat_bindings,
             user_channels=user_channels,
+            host_enrollments=host_enrollments,
+            host_bindings=host_bindings,
+            host_enroll_tokens=host_enroll_tokens,
         )
 
 
@@ -2839,6 +3535,66 @@ class _SQLiteAutomationStateStore:
                         ],
                     )
 
+                conn.execute("DELETE FROM automation_host_enrollments")
+                if state.host_enrollments:
+                    conn.executemany(
+                        """
+                        INSERT INTO automation_host_enrollments (host_id, payload_json, updated_at_ms)
+                        VALUES (?, ?, ?)
+                        """,
+                        [
+                            (
+                                host_id,
+                                json.dumps(enrollment.to_json(redact_secrets=False), ensure_ascii=False, separators=(",", ":")),
+                                now_ms,
+                            )
+                            for host_id, enrollment in state.host_enrollments.items()
+                            if isinstance(host_id, str)
+                            and host_id.strip()
+                            and isinstance(enrollment, PersistedHostEnrollment)
+                        ],
+                    )
+
+                conn.execute("DELETE FROM automation_host_bindings")
+                if state.host_bindings:
+                    conn.executemany(
+                        """
+                        INSERT INTO automation_host_bindings (binding_key, payload_json, updated_at_ms)
+                        VALUES (?, ?, ?)
+                        """,
+                        [
+                            (
+                                binding_key,
+                                json.dumps(binding.to_json(), ensure_ascii=False, separators=(",", ":")),
+                                now_ms,
+                            )
+                            for binding_key, binding in state.host_bindings.items()
+                            if isinstance(binding_key, str)
+                            and binding_key.strip()
+                            and isinstance(binding, PersistedHostBinding)
+                        ],
+                    )
+
+                conn.execute("DELETE FROM automation_host_enroll_tokens")
+                if state.host_enroll_tokens:
+                    conn.executemany(
+                        """
+                        INSERT INTO automation_host_enroll_tokens (token_id, payload_json, updated_at_ms)
+                        VALUES (?, ?, ?)
+                        """,
+                        [
+                            (
+                                token_id,
+                                json.dumps(token.to_json(redact_secrets=False), ensure_ascii=False, separators=(",", ":")),
+                                now_ms,
+                            )
+                            for token_id, token in state.host_enroll_tokens.items()
+                            if isinstance(token_id, str)
+                            and token_id.strip()
+                            and isinstance(token, PersistedHostEnrollToken)
+                        ],
+                    )
+
     def _initialize_schema(self, conn: sqlite3.Connection) -> None:
         if self._initialized:
             return
@@ -2870,6 +3626,21 @@ class _SQLiteAutomationStateStore:
                 payload_json TEXT NOT NULL,
                 updated_at_ms INTEGER NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS automation_host_enrollments (
+                host_id TEXT PRIMARY KEY,
+                payload_json TEXT NOT NULL,
+                updated_at_ms INTEGER NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS automation_host_bindings (
+                binding_key TEXT PRIMARY KEY,
+                payload_json TEXT NOT NULL,
+                updated_at_ms INTEGER NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS automation_host_enroll_tokens (
+                token_id TEXT PRIMARY KEY,
+                payload_json TEXT NOT NULL,
+                updated_at_ms INTEGER NOT NULL
+            );
             """
         )
         self._initialized = True
@@ -2881,6 +3652,9 @@ class _SQLiteAutomationStateStore:
             "automation_agents",
             "automation_chat_bindings",
             "automation_user_channels",
+            "automation_host_enrollments",
+            "automation_host_bindings",
+            "automation_host_enroll_tokens",
         ):
             row = conn.execute(f"SELECT 1 FROM {table_name} LIMIT 1").fetchone()
             if row is not None:
@@ -2946,12 +3720,57 @@ class _SQLiteAutomationStateStore:
                 continue
             user_channels[user_id] = PersistedUserChannelState.from_json(payload)
 
+        host_enrollments: dict[str, PersistedHostEnrollment] = {}
+        for row in conn.execute("SELECT host_id, payload_json FROM automation_host_enrollments"):
+            try:
+                payload = json.loads(str(row["payload_json"] or "{}"))
+            except Exception:
+                continue
+            enrollment = PersistedHostEnrollment.from_json(payload)
+            host_id = _normalize_runtime_host_id(row["host_id"])
+            if enrollment is None:
+                continue
+            key = host_id or enrollment.host_id
+            if key:
+                host_enrollments[key] = enrollment
+
+        host_bindings: dict[str, PersistedHostBinding] = {}
+        for row in conn.execute("SELECT binding_key, payload_json FROM automation_host_bindings"):
+            try:
+                payload = json.loads(str(row["payload_json"] or "{}"))
+            except Exception:
+                continue
+            binding = PersistedHostBinding.from_json(payload)
+            binding_key = str(row["binding_key"] or "").strip()
+            if binding is None:
+                continue
+            key = binding_key or binding.storage_key()
+            if key:
+                host_bindings[key] = binding
+
+        host_enroll_tokens: dict[str, PersistedHostEnrollToken] = {}
+        for row in conn.execute("SELECT token_id, payload_json FROM automation_host_enroll_tokens"):
+            try:
+                payload = json.loads(str(row["payload_json"] or "{}"))
+            except Exception:
+                continue
+            token = PersistedHostEnrollToken.from_json(payload)
+            token_id = _normalize_runtime_host_id(row["token_id"])
+            if token is None:
+                continue
+            key = token_id or token.token_id
+            if key:
+                host_enroll_tokens[key] = token
+
         return PersistedGatewayAutomationState(
             version=version,
             sessions=sessions,
             agents=agents,
             chat_bindings=chat_bindings,
             user_channels=user_channels,
+            host_enrollments=host_enrollments,
+            host_bindings=host_bindings,
+            host_enroll_tokens=host_enroll_tokens,
         )
 
     def _connect(self) -> sqlite3.Connection:
@@ -3671,6 +4490,66 @@ class _PostgresAutomationStateStore:
                             ],
                         )
 
+                    cur.execute("DELETE FROM automation_host_enrollments")
+                    if state.host_enrollments:
+                        cur.executemany(
+                            """
+                            INSERT INTO automation_host_enrollments (host_id, payload_json, updated_at_ms)
+                            VALUES (%s, %s, %s)
+                            """,
+                            [
+                                (
+                                    host_id,
+                                    json.dumps(enrollment.to_json(redact_secrets=False), ensure_ascii=False, separators=(",", ":")),
+                                    now_ms,
+                                )
+                                for host_id, enrollment in state.host_enrollments.items()
+                                if isinstance(host_id, str)
+                                and host_id.strip()
+                                and isinstance(enrollment, PersistedHostEnrollment)
+                            ],
+                        )
+
+                    cur.execute("DELETE FROM automation_host_bindings")
+                    if state.host_bindings:
+                        cur.executemany(
+                            """
+                            INSERT INTO automation_host_bindings (binding_key, payload_json, updated_at_ms)
+                            VALUES (%s, %s, %s)
+                            """,
+                            [
+                                (
+                                    binding_key,
+                                    json.dumps(binding.to_json(), ensure_ascii=False, separators=(",", ":")),
+                                    now_ms,
+                                )
+                                for binding_key, binding in state.host_bindings.items()
+                                if isinstance(binding_key, str)
+                                and binding_key.strip()
+                                and isinstance(binding, PersistedHostBinding)
+                            ],
+                        )
+
+                    cur.execute("DELETE FROM automation_host_enroll_tokens")
+                    if state.host_enroll_tokens:
+                        cur.executemany(
+                            """
+                            INSERT INTO automation_host_enroll_tokens (token_id, payload_json, updated_at_ms)
+                            VALUES (%s, %s, %s)
+                            """,
+                            [
+                                (
+                                    token_id,
+                                    json.dumps(token.to_json(redact_secrets=False), ensure_ascii=False, separators=(",", ":")),
+                                    now_ms,
+                                )
+                                for token_id, token in state.host_enroll_tokens.items()
+                                if isinstance(token_id, str)
+                                and token_id.strip()
+                                and isinstance(token, PersistedHostEnrollToken)
+                            ],
+                        )
+
     def _initialize_schema(self, conn) -> None:
         if self._initialized:
             return
@@ -3710,6 +4589,27 @@ class _PostgresAutomationStateStore:
                 updated_at_ms BIGINT NOT NULL
             )
             """,
+            """
+            CREATE TABLE IF NOT EXISTS automation_host_enrollments (
+                host_id TEXT PRIMARY KEY,
+                payload_json TEXT NOT NULL,
+                updated_at_ms BIGINT NOT NULL
+            )
+            """,
+            """
+            CREATE TABLE IF NOT EXISTS automation_host_bindings (
+                binding_key TEXT PRIMARY KEY,
+                payload_json TEXT NOT NULL,
+                updated_at_ms BIGINT NOT NULL
+            )
+            """,
+            """
+            CREATE TABLE IF NOT EXISTS automation_host_enroll_tokens (
+                token_id TEXT PRIMARY KEY,
+                payload_json TEXT NOT NULL,
+                updated_at_ms BIGINT NOT NULL
+            )
+            """,
         ):
             conn.execute(statement)
         self._initialized = True
@@ -3721,6 +4621,9 @@ class _PostgresAutomationStateStore:
             "automation_agents",
             "automation_chat_bindings",
             "automation_user_channels",
+            "automation_host_enrollments",
+            "automation_host_bindings",
+            "automation_host_enroll_tokens",
         ):
             row = conn.execute(f"SELECT 1 FROM {table_name} LIMIT 1").fetchone()
             if row is not None:
@@ -3786,12 +4689,57 @@ class _PostgresAutomationStateStore:
                 continue
             user_channels[user_id] = PersistedUserChannelState.from_json(payload)
 
+        host_enrollments: dict[str, PersistedHostEnrollment] = {}
+        for row in conn.execute("SELECT host_id, payload_json FROM automation_host_enrollments").fetchall():
+            try:
+                payload = json.loads(str(row["payload_json"] or "{}"))
+            except Exception:
+                continue
+            enrollment = PersistedHostEnrollment.from_json(payload)
+            host_id = _normalize_runtime_host_id(row["host_id"])
+            if enrollment is None:
+                continue
+            key = host_id or enrollment.host_id
+            if key:
+                host_enrollments[key] = enrollment
+
+        host_bindings: dict[str, PersistedHostBinding] = {}
+        for row in conn.execute("SELECT binding_key, payload_json FROM automation_host_bindings").fetchall():
+            try:
+                payload = json.loads(str(row["payload_json"] or "{}"))
+            except Exception:
+                continue
+            binding = PersistedHostBinding.from_json(payload)
+            binding_key = str(row["binding_key"] or "").strip()
+            if binding is None:
+                continue
+            key = binding_key or binding.storage_key()
+            if key:
+                host_bindings[key] = binding
+
+        host_enroll_tokens: dict[str, PersistedHostEnrollToken] = {}
+        for row in conn.execute("SELECT token_id, payload_json FROM automation_host_enroll_tokens").fetchall():
+            try:
+                payload = json.loads(str(row["payload_json"] or "{}"))
+            except Exception:
+                continue
+            token = PersistedHostEnrollToken.from_json(payload)
+            token_id = _normalize_runtime_host_id(row["token_id"])
+            if token is None:
+                continue
+            key = token_id or token.token_id
+            if key:
+                host_enroll_tokens[key] = token
+
         return PersistedGatewayAutomationState(
             version=version,
             sessions=sessions,
             agents=agents,
             chat_bindings=chat_bindings,
             user_channels=user_channels,
+            host_enrollments=host_enrollments,
+            host_bindings=host_bindings,
+            host_enroll_tokens=host_enroll_tokens,
         )
 
     def _connect(self):
@@ -4469,10 +5417,377 @@ class AutomationManager:
         self._tasks.append(asyncio.create_task(self._heartbeat_loop()))
         self._tasks.append(asyncio.create_task(self._lane_watchdog_loop()))
 
+    def get_host_enrollment(self, host_id: str) -> Optional[PersistedHostEnrollment]:
+        hid = _normalize_runtime_host_id(host_id)
+        if not hid:
+            return None
+        st = self._store.state
+        enrollment = st.host_enrollments.get(hid) if isinstance(st.host_enrollments, dict) else None
+        return enrollment if isinstance(enrollment, PersistedHostEnrollment) else None
+
+    def list_host_enrollments(self) -> list[PersistedHostEnrollment]:
+        st = self._store.state
+        items = [
+            enrollment
+            for enrollment in (st.host_enrollments or {}).values()
+            if isinstance(enrollment, PersistedHostEnrollment)
+        ]
+        items.sort(key=lambda item: (item.display_name or item.host_id or "").lower())
+        return items
+
+    def get_host_binding(self, scope_type: str, scope_id: Any) -> Optional[PersistedHostBinding]:
+        key = _host_binding_storage_key(scope_type, scope_id)
+        if not key:
+            return None
+        st = self._store.state
+        binding = st.host_bindings.get(key) if isinstance(st.host_bindings, dict) else None
+        if isinstance(binding, PersistedHostBinding):
+            return binding.normalized()
+        return None
+
+    def list_host_bindings(self, *, host_id: Optional[str] = None) -> list[PersistedHostBinding]:
+        target_host_id = _normalize_runtime_host_id(host_id) or None
+        st = self._store.state
+        out: list[PersistedHostBinding] = []
+        for binding in (st.host_bindings or {}).values():
+            if not isinstance(binding, PersistedHostBinding):
+                continue
+            normalized = binding.normalized()
+            if normalized is None:
+                continue
+            if target_host_id and normalized.host_id != target_host_id:
+                continue
+            out.append(normalized)
+        out.sort(key=lambda item: (item.scope_type, item.scope_id))
+        return out
+
+    def resolve_default_host_binding_for_session(self, session_id: str) -> Optional[PersistedHostBinding]:
+        sid = session_id.strip() if isinstance(session_id, str) else ""
+        if not sid:
+            return None
+        st = self._store.state
+        matched_agent: Optional[PersistedAgentRuntime] = None
+        for agent in (st.agents or {}).values():
+            if isinstance(agent, PersistedAgentRuntime) and agent.session_id == sid:
+                matched_agent = agent
+                break
+        if matched_agent is not None:
+            binding = self.get_host_binding(HOST_BINDING_SCOPE_AGENT, matched_agent.agent_id)
+            if binding is not None:
+                return binding
+            owner_user_id = getattr(matched_agent, "owner_user_id", None)
+            if isinstance(owner_user_id, int) and owner_user_id > 0:
+                binding = self.get_host_binding(HOST_BINDING_SCOPE_USER, owner_user_id)
+                if binding is not None:
+                    return binding
+        return self.get_host_binding(HOST_BINDING_SCOPE_GLOBAL, "default")
+
+    def default_host_placement_for_session(self, session_id: str) -> Optional[SessionPlacement]:
+        binding = self.resolve_default_host_binding_for_session(session_id)
+        if binding is None:
+            return None
+        workspace_path = binding.workspace_path_for_session(session_id)
+        return SessionPlacement(
+            kind=SESSION_PLACEMENT_KIND_NATIVE,
+            target_host_id=binding.host_id,
+            workspace_mode=SESSION_WORKSPACE_MODE_HOST_LOCAL,
+            workspace_path=workspace_path,
+            codex_profile_mode=binding.codex_profile_mode,
+            fallback=SESSION_FALLBACK_NONE,
+        ).normalized(session_id=session_id)
+
+    async def issue_host_enroll_token(
+        self,
+        *,
+        host_id_hint: Optional[str],
+        scope_type: Optional[str],
+        scope_id: Optional[Any],
+        workspace_base_path: Optional[str],
+        ttl_s: int,
+    ) -> tuple[PersistedHostEnrollToken, str]:
+        ttl_s = max(60, min(int(ttl_s or DEFAULT_HOST_AGENT_ENROLL_TTL_S), MAX_HOST_AGENT_ENROLL_TTL_S))
+        token_id = uuid.uuid4().hex[:12]
+        raw_token, secret_hash = _mint_host_agent_enroll_token(token_id)
+        now_ms = _now_ms()
+        pending = PersistedHostEnrollToken(
+            token_id=token_id,
+            secret_hash=secret_hash,
+            host_id_hint=_normalize_runtime_host_id(host_id_hint) or None,
+            scope_type=_normalize_host_binding_scope_type(scope_type) or None,
+            scope_id=_normalize_host_binding_scope_id(scope_type or "", scope_id) if scope_type else None,
+            workspace_base_path=_normalize_abs_host_path(workspace_base_path),
+            expires_at_ms=now_ms + ttl_s * 1000,
+            created_at_ms=now_ms,
+        ).normalized()
+        if pending is None:
+            raise ValueError("Invalid host enrollment token request")
+
+        def _write(st: PersistedGatewayAutomationState) -> None:
+            st.version = max(int(getattr(st, "version", 1) or 1), AUTOMATION_STATE_VERSION)
+            for key, existing in list((st.host_enroll_tokens or {}).items()):
+                if not isinstance(existing, PersistedHostEnrollToken):
+                    st.host_enroll_tokens.pop(key, None)
+                    continue
+                if existing.consumed_at_ms is not None or existing.expires_at_ms <= now_ms:
+                    st.host_enroll_tokens.pop(key, None)
+            st.host_enroll_tokens[pending.token_id] = pending
+
+        await self._store.update(_write)
+        return pending, raw_token
+
+    async def claim_host_agent(
+        self,
+        *,
+        enroll_token: str,
+        host_id: str,
+        display_name: Optional[str],
+        platform: Optional[str],
+        version: Optional[str],
+        set_default: bool,
+        scope_type: Optional[str],
+        scope_id: Optional[Any],
+        workspace_base_path: Optional[str],
+    ) -> tuple[PersistedHostEnrollment, str, Optional[PersistedHostBinding]]:
+        token_id, secret = _parse_prefixed_token(enroll_token, HOST_AGENT_ENROLL_TOKEN_PREFIX)
+        hid = _normalize_runtime_host_id(host_id)
+        if not token_id or not secret or not hid:
+            raise ValueError("Invalid enrollment token or hostId")
+
+        secret_hash = _hash_host_agent_secret(secret)
+        now_ms = _now_ms()
+        raw_device_token, device_token_hash = _mint_host_agent_device_token(hid)
+        device_token_preview = _mask_secret(raw_device_token)
+        normalized_scope_type = _normalize_host_binding_scope_type(scope_type) or None
+        normalized_scope_id = _normalize_host_binding_scope_id(normalized_scope_type, scope_id) if normalized_scope_type else None
+        normalized_workspace_base = _normalize_abs_host_path(workspace_base_path)
+        enrollment_out: Optional[PersistedHostEnrollment] = None
+        binding_out: Optional[PersistedHostBinding] = None
+
+        def _write(st: PersistedGatewayAutomationState) -> None:
+            nonlocal enrollment_out, binding_out
+            st.version = max(int(getattr(st, "version", 1) or 1), AUTOMATION_STATE_VERSION)
+            pending = st.host_enroll_tokens.get(token_id) if isinstance(st.host_enroll_tokens, dict) else None
+            if not isinstance(pending, PersistedHostEnrollToken):
+                raise ValueError("Unknown enrollment token")
+            pending_norm = pending.normalized()
+            if pending_norm is None:
+                raise ValueError("Invalid enrollment token")
+            if pending_norm.consumed_at_ms is not None:
+                raise ValueError("Enrollment token already used")
+            if pending_norm.expires_at_ms <= now_ms:
+                raise ValueError("Enrollment token expired")
+            if pending_norm.secret_hash != secret_hash:
+                raise ValueError("Enrollment token mismatch")
+            if pending_norm.host_id_hint and pending_norm.host_id_hint != hid:
+                raise ValueError("hostId does not match enrollment token")
+            pending.consumed_at_ms = now_ms
+
+            enrollment = st.host_enrollments.get(hid) if isinstance(st.host_enrollments, dict) else None
+            if not isinstance(enrollment, PersistedHostEnrollment):
+                enrollment = PersistedHostEnrollment(host_id=hid, created_at_ms=now_ms)
+            enrollment.display_name = (str(display_name).strip() if isinstance(display_name, str) and display_name.strip() else enrollment.display_name)
+            enrollment.platform = (str(platform).strip() if isinstance(platform, str) and platform.strip() else enrollment.platform)
+            enrollment.version = (str(version).strip() if isinstance(version, str) and version.strip() else enrollment.version)
+            enrollment.device_token_hash = device_token_hash
+            enrollment.token_preview = device_token_preview
+            enrollment.claimed_at_ms = now_ms
+            enrollment.updated_at_ms = now_ms
+            enrollment.revoked_at_ms = None
+            st.host_enrollments[hid] = enrollment
+            enrollment_out = replace(enrollment)
+
+            binding_scope_type = normalized_scope_type or pending_norm.scope_type
+            binding_scope_id = normalized_scope_id or pending_norm.scope_id
+            binding_workspace_base = normalized_workspace_base or pending_norm.workspace_base_path
+            if set_default or binding_scope_type:
+                scope_type_value = binding_scope_type or HOST_BINDING_SCOPE_GLOBAL
+                scope_id_value = binding_scope_id or ("default" if scope_type_value == HOST_BINDING_SCOPE_GLOBAL else None)
+                binding = PersistedHostBinding(
+                    scope_type=scope_type_value,
+                    scope_id=scope_id_value or "",
+                    host_id=hid,
+                    workspace_base_path=binding_workspace_base,
+                    codex_profile_mode=SESSION_CODEX_PROFILE_MODE_INHERIT_PATCH,
+                    created_at_ms=now_ms,
+                    updated_at_ms=now_ms,
+                ).normalized()
+                if binding is None:
+                    raise ValueError("Invalid host binding")
+                st.host_bindings[binding.storage_key()] = binding
+                binding_out = replace(binding)
+
+        await self._store.update(_write)
+        if enrollment_out is None:
+            raise RuntimeError("Failed to persist host enrollment")
+        return enrollment_out, raw_device_token, binding_out
+
+    async def set_host_binding(
+        self,
+        *,
+        host_id: str,
+        scope_type: str,
+        scope_id: Any,
+        workspace_base_path: Optional[str],
+        codex_profile_mode: Optional[str] = None,
+    ) -> PersistedHostBinding:
+        hid = _normalize_runtime_host_id(host_id)
+        if not hid:
+            raise ValueError("Invalid hostId")
+        if self.get_host_enrollment(hid) is None:
+            raise ValueError("Unknown hostId")
+        now_ms = _now_ms()
+        normalized = PersistedHostBinding(
+            scope_type=scope_type,
+            scope_id=str(scope_id or ""),
+            host_id=hid,
+            workspace_base_path=workspace_base_path,
+            codex_profile_mode=codex_profile_mode or SESSION_CODEX_PROFILE_MODE_INHERIT_PATCH,
+            created_at_ms=now_ms,
+            updated_at_ms=now_ms,
+        ).normalized()
+        if normalized is None:
+            raise ValueError("Invalid host binding")
+
+        def _write(st: PersistedGatewayAutomationState) -> None:
+            st.version = max(int(getattr(st, "version", 1) or 1), AUTOMATION_STATE_VERSION)
+            existing = st.host_bindings.get(normalized.storage_key()) if isinstance(st.host_bindings, dict) else None
+            if isinstance(existing, PersistedHostBinding) and existing.created_at_ms:
+                normalized.created_at_ms = existing.created_at_ms
+            normalized.updated_at_ms = now_ms
+            st.host_bindings[normalized.storage_key()] = normalized
+
+        await self._store.update(_write)
+        return normalized
+
+    async def revoke_host_enrollment(self, host_id: str) -> Optional[PersistedHostEnrollment]:
+        hid = _normalize_runtime_host_id(host_id)
+        if not hid:
+            raise ValueError("Invalid hostId")
+        revoked: Optional[PersistedHostEnrollment] = None
+        now_ms = _now_ms()
+
+        def _write(st: PersistedGatewayAutomationState) -> None:
+            nonlocal revoked
+            st.version = max(int(getattr(st, "version", 1) or 1), AUTOMATION_STATE_VERSION)
+            enrollment = st.host_enrollments.get(hid) if isinstance(st.host_enrollments, dict) else None
+            if not isinstance(enrollment, PersistedHostEnrollment):
+                return
+            enrollment.revoked_at_ms = now_ms
+            enrollment.updated_at_ms = now_ms
+            revoked = replace(enrollment)
+            for key, binding in list((st.host_bindings or {}).items()):
+                if isinstance(binding, PersistedHostBinding) and binding.host_id == hid:
+                    st.host_bindings.pop(key, None)
+
+        await self._store.update(_write)
+        return revoked
+
+    async def note_host_connected(
+        self,
+        *,
+        host_id: str,
+        display_name: Optional[str],
+        platform: Optional[str],
+        version: Optional[str],
+    ) -> Optional[PersistedHostEnrollment]:
+        hid = _normalize_runtime_host_id(host_id)
+        if not hid:
+            return None
+        now_ms = _now_ms()
+        updated: Optional[PersistedHostEnrollment] = None
+
+        def _write(st: PersistedGatewayAutomationState) -> None:
+            nonlocal updated
+            enrollment = st.host_enrollments.get(hid) if isinstance(st.host_enrollments, dict) else None
+            if not isinstance(enrollment, PersistedHostEnrollment):
+                return
+            if isinstance(display_name, str) and display_name.strip():
+                enrollment.display_name = display_name.strip()
+            if isinstance(platform, str) and platform.strip():
+                enrollment.platform = platform.strip()
+            if isinstance(version, str) and version.strip():
+                enrollment.version = version.strip()
+            enrollment.last_connected_at_ms = now_ms
+            enrollment.last_seen_at_ms = now_ms
+            enrollment.updated_at_ms = now_ms
+            updated = replace(enrollment)
+
+        await self._store.update(_write)
+        return updated
+
+    async def note_host_seen(self, host_id: str) -> Optional[PersistedHostEnrollment]:
+        hid = _normalize_runtime_host_id(host_id)
+        if not hid:
+            return None
+        now_ms = _now_ms()
+        updated: Optional[PersistedHostEnrollment] = None
+
+        def _write(st: PersistedGatewayAutomationState) -> None:
+            nonlocal updated
+            enrollment = st.host_enrollments.get(hid) if isinstance(st.host_enrollments, dict) else None
+            if not isinstance(enrollment, PersistedHostEnrollment):
+                return
+            enrollment.last_seen_at_ms = now_ms
+            enrollment.updated_at_ms = now_ms
+            updated = replace(enrollment)
+
+        await self._store.update(_write)
+        return updated
+
+    async def note_host_disconnected(self, host_id: str) -> Optional[PersistedHostEnrollment]:
+        hid = _normalize_runtime_host_id(host_id)
+        if not hid:
+            return None
+        now_ms = _now_ms()
+        updated: Optional[PersistedHostEnrollment] = None
+
+        def _write(st: PersistedGatewayAutomationState) -> None:
+            nonlocal updated
+            enrollment = st.host_enrollments.get(hid) if isinstance(st.host_enrollments, dict) else None
+            if not isinstance(enrollment, PersistedHostEnrollment):
+                return
+            enrollment.last_disconnected_at_ms = now_ms
+            enrollment.updated_at_ms = now_ms
+            updated = replace(enrollment)
+
+        await self._store.update(_write)
+        return updated
+
+    def get_session_placement(self, session_id: str) -> Optional[SessionPlacement]:
+        sid = session_id.strip() if isinstance(session_id, str) else ""
+        if not sid:
+            return None
+        st = self._store.state
+        sess = st.sessions.get(sid) if isinstance(st.sessions, dict) else None
+        placement = getattr(sess, "placement", None) if isinstance(sess, PersistedSessionAutomation) else None
+        if isinstance(placement, SessionPlacement):
+            return placement.normalized(session_id=sid)
+        return None
+
+    async def set_session_placement(self, *, session_id: str, placement: Optional[SessionPlacement]) -> Optional[SessionPlacement]:
+        sid = session_id.strip() if isinstance(session_id, str) else ""
+        if not sid:
+            raise ValueError("session_id must not be empty")
+        normalized = placement.normalized(session_id=sid) if isinstance(placement, SessionPlacement) else None
+
+        def _write(st: PersistedGatewayAutomationState) -> None:
+            st.version = max(int(getattr(st, "version", 1) or 1), AUTOMATION_STATE_VERSION)
+            sess = st.sessions.get(sid)
+            if sess is None:
+                sess = PersistedSessionAutomation()
+                st.sessions[sid] = sess
+            sess.placement = normalized
+
+        await self._store.update(_write)
+        return normalized
+
     def get_workspace_host_path_for_session(self, session_id: str) -> Optional[str]:
         sid = session_id.strip() if isinstance(session_id, str) else ""
         if not sid:
             return None
+        placement = self.get_session_placement(sid)
+        if isinstance(placement, SessionPlacement) and placement.workspace_path:
+            return placement.workspace_path
         st = self._store.state
         for agent in (st.agents or {}).values():
             if not isinstance(agent, PersistedAgentRuntime):
@@ -5452,6 +6767,35 @@ class AutomationManager:
 
         await asyncio.to_thread(_write)
 
+    async def _ensure_workspace_files_for_session(self, session_id: str, root: Path) -> None:
+        sid = session_id.strip() if isinstance(session_id, str) else ""
+        if sid and _session_uses_remote_workspace(sid):
+            live, _ = await _ensure_live_session(sid, allow_create=True)
+            await _sync_remote_workspace_templates(live, session_id=sid, workspace_path=str(root))
+            return
+        await self._ensure_workspace_files_at(root)
+
+    async def _sync_workspace_agents_file_for_session(self, session_id: str, root: Path) -> None:
+        sid = session_id.strip() if isinstance(session_id, str) else ""
+        if sid and _session_uses_remote_workspace(sid):
+            live, _ = await _ensure_live_session(sid, allow_create=True)
+            await _live_fs_write_text(
+                live,
+                str(root / AGENTS_FILENAME),
+                _render_workspace_template_content(AGENTS_TEMPLATE_FILENAME, AGENTS_FILENAME),
+            )
+            return
+        await self._sync_workspace_agents_file_at(root)
+
+    async def _write_agent_model_for_session(self, session_id: str, root: Path, model: str) -> None:
+        sid = session_id.strip() if isinstance(session_id, str) else ""
+        normalized = _normalize_agent_model(model) or ARGUS_AGENT_MODEL_DEFAULT
+        if sid and _session_uses_remote_workspace(sid):
+            live, _ = await _ensure_live_session(sid, allow_create=True)
+            await _live_fs_write_text(live, str(self._agent_model_file_for_workspace(root)), normalized + "\n")
+            return
+        await self._write_agent_model_file(root, normalized)
+
     async def _sync_user_agent_models_for_current_channel(self, *, user_id: int) -> None:
         if not isinstance(user_id, int) or user_id <= 0:
             return
@@ -5466,8 +6810,8 @@ class AutomationManager:
             model = self._channel_adjusted_agent_model(agent)
             try:
                 root = Path(workspace_host_path)
-                await self._ensure_workspace_files_at(root)
-                await self._write_agent_model_file(root, model)
+                await self._ensure_workspace_files_for_session(agent.session_id, root)
+                await self._write_agent_model_for_session(agent.session_id, root, model)
                 await _sync_session_workspace_file(
                     agent.session_id,
                     root,
@@ -5492,18 +6836,41 @@ class AutomationManager:
                 continue
             root = Path(workspace_host_path)
             try:
-                await self._ensure_workspace_files_at(root)
-                await self._write_agent_model_file(root, self._channel_adjusted_agent_model(agent))
+                await self._ensure_workspace_files_for_session(agent.session_id, root)
+                await self._write_agent_model_for_session(agent.session_id, root, self._channel_adjusted_agent_model(agent))
                 await _sync_session_workspace_snapshot(agent.session_id, root)
             except Exception as e:
                 log.warning("Failed to persist model file for agent %s at %s: %s", agent.agent_id, str(root), str(e))
 
     async def _sync_live_session_default_model(self, *, session_id: str, model: str) -> bool:
-        return False
+        sid = session_id.strip() if isinstance(session_id, str) else ""
+        if not sid:
+            return False
+        normalized = _normalize_agent_model(model) or ARGUS_AGENT_MODEL_DEFAULT
+        if not _session_uses_remote_workspace(sid):
+            return False
+        try:
+            live, _ = await _ensure_live_session(sid, allow_create=True)
+            await _live_session_rpc(
+                live,
+                "config/value/write",
+                {
+                    "keyPath": "model",
+                    "value": normalized,
+                    "mergeStrategy": "upsert",
+                },
+            )
+            root = self._workspace_root_for_session(sid)
+            if root is not None:
+                await _live_fs_write_text(live, str(self._agent_model_file_for_workspace(root)), normalized + "\n")
+            return True
+        except Exception:
+            log.exception("Failed to sync live model for session %s", sid)
+            return False
 
     async def ensure_user_main_agent(self, *, user_id: int) -> tuple[PersistedAgentRuntime, bool]:
         _require_user_agent_support()
-        if not self._home_host_path:
+        if not self._home_host_path and _default_runtime_provisioner().name != SESSION_PLACEMENT_KIND_NATIVE:
             raise RuntimeError("ARGUS_HOME_HOST_PATH is required to create user agents")
         if not isinstance(user_id, int) or user_id <= 0:
             raise ValueError("Invalid userId")
@@ -5520,7 +6887,10 @@ class AutomationManager:
                 return
             created = True
             session_id = uuid.uuid4().hex[:12]
-            workspace_host_path = str((Path(self._home_host_path) / f"workspace-{user_id}-main").resolve())
+            placement = _default_session_placement(session_id)
+            workspace_host_path = placement.workspace_path or _default_native_workspace_path(session_id) or (
+                str((Path(self._home_host_path) / f"workspace-{user_id}-main").resolve()) if self._home_host_path else ""
+            )
             st.agents[aid] = PersistedAgentRuntime(
                 agent_id=aid,
                 session_id=session_id,
@@ -5532,22 +6902,24 @@ class AutomationManager:
                 model=ARGUS_AGENT_MODEL_DEFAULT,
             )
             if session_id not in st.sessions:
-                st.sessions[session_id] = PersistedSessionAutomation()
+                st.sessions[session_id] = PersistedSessionAutomation(placement=placement)
+            elif st.sessions[session_id].placement is None:
+                st.sessions[session_id].placement = placement
 
         await self._store.update(_write)
         agent = self._get_agent(aid)
         if agent is None:
             raise RuntimeError("Failed to persist user main agent")
         root = Path(agent.workspace_host_path)
-        await self._ensure_workspace_files_at(root)
-        await self._write_agent_model_file(root, self._channel_adjusted_agent_model(agent))
+        await self._ensure_workspace_files_for_session(agent.session_id, root)
+        await self._write_agent_model_for_session(agent.session_id, root, self._channel_adjusted_agent_model(agent))
         await _sync_session_workspace_snapshot(agent.session_id, root)
         await _ensure_live_session(agent.session_id, allow_create=True)
         return agent, created
 
     async def create_user_agent(self, *, user_id: int, short_name: str) -> PersistedAgentRuntime:
         _require_user_agent_support()
-        if not self._home_host_path:
+        if not self._home_host_path and _default_runtime_provisioner().name != SESSION_PLACEMENT_KIND_NATIVE:
             raise RuntimeError("ARGUS_HOME_HOST_PATH is required to create user agents")
         if not isinstance(user_id, int) or user_id <= 0:
             raise ValueError("Invalid userId")
@@ -5568,7 +6940,10 @@ class AutomationManager:
             if aid in st.agents:
                 raise ValueError(f"Agent already exists: {name}")
             session_id = uuid.uuid4().hex[:12]
-            workspace_host_path = str((Path(self._home_host_path) / f"workspace-{user_id}-{name}").resolve())
+            placement = _default_session_placement(session_id)
+            workspace_host_path = placement.workspace_path or _default_native_workspace_path(session_id) or (
+                str((Path(self._home_host_path) / f"workspace-{user_id}-{name}").resolve()) if self._home_host_path else ""
+            )
             st.agents[aid] = PersistedAgentRuntime(
                 agent_id=aid,
                 session_id=session_id,
@@ -5580,23 +6955,23 @@ class AutomationManager:
                 model=ARGUS_AGENT_MODEL_DEFAULT,
             )
             if session_id not in st.sessions:
-                st.sessions[session_id] = PersistedSessionAutomation()
+                st.sessions[session_id] = PersistedSessionAutomation(placement=placement)
+            elif st.sessions[session_id].placement is None:
+                st.sessions[session_id].placement = placement
 
         await self._store.update(_write)
         agent = self._get_agent(aid)
         if agent is None:
             raise RuntimeError("Failed to persist user agent")
         root = Path(agent.workspace_host_path)
-        await self._ensure_workspace_files_at(root)
-        await self._write_agent_model_file(root, self._channel_adjusted_agent_model(agent))
+        await self._ensure_workspace_files_for_session(agent.session_id, root)
+        await self._write_agent_model_for_session(agent.session_id, root, self._channel_adjusted_agent_model(agent))
         await _sync_session_workspace_snapshot(agent.session_id, root)
         await _ensure_live_session(agent.session_id, allow_create=True)
         return agent
 
     async def rename_user_agent(self, *, user_id: int, agent_id: str, new_short_name: str) -> PersistedAgentRuntime:
         _require_user_agent_support()
-        if not self._home_host_path:
-            raise RuntimeError("ARGUS_HOME_HOST_PATH is required to rename user agents")
         if not isinstance(user_id, int) or user_id <= 0:
             raise ValueError("Invalid userId")
 
@@ -5626,6 +7001,9 @@ class AutomationManager:
         session_id = str(old_agent.session_id or "").strip()
         if not session_id:
             raise RuntimeError("Agent has no sessionId")
+        remote_workspace = _session_uses_remote_workspace(session_id)
+        if not self._home_host_path and not remote_workspace:
+            raise RuntimeError("ARGUS_HOME_HOST_PATH is required to rename user agents")
 
         lock = self._session_restart_locks.get(session_id)
         if lock is None:
@@ -5651,25 +7029,28 @@ class AutomationManager:
                 ws_raw = str(agent.workspace_host_path or "").strip()
                 if not ws_raw:
                     raise RuntimeError("Agent has no workspaceHostPath")
-                old_ws = Path(ws_raw).resolve()
-                if not str(old_ws).startswith(str(home_root) + os.sep):
-                    raise PermissionError("Forbidden")
-                if not old_ws.exists() or not old_ws.is_dir():
-                    raise FileNotFoundError(f"Workspace not found: {old_ws}")
-                new_ws = Path(new_workspace_host_path).resolve()
-                if not str(new_ws).startswith(str(home_root) + os.sep):
-                    raise PermissionError("Forbidden")
-                if new_ws.exists():
-                    raise ValueError(f"Workspace already exists: {new_ws}")
+                new_ws_str = ws_raw
+                if not remote_workspace:
+                    old_ws = Path(ws_raw).resolve()
+                    if not str(old_ws).startswith(str(home_root) + os.sep):
+                        raise PermissionError("Forbidden")
+                    if not old_ws.exists() or not old_ws.is_dir():
+                        raise FileNotFoundError(f"Workspace not found: {old_ws}")
+                    new_ws = Path(new_workspace_host_path).resolve()
+                    if not str(new_ws).startswith(str(home_root) + os.sep):
+                        raise PermissionError("Forbidden")
+                    if new_ws.exists():
+                        raise ValueError(f"Workspace already exists: {new_ws}")
 
-                old_ws.rename(new_ws)
+                    old_ws.rename(new_ws)
+                    new_ws_str = str(new_ws)
 
                 # Update chat bindings to the new agentId.
                 for ck, aid in list(st.chat_bindings.items()):
                     if aid == old_aid:
                         st.chat_bindings[ck] = new_aid
 
-                updated = replace(agent, agent_id=new_aid, short_name=name, workspace_host_path=str(new_ws))
+                updated = replace(agent, agent_id=new_aid, short_name=name, workspace_host_path=new_ws_str)
                 st.agents.pop(old_aid, None)
                 st.agents[new_aid] = updated
 
@@ -5679,7 +7060,7 @@ class AutomationManager:
             if agent2 is None:
                 raise RuntimeError("Agent not found after rename")
             root = Path(agent2.workspace_host_path)
-            await self._write_agent_model_file(root, self._channel_adjusted_agent_model(agent2))
+            await self._write_agent_model_for_session(agent2.session_id, root, self._channel_adjusted_agent_model(agent2))
             await _sync_session_workspace_snapshot(agent2.session_id, root)
 
             if _provisioner_requires_runtime_recreation_on_workspace_change():
@@ -5698,8 +7079,6 @@ class AutomationManager:
 
     async def delete_user_agent(self, *, user_id: int, chat_key: str, agent_id: str) -> dict[str, Any]:
         _require_user_agent_support()
-        if not self._home_host_path:
-            raise RuntimeError("ARGUS_HOME_HOST_PATH is required to delete user agents")
         if not isinstance(user_id, int) or user_id <= 0:
             raise ValueError("Invalid userId")
 
@@ -5720,6 +7099,9 @@ class AutomationManager:
         session_id = str(agent.session_id or "").strip()
         if not session_id:
             raise RuntimeError("Agent has no sessionId")
+        remote_workspace = _session_uses_remote_workspace(session_id)
+        if not self._home_host_path and not remote_workspace:
+            raise RuntimeError("ARGUS_HOME_HOST_PATH is required to delete user agents")
 
         lock = self._session_restart_locks.get(session_id)
         if lock is None:
@@ -5745,7 +7127,7 @@ class AutomationManager:
                 sid = str(current.session_id or "").strip()
                 if sid:
                     ws_raw = str(current.workspace_host_path or "").strip()
-                    if ws_raw:
+                    if ws_raw and not remote_workspace:
                         try:
                             old_ws = Path(ws_raw).resolve()
                             if str(old_ws).startswith(str(home_root) + os.sep) and old_ws.exists() and old_ws.is_dir():
@@ -5839,8 +7221,6 @@ class AutomationManager:
 
     async def set_user_agent_model(self, *, user_id: int, agent_id: str, model: str) -> tuple[PersistedAgentRuntime, bool]:
         _require_user_agent_support()
-        if not self._home_host_path:
-            raise RuntimeError("ARGUS_HOME_HOST_PATH is required to update user agents")
         if not isinstance(user_id, int) or user_id <= 0:
             raise ValueError("Invalid userId")
 
@@ -5856,6 +7236,8 @@ class AutomationManager:
             raise ValueError(f"Unknown agent: {aid}")
         if not (isinstance(current.owner_user_id, int) and current.owner_user_id == user_id):
             raise PermissionError("Forbidden")
+        if not self._home_host_path and not _session_uses_remote_workspace(current.session_id):
+            raise RuntimeError("ARGUS_HOME_HOST_PATH is required to update user agents")
         user_state = self._get_user_channel_state_for_user(user_id=user_id)
         current_channel_id = self._current_channel_id_for_user_state(user_state=user_state)
         if current_channel_id == CHANNEL_ID_GATEWAY and normalized_model not in ARGUS_GATEWAY_AGENT_MODELS_SET:
@@ -5878,8 +7260,8 @@ class AutomationManager:
             raise RuntimeError("Agent not found after model update")
         effective_model = self._channel_adjusted_agent_model(updated)
         root = Path(updated.workspace_host_path)
-        await self._ensure_workspace_files_at(root)
-        await self._write_agent_model_file(root, effective_model)
+        await self._ensure_workspace_files_for_session(updated.session_id, root)
+        await self._write_agent_model_for_session(updated.session_id, root, effective_model)
         await _sync_session_workspace_file(updated.session_id, root, self._agent_model_file_for_workspace(root))
         synced = await self._sync_live_session_default_model(session_id=updated.session_id, model=effective_model)
         return updated, synced
@@ -8469,15 +9851,29 @@ class AutomationManager:
             return []
 
         root = self._workspace_root_for_session(session_id)
+        if root is None and _session_uses_remote_workspace(session_id):
+            try:
+                await _ensure_live_session(session_id, allow_create=True)
+            except Exception:
+                return []
+            root = self._workspace_root_for_session(session_id)
         if root is None:
             return []
+        use_remote_workspace = _session_uses_remote_workspace(session_id)
+        live: Optional[LiveRuntimeSession] = None
+        if use_remote_workspace:
+            try:
+                live, _ = await _ensure_live_session(session_id, allow_create=True)
+            except Exception:
+                return []
 
         chat_part = _sanitize_path_part(source_chat_key or session_id or "unknown", fallback="unknown")
         base_dir = root / "inbox" / "telegram" / chat_part
-        try:
-            base_dir.mkdir(parents=True, exist_ok=True)
-        except Exception:
-            pass
+        if not use_remote_workspace:
+            try:
+                base_dir.mkdir(parents=True, exist_ok=True)
+            except Exception:
+                pass
 
         mime_to_ext = {
             "image/png": ".png",
@@ -8575,17 +9971,32 @@ class AutomationManager:
 
             ts = _now_ms()
             dest = base_dir / f"{ts}_{idx:02d}_{source_part}_{file_stem}_{unique_part}{ext}"
-            try:
-                downloaded_size = await asyncio.to_thread(
-                    _telegram_download_file_to_path_sync,
-                    token,
-                    file_path,
-                    dest,
-                    max_bytes=TELEGRAM_MAX_DOWNLOAD_BYTES,
-                )
-            except Exception as e:
-                log.warning("Telegram download failed for fileId=%s: %s", file_id, str(e))
-                continue
+            downloaded_size = 0
+            if use_remote_workspace and live is not None:
+                try:
+                    payload = await asyncio.to_thread(
+                        _telegram_download_file_bytes_sync,
+                        token,
+                        file_path,
+                        max_bytes=TELEGRAM_MAX_DOWNLOAD_BYTES,
+                    )
+                    downloaded_size = len(payload)
+                    await _live_fs_write_bytes(live, str(dest), payload)
+                except Exception as e:
+                    log.warning("Telegram remote download failed for fileId=%s: %s", file_id, str(e))
+                    continue
+            else:
+                try:
+                    downloaded_size = await asyncio.to_thread(
+                        _telegram_download_file_to_path_sync,
+                        token,
+                        file_path,
+                        dest,
+                        max_bytes=TELEGRAM_MAX_DOWNLOAD_BYTES,
+                    )
+                except Exception as e:
+                    log.warning("Telegram download failed for fileId=%s: %s", file_id, str(e))
+                    continue
 
             rel = None
             try:
@@ -8595,7 +10006,8 @@ class AutomationManager:
             rel_norm = _normalize_workspace_relative_path(rel)
             if not rel_norm:
                 continue
-            await _sync_session_workspace_file(session_id, root, dest)
+            if not use_remote_workspace:
+                await _sync_session_workspace_file(session_id, root, dest)
             out.append(
                 PersistedStagedAttachment(
                     path=rel_norm,
@@ -8818,13 +10230,56 @@ class AutomationManager:
         if root is None:
             return ""
 
+        if _session_uses_remote_workspace(session_id):
+            try:
+                live, _ = await _ensure_live_session(session_id, allow_create=True)
+                await self._sync_workspace_agents_file_for_session(session_id, root)
+            except Exception:
+                log.exception("Failed to prepare remote project context for session %s", session_id)
+                return ""
+
+            filenames = list(PROJECT_CONTEXT_FILENAMES)
+            if include_heartbeat:
+                filenames.append(HEARTBEAT_FILENAME)
+
+            blocks: list[str] = []
+            sid = (session_id or "").strip()
+            if sid:
+                blocks.append(
+                    "\n".join(
+                        [
+                            "[ARGUS]",
+                            f"sessionId: {sid}",
+                            f"selfNodeId: runtime:{sid}",
+                            'node_invoke 建议：优先用 node="self"；多 runtime 在线时用 node="runtime:<sessionId>"（即 selfNodeId）。',
+                            '交互式 CLI：先用 command="system.run" + params={"argv":[...],"pty":true,"yieldMs":0} 拿到 jobId，再继续调用 process.write / process.send_keys / process.submit / process.paste。',
+                            "[/ARGUS]",
+                        ]
+                    )
+                )
+
+            for name in filenames:
+                path_str = str(root / name)
+                try:
+                    content = await _live_fs_read_text(live, path_str, max_bytes=512 * 1024)
+                except Exception as e:
+                    blocks.append(f"[{name}]\n(failed to read {name}: {e})\n[/{name}]")
+                    continue
+                if content is None:
+                    continue
+                blocks.append(f"[{name}]\n{content.strip()}\n[/{name}]")
+
+            if not blocks:
+                return ""
+            return "# Project Context\n\n" + "\n\n".join(blocks)
+
         try:
             await _sync_session_prompt_context_to_local(session_id, root, include_heartbeat=include_heartbeat)
         except Exception:
             log.exception("Failed to sync remote prompt context for session %s", session_id)
 
         try:
-            await self._sync_workspace_agents_file_at(root)
+            await self._sync_workspace_agents_file_for_session(session_id, root)
             await _sync_session_workspace_file(session_id, root, root / AGENTS_FILENAME)
         except Exception:
             log.exception("Failed to refresh AGENTS.md from template at %s", str(root))
@@ -8877,6 +10332,61 @@ class AutomationManager:
         root = self._workspace_root_for_session(session_id)
         if root is None:
             return ""
+
+        if _session_uses_remote_workspace(session_id):
+            try:
+                live, _ = await _ensure_live_session(session_id, allow_create=True)
+            except Exception:
+                log.exception("Failed to open remote workspace for skill discovery in session %s", session_id)
+                return ""
+
+            skills_root = root / SKILLS_DIRNAME
+            try:
+                entries = await _live_fs_read_directory(live, str(skills_root))
+            except Exception:
+                log.exception("Failed to list remote skills from workspace %s", str(skills_root))
+                return ""
+
+            skills: list[dict[str, str]] = []
+            for entry in sorted(entries, key=lambda item: str(item.get("fileName") or "")):
+                if not bool(entry.get("isDirectory")):
+                    continue
+                skill_name = str(entry.get("fileName") or "").strip()
+                if not skill_name:
+                    continue
+                skill_md = skills_root / skill_name / SKILL_MD_FILENAME
+                raw = await _live_fs_read_text(live, str(skill_md), max_bytes=256 * 1024)
+                if raw is None:
+                    continue
+                meta = _parse_yaml_front_matter(raw)
+                name = (meta.get("name") or skill_name).strip()
+                if not name:
+                    continue
+                description = (meta.get("description") or "").strip()
+                location = str(skills_root / skill_name / SKILL_MD_FILENAME)
+                skills.append({"name": name, "description": description, "location": location})
+
+            if not skills:
+                return ""
+
+            lines: list[str] = [
+                "## Skills",
+                "",
+                "A skill is a set of local instructions stored in a `SKILL.md` file.",
+                "",
+                "Trigger rules:",
+                "- If the user names a skill (e.g. `$skill-creator`) OR the task clearly matches a skill’s description, you MUST use that skill for this turn.",
+                "- After selecting a skill, read its `SKILL.md` at the `location` (read only enough to follow the workflow).",
+                "",
+                "<available_skills>",
+            ]
+            for skill in skills:
+                lines.append(f"- name: {skill['name']}")
+                if skill["description"]:
+                    lines.append(f"  description: {skill['description']}")
+                lines.append(f"  location: {skill['location']}")
+            lines.append("</available_skills>")
+            return "\n".join(lines).strip()
 
         def _read() -> str:
             skills_root = root / SKILLS_DIRNAME
@@ -9486,6 +10996,14 @@ class AutomationManager:
         if root is None:
             return False
         p = root / HEARTBEAT_FILENAME
+        if _session_uses_remote_workspace(session_id):
+            try:
+                live, _ = await _ensure_live_session(session_id, allow_create=True)
+                raw = await _live_fs_read_text(live, str(p), max_bytes=512 * 1024)
+            except Exception:
+                log.exception("Failed to read remote HEARTBEAT.md for session %s", session_id)
+                return False
+            return not _is_heartbeat_content_effectively_empty(raw)
         try:
             await _pull_session_workspace_file_to_local(
                 session_id,
@@ -9646,6 +11164,35 @@ class NodeInvokeResult:
     error: Optional[dict[str, Any]] = None
 
 
+@dataclass
+class RuntimeRelay:
+    session_id: str
+    host_id: str
+    reader: RelayRuntimeReader
+    writer: RelayRuntimeWriter
+    runtime_id: str
+    runtime_name: str
+    workspace_path: Optional[str]
+    metadata: dict[str, Any] = field(default_factory=dict)
+    connected_at_ms: int = 0
+    last_seen_ms: int = 0
+
+
+@dataclass
+class RuntimeHostSession:
+    host_id: str
+    conn_id: str
+    ws: WebSocket
+    display_name: Optional[str] = None
+    platform: Optional[str] = None
+    version: Optional[str] = None
+    caps: list[str] = field(default_factory=list)
+    connected_at_ms: int = 0
+    last_seen_ms: int = 0
+    runtime_session_ids: set[str] = field(default_factory=set)
+    pending_open_futures: dict[str, asyncio.Future[dict[str, Any]]] = field(default_factory=dict)
+
+
 class NodeRegistry:
     def __init__(self) -> None:
         self._lock = asyncio.Lock()
@@ -9698,6 +11245,22 @@ class NodeRegistry:
                 )
                 self._pending.pop(rid, None)
             return removed
+
+    async def force_close(self, node_id: str, *, scope_session_id: Optional[str] = None, reason: str = "closed") -> bool:
+        scope = self._norm_scope(scope_session_id) if scope_session_id is not None else None
+        async with self._lock:
+            if scope is not None:
+                session = self._nodes_by_key.get((scope, node_id))
+            else:
+                matches = [s for (sid, nid), s in self._nodes_by_key.items() if nid == node_id]
+                session = matches[0] if len(matches) == 1 else None
+        if session is None:
+            return False
+        try:
+            await session.ws.close(code=1012, reason=reason)
+        except Exception:
+            return False
+        return True
 
     async def list_connected(self, *, scope_session_id: Optional[str] = None) -> list[dict[str, Any]]:
         scope = self._norm_scope(scope_session_id) if scope_session_id is not None else None
@@ -9887,6 +11450,342 @@ class NodeRegistry:
         )
         return True
 
+
+class RuntimeHostRegistry:
+    def __init__(self) -> None:
+        self._lock = asyncio.Lock()
+        self._hosts_by_id: dict[str, RuntimeHostSession] = {}
+        self._hosts_by_conn: dict[str, str] = {}
+        self._relays_by_session: dict[str, RuntimeRelay] = {}
+
+    async def register(self, session: RuntimeHostSession) -> None:
+        async with self._lock:
+            existing = self._hosts_by_id.get(session.host_id)
+            if existing is not None:
+                self._hosts_by_conn.pop(existing.conn_id, None)
+                self._hosts_by_id.pop(session.host_id, None)
+                for fut in existing.pending_open_futures.values():
+                    if not fut.done():
+                        fut.set_exception(RuntimeError("runtime host replaced by a new connection"))
+                existing.pending_open_futures.clear()
+                try:
+                    await existing.ws.close(code=1012, reason="replaced")
+                except Exception:
+                    pass
+            self._hosts_by_id[session.host_id] = session
+            self._hosts_by_conn[session.conn_id] = session.host_id
+
+    async def unregister(self, conn_id: str) -> Optional[RuntimeHostSession]:
+        async with self._lock:
+            host_id = self._hosts_by_conn.pop(conn_id, None)
+            if not host_id:
+                return None
+            session = self._hosts_by_id.pop(host_id, None)
+            if session is None:
+                return None
+            relay_session_ids = list(session.runtime_session_ids)
+            for fut in session.pending_open_futures.values():
+                if not fut.done():
+                    fut.set_exception(RuntimeError("runtime host disconnected"))
+            session.pending_open_futures.clear()
+            relays = [self._relays_by_session.pop(sid, None) for sid in relay_session_ids]
+
+        for relay in relays:
+            if relay is None:
+                continue
+            relay.reader.feed_eof()
+            try:
+                relay.writer.close()
+            except Exception:
+                pass
+        return session
+
+    async def force_close_host(self, host_id: str, *, reason: str = "closed") -> bool:
+        hid = _normalize_runtime_host_id(host_id)
+        if not hid:
+            return False
+        async with self._lock:
+            session = self._hosts_by_id.get(hid)
+        if session is None:
+            return False
+        try:
+            await session.ws.close(code=1012, reason=reason)
+        except Exception:
+            return False
+        return True
+
+    async def close_all_for_host(self, host_id: str, *, reason: str = "closed") -> int:
+        hid = _normalize_runtime_host_id(host_id)
+        if not hid:
+            return 0
+        async with self._lock:
+            relays = [relay for relay in self._relays_by_session.values() if relay.host_id == hid]
+        closed = 0
+        for relay in relays:
+            if await self.close_runtime(relay.session_id, reason=reason):
+                closed += 1
+        await self.force_close_host(hid, reason=reason)
+        return closed
+
+    async def list_connected(self) -> list[dict[str, Any]]:
+        async with self._lock:
+            sessions = list(self._hosts_by_id.values())
+        out: list[dict[str, Any]] = []
+        for s in sessions:
+            out.append(
+                {
+                    "hostId": s.host_id,
+                    "displayName": s.display_name,
+                    "platform": s.platform,
+                    "version": s.version,
+                    "caps": list(s.caps or []),
+                    "connectedAtMs": s.connected_at_ms,
+                    "lastSeenMs": s.last_seen_ms,
+                    "runtimeSessionCount": len(s.runtime_session_ids),
+                }
+            )
+        out.sort(key=lambda item: item.get("displayName") or item.get("hostId") or "")
+        return out
+
+    async def resolve_host_id(self, host_id: Optional[str]) -> Optional[str]:
+        host_norm = _normalize_runtime_host_id(host_id)
+        async with self._lock:
+            if host_norm:
+                session = self._hosts_by_id.get(host_norm)
+                if session is not None and session.ws.client_state == WebSocketState.CONNECTED:
+                    return host_norm
+                return None
+            connected = [
+                h.host_id
+                for h in self._hosts_by_id.values()
+                if h.ws.client_state == WebSocketState.CONNECTED
+            ]
+        if len(connected) == 1:
+            return connected[0]
+        return None
+
+    async def touch(self, host_id: str) -> None:
+        hid = _normalize_runtime_host_id(host_id)
+        if not hid:
+            return
+        now_ms = int(time.time() * 1000)
+        async with self._lock:
+            session = self._hosts_by_id.get(hid)
+            if session is not None:
+                session.last_seen_ms = now_ms
+
+    async def get_relay(self, session_id: str) -> Optional[RuntimeRelay]:
+        sid = _normalize_runtime_session_id(session_id)
+        if not sid:
+            return None
+        async with self._lock:
+            return self._relays_by_session.get(sid)
+
+    async def send_event(self, host_id: str, *, event: str, payload: dict[str, Any]) -> None:
+        hid = _normalize_runtime_host_id(host_id)
+        if not hid:
+            raise RuntimeError("invalid runtime host id")
+        async with self._lock:
+            session = self._hosts_by_id.get(hid)
+        if session is None or session.ws.client_state != WebSocketState.CONNECTED:
+            raise RuntimeError(f"runtime host {hid} is not connected")
+        await session.ws.send_text(json.dumps({"type": "event", "event": event, "payload": payload}))
+
+    async def open_runtime(
+        self,
+        *,
+        session_id: str,
+        target_host_id: Optional[str],
+        payload: dict[str, Any],
+        timeout_ms: int = 30_000,
+    ) -> tuple[RuntimeRelay, bool]:
+        sid = _normalize_runtime_session_id(session_id)
+        if not sid:
+            raise RuntimeError("invalid session id")
+
+        resolved_host_id = await self.resolve_host_id(target_host_id)
+        if not resolved_host_id:
+            if target_host_id:
+                raise RuntimeError(f"runtime host not connected: {target_host_id}")
+            raise RuntimeError("no runtime host connected")
+
+        async with self._lock:
+            existing = self._relays_by_session.get(sid)
+            if existing is not None and existing.host_id == resolved_host_id:
+                try:
+                    writer_closing = existing.writer.is_closing()
+                except Exception:
+                    writer_closing = False
+                if not writer_closing:
+                    return existing, False
+
+            host = self._hosts_by_id.get(resolved_host_id)
+            if host is None or host.ws.client_state != WebSocketState.CONNECTED:
+                raise RuntimeError(f"runtime host {resolved_host_id} is not connected")
+            fut: asyncio.Future[dict[str, Any]] = asyncio.get_running_loop().create_future()
+            host.pending_open_futures[sid] = fut
+
+        try:
+            await self.send_event(resolved_host_id, event="runtime.open", payload=payload)
+        except Exception:
+            async with self._lock:
+                host = self._hosts_by_id.get(resolved_host_id)
+                if host is not None:
+                    host.pending_open_futures.pop(sid, None)
+            raise
+
+        try:
+            opened = await asyncio.wait_for(fut, timeout_ms / 1000.0)
+        except Exception:
+            async with self._lock:
+                host = self._hosts_by_id.get(resolved_host_id)
+                if host is not None:
+                    host.pending_open_futures.pop(sid, None)
+            raise
+
+        reader = RelayRuntimeReader()
+        writer = RelayRuntimeWriter(
+            send_line=lambda text, hid=resolved_host_id, current_sid=sid: self.send_event(
+                hid,
+                event="runtime.frame",
+                payload={"sessionId": current_sid, "data": text},
+            )
+        )
+        now_ms = int(time.time() * 1000)
+        relay = RuntimeRelay(
+            session_id=sid,
+            host_id=resolved_host_id,
+            reader=reader,
+            writer=writer,
+            runtime_id=str(opened.get("runtimeId") or sid),
+            runtime_name=str(opened.get("runtimeName") or f"native-{sid}"),
+            workspace_path=str(opened.get("workspacePath") or "").strip() or None,
+            metadata=dict(opened),
+            connected_at_ms=now_ms,
+            last_seen_ms=now_ms,
+        )
+        async with self._lock:
+            self._relays_by_session[sid] = relay
+            host = self._hosts_by_id.get(resolved_host_id)
+            if host is not None:
+                host.runtime_session_ids.add(sid)
+        return relay, True
+
+    async def close_runtime(self, session_id: str, *, reason: str = "closed", restart: bool = False) -> bool:
+        sid = _normalize_runtime_session_id(session_id)
+        if not sid:
+            return False
+        async with self._lock:
+            relay = self._relays_by_session.pop(sid, None)
+            host: Optional[RuntimeHostSession] = None
+            if relay is not None:
+                host = self._hosts_by_id.get(relay.host_id)
+                if host is not None:
+                    host.runtime_session_ids.discard(sid)
+        if relay is None:
+            return False
+        relay.reader.feed_eof()
+        try:
+            relay.writer.close()
+        except Exception:
+            pass
+        if host is not None and host.ws.client_state == WebSocketState.CONNECTED:
+            event = "runtime.restart" if restart else "runtime.close"
+            try:
+                await host.ws.send_text(
+                    json.dumps({"type": "event", "event": event, "payload": {"sessionId": sid, "reason": reason}})
+                )
+            except Exception:
+                pass
+        return True
+
+    async def handle_runtime_opened(self, conn_id: str, payload: dict[str, Any]) -> bool:
+        sid = _normalize_runtime_session_id(payload.get("sessionId"))
+        if not sid:
+            return False
+        async with self._lock:
+            host_id = self._hosts_by_conn.get(conn_id)
+            host = self._hosts_by_id.get(host_id or "")
+            fut = host.pending_open_futures.pop(sid, None) if host is not None else None
+        if fut is None:
+            return False
+        if not fut.done():
+            fut.set_result(dict(payload))
+        return True
+
+    async def handle_runtime_open_failed(self, conn_id: str, payload: dict[str, Any]) -> bool:
+        sid = _normalize_runtime_session_id(payload.get("sessionId"))
+        if not sid:
+            return False
+        message = str(payload.get("message") or "failed to open runtime").strip() or "failed to open runtime"
+        async with self._lock:
+            host_id = self._hosts_by_conn.get(conn_id)
+            host = self._hosts_by_id.get(host_id or "")
+            fut = host.pending_open_futures.pop(sid, None) if host is not None else None
+        if fut is None:
+            return False
+        if not fut.done():
+            fut.set_exception(RuntimeError(message))
+        return True
+
+    async def handle_runtime_frame(self, conn_id: str, payload: dict[str, Any]) -> bool:
+        sid = _normalize_runtime_session_id(payload.get("sessionId"))
+        data = payload.get("data")
+        if not sid or not isinstance(data, str):
+            return False
+        now_ms = int(time.time() * 1000)
+        async with self._lock:
+            host_id = self._hosts_by_conn.get(conn_id)
+            host = self._hosts_by_id.get(host_id or "")
+            relay = self._relays_by_session.get(sid)
+            if host is not None:
+                host.last_seen_ms = now_ms
+        if relay is None:
+            return False
+        relay.last_seen_ms = now_ms
+        relay.reader.feed_text(data)
+        return True
+
+    async def handle_runtime_exit(self, conn_id: str, payload: dict[str, Any]) -> bool:
+        sid = _normalize_runtime_session_id(payload.get("sessionId"))
+        if not sid:
+            return False
+        async with self._lock:
+            host_id = self._hosts_by_conn.get(conn_id)
+            host = self._hosts_by_id.get(host_id or "")
+            relay = self._relays_by_session.pop(sid, None)
+            if host is not None:
+                host.runtime_session_ids.discard(sid)
+        if relay is None:
+            return False
+        relay.reader.feed_eof()
+        try:
+            relay.writer.close()
+        except Exception:
+            pass
+        return True
+
+    async def list_sessions(self) -> list[dict[str, Any]]:
+        async with self._lock:
+            relays = list(self._relays_by_session.values())
+        out: list[dict[str, Any]] = []
+        for relay in relays:
+            out.append(
+                {
+                    "sessionId": relay.session_id,
+                    "provider": SESSION_PLACEMENT_KIND_NATIVE,
+                    "runtimeId": relay.runtime_id,
+                    "runtimeName": relay.runtime_name,
+                    "name": relay.runtime_name,
+                    "status": "running",
+                    "hostId": relay.host_id,
+                    "workspacePath": relay.workspace_path,
+                    "runtimeLayout": RUNTIME_LAYOUT,
+                }
+            )
+        out.sort(key=lambda item: item.get("sessionId") or "")
+        return out
+
 @dataclass
 class McpSessionState:
     session_id: str
@@ -9982,7 +11881,7 @@ def _resolve_provision_mode() -> ProvisionModeResolution:
     raw_mode = _configured_provision_mode()
     explicit_mode = raw_mode or "auto"
 
-    if explicit_mode in ("static", "docker", "fugue"):
+    if explicit_mode in ("static", "docker", "fugue", "native"):
         return ProvisionModeResolution(
             raw_mode=explicit_mode,
             resolved_mode=explicit_mode,
@@ -9991,7 +11890,8 @@ def _resolve_provision_mode() -> ProvisionModeResolution:
 
     if explicit_mode not in ("", "auto"):
         raise RuntimeError(
-            f"Unsupported ARGUS_PROVISION_MODE={raw_mode!r}; supported modes are: 'auto', 'static', 'docker', 'fugue'"
+            "Unsupported ARGUS_PROVISION_MODE="
+            f"{raw_mode!r}; supported modes are: 'auto', 'static', 'docker', 'fugue', 'native'"
         )
 
     warnings: list[str] = []
@@ -10220,45 +12120,177 @@ class FugueRuntimeProvisioner(RuntimeProvisioner):
         return await asyncio.to_thread(_fugue_restart_session_sync, session_id)
 
 
-def _build_runtime_provisioner() -> RuntimeProvisioner:
-    mode = _provision_mode()
-    if mode in ("", "static"):
+class NativeRuntimeProvisioner(RuntimeProvisioner):
+    name = SESSION_PLACEMENT_KIND_NATIVE
+
+    @property
+    def supports_user_agents(self) -> bool:
+        return True
+
+    @property
+    def supports_runtime_automation(self) -> bool:
+        return True
+
+    @property
+    def manages_runtime_sessions(self) -> bool:
+        return True
+
+    async def ensure_live_session(self, session_id: str, *, allow_create: bool) -> tuple[LiveRuntimeSession, bool]:
+        return await _ensure_live_native_session(session_id, allow_create=allow_create)
+
+    async def list_sessions(self) -> list[dict[str, Any]]:
+        return await app.state.runtime_host_registry.list_sessions()
+
+    async def delete_session(self, session_id: str) -> None:
+        await _close_live_session(session_id)
+        if not await app.state.runtime_host_registry.close_runtime(session_id, reason="deleted"):
+            raise KeyError("Unknown session")
+
+    async def remove_runtime(self, session_id: str) -> bool:
+        await _close_live_session(session_id)
+        return await app.state.runtime_host_registry.close_runtime(session_id, reason="removed")
+
+    async def restart_runtime(self, session_id: str) -> bool:
+        await _close_live_session(session_id)
+        return await app.state.runtime_host_registry.close_runtime(session_id, reason="restart", restart=True)
+
+
+def _build_runtime_provisioner(mode: str) -> RuntimeProvisioner:
+    mode = _normalize_session_placement_kind(mode) or SESSION_PLACEMENT_KIND_STATIC
+    if mode in ("", SESSION_PLACEMENT_KIND_STATIC):
         return StaticRuntimeProvisioner()
-    if mode == "docker":
+    if mode == SESSION_PLACEMENT_KIND_DOCKER:
         return DockerRuntimeProvisioner()
-    if mode == "fugue":
+    if mode == SESSION_PLACEMENT_KIND_FUGUE:
         return FugueRuntimeProvisioner()
+    if mode == SESSION_PLACEMENT_KIND_NATIVE:
+        return NativeRuntimeProvisioner()
     raise RuntimeError(
-        f"Unsupported resolved provision mode {mode!r}; supported modes are: 'static', 'docker', 'fugue'"
+        f"Unsupported resolved provision mode {mode!r}; supported modes are: 'static', 'docker', 'fugue', 'native'"
     )
 
 
-def _runtime_provisioner() -> RuntimeProvisioner:
-    provisioner = getattr(app.state, "runtime_provisioner", None)
+def _runtime_provisioners() -> dict[str, RuntimeProvisioner]:
+    provisioners = getattr(app.state, "runtime_provisioners", None)
+    if not isinstance(provisioners, dict):
+        provisioners = {
+            SESSION_PLACEMENT_KIND_STATIC: _build_runtime_provisioner(SESSION_PLACEMENT_KIND_STATIC),
+            SESSION_PLACEMENT_KIND_DOCKER: _build_runtime_provisioner(SESSION_PLACEMENT_KIND_DOCKER),
+            SESSION_PLACEMENT_KIND_FUGUE: _build_runtime_provisioner(SESSION_PLACEMENT_KIND_FUGUE),
+            SESSION_PLACEMENT_KIND_NATIVE: _build_runtime_provisioner(SESSION_PLACEMENT_KIND_NATIVE),
+        }
+        app.state.runtime_provisioners = provisioners
+    return provisioners
+
+
+def _runtime_provisioner_for_mode(mode: str) -> RuntimeProvisioner:
+    normalized = _normalize_session_placement_kind(mode) or SESSION_PLACEMENT_KIND_STATIC
+    provisioners = _runtime_provisioners()
+    provisioner = provisioners.get(normalized)
     if provisioner is None:
-        provisioner = _build_runtime_provisioner()
-        app.state.runtime_provisioner = provisioner
+        provisioner = _build_runtime_provisioner(normalized)
+        provisioners[normalized] = provisioner
     return provisioner
 
 
+def _default_runtime_provisioner() -> RuntimeProvisioner:
+    return _runtime_provisioner_for_mode(_provision_mode())
+
+
 def _provisioner_mode_name() -> str:
-    return _runtime_provisioner().name
+    return _default_runtime_provisioner().name
+
+
+def _stored_session_placement(session_id: str) -> Optional[SessionPlacement]:
+    sid = session_id.strip() if isinstance(session_id, str) else ""
+    if not sid:
+        return None
+    automation: Optional[AutomationManager] = getattr(app.state, "automation", None)
+    if automation is None:
+        return None
+    try:
+        return automation.get_session_placement(sid)
+    except Exception:
+        return None
+
+
+def _effective_session_placement(session_id: str) -> SessionPlacement:
+    sid = session_id.strip() if isinstance(session_id, str) else ""
+    if not sid:
+        return SessionPlacement(kind=_provision_mode()).normalized()
+    placement = _stored_session_placement(sid)
+    if isinstance(placement, SessionPlacement):
+        return placement.normalized(session_id=sid)
+    return _default_session_placement(sid)
+
+
+async def _persist_session_placement(session_id: str, placement: Optional[SessionPlacement]) -> Optional[SessionPlacement]:
+    sid = session_id.strip() if isinstance(session_id, str) else ""
+    if not sid:
+        raise ValueError("session_id must not be empty")
+    automation: Optional[AutomationManager] = getattr(app.state, "automation", None)
+    normalized = placement.normalized(session_id=sid) if isinstance(placement, SessionPlacement) else None
+    if automation is None:
+        return normalized
+    return await automation.set_session_placement(session_id=sid, placement=normalized)
+
+
+def _runtime_provisioner_for_session(session_id: str) -> RuntimeProvisioner:
+    placement = _effective_session_placement(session_id)
+    return _runtime_provisioner_for_mode(placement.kind)
+
+
+def _active_runtime_provider_modes() -> set[str]:
+    modes: set[str] = {_normalize_session_placement_kind(_provision_mode()) or SESSION_PLACEMENT_KIND_STATIC}
+    try:
+        sessions = getattr(app.state, "sessions", {})
+        if isinstance(sessions, dict):
+            for live in sessions.values():
+                provider = _normalize_session_placement_kind(getattr(live, "provider", None))
+                if provider:
+                    modes.add(provider)
+    except Exception:
+        pass
+    automation: Optional[AutomationManager] = getattr(app.state, "automation", None)
+    if automation is not None:
+        try:
+            for sess in (automation._store.state.sessions or {}).values():
+                if not isinstance(sess, PersistedSessionAutomation):
+                    continue
+                placement = getattr(sess, "placement", None)
+                if isinstance(placement, SessionPlacement):
+                    provider = _normalize_session_placement_kind(placement.kind)
+                    if provider:
+                        modes.add(provider)
+        except Exception:
+            pass
+    return modes
 
 
 def _provisioner_supports_user_agents() -> bool:
-    return _runtime_provisioner().supports_user_agents
+    return _default_runtime_provisioner().supports_user_agents
 
 
 def _provisioner_supports_runtime_automation() -> bool:
-    return _runtime_provisioner().supports_runtime_automation
+    return any(
+        _runtime_provisioner_for_mode(mode).supports_runtime_automation
+        for mode in _active_runtime_provider_modes()
+    )
 
 
-def _provisioner_manages_runtime_sessions() -> bool:
-    return _runtime_provisioner().manages_runtime_sessions
+def _provisioner_manages_runtime_sessions(session_id: Optional[str] = None) -> bool:
+    if isinstance(session_id, str) and session_id.strip():
+        return _runtime_provisioner_for_session(session_id).manages_runtime_sessions
+    return any(
+        _runtime_provisioner_for_mode(mode).manages_runtime_sessions
+        for mode in _active_runtime_provider_modes()
+    )
 
 
-def _provisioner_requires_runtime_recreation_on_workspace_change() -> bool:
-    return _runtime_provisioner().requires_runtime_recreation_on_workspace_change
+def _provisioner_requires_runtime_recreation_on_workspace_change(session_id: Optional[str] = None) -> bool:
+    if isinstance(session_id, str) and session_id.strip():
+        return _runtime_provisioner_for_session(session_id).requires_runtime_recreation_on_workspace_change
+    return _default_runtime_provisioner().requires_runtime_recreation_on_workspace_change
 
 
 def _require_user_agent_support() -> None:
@@ -10272,27 +12304,54 @@ def _require_runtime_automation_support(*, feature: str) -> None:
 
 
 async def _ensure_live_session(session_id: str, *, allow_create: bool) -> tuple[LiveRuntimeSession, bool]:
-    return await _runtime_provisioner().ensure_live_session(session_id, allow_create=allow_create)
+    return await _runtime_provisioner_for_session(session_id).ensure_live_session(session_id, allow_create=allow_create)
 
 
 async def _list_managed_sessions() -> list[dict[str, Any]]:
-    return await _runtime_provisioner().list_sessions()
+    out: list[dict[str, Any]] = []
+    seen: set[tuple[str, str]] = set()
+    for mode in sorted(_active_runtime_provider_modes()):
+        provider = _runtime_provisioner_for_mode(mode)
+        if not provider.manages_runtime_sessions:
+            continue
+        try:
+            rows = await provider.list_sessions()
+        except ProvisionerOperationUnsupportedError:
+            continue
+        except Exception:
+            if mode == _provision_mode():
+                raise
+            log.warning("Skipping managed session listing for provider %s after error", mode, exc_info=True)
+            continue
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            sid = str(row.get("sessionId") or "").strip()
+            key = (mode, sid)
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append(row)
+    out.sort(key=lambda item: ((item.get("provider") or ""), (item.get("sessionId") or "")))
+    return out
 
 
 async def _delete_managed_session(session_id: str) -> None:
-    await _runtime_provisioner().delete_session(session_id)
+    await _runtime_provisioner_for_session(session_id).delete_session(session_id)
 
 
 async def _remove_managed_runtime(session_id: str) -> bool:
-    return await _runtime_provisioner().remove_runtime(session_id)
+    return await _runtime_provisioner_for_session(session_id).remove_runtime(session_id)
 
 
 async def _restart_managed_runtime(session_id: str) -> bool:
-    return await _runtime_provisioner().restart_runtime(session_id)
+    return await _runtime_provisioner_for_session(session_id).restart_runtime(session_id)
 
 
-def _fugue_workspace_enabled() -> bool:
-    return isinstance(_runtime_provisioner(), FugueRuntimeProvisioner)
+def _fugue_workspace_enabled(session_id: Optional[str] = None) -> bool:
+    if isinstance(session_id, str) and session_id.strip():
+        return isinstance(_runtime_provisioner_for_session(session_id), FugueRuntimeProvisioner)
+    return isinstance(_default_runtime_provisioner(), FugueRuntimeProvisioner)
 
 
 def _fugue_relative_workspace_path(cfg: FugueProvisionConfig, workspace_path: str) -> Optional[str]:
@@ -10309,7 +12368,7 @@ def _fugue_relative_workspace_path(cfg: FugueProvisionConfig, workspace_path: st
 
 
 async def _sync_session_workspace_snapshot(session_id: str, root: Path) -> None:
-    if not _fugue_workspace_enabled():
+    if not _fugue_workspace_enabled(session_id):
         return
     cfg = _fugue_cfg()
     try:
@@ -10319,7 +12378,7 @@ async def _sync_session_workspace_snapshot(session_id: str, root: Path) -> None:
 
 
 async def _sync_session_workspace_file(session_id: str, root: Path, path_obj: Path) -> None:
-    if not _fugue_workspace_enabled():
+    if not _fugue_workspace_enabled(session_id):
         return
     rel = _relative_workspace_path(root, path_obj)
     if not rel or not path_obj.is_file():
@@ -10339,7 +12398,7 @@ async def _pull_session_workspace_file_to_local(
     dest_path: Path,
     max_bytes: int,
 ) -> bool:
-    if not _fugue_workspace_enabled():
+    if not _fugue_workspace_enabled(session_id):
         return False
     rel = _normalize_workspace_relative_path(relative_path)
     if not rel:
@@ -10358,7 +12417,7 @@ async def _pull_session_workspace_file_to_local(
 
 
 async def _sync_session_prompt_context_to_local(session_id: str, root: Path, *, include_heartbeat: bool) -> None:
-    if not _fugue_workspace_enabled():
+    if not _fugue_workspace_enabled(session_id):
         return
     filenames = list(PROJECT_CONTEXT_FILENAMES)
     if include_heartbeat:
@@ -10426,6 +12485,41 @@ def _is_token_valid(expected: Optional[str], provided: Optional[str]) -> bool:
     return provided == expected
 
 
+def _admin_token() -> Optional[str]:
+    return os.getenv("ARGUS_TOKEN") or None
+
+
+def _host_agent_device_auth(token: Any) -> Optional[PersistedHostEnrollment]:
+    host_id, secret = _parse_prefixed_token(token, HOST_AGENT_DEVICE_TOKEN_PREFIX)
+    hid = _normalize_runtime_host_id(host_id)
+    if not hid or not secret:
+        return None
+    automation: Optional[AutomationManager] = getattr(app.state, "automation", None)
+    if automation is None:
+        return None
+    enrollment = automation.get_host_enrollment(hid)
+    if enrollment is None or enrollment.revoked_at_ms is not None:
+        return None
+    expected_hash = str(enrollment.device_token_hash or "").strip()
+    if not expected_hash:
+        return None
+    provided_hash = _hash_host_agent_secret(secret)
+    if not hmac.compare_digest(expected_hash, provided_hash):
+        return None
+    return enrollment
+
+
+def _http_require_host_agent_or_admin(request: Request) -> tuple[str, Optional[PersistedHostEnrollment]]:
+    provided = _extract_token_http(request)
+    expected_admin = _admin_token()
+    if expected_admin is not None and provided == expected_admin:
+        return "admin", None
+    enrollment = _host_agent_device_auth(provided)
+    if enrollment is not None:
+        return "host", enrollment
+    raise HTTPException(status_code=401, detail="Unauthorized")
+
+
 app = FastAPI(title="Argus gateway", version=ARGUS_VERSION)
 
 origins_raw = os.getenv("ARGUS_CORS_ORIGINS") or ""
@@ -10443,10 +12537,11 @@ app.add_middleware(
 @app.on_event("startup")
 async def _startup():
     mode_resolution = _resolve_provision_mode()
-    app.state.runtime_provisioner = _build_runtime_provisioner()
+    app.state.runtime_provisioners = _runtime_provisioners()
     app.state.sessions_lock = asyncio.Lock()
     app.state.sessions: dict[str, LiveRuntimeSession] = {}
     app.state.node_registry = NodeRegistry()
+    app.state.runtime_host_registry = RuntimeHostRegistry()
     app.state.mcp_lock = asyncio.Lock()
     app.state.mcp_sessions: dict[str, McpSessionState] = {}
     log.info(
@@ -10458,7 +12553,7 @@ async def _startup():
     )
     for warning in mode_resolution.warnings:
         log.warning("%s", warning)
-    if _provisioner_manages_runtime_sessions() and not (os.getenv("ARGUS_RUNTIME_CMD") or "").strip():
+    if _default_runtime_provisioner().name in ("docker", "fugue") and not (os.getenv("ARGUS_RUNTIME_CMD") or "").strip():
         log.warning(
             "Managed runtime provisioning is enabled (mode=%s) but ARGUS_RUNTIME_CMD is unset; "
             "session startup may fail because the runtime image requires APP_SERVER_CMD.",
@@ -12394,7 +14489,7 @@ async def _mcp_handle_single_message(request: Request, body: dict[str, Any]) -> 
 
 
 def _http_require_token(request: Request):
-    expected = os.getenv("ARGUS_TOKEN") or None
+    expected = _admin_token()
     if expected is None:
         return
     provided = _extract_token_http(request)
@@ -12496,6 +14591,39 @@ def _node_verify_derived_session_token(master: str, token: str) -> Optional[str]
     if expected != t:
         return None
     return sid
+
+
+_RUNTIME_HOST_DERIVED_TOKEN_PREFIX = "argus-runtime-host-v1"
+
+
+def _runtime_host_derive_token(master: str, host_id: str) -> str:
+    hid = _normalize_runtime_host_id(host_id)
+    if not hid:
+        raise ValueError("host_id must not be empty")
+    mac = hmac.new(master.encode("utf-8"), hid.encode("utf-8"), hashlib.sha256).digest()
+    sig = _b64url_no_pad(mac)[:32]
+    return f"{_RUNTIME_HOST_DERIVED_TOKEN_PREFIX}.{hid}.{sig}"
+
+
+def _runtime_host_verify_token(master: str, token: str) -> Optional[str]:
+    t = str(token or "").strip()
+    if not t:
+        return None
+    parts = t.split(".", 2)
+    if len(parts) != 3:
+        return None
+    prefix, host_id, sig = parts
+    if prefix != _RUNTIME_HOST_DERIVED_TOKEN_PREFIX:
+        return None
+    if not host_id or not sig:
+        return None
+    try:
+        expected = _runtime_host_derive_token(master, host_id)
+    except Exception:
+        return None
+    if not hmac.compare_digest(expected, t):
+        return None
+    return host_id
 
 
 _OPENAI_PROXY_DERIVED_TOKEN_PREFIX = "argus-openai-v1"
@@ -12749,6 +14877,9 @@ def _resolve_workspace_host_path_for_session(session_id: str) -> Optional[str]:
     sid = session_id.strip() if isinstance(session_id, str) else ""
     if not sid:
         return None
+    placement = _effective_session_placement(sid)
+    if isinstance(placement, SessionPlacement) and placement.workspace_path:
+        return placement.workspace_path
     automation: Optional[AutomationManager] = getattr(app.state, "automation", None)
     if automation is None:
         return None
@@ -13951,6 +16082,285 @@ async def _ensure_live_fugue_session(session_id: str, *, allow_create: bool) -> 
     return live, created
 
 
+def _is_missing_runtime_fs_error(exc: Exception) -> bool:
+    text = str(exc or "").strip().lower()
+    if not text:
+        return False
+    return any(marker in text for marker in ("no such file", "not found", "enoent", "missing"))
+
+
+def _session_uses_remote_workspace(session_id: str) -> bool:
+    placement = _effective_session_placement(session_id)
+    return (
+        placement.kind == SESSION_PLACEMENT_KIND_NATIVE
+        and placement.workspace_mode == SESSION_WORKSPACE_MODE_HOST_LOCAL
+    )
+
+
+async def _live_session_rpc(live: LiveRuntimeSession, method: str, params: Any) -> Any:
+    automation: Optional[AutomationManager] = getattr(app.state, "automation", None)
+    if automation is None:
+        raise RuntimeError("Automation is not available")
+    await automation._ensure_initialized(live)
+    return await automation._rpc(live, method, params)
+
+
+async def _live_fs_create_directory(live: LiveRuntimeSession, path: str) -> None:
+    await _live_session_rpc(live, "fs/createDirectory", {"path": path, "recursive": True})
+
+
+async def _live_fs_get_metadata(live: LiveRuntimeSession, path: str) -> Optional[dict[str, Any]]:
+    try:
+        result = await _live_session_rpc(live, "fs/getMetadata", {"path": path})
+    except Exception as exc:
+        if _is_missing_runtime_fs_error(exc):
+            return None
+        raise
+    return result if isinstance(result, dict) else None
+
+
+async def _live_fs_read_bytes(live: LiveRuntimeSession, path: str) -> Optional[bytes]:
+    try:
+        result = await _live_session_rpc(live, "fs/readFile", {"path": path})
+    except Exception as exc:
+        if _is_missing_runtime_fs_error(exc):
+            return None
+        raise
+    if not isinstance(result, dict):
+        return None
+    data_b64 = result.get("dataBase64")
+    if not isinstance(data_b64, str) or not data_b64:
+        return None
+    try:
+        return base64.b64decode(data_b64)
+    except Exception:
+        return None
+
+
+async def _live_fs_read_text(live: LiveRuntimeSession, path: str, *, max_bytes: int = 512 * 1024) -> Optional[str]:
+    data = await _live_fs_read_bytes(live, path)
+    if data is None:
+        return None
+    if len(data) > max_bytes:
+        data = data[:max_bytes]
+    return data.decode("utf-8", errors="replace")
+
+
+async def _live_fs_write_bytes(live: LiveRuntimeSession, path: str, data: bytes) -> None:
+    parent = str(Path(path).parent)
+    if parent and parent not in (".", ""):
+        await _live_fs_create_directory(live, parent)
+    await _live_session_rpc(
+        live,
+        "fs/writeFile",
+        {"path": path, "dataBase64": base64.b64encode(data).decode("ascii")},
+    )
+
+
+async def _live_fs_write_text(live: LiveRuntimeSession, path: str, text: str) -> None:
+    await _live_fs_write_bytes(live, path, text.encode("utf-8"))
+
+
+async def _live_fs_read_directory(live: LiveRuntimeSession, path: str) -> list[dict[str, Any]]:
+    try:
+        result = await _live_session_rpc(live, "fs/readDirectory", {"path": path})
+    except Exception as exc:
+        if _is_missing_runtime_fs_error(exc):
+            return []
+        raise
+    if isinstance(result, dict):
+        entries = result.get("entries")
+        if isinstance(entries, list):
+            return [entry for entry in entries if isinstance(entry, dict)]
+    if isinstance(result, list):
+        return [entry for entry in result if isinstance(entry, dict)]
+    return []
+
+
+async def _sync_remote_workspace_templates(live: LiveRuntimeSession, *, session_id: str, workspace_path: str) -> None:
+    root = Path(workspace_path)
+    await _live_fs_create_directory(live, str(root))
+    for template_name, target_name, overwrite_existing in WORKSPACE_TEMPLATE_SYNC_RULES:
+        target_path = str(root / target_name)
+        if not overwrite_existing:
+            meta = await _live_fs_get_metadata(live, target_path)
+            if isinstance(meta, dict) and meta.get("isFile"):
+                continue
+        rendered = _render_workspace_template_content(template_name, target_name)
+        await _live_fs_write_text(live, target_path, rendered)
+
+    template_root = _resolve_repo_root() / "docs" / "templates" / SKILLS_DIRNAME
+    if template_root.is_dir():
+        for skill_dir in sorted([p for p in template_root.iterdir() if p.is_dir()]):
+            for src in sorted([p for p in skill_dir.rglob("*") if p.is_file()]):
+                rel = src.relative_to(template_root)
+                dest = root / SKILLS_DIRNAME / rel
+                dest_str = str(dest)
+                meta = await _live_fs_get_metadata(live, dest_str)
+                if isinstance(meta, dict) and meta.get("isFile"):
+                    continue
+                try:
+                    payload = await asyncio.to_thread(src.read_bytes)
+                except Exception:
+                    continue
+                await _live_fs_write_bytes(live, dest_str, payload)
+
+    model_path = str(root / ".codex" / ARGUS_AGENT_MODEL_FILE)
+    model = _resolve_agent_model_for_session(session_id)
+    await _live_fs_write_text(live, model_path, (_normalize_agent_model(model) or ARGUS_AGENT_MODEL_DEFAULT) + "\n")
+
+
+async def _configure_native_live_session(
+    session_id: str,
+    live: LiveRuntimeSession,
+    placement: SessionPlacement,
+) -> None:
+    if live.metadata.get("nativeConfigured"):
+        return
+
+    edits: list[dict[str, Any]] = [
+        {
+            "keyPath": "model",
+            "value": _resolve_agent_model_for_session(session_id),
+            "mergeStrategy": "upsert",
+        }
+    ]
+    public_base = _public_gateway_base_url()
+    edits.append(
+        {
+            "keyPath": "mcp_servers.argus",
+            "value": {
+                "url": f"{public_base}/mcp",
+                "bearer_token_env_var": "ARGUS_MCP_TOKEN",
+            },
+            "mergeStrategy": "upsert",
+        }
+    )
+    openai_master = (os.getenv("ARGUS_OPENAI_TOKEN") or os.getenv("ARGUS_TOKEN") or "").strip() or None
+    if openai_master:
+        edits.extend(
+            [
+                {
+                    "keyPath": "model_provider",
+                    "value": "OpenAI",
+                    "mergeStrategy": "upsert",
+                },
+                {
+                    "keyPath": "model_providers.OpenAI",
+                    "value": {
+                        "name": "OpenAI",
+                        "base_url": f"{public_base}/openai/v1",
+                        "wire_api": "responses",
+                        "env_key": "ARGUS_OPENAI_TOKEN",
+                        "requires_openai_auth": False,
+                    },
+                    "mergeStrategy": "upsert",
+                },
+            ]
+        )
+
+    try:
+        await _live_session_rpc(live, "config/batchWrite", {"edits": edits, "reloadUserConfig": True})
+    except Exception:
+        log.exception("Failed to patch native runtime config for session %s", session_id)
+
+    workspace_path = placement.workspace_path or live.workspace_runtime_path
+    if workspace_path:
+        try:
+            await _sync_remote_workspace_templates(live, session_id=session_id, workspace_path=workspace_path)
+        except Exception:
+            log.exception("Failed to sync remote workspace templates for session %s", session_id)
+
+    live.metadata["nativeConfigured"] = True
+
+
+async def _ensure_live_native_session(session_id: str, *, allow_create: bool) -> tuple[LiveRuntimeSession, bool]:
+    async with app.state.sessions_lock:
+        existing = app.state.sessions.get(session_id)
+    if existing is not None:
+        try:
+            writer_closing = existing.writer.is_closing()
+        except Exception:
+            writer_closing = False
+        if not existing.closed and not writer_closing:
+            return existing, False
+        log.info("Ignoring stale native live session for %s (closed=%s, writer_closing=%s)", session_id, existing.closed, writer_closing)
+
+    placement = _effective_session_placement(session_id).normalized(session_id=session_id)
+    if placement.kind != SESSION_PLACEMENT_KIND_NATIVE:
+        raise RuntimeError(f"session {session_id} is not placed on a native runtime host")
+
+    relay = await app.state.runtime_host_registry.get_relay(session_id)
+    created = False
+    if relay is None:
+        if not allow_create:
+            raise KeyError("Unknown session")
+        gateway_token = os.getenv("ARGUS_TOKEN") or None
+        mcp_master = os.getenv("ARGUS_MCP_TOKEN") or gateway_token
+        openai_master = (os.getenv("ARGUS_OPENAI_TOKEN") or gateway_token or "").strip() or None
+        payload: dict[str, Any] = {
+            "sessionId": session_id,
+            "workspacePath": placement.workspace_path,
+            "workspaceMode": placement.workspace_mode,
+            "codexProfileMode": placement.codex_profile_mode,
+            "model": _resolve_agent_model_for_session(session_id),
+            "publicBaseUrl": _public_gateway_base_url(),
+        }
+        if mcp_master:
+            payload["mcpToken"] = _mcp_derive_session_token(mcp_master, session_id)
+        if openai_master:
+            payload["openaiToken"] = _openai_proxy_derive_session_token(openai_master, session_id)
+        relay, created = await app.state.runtime_host_registry.open_runtime(
+            session_id=session_id,
+            target_host_id=placement.target_host_id,
+            payload=payload,
+        )
+
+    updated_placement = SessionPlacement(
+        kind=SESSION_PLACEMENT_KIND_NATIVE,
+        target_host_id=relay.host_id,
+        workspace_mode=placement.workspace_mode,
+        workspace_path=relay.workspace_path or placement.workspace_path,
+        codex_profile_mode=placement.codex_profile_mode,
+        fallback=placement.fallback,
+    ).normalized(session_id=session_id)
+    if updated_placement != placement:
+        await _persist_session_placement(session_id, updated_placement)
+        placement = updated_placement
+
+    live = LiveRuntimeSession(
+        session_id=session_id,
+        provider=SESSION_PLACEMENT_KIND_NATIVE,
+        runtime_id=relay.runtime_id,
+        runtime_name=relay.runtime_name,
+        workspace_runtime_path=placement.workspace_path or relay.workspace_path or "/",
+        jsonl_line_limit_bytes=DEFAULT_JSONL_LINE_LIMIT_BYTES,
+        upstream_host=relay.host_id,
+        upstream_port=0,
+        reader=relay.reader,
+        writer=relay.writer,
+        pump_task=None,
+        attach_lock=asyncio.Lock(),
+        attached_wss=set(),
+        request_handler_ws=None,
+        initialized_result=None,
+        handshake_done=False,
+        pending_initialize_ids=set(),
+        initialize_waiters=[],
+        pending_client_requests={},
+        pending_internal_requests={},
+        next_upstream_id=1_000_000_000,
+        pending_server_requests={},
+        outbox=deque(),
+        pending_client_turn_starts={},
+        turn_owners_by_thread={},
+        metadata={"runtimeHostId": relay.host_id, **(relay.metadata or {})},
+    )
+    live = await _activate_live_session(live)
+    await _configure_native_live_session(session_id, live, placement)
+    return live, created
+
+
 @app.get("/sessions")
 async def list_sessions(request: Request):
     _http_require_token(request)
@@ -13965,6 +16375,296 @@ async def list_sessions(request: Request):
         log.exception("Failed to list managed sessions")
         raise HTTPException(status_code=500, detail=str(e)) from e
     return {"sessions": sessions}
+
+
+def _host_agent_summary_payload(
+    automation: AutomationManager,
+    enrollment: PersistedHostEnrollment,
+    *,
+    runtime_hosts_by_id: dict[str, dict[str, Any]],
+    nodes_by_id: dict[str, dict[str, Any]],
+) -> dict[str, Any]:
+    host_id = enrollment.host_id
+    runtime_info = runtime_hosts_by_id.get(host_id) or {}
+    node_info = nodes_by_id.get(host_id) or {}
+    bindings = [binding.to_json() for binding in automation.list_host_bindings(host_id=host_id)]
+    return {
+        "hostId": host_id,
+        "displayName": runtime_info.get("displayName") or node_info.get("displayName") or enrollment.display_name,
+        "platform": runtime_info.get("platform") or node_info.get("platform") or enrollment.platform,
+        "version": runtime_info.get("version") or node_info.get("version") or enrollment.version,
+        "runtimeConnected": bool(runtime_info),
+        "controlConnected": bool(node_info),
+        "online": bool(runtime_info) or bool(node_info),
+        "caps": sorted({*(runtime_info.get("caps") or []), *(node_info.get("caps") or [])}),
+        "commands": list(node_info.get("commands") or []),
+        "bindings": bindings,
+        "createdAtMs": enrollment.created_at_ms,
+        "updatedAtMs": enrollment.updated_at_ms,
+        "claimedAtMs": enrollment.claimed_at_ms,
+        "revokedAtMs": enrollment.revoked_at_ms,
+        "lastConnectedAtMs": enrollment.last_connected_at_ms,
+        "lastSeenAtMs": max(
+            int(enrollment.last_seen_at_ms or 0),
+            int(runtime_info.get("lastSeenMs") or 0),
+            int(node_info.get("lastSeenMs") or 0),
+        )
+        or None,
+        "lastDisconnectedAtMs": enrollment.last_disconnected_at_ms,
+    }
+
+
+@app.post("/host-agent/enroll-token")
+async def host_agent_enroll_token(request: Request):
+    _http_require_token(request)
+    automation = _get_automation_or_500()
+    try:
+        body = await request.json()
+    except Exception as e:
+        raise HTTPException(status_code=400, detail="Invalid JSON body") from e
+    if not isinstance(body, dict):
+        raise HTTPException(status_code=400, detail="Invalid JSON body")
+
+    host_id_hint = _normalize_runtime_host_id(body.get("hostId") or body.get("hostIdHint")) or None
+    scope_type = _normalize_host_binding_scope_type(body.get("scopeType")) or None
+    scope_id = body.get("scopeId")
+    workspace_base_path = _normalize_abs_host_path(body.get("workspaceBasePath"))
+    try:
+        ttl_s = int(body.get("ttlSec")) if body.get("ttlSec") is not None else DEFAULT_HOST_AGENT_ENROLL_TTL_S
+    except Exception as e:
+        raise HTTPException(status_code=400, detail="Invalid 'ttlSec'") from e
+
+    try:
+        pending, enroll_token = await automation.issue_host_enroll_token(
+            host_id_hint=host_id_hint,
+            scope_type=scope_type,
+            scope_id=scope_id,
+            workspace_base_path=workspace_base_path,
+            ttl_s=ttl_s,
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+
+    gateway_base = _public_gateway_base_url()
+    command = f'argus connect --gateway "{gateway_base}" --enroll-token "{enroll_token}"'
+    if host_id_hint:
+        command += f' --host-id "{host_id_hint}"'
+    return {
+        "ok": True,
+        "token": enroll_token,
+        "tokenId": pending.token_id,
+        "hostIdHint": pending.host_id_hint,
+        "scopeType": pending.scope_type,
+        "scopeId": pending.scope_id,
+        "workspaceBasePath": pending.workspace_base_path,
+        "expiresAtMs": pending.expires_at_ms,
+        "command": command,
+    }
+
+
+@app.post("/host-agent/claim")
+async def host_agent_claim(request: Request):
+    automation = _get_automation_or_500()
+    try:
+        body = await request.json()
+    except Exception as e:
+        raise HTTPException(status_code=400, detail="Invalid JSON body") from e
+    if not isinstance(body, dict):
+        raise HTTPException(status_code=400, detail="Invalid JSON body")
+
+    enroll_token = str(body.get("enrollToken") or body.get("token") or "").strip()
+    host_id = _normalize_runtime_host_id(body.get("hostId") or body.get("id"))
+    if not enroll_token:
+        raise HTTPException(status_code=400, detail="Missing 'enrollToken'")
+    if not host_id:
+        raise HTTPException(status_code=400, detail="Missing 'hostId'")
+
+    display_name = str(body.get("displayName") or "").strip() or None
+    platform = str(body.get("platform") or "").strip() or None
+    version = str(body.get("version") or "").strip() or None
+    set_default = bool(body.get("setDefault") or body.get("default"))
+    scope_type = _normalize_host_binding_scope_type(body.get("scopeType")) or None
+    scope_id = body.get("scopeId")
+    workspace_base_path = _normalize_abs_host_path(body.get("workspaceBasePath"))
+
+    try:
+        enrollment, device_token, binding = await automation.claim_host_agent(
+            enroll_token=enroll_token,
+            host_id=host_id,
+            display_name=display_name,
+            platform=platform,
+            version=version,
+            set_default=set_default,
+            scope_type=scope_type,
+            scope_id=scope_id,
+            workspace_base_path=workspace_base_path,
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+
+    return {
+        "ok": True,
+        "hostId": enrollment.host_id,
+        "displayName": enrollment.display_name,
+        "token": device_token,
+        "wsPath": "/host-agent/ws",
+        "gatewayBaseUrl": _public_gateway_base_url(),
+        "binding": binding.to_json() if isinstance(binding, PersistedHostBinding) else None,
+    }
+
+
+@app.get("/host-agents")
+async def list_host_agents(request: Request):
+    _http_require_token(request)
+    automation = _get_automation_or_500()
+    runtime_hosts = await app.state.runtime_host_registry.list_connected()
+    nodes = await app.state.node_registry.list_connected(scope_session_id=None)
+    runtime_by_id = {str(item.get("hostId") or ""): item for item in runtime_hosts if str(item.get("hostId") or "").strip()}
+    nodes_by_id = {
+        str(item.get("nodeId") or ""): item
+        for item in nodes
+        if not item.get("sessionId") and str(item.get("nodeId") or "").strip()
+    }
+    hosts = [
+        _host_agent_summary_payload(automation, enrollment, runtime_hosts_by_id=runtime_by_id, nodes_by_id=nodes_by_id)
+        for enrollment in automation.list_host_enrollments()
+    ]
+    return {"hosts": hosts}
+
+
+@app.get("/host-agent/self")
+async def host_agent_self(request: Request):
+    auth_kind, enrollment = _http_require_host_agent_or_admin(request)
+    automation = _get_automation_or_500()
+    if auth_kind == "admin":
+        host_id = _normalize_runtime_host_id(request.query_params.get("hostId"))
+        if not host_id:
+            raise HTTPException(status_code=400, detail="Missing 'hostId'")
+        enrollment = automation.get_host_enrollment(host_id)
+    if enrollment is None:
+        raise HTTPException(status_code=404, detail="Host not found")
+    runtime_hosts = await app.state.runtime_host_registry.list_connected()
+    nodes = await app.state.node_registry.list_connected(scope_session_id=None)
+    runtime_by_id = {str(item.get("hostId") or ""): item for item in runtime_hosts if str(item.get("hostId") or "").strip()}
+    nodes_by_id = {
+        str(item.get("nodeId") or ""): item
+        for item in nodes
+        if not item.get("sessionId") and str(item.get("nodeId") or "").strip()
+    }
+    return {
+        "ok": True,
+        "host": _host_agent_summary_payload(automation, enrollment, runtime_hosts_by_id=runtime_by_id, nodes_by_id=nodes_by_id),
+    }
+
+
+@app.post("/host-agent/revoke")
+async def host_agent_revoke(request: Request):
+    auth_kind, enrollment = _http_require_host_agent_or_admin(request)
+    automation = _get_automation_or_500()
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    if not isinstance(body, dict):
+        body = {}
+    host_id = (
+        enrollment.host_id
+        if auth_kind == "host" and enrollment is not None
+        else _normalize_runtime_host_id(body.get("hostId") or request.query_params.get("hostId"))
+    )
+    if not host_id:
+        raise HTTPException(status_code=400, detail="Missing 'hostId'")
+    revoked = await automation.revoke_host_enrollment(host_id)
+    if revoked is None:
+        raise HTTPException(status_code=404, detail="Host not found")
+    await app.state.node_registry.force_close(host_id, reason="revoked")
+    await app.state.runtime_host_registry.close_all_for_host(host_id)
+    return {"ok": True, "hostId": host_id, "revokedAtMs": revoked.revoked_at_ms}
+
+
+@app.put("/host-agents/{host_id}/binding")
+async def put_host_agent_binding(host_id: str, request: Request):
+    _http_require_token(request)
+    automation = _get_automation_or_500()
+    hid = _normalize_runtime_host_id(host_id)
+    if not hid:
+        raise HTTPException(status_code=400, detail="Invalid hostId")
+    try:
+        body = await request.json()
+    except Exception as e:
+        raise HTTPException(status_code=400, detail="Invalid JSON body") from e
+    if not isinstance(body, dict):
+        raise HTTPException(status_code=400, detail="Invalid JSON body")
+    scope_type = _normalize_host_binding_scope_type(body.get("scopeType")) or HOST_BINDING_SCOPE_GLOBAL
+    scope_id = body.get("scopeId") or ("default" if scope_type == HOST_BINDING_SCOPE_GLOBAL else None)
+    workspace_base_path = _normalize_abs_host_path(body.get("workspaceBasePath"))
+    codex_profile_mode = _normalize_session_codex_profile_mode(body.get("codexProfileMode")) or SESSION_CODEX_PROFILE_MODE_INHERIT_PATCH
+    try:
+        binding = await automation.set_host_binding(
+            host_id=hid,
+            scope_type=scope_type,
+            scope_id=scope_id,
+            workspace_base_path=workspace_base_path,
+            codex_profile_mode=codex_profile_mode,
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    return {"ok": True, "hostId": hid, "binding": binding.to_json()}
+
+
+@app.get("/runtime-hosts")
+async def list_runtime_hosts(request: Request):
+    _http_require_token(request)
+    hosts = await app.state.runtime_host_registry.list_connected()
+    return {"hosts": hosts}
+
+
+@app.post("/runtime-host/token")
+async def runtime_host_token(request: Request):
+    _http_require_token(request)
+    try:
+        body = await request.json()
+    except Exception as e:
+        raise HTTPException(status_code=400, detail="Invalid JSON body") from e
+    if not isinstance(body, dict):
+        raise HTTPException(status_code=400, detail="Invalid JSON body")
+    host_id = _normalize_runtime_host_id(body.get("hostId") or body.get("id"))
+    if not host_id:
+        raise HTTPException(status_code=400, detail="Missing 'hostId'")
+    master = os.getenv("ARGUS_RUNTIME_HOST_TOKEN") or os.getenv("ARGUS_TOKEN") or None
+    token = _runtime_host_derive_token(master, host_id) if master else None
+    return {"ok": True, "hostId": host_id, "path": "/runtime-host/ws", "token": token}
+
+
+@app.get("/sessions/{session_id}/placement")
+async def get_session_placement(session_id: str, request: Request):
+    _http_require_token(request)
+    sid = _normalize_runtime_session_id(session_id)
+    if not sid:
+        raise HTTPException(status_code=400, detail="Invalid sessionId")
+    placement = _effective_session_placement(sid)
+    return {"ok": True, "sessionId": sid, "placement": placement.to_json()}
+
+
+@app.put("/sessions/{session_id}/placement")
+async def put_session_placement(session_id: str, request: Request):
+    _http_require_token(request)
+    sid = _normalize_runtime_session_id(session_id)
+    if not sid:
+        raise HTTPException(status_code=400, detail="Invalid sessionId")
+    try:
+        body = await request.json()
+    except Exception as e:
+        raise HTTPException(status_code=400, detail="Invalid JSON body") from e
+    placement = SessionPlacement.from_json(body, session_id=sid)
+    if placement is None:
+        raise HTTPException(status_code=400, detail="Invalid placement")
+    await _persist_session_placement(sid, placement)
+    try:
+        await _close_live_session(sid)
+    except Exception:
+        pass
+    return {"ok": True, "sessionId": sid, "placement": placement.to_json()}
 
 
 @app.get("/nodes")
@@ -15842,10 +18542,10 @@ async def automation_heartbeat_now(request: Request):
 @app.delete("/sessions/{session_id}")
 async def delete_session(session_id: str, request: Request):
     _http_require_token(request)
-    if not _provisioner_manages_runtime_sessions():
+    if not _provisioner_manages_runtime_sessions(session_id):
         raise HTTPException(
             status_code=400,
-            detail=f"Managed sessions are not available in provision mode '{_provisioner_mode_name()}'",
+            detail=f"Managed sessions are not available for session '{session_id}'",
         )
     try:
         await _delete_managed_session(session_id)
@@ -16059,6 +18759,277 @@ async def _enqueue_process_exited_system_event(
         log.exception("Failed to enqueue process-exit systemEvent for job %s", job_id)
 
 
+def _requested_session_placement_from_query(ws: WebSocket, session_id: Optional[str]) -> Optional[SessionPlacement]:
+    kind = (
+        ws.query_params.get("placement")
+        or ws.query_params.get("placementKind")
+        or ws.query_params.get("provisionMode")
+        or ""
+    )
+    kind_norm = _normalize_session_placement_kind(kind)
+    if not kind_norm:
+        return None
+    placement = SessionPlacement(
+        kind=kind_norm,
+        target_host_id=ws.query_params.get("runtimeHostId") or ws.query_params.get("hostId") or None,
+        workspace_mode=ws.query_params.get("workspaceMode") or SESSION_WORKSPACE_MODE_GATEWAY_MANAGED,
+        workspace_path=ws.query_params.get("workspacePath") or ws.query_params.get("workspace") or None,
+        codex_profile_mode=ws.query_params.get("codexProfileMode") or SESSION_CODEX_PROFILE_MODE_ISOLATED,
+        fallback=ws.query_params.get("fallback") or SESSION_FALLBACK_NONE,
+    )
+    return placement.normalized(session_id=session_id)
+
+
+def _ws_request_uses_managed_session(
+    *,
+    requested_session: Optional[str],
+    requested_placement: Optional[SessionPlacement],
+) -> bool:
+    if isinstance(requested_placement, SessionPlacement):
+        return _runtime_provisioner_for_mode(requested_placement.kind).manages_runtime_sessions
+    sid = requested_session.strip() if isinstance(requested_session, str) and requested_session.strip() else ""
+    if sid:
+        try:
+            return _runtime_provisioner_for_session(sid).manages_runtime_sessions
+        except Exception:
+            pass
+    return _default_runtime_provisioner().manages_runtime_sessions
+
+
+@app.websocket("/host-agent/ws")
+async def ws_host_agent(ws: WebSocket):
+    enrollment = _host_agent_device_auth(_extract_token(ws))
+    await ws.accept()
+    if enrollment is None:
+        await ws.close(code=1008, reason="Unauthorized")
+        return
+
+    conn_id = uuid.uuid4().hex[:12]
+    try:
+        raw = await ws.receive_text()
+    except WebSocketDisconnect:
+        return
+
+    try:
+        msg = json.loads(raw)
+    except Exception:
+        msg = None
+    if not isinstance(msg, dict) or msg.get("type") != "connect":
+        await ws.close(code=1008, reason="First message must be {type:'connect', ...}")
+        return
+
+    host_id = _normalize_runtime_host_id(msg.get("hostId")) or enrollment.host_id
+    if not host_id or host_id != enrollment.host_id:
+        await ws.close(code=1008, reason="hostId mismatch")
+        return
+
+    display_name = (str(msg.get("displayName")) if msg.get("displayName") is not None else None) or enrollment.display_name
+    platform = (str(msg.get("platform")) if msg.get("platform") is not None else None) or enrollment.platform
+    version = (str(msg.get("version")) if msg.get("version") is not None else None) or enrollment.version
+    caps = [str(x) for x in (msg.get("caps") or [])] if isinstance(msg.get("caps"), list) else []
+    commands = [str(x) for x in (msg.get("commands") or [])] if isinstance(msg.get("commands"), list) else []
+    now_ms = int(time.time() * 1000)
+
+    node_session = NodeSession(
+        node_id=host_id,
+        conn_id=conn_id,
+        ws=ws,
+        scoped_session_id=None,
+        display_name=display_name,
+        platform=platform,
+        version=version,
+        caps=list(caps or []),
+        commands=list(commands or []),
+        connected_at_ms=now_ms,
+        last_seen_ms=now_ms,
+    )
+    runtime_session = RuntimeHostSession(
+        host_id=host_id,
+        conn_id=conn_id,
+        ws=ws,
+        display_name=display_name,
+        platform=platform,
+        version=version,
+        caps=list(caps or []),
+        connected_at_ms=now_ms,
+        last_seen_ms=now_ms,
+    )
+
+    await app.state.node_registry.register(node_session)
+    await app.state.runtime_host_registry.register(runtime_session)
+    automation: Optional[AutomationManager] = getattr(app.state, "automation", None)
+    if automation is not None:
+        try:
+            await automation.note_host_connected(
+                host_id=host_id,
+                display_name=display_name,
+                platform=platform,
+                version=version,
+            )
+        except Exception:
+            log.exception("Failed to note host-agent connection for %s", host_id)
+
+    try:
+        await ws.send_text(json.dumps({"type": "event", "event": "host-agent.connected", "payload": {"hostId": host_id}}))
+    except Exception:
+        pass
+
+    try:
+        while True:
+            raw = await ws.receive_text()
+            try:
+                msg = json.loads(raw)
+            except Exception:
+                msg = None
+            if not isinstance(msg, dict):
+                continue
+            event = str(msg.get("event") or "")
+            payload = msg.get("payload")
+            if event == "node.heartbeat":
+                await app.state.node_registry.touch(host_id)
+                continue
+            if event == "runtime.heartbeat":
+                await app.state.runtime_host_registry.touch(host_id)
+                continue
+            if event == "host-agent.heartbeat":
+                await app.state.node_registry.touch(host_id)
+                await app.state.runtime_host_registry.touch(host_id)
+                continue
+            if not isinstance(payload, dict):
+                continue
+            if event == "node.invoke.result":
+                if str(payload.get("nodeId") or "") not in ("", host_id):
+                    continue
+                await app.state.node_registry.touch(host_id)
+                await app.state.node_registry.handle_invoke_result(payload)
+                continue
+            if event == "node.process.exited":
+                if str(payload.get("nodeId") or "") not in ("", host_id):
+                    continue
+                await app.state.node_registry.touch(host_id)
+                asyncio.create_task(
+                    _enqueue_process_exited_system_event(node_id=host_id, payload=payload, scoped_session_id=None)
+                )
+                continue
+            if event == "runtime.opened":
+                await app.state.runtime_host_registry.touch(host_id)
+                await app.state.runtime_host_registry.handle_runtime_opened(conn_id, payload)
+                continue
+            if event == "runtime.open.failed":
+                await app.state.runtime_host_registry.touch(host_id)
+                await app.state.runtime_host_registry.handle_runtime_open_failed(conn_id, payload)
+                continue
+            if event == "runtime.frame":
+                await app.state.runtime_host_registry.touch(host_id)
+                await app.state.runtime_host_registry.handle_runtime_frame(conn_id, payload)
+                continue
+            if event == "runtime.exit":
+                await app.state.runtime_host_registry.touch(host_id)
+                await app.state.runtime_host_registry.handle_runtime_exit(conn_id, payload)
+                continue
+    except WebSocketDisconnect:
+        pass
+    finally:
+        await app.state.runtime_host_registry.unregister(conn_id)
+        await app.state.node_registry.unregister(conn_id)
+        if automation is not None:
+            try:
+                await automation.note_host_disconnected(host_id)
+            except Exception:
+                log.exception("Failed to note host-agent disconnect for %s", host_id)
+
+
+@app.websocket("/runtime-host/ws")
+async def ws_runtime_host(ws: WebSocket):
+    provided = _extract_token(ws) or ""
+    master = os.getenv("ARGUS_RUNTIME_HOST_TOKEN") or os.getenv("ARGUS_TOKEN") or None
+    host_from_token: Optional[str] = None
+    if master is not None:
+        host_from_token = _runtime_host_verify_token(master, provided)
+
+    await ws.accept()
+    if master is not None and not host_from_token:
+        await ws.close(code=1008, reason="Unauthorized")
+        return
+
+    conn_id = uuid.uuid4().hex[:12]
+    try:
+        raw = await ws.receive_text()
+    except WebSocketDisconnect:
+        return
+
+    try:
+        msg = json.loads(raw)
+    except Exception:
+        msg = None
+    if not isinstance(msg, dict) or msg.get("type") != "connect":
+        await ws.close(code=1008, reason="First message must be {type:'connect', ...}")
+        return
+
+    host_id = _normalize_runtime_host_id(msg.get("hostId")) or (host_from_token or "")
+    if not host_id:
+        await ws.close(code=1008, reason="Missing hostId")
+        return
+    if host_from_token and host_from_token != host_id:
+        await ws.close(code=1008, reason="hostId mismatch")
+        return
+
+    now_ms = int(time.time() * 1000)
+    session = RuntimeHostSession(
+        host_id=host_id,
+        conn_id=conn_id,
+        ws=ws,
+        display_name=(str(msg.get("displayName")) if msg.get("displayName") is not None else None) or None,
+        platform=(str(msg.get("platform")) if msg.get("platform") is not None else None) or None,
+        version=(str(msg.get("version")) if msg.get("version") is not None else None) or None,
+        caps=[str(x) for x in (msg.get("caps") or [])] if isinstance(msg.get("caps"), list) else [],
+        connected_at_ms=now_ms,
+        last_seen_ms=now_ms,
+    )
+    await app.state.runtime_host_registry.register(session)
+
+    try:
+        await ws.send_text(json.dumps({"type": "event", "event": "runtime-host.connected", "payload": {"hostId": host_id}}))
+    except Exception:
+        pass
+
+    try:
+        while True:
+            raw = await ws.receive_text()
+            try:
+                msg = json.loads(raw)
+            except Exception:
+                msg = None
+            if not isinstance(msg, dict):
+                continue
+            if msg.get("type") == "event" and msg.get("event") == "runtime.heartbeat":
+                await app.state.runtime_host_registry.touch(host_id)
+                continue
+            payload = msg.get("payload")
+            if not isinstance(payload, dict):
+                continue
+            if msg.get("type") == "event" and msg.get("event") == "runtime.opened":
+                await app.state.runtime_host_registry.touch(host_id)
+                await app.state.runtime_host_registry.handle_runtime_opened(conn_id, payload)
+                continue
+            if msg.get("type") == "event" and msg.get("event") == "runtime.open.failed":
+                await app.state.runtime_host_registry.touch(host_id)
+                await app.state.runtime_host_registry.handle_runtime_open_failed(conn_id, payload)
+                continue
+            if msg.get("type") == "event" and msg.get("event") == "runtime.frame":
+                await app.state.runtime_host_registry.touch(host_id)
+                await app.state.runtime_host_registry.handle_runtime_frame(conn_id, payload)
+                continue
+            if msg.get("type") == "event" and msg.get("event") == "runtime.exit":
+                await app.state.runtime_host_registry.touch(host_id)
+                await app.state.runtime_host_registry.handle_runtime_exit(conn_id, payload)
+                continue
+    except WebSocketDisconnect:
+        pass
+    finally:
+        await app.state.runtime_host_registry.unregister(conn_id)
+
+
 @app.websocket("/nodes/ws")
 async def ws_nodes(ws: WebSocket):
     provided = _extract_token(ws) or ""
@@ -16185,8 +19156,16 @@ async def ws_nodes(ws: WebSocket):
 @app.websocket("/ws")
 async def ws_proxy(ws: WebSocket):
     provided = _extract_token(ws)
+    requested_session_raw = (ws.query_params.get("session") or "").strip() or None
+    requested_session = _normalize_runtime_session_id(requested_session_raw) if requested_session_raw else None
+    if requested_session_raw and not requested_session:
+        await ws.accept()
+        await ws.close(code=1008, reason="Invalid session")
+        return
+    provisional_session_id = requested_session or uuid.uuid4().hex[:12]
+    requested_placement = _requested_session_placement_from_query(ws, provisional_session_id)
 
-    if _provisioner_manages_runtime_sessions():
+    if _ws_request_uses_managed_session(requested_session=requested_session, requested_placement=requested_placement):
         expected = os.getenv("ARGUS_TOKEN")
         if expected and provided != expected:
             await ws.accept()
@@ -16194,13 +19173,7 @@ async def ws_proxy(ws: WebSocket):
             return
 
         await ws.accept()
-
-        requested_session_raw = (ws.query_params.get("session") or "").strip() or None
-        requested_session = _normalize_runtime_session_id(requested_session_raw) if requested_session_raw else None
-        if requested_session_raw and not requested_session:
-            await ws.close(code=1008, reason="Invalid session")
-            return
-        session_id = requested_session or uuid.uuid4().hex[:12]
+        session_id = provisional_session_id
         try:
             allow_create = not bool(requested_session)
             if requested_session:
@@ -16224,6 +19197,8 @@ async def ws_proxy(ws: WebSocket):
                     )
                     if derived and Path(derived).is_dir():
                         allow_create = True
+            if isinstance(requested_placement, SessionPlacement):
+                await _persist_session_placement(session_id, requested_placement)
             live, created = await _ensure_live_session(session_id, allow_create=allow_create)
         except KeyError:
             await ws.close(code=1008, reason="Unknown session")
@@ -16242,10 +19217,11 @@ async def ws_proxy(ws: WebSocket):
                             "method": "argus/session",
                             "params": {
                                 "id": session_id,
-                                "mode": _provisioner_mode_name(),
+                                "mode": live.provider,
                                 "provider": live.provider,
                                 "attached": bool(requested_session),
                                 "created": created,
+                                "placement": _effective_session_placement(session_id).to_json(),
                             },
                         }
                     )
@@ -16295,6 +19271,57 @@ async def ws_proxy(ws: WebSocket):
                             tid = await automation.ensure_main_thread(session_id)
                             if has_id:
                                 await ws.send_text(json.dumps({"id": req_id, "result": {"threadId": tid}}))
+                            continue
+
+                        if method == "argus/runtime-host/list":
+                            hosts = await app.state.runtime_host_registry.list_connected()
+                            if has_id:
+                                await ws.send_text(json.dumps({"id": req_id, "result": {"hosts": hosts}}))
+                            continue
+
+                        if method == "argus/host-agent/list":
+                            runtime_hosts = await app.state.runtime_host_registry.list_connected()
+                            nodes = await app.state.node_registry.list_connected(scope_session_id=None)
+                            runtime_by_id = {
+                                str(item.get("hostId") or ""): item
+                                for item in runtime_hosts
+                                if str(item.get("hostId") or "").strip()
+                            }
+                            nodes_by_id = {
+                                str(item.get("nodeId") or ""): item
+                                for item in nodes
+                                if not item.get("sessionId") and str(item.get("nodeId") or "").strip()
+                            }
+                            hosts = [
+                                _host_agent_summary_payload(
+                                    automation,
+                                    enrollment,
+                                    runtime_hosts_by_id=runtime_by_id,
+                                    nodes_by_id=nodes_by_id,
+                                )
+                                for enrollment in automation.list_host_enrollments()
+                            ]
+                            if has_id:
+                                await ws.send_text(json.dumps({"id": req_id, "result": {"hosts": hosts}}))
+                            continue
+
+                        if method == "argus/session/placement/get":
+                            placement = _effective_session_placement(session_id)
+                            if has_id:
+                                await ws.send_text(json.dumps({"id": req_id, "result": {"sessionId": session_id, "placement": placement.to_json()}}))
+                            continue
+
+                        if method == "argus/session/placement/set":
+                            placement = SessionPlacement.from_json(params, session_id=session_id)
+                            if placement is None:
+                                raise ValueError("Invalid placement")
+                            await _persist_session_placement(session_id, placement)
+                            try:
+                                await _close_live_session(session_id)
+                            except Exception:
+                                pass
+                            if has_id:
+                                await ws.send_text(json.dumps({"id": req_id, "result": {"ok": True, "sessionId": session_id, "placement": placement.to_json()}}))
                             continue
 
                         if method == "argus/user/bootstrap":

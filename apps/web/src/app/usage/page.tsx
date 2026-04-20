@@ -99,23 +99,19 @@ export default function UsagePage() {
   return (
     <ConsoleShell
       title="Usage"
-      subtitle="Read the gateway-side usage ledger by user, channel, model, and time window without leaving the operator console."
       actions={
-        <div className="flex flex-col gap-2 xl:items-end">
-          <div className="argus-surface-label">Gateway endpoint</div>
-          <div className="flex flex-wrap items-center gap-2">
-            <Input
-              value={wsUrl}
-              onChange={(event) => setWsUrl(event.target.value)}
-              className="w-[min(30rem,100%)]"
-              placeholder="Gateway wss://.../ws"
-              spellCheck={false}
-            />
-            <Button type="button" variant="secondary" disabled={loading} onClick={() => void refresh({ notify: true })}>
-              <RefreshCw className={cn("h-4 w-4", loading ? "animate-spin" : null)} />
-              Refresh
-            </Button>
-          </div>
+        <div className="flex flex-wrap items-center gap-2">
+          <Input
+            value={wsUrl}
+            onChange={(event) => setWsUrl(event.target.value)}
+            className="w-[min(30rem,100%)]"
+            placeholder="Gateway wss://.../ws"
+            spellCheck={false}
+          />
+          <Button type="button" variant="secondary" disabled={loading} onClick={() => void refresh({ notify: true })}>
+            <RefreshCw className={cn("h-4 w-4", loading ? "animate-spin" : null)} />
+            Refresh
+          </Button>
         </div>
       }
     >
@@ -259,7 +255,7 @@ export default function UsagePage() {
                       </button>
                     ))}
                     {!users.length ? (
-                      <EmptyState title="No users yet" body="Once Telegram or web activity starts flowing, usage will aggregate here." />
+                      <EmptyState title="No users" body="Once Telegram or web activity starts flowing, usage will aggregate here." />
                     ) : null}
                   </div>
                 )}

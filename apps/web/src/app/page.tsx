@@ -2422,7 +2422,7 @@ export default function Page() {
     const preview = activeThreadRow?.preview?.trim();
     if (preview) return preview;
     if (activeThreadId) return `Thread ${activeThreadId.slice(0, 12)}`;
-    return "Open a thread";
+    return "Workbench";
   }, [activeThreadId, activeThreadRow]);
 
   const loadedThreadCount = React.useMemo(
@@ -2438,15 +2438,7 @@ export default function Page() {
   const workbenchRail = (
     <div className="flex h-full min-h-0 flex-col">
       <div className="border-b border-border/68 px-4 py-4">
-        <div className="min-w-0">
-          <div className="argus-surface-label">Workbench</div>
-          <div className="mt-1 text-base font-semibold tracking-[-0.04em] text-foreground">Sessions and reopened threads</div>
-          <p className="mt-2 text-xs leading-5 text-muted-foreground">
-            The global navigation stays fixed on the far left. This rail is only for live session, thread, and connection context.
-          </p>
-        </div>
-
-        <div className="mt-4 relative">
+        <div className="relative">
           <Search className="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-muted-foreground" />
           <Input
             className="pl-9"
@@ -2461,14 +2453,12 @@ export default function Page() {
           <SidebarNavItem
             icon={<SquarePen className="h-4 w-4" />}
             label="Threads"
-            detail="Open, resume, and inspect thread activity."
             active={activePane === "chat"}
             onClick={() => setActivePane("chat")}
           />
           <SidebarNavItem
             icon={<LinkIcon className="h-4 w-4" />}
             label="Connection"
-            detail="Gateway URL, working directory, and approval posture."
             active={activePane === "connection"}
             onClick={() => setActivePane("connection")}
           />
@@ -2493,13 +2483,8 @@ export default function Page() {
           setThreadMenuOpenFor(null);
         }}
       >
-        <div className="mb-3 flex items-start justify-between gap-2 px-1">
-          <div>
-            <div className="argus-surface-label">Session fleet</div>
-            <div className="mt-1 text-xs leading-5 text-muted-foreground">
-              {sessionsLoaded ? `${sessionsList.length} live containers or saved runtimes.` : "Connecting to the gateway."}
-            </div>
-          </div>
+        <div className="mb-3 flex items-center justify-between gap-2 px-1">
+          <div className="text-sm font-medium text-foreground">Sessions</div>
           <div className="flex items-center gap-2">
             <Button
               type="button"
@@ -2787,11 +2772,7 @@ export default function Page() {
   const connectionHeader = (
     <div className="flex flex-col gap-4 xl:flex-row xl:items-start xl:justify-between">
       <div className="min-w-0">
-        <div className="argus-kicker">Gateway posture</div>
-        <h1 className="argus-display-ui mt-2 text-[clamp(1.9rem,2.8vw,3rem)] text-foreground">Connection</h1>
-        <p className="mt-2 max-w-[72ch] text-sm leading-6 text-muted-foreground">
-          Set the public WebSocket endpoint, working directory, and approval policy that new turns inherit when they start.
-        </p>
+        <h1 className="text-[clamp(1.75rem,2.5vw,2.5rem)] font-semibold tracking-[-0.05em] text-foreground">Connection</h1>
       </div>
       <div className="flex flex-wrap items-center gap-2">
         <IdPill label="state" value={activeConnStatus?.text ?? "disconnected"} tone={activeConnStatus?.ok ? "ok" : "idle"} />
@@ -2803,15 +2784,9 @@ export default function Page() {
   const chatHeader = (
     <div className="flex flex-col gap-4 xl:flex-row xl:items-start xl:justify-between">
       <div className="min-w-0">
-        <div className="argus-kicker">Live workbench</div>
-        <h1 className="mt-2 text-[clamp(1.7rem,2.3vw,2.5rem)] font-semibold tracking-[-0.05em] text-foreground">
+        <h1 className="text-[clamp(1.75rem,2.5vw,2.5rem)] font-semibold tracking-[-0.05em] text-foreground">
           {activeThreadTitle}
         </h1>
-        <p className="mt-2 max-w-[72ch] text-sm leading-6 text-muted-foreground">
-          {activeThreadId
-            ? "Stay inside one thread, inspect tool activity as it happens, and branch into a new thread only when the session truly needs it."
-            : "Open a session or reconnect to an existing thread from the workbench rail, then continue the conversation in the main surface."}
-        </p>
       </div>
       <div className="flex flex-wrap items-center gap-2">
         <IdPill
@@ -2851,10 +2826,7 @@ export default function Page() {
         <div className="grid gap-4 xl:grid-cols-[minmax(0,1.05fr)_minmax(0,0.95fr)]">
           <div className="argus-shell-panel-soft rounded-[22px] p-4 md:p-5">
             <div className="border-b border-border/60 pb-3">
-              <div className="argus-surface-label">Gateway link</div>
-              <div className="mt-2 max-w-[40rem] text-sm leading-6 text-muted-foreground">
-                Use the same public WebSocket endpoint the rest of the console shares, then choose the working directory and approval posture for newly created turns.
-              </div>
+              <div className="text-sm font-semibold tracking-[-0.02em] text-foreground">Connection</div>
             </div>
 
             <div className="mt-4 grid gap-4">
@@ -2900,35 +2872,19 @@ export default function Page() {
                 >
                   {activeConnStatus?.ok ? "Disconnect" : "Connect"}
                 </Button>
-                <span className="text-xs text-muted-foreground">Connection changes apply to new turns and new sessions created from this browser.</span>
               </div>
             </div>
           </div>
 
-          <div className="grid gap-4">
-            <div className="argus-shell-panel-soft rounded-[22px] p-4 md:p-5">
-              <div className="argus-surface-label">Current posture</div>
-              <div className="mt-4 grid gap-3 sm:grid-cols-2">
-                <ConnectionFact label="Connected sessions" value={sessionsLoaded ? String(connectedSessionCount) : "…"} />
-                <ConnectionFact label="Loaded threads" value={String(loadedThreadCount)} />
-                <ConnectionFact label="Active session" value={activeSessionId || "—"} mono />
-                <ConnectionFact label="Working directory" value={cwd || "—"} mono />
-              </div>
-            </div>
-
-            <div className="argus-shell-panel-soft rounded-[22px] p-4 md:p-5">
-              <div className="argus-surface-label">What this controls</div>
-              <div className="mt-3 space-y-3 text-sm leading-6 text-muted-foreground">
-                <div className="argus-row-shell rounded-[14px] px-3.5 py-3">
-                  New turns inherit the working directory and approval policy shown here.
-                </div>
-                <div className="argus-row-shell rounded-[14px] px-3.5 py-3">
-                  Sessions stay listed on the gateway until you explicitly delete them from the workbench rail.
-                </div>
-                <div className="argus-row-shell rounded-[14px] px-3.5 py-3">
-                  Reopen existing threads from the rail instead of spawning duplicate runtimes.
-                </div>
-              </div>
+          <div className="argus-shell-panel-soft rounded-[22px] p-4 md:p-5">
+            <div className="text-sm font-semibold tracking-[-0.02em] text-foreground">Status</div>
+            <div className="mt-4 grid gap-3 sm:grid-cols-2">
+              <ConnectionFact label="Connected" value={sessionsLoaded ? String(connectedSessionCount) : "…"} />
+              <ConnectionFact label="Threads" value={String(loadedThreadCount)} />
+              <ConnectionFact label="Session" value={activeSessionId || "—"} mono />
+              <ConnectionFact label="CWD" value={cwd || "—"} mono />
+              <ConnectionFact label="Policy" value={approvalPolicy} mono />
+              <ConnectionFact label="State" value={activeConnStatus?.text ?? "disconnected"} />
             </div>
           </div>
         </div>
@@ -2941,41 +2897,12 @@ export default function Page() {
             <div className="mx-auto grid w-full max-w-[76rem] grid-cols-1 gap-3">
               {showChatEmptyState ? (
                 <div className="argus-shell-panel-soft mt-4 rounded-[22px] p-5 md:mt-8 md:p-6">
-                  <div className="argus-kicker">Start here</div>
-                  <h2 className="mt-2 text-[clamp(1.8rem,2.4vw,2.6rem)] font-semibold tracking-[-0.05em] text-foreground">
-                    Connect the gateway and reopen a thread.
+                  <h2 className="text-[clamp(1.55rem,2vw,2rem)] font-semibold tracking-[-0.05em] text-foreground">
+                    No thread
                   </h2>
-                  <p className="mt-3 max-w-[68ch] text-sm leading-7 text-muted-foreground">
-                    Keep the workbench thin: configure connection posture once, reuse the session fleet in the workbench rail, then keep prompts, reasoning, and tool output in one live surface.
-                  </p>
-
-                  <div className="mt-5 grid gap-3 md:grid-cols-3">
-                    <div className="argus-row-shell rounded-[16px] px-4 py-4">
-                      <div className="argus-surface-label">1. Configure</div>
-                      <div className="mt-2 font-medium text-foreground">Set the gateway link</div>
-                      <div className="mt-2 text-sm leading-6 text-muted-foreground">
-                        Point this browser at a public <code>/ws</code> endpoint and choose the turn posture you want new work to inherit.
-                      </div>
-                    </div>
-                    <div className="argus-row-shell rounded-[16px] px-4 py-4">
-                      <div className="argus-surface-label">2. Reuse</div>
-                      <div className="mt-2 font-medium text-foreground">Open a session</div>
-                      <div className="mt-2 text-sm leading-6 text-muted-foreground">
-                        Reconnect to a saved runtime from the rail or create a fresh one when you actually need a new container.
-                      </div>
-                    </div>
-                    <div className="argus-row-shell rounded-[16px] px-4 py-4">
-                      <div className="argus-surface-label">3. Continue</div>
-                      <div className="mt-2 font-medium text-foreground">Work the thread</div>
-                      <div className="mt-2 text-sm leading-6 text-muted-foreground">
-                        Send a prompt, inspect reasoning and tools, then archive or branch only when the conversation warrants it.
-                      </div>
-                    </div>
-                  </div>
-
                   <div className="mt-5 flex flex-wrap gap-2">
                     <Button type="button" onClick={() => setActivePane("connection")}>
-                      Configure connection
+                      Connection
                     </Button>
                     <Button
                       type="button"
@@ -2985,7 +2912,7 @@ export default function Page() {
                         void connectNewSession().catch((e) => toast.error((e as Error)?.message || String(e)))
                       }
                     >
-                      Start a new session
+                      New session
                     </Button>
                   </div>
                 </div>
@@ -3083,10 +3010,11 @@ export default function Page() {
                   </Button>
                 </div>
 
-                <div className="mt-2 flex items-center justify-between text-[11px] text-muted-foreground">
-                  <span>Enter to send, Shift+Enter for newline.</span>
-                  <span>{prompt.trim().length ? `${prompt.trim().length} chars` : "No draft"}</span>
-                </div>
+                {prompt.trim().length ? (
+                  <div className="mt-2 flex justify-end text-[11px] text-muted-foreground">
+                    <span>{`${prompt.trim().length} chars`}</span>
+                  </div>
+                ) : null}
               </div>
             </div>
           </div>
@@ -3099,27 +3027,27 @@ export default function Page() {
 interface SidebarNavItemProps {
   icon: React.ReactNode;
   label: string;
-  detail?: string;
   active?: boolean;
   onClick?: () => void;
 }
 
-function SidebarNavItem({ icon, label, detail, active = false, onClick }: SidebarNavItemProps) {
+function SidebarNavItem({ icon, label, active = false, onClick }: SidebarNavItemProps) {
   return (
     <button
       type="button"
       onClick={onClick}
       aria-current={active ? "page" : undefined}
       className={cn(
-        "group flex w-full items-start gap-3 rounded-[16px] px-3 py-3 text-left transition-colors",
+        "group relative flex w-full items-center gap-3 rounded-[12px] px-2.5 py-2.5 text-left transition-colors",
         active
           ? "bg-primary/10"
           : "bg-transparent hover:bg-background/24"
       )}
     >
+      {active ? <span className="absolute inset-y-2 left-0 w-px rounded-full bg-primary" /> : null}
       <span
         className={cn(
-          "mt-0.5 flex h-9 w-9 shrink-0 items-center justify-center rounded-lg border",
+          "flex h-8 w-8 shrink-0 items-center justify-center rounded-lg border",
           active
             ? "border-primary/24 bg-primary/12 text-primary"
             : "border-border/65 bg-background/24 text-muted-foreground group-hover:border-border/85 group-hover:text-foreground"
@@ -3127,13 +3055,7 @@ function SidebarNavItem({ icon, label, detail, active = false, onClick }: Sideba
       >
         {icon}
       </span>
-      <span className="min-w-0 flex-1">
-        <span className="flex items-center justify-between gap-2">
-          <span className="truncate text-sm font-medium text-foreground">{label}</span>
-          {active ? <span className="h-1.5 w-1.5 rounded-full bg-primary" /> : null}
-        </span>
-        {detail ? <span className="mt-1 block text-xs leading-5 text-muted-foreground">{detail}</span> : null}
-      </span>
+      <span className="truncate text-sm font-medium text-foreground">{label}</span>
     </button>
   );
 }

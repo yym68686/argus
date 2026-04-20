@@ -224,21 +224,17 @@ export default function NodesPage() {
   return (
     <ConsoleShell
       title="Nodes"
-      subtitle="Inspect node-host peers, override transport wiring, and invoke remote commands without leaving the control plane."
       actions={
-        <div className="flex flex-col gap-2 xl:items-end">
-          <div className="argus-surface-label">Gateway endpoint</div>
-          <div className="flex flex-wrap items-center gap-2">
-            <Input
-              value={effectiveWsUrl}
-              onChange={(event) => syncFromWsUrl(event.target.value)}
-              className="w-[min(30rem,100%)]"
-              placeholder="Gateway wss://.../ws"
-            />
-            <Button type="button" variant="secondary" onClick={refreshNodes} disabled={loading || !effectiveHttpBase}>
-              {loading ? "Loading…" : "Refresh nodes"}
-            </Button>
-          </div>
+        <div className="flex flex-wrap items-center gap-2">
+          <Input
+            value={effectiveWsUrl}
+            onChange={(event) => syncFromWsUrl(event.target.value)}
+            className="w-[min(30rem,100%)]"
+            placeholder="Gateway wss://.../ws"
+          />
+          <Button type="button" variant="secondary" onClick={refreshNodes} disabled={loading || !effectiveHttpBase}>
+            {loading ? "Loading…" : "Refresh nodes"}
+          </Button>
         </div>
       }
     >
@@ -279,13 +275,13 @@ export default function NodesPage() {
                 ))}
               </div>
             ) : (
-              <EmptyState title="No nodes connected" body="Start node-host on a machine, then refresh this page to discover it." />
+              <EmptyState title="No nodes" body="Start node-host on a machine, then refresh this page to discover it." />
             )}
           </PanelCard>
 
           <PanelCard
             eyebrow="Selected peer"
-            title={selected?.displayName || selected?.nodeId || "No node selected"}
+            title={selected?.displayName || selected?.nodeId || "Node"}
             subtitle="Quick identity snapshot for the currently selected node."
           >
             {selected ? (
@@ -300,7 +296,7 @@ export default function NodesPage() {
             ) : inventoryError ? (
               <EmptyState title="Inventory unavailable" body="Refresh once the gateway node API is responding again." />
             ) : (
-              <EmptyState title="Nothing selected" body="Pick a node from the inventory to inspect metadata and target commands." />
+              <EmptyState title="No selection" body="Pick a node from the inventory to inspect metadata and target commands." />
             )}
           </PanelCard>
         </section>

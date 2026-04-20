@@ -19,6 +19,7 @@ export ARGUS_TOKEN="<ARGUS_TOKEN>"
 - 网关健康检查：`http://$HOST:8080/healthz`
   - 期望返回：`{"ok":true}`
 - 网关 WebSocket（给程序接入 app-server runtime）：`ws://$HOST:8080/ws`
+- Host Agent WebSocket（统一设备接入；推荐本机 Codex 接入方式）：`ws://$HOST:8080/host-agent/ws`
 - Node Host WebSocket（可选；设备能力注册）：`ws://$HOST:8080/nodes/ws`
 - 网关 MCP（可选；给 runtime 容器内 agent 调用的 MCP Server）：`http://$HOST:8080/mcp`
 - 可选：Web UI（用于验证后端；需要服务器启动 web 服务）：`http://$HOST:3000`
@@ -32,6 +33,10 @@ export ARGUS_TOKEN="<ARGUS_TOKEN>"
 > 备注：
 >
 > - 如果服务端配置了分离 token（`ARGUS_NODE_TOKEN` / `ARGUS_MCP_TOKEN`），则 Node Host / MCP 会使用对应的 master secret；未配置时默认复用 `ARGUS_TOKEN`。
+> - 如果你要把一台电脑作为“一等 native Codex host”接入，不再推荐直接手工连 `/runtime-host/ws` 或 `/nodes/ws`；优先使用新的 enrollment 流程：
+>   1. 管理端调用 `POST /host-agent/enroll-token`
+>   2. 目标机器执行 `argus connect --gateway <base> --enroll-token <token> --default`
+>   3. 机器随后通过 `/host-agent/ws` 同时提供 native runtime + control plane
 > - Node Host（`/nodes/ws`）是按 **session 隔离** 的：推荐用派生 token `argus-node-v1.<sessionId>.<sig>` 把 node 绑定到指定 session（`sig = base64url(hmac_sha256(master, sessionId)).rstrip("=")[:32]`）。
 >   - 如果服务端开启了认证，raw master token **不会被接受**（必须用派生 token）。
 > - MCP（`/mcp`）是按 **session 隔离** 的：**必须**使用派生 token `argus-mcp-v1.<sessionId>.<sig>`（raw master token **不会被接受**）。

@@ -573,32 +573,24 @@ export default function UsersPage() {
   }, [detail]);
 
   const showDetailSkeleton = Boolean(selectedUserId && detailBusy && !detail);
-  const rosterSubtitle = usersError
-    ? "Unable to load the operator roster from /admin/users."
-    : usersBusy
-      ? "Refreshing the operator roster."
-      : `${users.length} tracked users with agents, channels, and gateway activity.`;
+  const rosterTitle = users.length ? `Users (${users.length})` : "Users";
 
   return (
     <ConsoleShell
       title="Users"
-      subtitle="Manage Telegram-backed users, their agent fleets, upstream channels, and recent Requests API activity from one dense operator view."
       actions={
-        <div className="flex flex-col gap-2 xl:items-end">
-          <div className="argus-surface-label">Gateway endpoint</div>
-          <div className="flex flex-wrap items-center gap-2">
-            <Input
-              value={wsUrl}
-              onChange={(event) => setWsUrl(event.target.value)}
-              className="w-[min(30rem,100%)]"
-              placeholder="Gateway wss://.../ws"
-              spellCheck={false}
-            />
-            <Button type="button" variant="secondary" onClick={() => void refreshUsers({ notify: true })} disabled={usersBusy}>
-              <RefreshCw className={cn("h-4 w-4", usersBusy ? "animate-spin" : null)} />
-              Refresh
-            </Button>
-          </div>
+        <div className="flex flex-wrap items-center gap-2">
+          <Input
+            value={wsUrl}
+            onChange={(event) => setWsUrl(event.target.value)}
+            className="w-[min(30rem,100%)]"
+            placeholder="Gateway wss://.../ws"
+            spellCheck={false}
+          />
+          <Button type="button" variant="secondary" onClick={() => void refreshUsers({ notify: true })} disabled={usersBusy}>
+            <RefreshCw className={cn("h-4 w-4", usersBusy ? "animate-spin" : null)} />
+            Refresh
+          </Button>
         </div>
       }
     >
@@ -606,19 +598,18 @@ export default function UsersPage() {
         <section className="space-y-4">
           <PanelCard
             eyebrow="Fleet roster"
-            title="Users"
-            subtitle={rosterSubtitle}
+            title={rosterTitle}
             action={
               <div className="grid gap-2 md:grid-cols-[minmax(0,1fr)_auto]">
                 <Input
                   value={bootstrapUserId}
                   onChange={(event) => setBootstrapUserId(event.target.value)}
-                  placeholder="Telegram user id"
+                  placeholder="User id"
                   spellCheck={false}
                 />
                 <Button type="button" onClick={() => void bootstrapUser()}>
                   <Plus className="h-4 w-4" />
-                  Bootstrap user
+                  Bootstrap
                 </Button>
               </div>
             }
@@ -657,7 +648,7 @@ export default function UsersPage() {
                 );
               })}
               {!users.length && !usersError ? (
-                <EmptyState title="No users yet" body="Bootstrap a Telegram user id to create the first managed account." />
+                <EmptyState title="No users" />
               ) : null}
             </div>
           </PanelCard>
@@ -665,17 +656,17 @@ export default function UsersPage() {
 
         <section className="space-y-6">
           {usersError && !selectedUserId ? (
-            <PanelCard title="User detail" subtitle="Gateway user inventory is currently unavailable.">
+            <PanelCard title="User">
               <InlineError message={usersError} />
             </PanelCard>
           ) : !selectedUserId ? (
-            <PanelCard title="User detail" subtitle="Select a user to inspect agents, channels, default bindings, and recent gateway activity.">
-              <EmptyState title="Nothing selected" body="Pick a user from the list on the left." />
+            <PanelCard title="User">
+              <EmptyState title="No selection" />
             </PanelCard>
           ) : showDetailSkeleton ? (
             <UserDetailSkeleton userId={selectedUserId} />
           ) : detailError ? (
-            <PanelCard title="User detail" subtitle={`User ${selectedUserId}`}>
+            <PanelCard title={`User ${selectedUserId}`}>
               <InlineError message={detailError} />
             </PanelCard>
           ) : detail ? (
@@ -904,7 +895,7 @@ export default function UsersPage() {
                 </PanelCard>
               </div>
 
-              <PanelCard eyebrow="Ledger" title="Recent usage" subtitle="Last 100 Responses calls attributed to this user.">
+              <PanelCard eyebrow="Ledger" title="Usage">
                 <div className="argus-table-shell rounded-[20px]">
                   <table className="w-full border-collapse text-sm">
                     <thead className="argus-table-head text-left text-[10px] uppercase tracking-[0.12em] text-muted-foreground">
@@ -948,7 +939,7 @@ export default function UsersPage() {
                     </tbody>
                   </table>
                   {!detail.recentUsage.length ? (
-                    <div className="px-4 py-8 text-center text-sm text-muted-foreground">No recorded usage yet.</div>
+                    <div className="px-4 py-8 text-center text-sm text-muted-foreground">No usage</div>
                   ) : null}
                 </div>
               </PanelCard>
@@ -965,8 +956,7 @@ function UserDetailSkeleton({ userId }: { userId: number }) {
     <>
       <PanelCard
         eyebrow="Selected user"
-        title={`Loading user ${userId}`}
-        subtitle="Preparing agents, channels, and recent usage."
+        title={`User ${userId}`}
         className="argus-data-grid"
       >
         <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-4">
@@ -983,7 +973,7 @@ function UserDetailSkeleton({ userId }: { userId: number }) {
       </PanelCard>
 
       <div className="grid gap-4 xl:grid-cols-2">
-        <PanelCard eyebrow="Agent fleet" title="Agents" subtitle="Loading agent bindings and model defaults.">
+        <PanelCard eyebrow="Agent fleet" title="Agents">
           <div className="grid gap-3">
             {Array.from({ length: 2 }).map((_, index) => (
               <div
@@ -1001,7 +991,7 @@ function UserDetailSkeleton({ userId }: { userId: number }) {
           </div>
         </PanelCard>
 
-        <PanelCard eyebrow="Upstreams" title="Channels" subtitle="Loading channel readiness and access policy.">
+        <PanelCard eyebrow="Upstreams" title="Channels">
           <div className="grid gap-3">
             {Array.from({ length: 3 }).map((_, index) => (
               <div
@@ -1020,7 +1010,7 @@ function UserDetailSkeleton({ userId }: { userId: number }) {
         </PanelCard>
       </div>
 
-      <PanelCard eyebrow="Ledger" title="Recent usage" subtitle="Loading the latest Requests API events for this user.">
+      <PanelCard eyebrow="Ledger" title="Usage">
         <div className="space-y-3">
           {Array.from({ length: 6 }).map((_, index) => (
             <div key={index} className="grid gap-3 rounded-[16px] border border-border/70 bg-background/24 px-4 py-3 md:grid-cols-[1.1fr_0.9fr_0.9fr_1fr_0.6fr]">

@@ -74,6 +74,7 @@ How changes take effect:
 | Variable | Required? | Default | What it does / notes |
 | --- | --- | --- | --- |
 | `ARGUS_TOKEN` | Recommended; effectively required if you expose the gateway beyond localhost | unset | Shared bearer token for `/ws` and the HTTP management endpoints. Also acts as the fallback master secret for `ARGUS_NODE_TOKEN`, `ARGUS_MCP_TOKEN`, and `ARGUS_OPENAI_TOKEN`. This is **not** an OpenAI API key. |
+| `ARGUS_PUBLIC_BASE_URL` | Required if you use native host-agents / local Codex hosts | unset | Public gateway base URL that native host sessions use when wiring back to `/mcp`, `/openai/v1`, and the host-agent enrollment flow. Example: `https://argus.example.com`. |
 | `ARGUS_NODE_TOKEN` | Optional | falls back to `ARGUS_TOKEN` | Separate master secret for derived `/nodes/ws` session tokens. Set this if you want node access scoped separately from the main gateway token. |
 | `ARGUS_MCP_TOKEN` | Optional | falls back to `ARGUS_TOKEN` | Separate master secret for the gateway MCP endpoint. Runtime containers receive per-session derived tokens instead of the raw secret. |
 | `ARGUS_DATABASE_URL` | Optional, but recommended for non-trivial deployments | unset | PostgreSQL DSN used for gateway automation state and usage ledger, for example `postgresql://argus:argus@postgres:5432/argus`. When set, Argus stores gateway state in PostgreSQL and auto-imports legacy `state.json`, `state.db`, and `usage.db` on first boot when the target tables are still empty. |
@@ -156,9 +157,21 @@ Channel behavior:
 | `STATE_PATH` | Optional | In container: `/data/state.json`; outside container: `./state.json` | Persistent state path for `apps/telegram-bot`. Only relevant if you run the bot directly rather than through the provided volume setup. |
 | `TELEGRAM_ADMIN_CHAT_IDS` | Reserved / currently unused in this repo | unset | Present in `docker-compose.yml`, but the current codebase does not read it yet. Safe to leave unset for now. |
 
-### Standalone node-host (`apps/node-host`)
+### Standalone host-agent (`apps/node-host`)
 
-You normally do **not** need these when using the built-in runtime node-host; the gateway injects that wiring automatically. These are for running `apps/node-host` manually on another machine (for example your Mac).
+For a user machine that should act as a first-class native Codex host, use the unified CLI:
+
+```bash
+cd apps/node-host
+go build -o argus ./cmd/argus
+./argus connect --gateway "https://argus.example.com" --enroll-token "<one-time-token>" --default
+```
+
+This claims a one-time enrollment token, saves a local device credential, and starts a unified host-agent over `/host-agent/ws`.
+
+Legacy `/nodes/ws` and `/runtime-host/ws` binaries still exist for compatibility, but the primary path is now `argus connect`.
+
+You normally do **not** need the legacy node-only flags below unless you are explicitly running the old `/nodes/ws` control plane by itself.
 
 | Variable | Required? | Default | What it does / notes |
 | --- | --- | --- | --- |
