@@ -2,6 +2,7 @@ import * as React from "react";
 
 export const GATEWAY_WS_STORAGE_KEY = "argus.gateway.wsUrl";
 export const GATEWAY_ADMIN_TOKEN_STORAGE_KEY = "argus.gateway.adminToken";
+export const GATEWAY_AUTH_TOKEN_STORAGE_KEY = "argus.auth.sessionToken";
 
 export function sanitizeGatewayWsUrl(url: string): string {
   try {
@@ -97,8 +98,15 @@ export function useGatewayWsUrlState(): [string, (value: string) => void] {
   return [value, setValue];
 }
 
-export function loadGatewayAdminToken(): string {
+export function loadGatewayAuthToken(): string {
   if (typeof window === "undefined") return "";
+  try {
+    const saved = window.localStorage.getItem(GATEWAY_AUTH_TOKEN_STORAGE_KEY);
+    if (saved && saved.trim()) return saved.trim();
+  } catch {
+    // ignore
+  }
+
   try {
     const saved = window.localStorage.getItem(GATEWAY_ADMIN_TOKEN_STORAGE_KEY);
     if (saved && saved.trim()) return saved.trim();
@@ -117,63 +125,79 @@ export function loadGatewayAdminToken(): string {
   return extractTokenFromWsUrl(defaultWsUrl()) ?? "";
 }
 
-export function storeGatewayAdminToken(token: string): void {
+export function storeGatewayAuthToken(token: string): void {
   if (typeof window === "undefined") return;
   try {
     const trimmed = token.trim();
     if (trimmed) {
-      window.localStorage.setItem(GATEWAY_ADMIN_TOKEN_STORAGE_KEY, trimmed);
+      window.localStorage.setItem(GATEWAY_AUTH_TOKEN_STORAGE_KEY, trimmed);
+      window.localStorage.removeItem(GATEWAY_ADMIN_TOKEN_STORAGE_KEY);
     } else {
+      window.localStorage.removeItem(GATEWAY_AUTH_TOKEN_STORAGE_KEY);
       window.localStorage.removeItem(GATEWAY_ADMIN_TOKEN_STORAGE_KEY);
     }
   } catch {
     // ignore
   }
-  window.dispatchEvent(new Event("argus-admin-token"));
+  window.dispatchEvent(new Event("argus-auth-token"));
 }
 
-export function clearGatewayAdminToken(): void {
+export function clearGatewayAuthToken(): void {
   if (typeof window === "undefined") return;
   try {
+    window.localStorage.removeItem(GATEWAY_AUTH_TOKEN_STORAGE_KEY);
     window.localStorage.removeItem(GATEWAY_ADMIN_TOKEN_STORAGE_KEY);
   } catch {
     // ignore
   }
-  window.dispatchEvent(new Event("argus-admin-token"));
+  window.dispatchEvent(new Event("argus-auth-token"));
 }
 
-function subscribeGatewayAdminToken(onStoreChange: () => void): () => void {
+function subscribeGatewayAuthToken(onStoreChange: () => void): () => void {
   if (typeof window === "undefined") return () => {};
   const onStorage = (event: StorageEvent) => {
-    if (event.key && event.key !== GATEWAY_ADMIN_TOKEN_STORAGE_KEY && event.key !== GATEWAY_WS_STORAGE_KEY) return;
+    if (
+      event.key &&
+      event.key !== GATEWAY_AUTH_TOKEN_STORAGE_KEY &&
+      event.key !== GATEWAY_ADMIN_TOKEN_STORAGE_KEY &&
+      event.key !== GATEWAY_WS_STORAGE_KEY
+    ) {
+      return;
+    }
     onStoreChange();
   };
   const onInternal = () => onStoreChange();
   window.addEventListener("storage", onStorage);
-  window.addEventListener("argus-admin-token", onInternal);
+  window.addEventListener("argus-auth-token", onInternal);
   return () => {
     window.removeEventListener("storage", onStorage);
-    window.removeEventListener("argus-admin-token", onInternal);
+    window.removeEventListener("argus-auth-token", onInternal);
   };
 }
 
-export function useStoredGatewayAdminToken(): string {
-  return React.useSyncExternalStore(subscribeGatewayAdminToken, loadGatewayAdminToken, () => "");
+export function useStoredGatewayAuthToken(): string {
+  return React.useSyncExternalStore(subscribeGatewayAuthToken, loadGatewayAuthToken, () => "");
 }
 
-export function useGatewayAdminTokenState(): [string, (value: string) => void] {
-  const stored = useStoredGatewayAdminToken();
+export function useGatewayAuthTokenState(): [string, (value: string) => void] {
+  const stored = useStoredGatewayAuthToken();
   const [override, setOverride] = React.useState<string | null>(null);
 
   const value = override ?? stored;
 
   const setValue = React.useCallback((nextValue: string) => {
     setOverride(nextValue);
-    storeGatewayAdminToken(nextValue);
+    storeGatewayAuthToken(nextValue);
   }, []);
 
   return [value, setValue];
 }
+
+export const loadGatewayAdminToken = loadGatewayAuthToken;
+export const storeGatewayAdminToken = storeGatewayAuthToken;
+export const clearGatewayAdminToken = clearGatewayAuthToken;
+export const useStoredGatewayAdminToken = useStoredGatewayAuthToken;
+export const useGatewayAdminTokenState = useGatewayAuthTokenState;
 
 export function extractTokenFromWsUrl(url: string): string | null {
   try {
@@ -185,8 +209,8 @@ export function extractTokenFromWsUrl(url: string): string | null {
   }
 }
 
-export function withGatewayAdminToken(wsUrl: string, token?: string | null): string {
-  const effectiveToken = (token ?? loadGatewayAdminToken()).trim();
+export function withGatewayAuthToken(wsUrl: string, token?: string | null): string {
+  const effectiveToken = (token ?? loadGatewayAuthToken()).trim();
   if (!effectiveToken) return wsUrl;
   try {
     const u = new URL(wsUrl);
@@ -196,6 +220,8 @@ export function withGatewayAdminToken(wsUrl: string, token?: string | null): str
     return wsUrl;
   }
 }
+
+export const withGatewayAdminToken = withGatewayAuthToken;
 
 export function httpBaseFromWsUrl(url: string): string | null {
   try {
@@ -209,7 +235,7 @@ export function httpBaseFromWsUrl(url: string): string | null {
 
 export function buildGatewayHeaders(wsUrl: string, extra?: HeadersInit): Headers {
   const headers = new Headers(extra ?? {});
-  const token = extractTokenFromWsUrl(wsUrl) ?? loadGatewayAdminToken();
+  const token = extractTokenFromWsUrl(wsUrl) ?? loadGatewayAuthToken();
   if (token && !headers.has("Authorization")) {
     headers.set("Authorization", `Bearer ${token}`);
   }

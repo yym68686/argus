@@ -8,6 +8,7 @@ import json
 import logging
 import os
 import re
+import secrets
 import shlex
 import sqlite3
 import threading
@@ -118,6 +119,8 @@ HOST_AGENT_DEVICE_TOKEN_PREFIX = "argus-host-agent-v1"
 DEFAULT_HOST_AGENT_ENROLL_TTL_S = 15 * 60
 MAX_HOST_AGENT_ENROLL_TTL_S = 7 * 24 * 60 * 60
 HOST_AGENT_BINARY_TARGETS: dict[str, dict[str, str]] = {
+    "linux-amd64": {"filename": "argus-linux-amd64", "download_name": "argus"},
+    "linux-arm64": {"filename": "argus-linux-arm64", "download_name": "argus"},
     "darwin-amd64": {"filename": "argus-darwin-amd64", "download_name": "argus"},
     "darwin-arm64": {"filename": "argus-darwin-arm64", "download_name": "argus"},
     "windows-amd64": {"filename": "argus-windows-amd64.exe", "download_name": "argus.exe"},
@@ -336,6 +339,11 @@ def _host_agent_dist_dir() -> Path:
 def _normalize_host_agent_download_target(raw: Any) -> str:
     value = str(raw or "").strip().lower().replace("_", "-")
     aliases = {
+        "linux": "linux-amd64",
+        "linux-x64": "linux-amd64",
+        "linux-x86-64": "linux-amd64",
+        "linux-amd64": "linux-amd64",
+        "linux-arm64": "linux-arm64",
         "mac": "darwin-arm64",
         "macos": "darwin-arm64",
         "darwin": "darwin-arm64",
@@ -2413,7 +2421,9 @@ class PersistedStagedAttachment:
 AGENT_ID_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9_-]{0,63}$")
 CHANNEL_ID_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,63}$")
 TELEGRAM_PRIVATE_CHAT_ID_RE = re.compile(r"^[1-9]\d{0,19}$")
-AUTOMATION_STATE_VERSION = 8
+CONSOLE_EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+CONSOLE_SESSION_ID_RE = re.compile(r"^[a-f0-9]{24}$")
+AUTOMATION_STATE_VERSION = 9
 ARGUS_AGENT_MODEL_DEFAULT = "gpt-5.4"
 ARGUS_GATEWAY_AGENT_MODELS = ("gpt-5.2", "gpt-5.4")
 ARGUS_GATEWAY_AGENT_MODELS_SET = frozenset(ARGUS_GATEWAY_AGENT_MODELS)
@@ -2425,6 +2435,10 @@ CHANNEL_ID_ZERO_ZERO_PRO = "0-0.pro"
 CHANNEL_IDS_BUILTIN = frozenset((CHANNEL_ID_GATEWAY, CHANNEL_ID_ZERO_ZERO_PRO))
 CHANNEL_ZERO_ZERO_PRO_BASE_URL = "https://api.0-0.pro/v1"
 CHANNEL_ZERO_ZERO_PRO_PROMO_URL = "https://0-0.pro"
+CONSOLE_SESSION_TOKEN_PREFIX = "argus-console-v1"
+CONSOLE_PASSWORD_HASH_KIND = "pbkdf2_sha256"
+CONSOLE_PASSWORD_PBKDF2_ITERATIONS = 600_000
+CONSOLE_SESSION_TTL_MS = 30 * 24 * 60 * 60 * 1000
 
 
 def _normalize_runtime_session_id(raw: Any) -> str:
@@ -2436,6 +2450,105 @@ def _normalize_runtime_session_id(raw: Any) -> str:
     if not RUNTIME_SESSION_ID_RE.match(sid):
         return ""
     return sid
+
+
+def _normalize_console_email(raw: Any) -> str:
+    if not isinstance(raw, str):
+        return ""
+    email = raw.strip().lower()
+    if not email or len(email) > 320:
+        return ""
+    if not CONSOLE_EMAIL_RE.match(email):
+        return ""
+    return email
+
+
+def _normalize_console_password(raw: Any) -> str:
+    if not isinstance(raw, str):
+        return ""
+    password = raw
+    if len(password) < 8 or len(password) > 1024:
+        return ""
+    return password
+
+
+def _hash_console_password(password: str) -> str:
+    normalized = _normalize_console_password(password)
+    if not normalized:
+        raise ValueError("Password must be at least 8 characters")
+    salt = secrets.token_bytes(16)
+    digest = hashlib.pbkdf2_hmac(
+        "sha256",
+        normalized.encode("utf-8"),
+        salt,
+        CONSOLE_PASSWORD_PBKDF2_ITERATIONS,
+    )
+    return "$".join(
+        (
+            CONSOLE_PASSWORD_HASH_KIND,
+            str(CONSOLE_PASSWORD_PBKDF2_ITERATIONS),
+            _b64url_no_pad(salt),
+            _b64url_no_pad(digest),
+        )
+    )
+
+
+def _verify_console_password(stored_hash: Any, provided_password: Any) -> bool:
+    stored = str(stored_hash or "").strip()
+    password = _normalize_console_password(provided_password)
+    if not stored or not password:
+        return False
+    parts = stored.split("$", 3)
+    if len(parts) != 4:
+        return False
+    kind, iterations_raw, salt_raw, digest_raw = parts
+    if kind != CONSOLE_PASSWORD_HASH_KIND:
+        return False
+    try:
+        iterations = int(iterations_raw)
+    except Exception:
+        return False
+    if iterations <= 0:
+        return False
+    try:
+        salt = base64.urlsafe_b64decode(salt_raw + "=" * (-len(salt_raw) % 4))
+        expected = base64.urlsafe_b64decode(digest_raw + "=" * (-len(digest_raw) % 4))
+    except Exception:
+        return False
+    actual = hashlib.pbkdf2_hmac(
+        "sha256",
+        password.encode("utf-8"),
+        salt,
+        iterations,
+    )
+    return hmac.compare_digest(expected, actual)
+
+
+def _hash_console_session_token(token: Any) -> str:
+    return hashlib.sha256(str(token or "").encode("utf-8")).hexdigest()
+
+
+def _parse_console_session_token(token: Any) -> Optional[str]:
+    raw = str(token or "").strip()
+    if not raw:
+        return None
+    parts = raw.split(".", 2)
+    if len(parts) != 3:
+        return None
+    prefix, session_id, _secret = parts
+    if prefix != CONSOLE_SESSION_TOKEN_PREFIX:
+        return None
+    if not CONSOLE_SESSION_ID_RE.match(session_id):
+        return None
+    return session_id
+
+
+def _issue_console_session_token() -> tuple[str, str, int]:
+    session_id = uuid.uuid4().hex[:24]
+    secret = _b64url_no_pad(secrets.token_bytes(24))
+    token = f"{CONSOLE_SESSION_TOKEN_PREFIX}.{session_id}.{secret}"
+    expires_at_ms = _now_ms() + CONSOLE_SESSION_TTL_MS
+    return session_id, token, expires_at_ms
 
 
 def _is_missing_thread_for_archive_error(msg: str) -> bool:
@@ -2842,6 +2955,7 @@ class PersistedAgentRuntime:
 
 @dataclass
 class PersistedSessionAutomation:
+    owner_user_id: Optional[int] = None
     main_thread_id: Optional[str] = None
     placement: Optional[SessionPlacement] = None
     cron_jobs: list[PersistedCronJob] = field(default_factory=list)
@@ -2897,6 +3011,7 @@ class PersistedSessionAutomation:
             if out_runs:
                 cron_runs[jid.strip()] = out_runs
         return {
+            "ownerUserId": int(self.owner_user_id) if isinstance(self.owner_user_id, int) and self.owner_user_id > 0 else None,
             "mainThreadId": self.main_thread_id,
             "placement": self.placement.to_json() if isinstance(self.placement, SessionPlacement) else None,
             "cronJobs": [j.to_json() for j in self.cron_jobs],
@@ -2911,6 +3026,15 @@ class PersistedSessionAutomation:
     def from_json(obj: Any) -> "PersistedSessionAutomation":
         if not isinstance(obj, dict):
             return PersistedSessionAutomation()
+        owner_user_id = None
+        owner_raw = obj.get("ownerUserId")
+        if owner_raw is not None:
+            try:
+                owner_int = int(owner_raw)
+                if owner_int > 0:
+                    owner_user_id = owner_int
+            except Exception:
+                owner_user_id = None
         main_thread_id = obj.get("mainThreadId")
         if not isinstance(main_thread_id, str) or not main_thread_id.strip():
             main_thread_id = None
@@ -2989,6 +3113,7 @@ class PersistedSessionAutomation:
                 seen_node_ids.add(node_id_norm)
                 paused_node_ids.append(node_id_norm)
         return PersistedSessionAutomation(
+            owner_user_id=owner_user_id,
             main_thread_id=main_thread_id.strip() if isinstance(main_thread_id, str) else None,
             placement=placement,
             cron_jobs=cron_jobs,
@@ -3372,12 +3497,152 @@ class PersistedUserChannelState:
 
 
 @dataclass
+class PersistedConsoleUser:
+    user_id: int
+    email: str
+    password_hash: str
+    is_admin: bool = False
+    created_at_ms: int = field(default_factory=_now_ms)
+    updated_at_ms: int = field(default_factory=_now_ms)
+    last_login_at_ms: Optional[int] = None
+
+    def to_json(self, *, redact_secrets: bool = False) -> dict[str, Any]:
+        return {
+            "userId": int(self.user_id),
+            "email": self.email,
+            "passwordHash": None if redact_secrets else str(self.password_hash or "").strip(),
+            "isAdmin": bool(self.is_admin),
+            "createdAtMs": int(self.created_at_ms),
+            "updatedAtMs": int(self.updated_at_ms),
+            "lastLoginAtMs": int(self.last_login_at_ms) if isinstance(self.last_login_at_ms, int) and self.last_login_at_ms > 0 else None,
+        }
+
+    def to_public_json(self) -> dict[str, Any]:
+        return {
+            "userId": int(self.user_id),
+            "email": self.email,
+            "isAdmin": bool(self.is_admin),
+            "createdAtMs": int(self.created_at_ms),
+            "updatedAtMs": int(self.updated_at_ms),
+            "lastLoginAtMs": int(self.last_login_at_ms) if isinstance(self.last_login_at_ms, int) and self.last_login_at_ms > 0 else None,
+        }
+
+    @staticmethod
+    def from_json(obj: Any) -> Optional["PersistedConsoleUser"]:
+        if not isinstance(obj, dict):
+            return None
+        try:
+            user_id = int(obj.get("userId"))
+        except Exception:
+            return None
+        if user_id <= 0:
+            return None
+        email = _normalize_console_email(obj.get("email"))
+        password_hash = str(obj.get("passwordHash") or "").strip()
+        if not email or not password_hash:
+            return None
+        try:
+            created_at_ms = int(obj.get("createdAtMs")) if obj.get("createdAtMs") is not None else _now_ms()
+        except Exception:
+            created_at_ms = _now_ms()
+        try:
+            updated_at_ms = int(obj.get("updatedAtMs")) if obj.get("updatedAtMs") is not None else created_at_ms
+        except Exception:
+            updated_at_ms = created_at_ms
+        try:
+            last_login_at_ms = int(obj.get("lastLoginAtMs")) if obj.get("lastLoginAtMs") is not None else None
+        except Exception:
+            last_login_at_ms = None
+        return PersistedConsoleUser(
+            user_id=user_id,
+            email=email,
+            password_hash=password_hash,
+            is_admin=bool(obj.get("isAdmin")),
+            created_at_ms=created_at_ms,
+            updated_at_ms=updated_at_ms,
+            last_login_at_ms=last_login_at_ms,
+        )
+
+
+@dataclass
+class PersistedConsoleSession:
+    session_id: str
+    user_id: int
+    token_hash: str
+    created_at_ms: int = field(default_factory=_now_ms)
+    updated_at_ms: int = field(default_factory=_now_ms)
+    expires_at_ms: int = field(default_factory=lambda: _now_ms() + CONSOLE_SESSION_TTL_MS)
+    revoked_at_ms: Optional[int] = None
+
+    def to_json(self, *, redact_secrets: bool = False) -> dict[str, Any]:
+        return {
+            "sessionId": self.session_id,
+            "userId": int(self.user_id),
+            "tokenHash": None if redact_secrets else str(self.token_hash or "").strip(),
+            "createdAtMs": int(self.created_at_ms),
+            "updatedAtMs": int(self.updated_at_ms),
+            "expiresAtMs": int(self.expires_at_ms),
+            "revokedAtMs": int(self.revoked_at_ms) if isinstance(self.revoked_at_ms, int) and self.revoked_at_ms > 0 else None,
+        }
+
+    def is_active(self) -> bool:
+        if self.revoked_at_ms is not None:
+            return False
+        try:
+            return int(self.expires_at_ms) > _now_ms()
+        except Exception:
+            return False
+
+    @staticmethod
+    def from_json(obj: Any) -> Optional["PersistedConsoleSession"]:
+        if not isinstance(obj, dict):
+            return None
+        session_id = str(obj.get("sessionId") or "").strip().lower()
+        if not CONSOLE_SESSION_ID_RE.match(session_id):
+            return None
+        try:
+            user_id = int(obj.get("userId"))
+        except Exception:
+            return None
+        token_hash = str(obj.get("tokenHash") or "").strip()
+        if user_id <= 0 or not token_hash:
+            return None
+        try:
+            created_at_ms = int(obj.get("createdAtMs")) if obj.get("createdAtMs") is not None else _now_ms()
+        except Exception:
+            created_at_ms = _now_ms()
+        try:
+            updated_at_ms = int(obj.get("updatedAtMs")) if obj.get("updatedAtMs") is not None else created_at_ms
+        except Exception:
+            updated_at_ms = created_at_ms
+        try:
+            expires_at_ms = int(obj.get("expiresAtMs")) if obj.get("expiresAtMs") is not None else created_at_ms + CONSOLE_SESSION_TTL_MS
+        except Exception:
+            expires_at_ms = created_at_ms + CONSOLE_SESSION_TTL_MS
+        try:
+            revoked_at_ms = int(obj.get("revokedAtMs")) if obj.get("revokedAtMs") is not None else None
+        except Exception:
+            revoked_at_ms = None
+        return PersistedConsoleSession(
+            session_id=session_id,
+            user_id=user_id,
+            token_hash=token_hash,
+            created_at_ms=created_at_ms,
+            updated_at_ms=updated_at_ms,
+            expires_at_ms=expires_at_ms,
+            revoked_at_ms=revoked_at_ms,
+        )
+
+
+@dataclass
 class PersistedGatewayAutomationState:
     version: int = AUTOMATION_STATE_VERSION
     sessions: dict[str, PersistedSessionAutomation] = field(default_factory=dict)
     agents: dict[str, PersistedAgentRuntime] = field(default_factory=dict)
     chat_bindings: dict[str, str] = field(default_factory=dict)
     user_channels: dict[str, PersistedUserChannelState] = field(default_factory=dict)
+    console_users: dict[str, PersistedConsoleUser] = field(default_factory=dict)
+    console_sessions: dict[str, PersistedConsoleSession] = field(default_factory=dict)
     host_enrollments: dict[str, PersistedHostEnrollment] = field(default_factory=dict)
     host_bindings: dict[str, PersistedHostBinding] = field(default_factory=dict)
     host_enroll_tokens: dict[str, PersistedHostEnrollToken] = field(default_factory=dict)
@@ -3392,6 +3657,16 @@ class PersistedGatewayAutomationState:
                 user_id: channel_state.to_json(redact_secrets=redact_secrets)
                 for user_id, channel_state in (self.user_channels or {}).items()
                 if isinstance(user_id, str) and user_id.strip() and isinstance(channel_state, PersistedUserChannelState)
+            },
+            "consoleUsers": {
+                user_id: user.to_json(redact_secrets=redact_secrets)
+                for user_id, user in (self.console_users or {}).items()
+                if isinstance(user_id, str) and user_id.strip() and isinstance(user, PersistedConsoleUser)
+            },
+            "consoleSessions": {
+                session_id: session.to_json(redact_secrets=redact_secrets)
+                for session_id, session in (self.console_sessions or {}).items()
+                if isinstance(session_id, str) and session_id.strip() and isinstance(session, PersistedConsoleSession)
             },
             "hostEnrollments": {
                 host_id: enrollment.to_json(redact_secrets=redact_secrets)
@@ -3465,6 +3740,35 @@ class PersistedGatewayAutomationState:
                     continue
                 user_channels[str(user_id_int)] = PersistedUserChannelState.from_json(raw_state)
 
+        console_users_raw = obj.get("consoleUsers")
+        console_users: dict[str, PersistedConsoleUser] = {}
+        if isinstance(console_users_raw, dict):
+            for raw_user_id, raw_user in console_users_raw.items():
+                user = PersistedConsoleUser.from_json(raw_user)
+                if user is None:
+                    continue
+                key = str(user.user_id)
+                if isinstance(raw_user_id, str) and raw_user_id.strip():
+                    try:
+                        key = str(int(raw_user_id))
+                    except Exception:
+                        key = str(user.user_id)
+                console_users[key] = user
+
+        console_sessions_raw = obj.get("consoleSessions")
+        console_sessions: dict[str, PersistedConsoleSession] = {}
+        if isinstance(console_sessions_raw, dict):
+            for raw_session_id, raw_session in console_sessions_raw.items():
+                session = PersistedConsoleSession.from_json(raw_session)
+                if session is None:
+                    continue
+                key = session.session_id
+                if isinstance(raw_session_id, str):
+                    candidate = raw_session_id.strip().lower()
+                    if CONSOLE_SESSION_ID_RE.match(candidate):
+                        key = candidate
+                console_sessions[key] = session
+
         host_enrollments_raw = obj.get("hostEnrollments")
         host_enrollments: dict[str, PersistedHostEnrollment] = {}
         if isinstance(host_enrollments_raw, dict):
@@ -3506,6 +3810,8 @@ class PersistedGatewayAutomationState:
             agents=agents,
             chat_bindings=chat_bindings,
             user_channels=user_channels,
+            console_users=console_users,
+            console_sessions=console_sessions,
             host_enrollments=host_enrollments,
             host_bindings=host_bindings,
             host_enroll_tokens=host_enroll_tokens,
@@ -3685,6 +3991,46 @@ class _SQLiteAutomationStateStore:
                         ],
                     )
 
+                conn.execute("DELETE FROM automation_console_users")
+                if state.console_users:
+                    conn.executemany(
+                        """
+                        INSERT INTO automation_console_users (user_id, payload_json, updated_at_ms)
+                        VALUES (?, ?, ?)
+                        """,
+                        [
+                            (
+                                user_id,
+                                json.dumps(user.to_json(redact_secrets=False), ensure_ascii=False, separators=(",", ":")),
+                                now_ms,
+                            )
+                            for user_id, user in state.console_users.items()
+                            if isinstance(user_id, str)
+                            and user_id.strip()
+                            and isinstance(user, PersistedConsoleUser)
+                        ],
+                    )
+
+                conn.execute("DELETE FROM automation_console_sessions")
+                if state.console_sessions:
+                    conn.executemany(
+                        """
+                        INSERT INTO automation_console_sessions (session_id, payload_json, updated_at_ms)
+                        VALUES (?, ?, ?)
+                        """,
+                        [
+                            (
+                                session_id,
+                                json.dumps(session.to_json(redact_secrets=False), ensure_ascii=False, separators=(",", ":")),
+                                now_ms,
+                            )
+                            for session_id, session in state.console_sessions.items()
+                            if isinstance(session_id, str)
+                            and session_id.strip()
+                            and isinstance(session, PersistedConsoleSession)
+                        ],
+                    )
+
                 conn.execute("DELETE FROM automation_host_enrollments")
                 if state.host_enrollments:
                     conn.executemany(
@@ -3776,6 +4122,16 @@ class _SQLiteAutomationStateStore:
                 payload_json TEXT NOT NULL,
                 updated_at_ms INTEGER NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS automation_console_users (
+                user_id TEXT PRIMARY KEY,
+                payload_json TEXT NOT NULL,
+                updated_at_ms INTEGER NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS automation_console_sessions (
+                session_id TEXT PRIMARY KEY,
+                payload_json TEXT NOT NULL,
+                updated_at_ms INTEGER NOT NULL
+            );
             CREATE TABLE IF NOT EXISTS automation_host_enrollments (
                 host_id TEXT PRIMARY KEY,
                 payload_json TEXT NOT NULL,
@@ -3802,6 +4158,8 @@ class _SQLiteAutomationStateStore:
             "automation_agents",
             "automation_chat_bindings",
             "automation_user_channels",
+            "automation_console_users",
+            "automation_console_sessions",
             "automation_host_enrollments",
             "automation_host_bindings",
             "automation_host_enroll_tokens",
@@ -3870,6 +4228,38 @@ class _SQLiteAutomationStateStore:
                 continue
             user_channels[user_id] = PersistedUserChannelState.from_json(payload)
 
+        console_users: dict[str, PersistedConsoleUser] = {}
+        for row in conn.execute("SELECT user_id, payload_json FROM automation_console_users"):
+            user_id = str(row["user_id"] or "").strip()
+            if not user_id:
+                continue
+            try:
+                payload = json.loads(str(row["payload_json"] or "{}"))
+            except Exception:
+                continue
+            user = PersistedConsoleUser.from_json(payload)
+            if user is None:
+                continue
+            key = user_id
+            try:
+                key = str(int(user_id))
+            except Exception:
+                key = str(user.user_id)
+            console_users[key] = user
+
+        console_sessions: dict[str, PersistedConsoleSession] = {}
+        for row in conn.execute("SELECT session_id, payload_json FROM automation_console_sessions"):
+            try:
+                payload = json.loads(str(row["payload_json"] or "{}"))
+            except Exception:
+                continue
+            session = PersistedConsoleSession.from_json(payload)
+            session_id = str(row["session_id"] or "").strip().lower()
+            if session is None:
+                continue
+            key = session_id if CONSOLE_SESSION_ID_RE.match(session_id) else session.session_id
+            console_sessions[key] = session
+
         host_enrollments: dict[str, PersistedHostEnrollment] = {}
         for row in conn.execute("SELECT host_id, payload_json FROM automation_host_enrollments"):
             try:
@@ -3918,6 +4308,8 @@ class _SQLiteAutomationStateStore:
             agents=agents,
             chat_bindings=chat_bindings,
             user_channels=user_channels,
+            console_users=console_users,
+            console_sessions=console_sessions,
             host_enrollments=host_enrollments,
             host_bindings=host_bindings,
             host_enroll_tokens=host_enroll_tokens,
@@ -4640,6 +5032,46 @@ class _PostgresAutomationStateStore:
                             ],
                         )
 
+                    cur.execute("DELETE FROM automation_console_users")
+                    if state.console_users:
+                        cur.executemany(
+                            """
+                            INSERT INTO automation_console_users (user_id, payload_json, updated_at_ms)
+                            VALUES (%s, %s, %s)
+                            """,
+                            [
+                                (
+                                    user_id,
+                                    json.dumps(user.to_json(redact_secrets=False), ensure_ascii=False, separators=(",", ":")),
+                                    now_ms,
+                                )
+                                for user_id, user in state.console_users.items()
+                                if isinstance(user_id, str)
+                                and user_id.strip()
+                                and isinstance(user, PersistedConsoleUser)
+                            ],
+                        )
+
+                    cur.execute("DELETE FROM automation_console_sessions")
+                    if state.console_sessions:
+                        cur.executemany(
+                            """
+                            INSERT INTO automation_console_sessions (session_id, payload_json, updated_at_ms)
+                            VALUES (%s, %s, %s)
+                            """,
+                            [
+                                (
+                                    session_id,
+                                    json.dumps(session.to_json(redact_secrets=False), ensure_ascii=False, separators=(",", ":")),
+                                    now_ms,
+                                )
+                                for session_id, session in state.console_sessions.items()
+                                if isinstance(session_id, str)
+                                and session_id.strip()
+                                and isinstance(session, PersistedConsoleSession)
+                            ],
+                        )
+
                     cur.execute("DELETE FROM automation_host_enrollments")
                     if state.host_enrollments:
                         cur.executemany(
@@ -4740,6 +5172,20 @@ class _PostgresAutomationStateStore:
             )
             """,
             """
+            CREATE TABLE IF NOT EXISTS automation_console_users (
+                user_id TEXT PRIMARY KEY,
+                payload_json TEXT NOT NULL,
+                updated_at_ms BIGINT NOT NULL
+            )
+            """,
+            """
+            CREATE TABLE IF NOT EXISTS automation_console_sessions (
+                session_id TEXT PRIMARY KEY,
+                payload_json TEXT NOT NULL,
+                updated_at_ms BIGINT NOT NULL
+            )
+            """,
+            """
             CREATE TABLE IF NOT EXISTS automation_host_enrollments (
                 host_id TEXT PRIMARY KEY,
                 payload_json TEXT NOT NULL,
@@ -4771,6 +5217,8 @@ class _PostgresAutomationStateStore:
             "automation_agents",
             "automation_chat_bindings",
             "automation_user_channels",
+            "automation_console_users",
+            "automation_console_sessions",
             "automation_host_enrollments",
             "automation_host_bindings",
             "automation_host_enroll_tokens",
@@ -4839,6 +5287,38 @@ class _PostgresAutomationStateStore:
                 continue
             user_channels[user_id] = PersistedUserChannelState.from_json(payload)
 
+        console_users: dict[str, PersistedConsoleUser] = {}
+        for row in conn.execute("SELECT user_id, payload_json FROM automation_console_users").fetchall():
+            user_id = str(row["user_id"] or "").strip()
+            if not user_id:
+                continue
+            try:
+                payload = json.loads(str(row["payload_json"] or "{}"))
+            except Exception:
+                continue
+            user = PersistedConsoleUser.from_json(payload)
+            if user is None:
+                continue
+            key = user_id
+            try:
+                key = str(int(user_id))
+            except Exception:
+                key = str(user.user_id)
+            console_users[key] = user
+
+        console_sessions: dict[str, PersistedConsoleSession] = {}
+        for row in conn.execute("SELECT session_id, payload_json FROM automation_console_sessions").fetchall():
+            try:
+                payload = json.loads(str(row["payload_json"] or "{}"))
+            except Exception:
+                continue
+            session = PersistedConsoleSession.from_json(payload)
+            session_id = str(row["session_id"] or "").strip().lower()
+            if session is None:
+                continue
+            key = session_id if CONSOLE_SESSION_ID_RE.match(session_id) else session.session_id
+            console_sessions[key] = session
+
         host_enrollments: dict[str, PersistedHostEnrollment] = {}
         for row in conn.execute("SELECT host_id, payload_json FROM automation_host_enrollments").fetchall():
             try:
@@ -4887,6 +5367,8 @@ class _PostgresAutomationStateStore:
             agents=agents,
             chat_bindings=chat_bindings,
             user_channels=user_channels,
+            console_users=console_users,
+            console_sessions=console_sessions,
             host_enrollments=host_enrollments,
             host_bindings=host_bindings,
             host_enroll_tokens=host_enroll_tokens,
@@ -6141,6 +6623,14 @@ class AutomationManager:
         return aid or None
 
     def get_owner_user_id_for_session(self, session_id: str) -> Optional[int]:
+        sid = session_id.strip() if isinstance(session_id, str) else ""
+        if not sid:
+            return None
+        sess = self._store.state.sessions.get(sid)
+        if isinstance(sess, PersistedSessionAutomation):
+            owner_user_id = getattr(sess, "owner_user_id", None)
+            if isinstance(owner_user_id, int) and owner_user_id > 0:
+                return owner_user_id
         agent = self.get_agent_for_session(session_id)
         if not isinstance(agent, PersistedAgentRuntime):
             return None
@@ -6148,6 +6638,258 @@ class AutomationManager:
         if isinstance(owner_user_id, int) and owner_user_id > 0:
             return owner_user_id
         return None
+
+    def list_session_ids_for_user(self, *, user_id: int) -> list[str]:
+        if not isinstance(user_id, int) or user_id <= 0:
+            return []
+        st = self._store.state
+        session_ids: set[str] = set()
+        for session_id, sess in (st.sessions or {}).items():
+            if not isinstance(session_id, str) or not session_id.strip():
+                continue
+            if not isinstance(sess, PersistedSessionAutomation):
+                continue
+            owner_user_id = getattr(sess, "owner_user_id", None)
+            if isinstance(owner_user_id, int) and owner_user_id == user_id:
+                session_ids.add(session_id.strip())
+        for agent in (st.agents or {}).values():
+            if not isinstance(agent, PersistedAgentRuntime):
+                continue
+            if not (isinstance(agent.owner_user_id, int) and agent.owner_user_id == user_id):
+                continue
+            session_id = str(agent.session_id or "").strip()
+            if session_id:
+                session_ids.add(session_id)
+        return sorted(session_ids)
+
+    def can_user_access_session(self, *, user_id: int, session_id: str) -> bool:
+        owner_user_id = self.get_owner_user_id_for_session(session_id)
+        return isinstance(owner_user_id, int) and owner_user_id == user_id
+
+    def _next_console_user_id_from_state(self, st: PersistedGatewayAutomationState) -> int:
+        used: set[int] = set()
+        for raw_user_id in (st.user_channels or {}).keys():
+            try:
+                user_id = int(raw_user_id)
+            except Exception:
+                continue
+            if user_id > 0:
+                used.add(user_id)
+        for raw_user_id in (st.console_users or {}).keys():
+            try:
+                user_id = int(raw_user_id)
+            except Exception:
+                continue
+            if user_id > 0:
+                used.add(user_id)
+        for agent in (st.agents or {}).values():
+            if not isinstance(agent, PersistedAgentRuntime):
+                continue
+            owner_user_id = getattr(agent, "owner_user_id", None)
+            if isinstance(owner_user_id, int) and owner_user_id > 0:
+                used.add(owner_user_id)
+        for sess in (st.sessions or {}).values():
+            if not isinstance(sess, PersistedSessionAutomation):
+                continue
+            owner_user_id = getattr(sess, "owner_user_id", None)
+            if isinstance(owner_user_id, int) and owner_user_id > 0:
+                used.add(owner_user_id)
+        candidate = 1
+        while candidate in used:
+            candidate += 1
+        return candidate
+
+    def count_console_users(self) -> int:
+        return sum(1 for user in (self._store.state.console_users or {}).values() if isinstance(user, PersistedConsoleUser))
+
+    def get_console_user(self, user_id: int) -> Optional[PersistedConsoleUser]:
+        if not isinstance(user_id, int) or user_id <= 0:
+            return None
+        raw = self._store.state.console_users.get(str(user_id))
+        return raw if isinstance(raw, PersistedConsoleUser) else None
+
+    def get_console_user_by_email(self, email: str) -> Optional[PersistedConsoleUser]:
+        normalized_email = _normalize_console_email(email)
+        if not normalized_email:
+            return None
+        for user in (self._store.state.console_users or {}).values():
+            if not isinstance(user, PersistedConsoleUser):
+                continue
+            if user.email == normalized_email:
+                return user
+        return None
+
+    def list_console_users(self) -> list[dict[str, Any]]:
+        out = [user.to_public_json() for user in (self._store.state.console_users or {}).values() if isinstance(user, PersistedConsoleUser)]
+        out.sort(key=lambda item: (str(item.get("email") or ""), int(item.get("userId") or 0)))
+        return out
+
+    async def register_console_user(self, *, email: str, password: str) -> PersistedConsoleUser:
+        normalized_email = _normalize_console_email(email)
+        if not normalized_email:
+            raise ValueError("Invalid email")
+        normalized_password = _normalize_console_password(password)
+        if not normalized_password:
+            raise ValueError("Password must be at least 8 characters")
+
+        created: Optional[PersistedConsoleUser] = None
+
+        def _write(st: PersistedGatewayAutomationState) -> None:
+            nonlocal created
+            st.version = max(int(getattr(st, "version", 1) or 1), AUTOMATION_STATE_VERSION)
+            for existing in (st.console_users or {}).values():
+                if isinstance(existing, PersistedConsoleUser) and existing.email == normalized_email:
+                    raise ValueError("Email already registered")
+            now_ms = _now_ms()
+            user_id = self._next_console_user_id_from_state(st)
+            created = PersistedConsoleUser(
+                user_id=user_id,
+                email=normalized_email,
+                password_hash=_hash_console_password(normalized_password),
+                is_admin=not any(isinstance(user, PersistedConsoleUser) for user in (st.console_users or {}).values()),
+                created_at_ms=now_ms,
+                updated_at_ms=now_ms,
+                last_login_at_ms=None,
+            )
+            st.console_users[str(user_id)] = created
+
+        await self._store.update(_write)
+        if created is None:
+            raise RuntimeError("Failed to create user")
+        return created
+
+    def authenticate_console_user(self, *, email: str, password: str) -> PersistedConsoleUser:
+        normalized_email = _normalize_console_email(email)
+        normalized_password = _normalize_console_password(password)
+        if not normalized_email or not normalized_password:
+            raise PermissionError("Invalid email or password")
+        user = self.get_console_user_by_email(normalized_email)
+        if user is None or not _verify_console_password(user.password_hash, normalized_password):
+            raise PermissionError("Invalid email or password")
+        return user
+
+    def resolve_console_session(self, token: Any) -> Optional[tuple[PersistedConsoleUser, PersistedConsoleSession]]:
+        session_id = _parse_console_session_token(token)
+        if not session_id:
+            return None
+        session = self._store.state.console_sessions.get(session_id)
+        if not isinstance(session, PersistedConsoleSession):
+            return None
+        if not session.is_active():
+            return None
+        if not hmac.compare_digest(str(session.token_hash or ""), _hash_console_session_token(token)):
+            return None
+        user = self.get_console_user(session.user_id)
+        if user is None:
+            return None
+        return user, session
+
+    async def issue_console_session(self, *, user_id: int) -> tuple[PersistedConsoleSession, str]:
+        if not isinstance(user_id, int) or user_id <= 0:
+            raise ValueError("Invalid userId")
+        user = self.get_console_user(user_id)
+        if user is None:
+            raise ValueError("Unknown user")
+        created: Optional[PersistedConsoleSession] = None
+        issued_token: Optional[str] = None
+        now_ms = _now_ms()
+
+        def _write(st: PersistedGatewayAutomationState) -> None:
+            nonlocal created, issued_token
+            st.version = max(int(getattr(st, "version", 1) or 1), AUTOMATION_STATE_VERSION)
+            if str(user_id) not in st.console_users:
+                raise ValueError("Unknown user")
+            session_id, token, expires_at_ms = _issue_console_session_token()
+            session = PersistedConsoleSession(
+                session_id=session_id,
+                user_id=user_id,
+                token_hash=_hash_console_session_token(token),
+                created_at_ms=now_ms,
+                updated_at_ms=now_ms,
+                expires_at_ms=expires_at_ms,
+                revoked_at_ms=None,
+            )
+            st.console_sessions[session_id] = session
+            current_user = st.console_users.get(str(user_id))
+            if isinstance(current_user, PersistedConsoleUser):
+                st.console_users[str(user_id)] = replace(
+                    current_user,
+                    updated_at_ms=now_ms,
+                    last_login_at_ms=now_ms,
+                )
+            created = session
+            issued_token = token
+
+        await self._store.update(_write)
+        if created is None or issued_token is None:
+            raise RuntimeError("Failed to create session")
+        return created, issued_token
+
+    async def revoke_console_session(self, *, token: Any) -> bool:
+        session_id = _parse_console_session_token(token)
+        if not session_id:
+            return False
+        revoked = False
+
+        def _write(st: PersistedGatewayAutomationState) -> None:
+            nonlocal revoked
+            st.version = max(int(getattr(st, "version", 1) or 1), AUTOMATION_STATE_VERSION)
+            current = st.console_sessions.get(session_id)
+            if not isinstance(current, PersistedConsoleSession):
+                return
+            if current.revoked_at_ms is not None:
+                return
+            st.console_sessions[session_id] = replace(current, revoked_at_ms=_now_ms(), updated_at_ms=_now_ms())
+            revoked = True
+
+        await self._store.update(_write)
+        return revoked
+
+    async def set_session_owner_user_id(self, *, session_id: str, user_id: int) -> PersistedSessionAutomation:
+        sid = session_id.strip() if isinstance(session_id, str) else ""
+        if not sid:
+            raise ValueError("Invalid sessionId")
+        if not isinstance(user_id, int) or user_id <= 0:
+            raise ValueError("Invalid userId")
+        updated: Optional[PersistedSessionAutomation] = None
+
+        def _write(st: PersistedGatewayAutomationState) -> None:
+            nonlocal updated
+            st.version = max(int(getattr(st, "version", 1) or 1), AUTOMATION_STATE_VERSION)
+            current = st.sessions.get(sid)
+            if not isinstance(current, PersistedSessionAutomation):
+                current = PersistedSessionAutomation()
+                st.sessions[sid] = current
+            current_owner = getattr(current, "owner_user_id", None)
+            if isinstance(current_owner, int) and current_owner > 0 and current_owner != user_id:
+                raise PermissionError("Forbidden")
+            updated = replace(current, owner_user_id=user_id)
+            st.sessions[sid] = updated
+
+        await self._store.update(_write)
+        if updated is None:
+            raise RuntimeError("Failed to update session owner")
+        return updated
+
+    async def delete_persisted_session_if_unreferenced(self, *, session_id: str) -> bool:
+        sid = session_id.strip() if isinstance(session_id, str) else ""
+        if not sid:
+            return False
+        removed = False
+
+        def _write(st: PersistedGatewayAutomationState) -> None:
+            nonlocal removed
+            if sid not in st.sessions:
+                return
+            for agent in (st.agents or {}).values():
+                if isinstance(agent, PersistedAgentRuntime) and str(agent.session_id or "").strip() == sid:
+                    return
+            st.version = max(int(getattr(st, "version", 1) or 1), AUTOMATION_STATE_VERSION)
+            st.sessions.pop(sid, None)
+            removed = True
+
+        await self._store.update(_write)
+        return removed
 
     def _get_user_channel_state_for_user(self, *, user_id: int) -> PersistedUserChannelState:
         if not isinstance(user_id, int) or user_id <= 0:
@@ -12498,6 +13240,51 @@ async def _restart_managed_runtime(session_id: str) -> bool:
     return await _runtime_provisioner_for_session(session_id).restart_runtime(session_id)
 
 
+async def _list_managed_sessions_for_user(user_id: int) -> list[dict[str, Any]]:
+    if not isinstance(user_id, int) or user_id <= 0:
+        return []
+    automation: Optional[AutomationManager] = getattr(app.state, "automation", None)
+    if automation is None:
+        return []
+    visible_ids = set(automation.list_session_ids_for_user(user_id=user_id))
+    if not visible_ids:
+        return []
+    rows = await _list_managed_sessions()
+    out: list[dict[str, Any]] = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        session_id = str(row.get("sessionId") or "").strip()
+        if not session_id or session_id not in visible_ids:
+            continue
+        enriched = dict(row)
+        agent = automation.get_agent_for_session(session_id)
+        if isinstance(agent, PersistedAgentRuntime):
+            if isinstance(agent.short_name, str) and agent.short_name.strip():
+                enriched["name"] = agent.short_name.strip()
+            enriched["ownerUserId"] = agent.owner_user_id
+        else:
+            enriched["ownerUserId"] = automation.get_owner_user_id_for_session(session_id)
+        out.append(enriched)
+    out.sort(key=lambda item: ((item.get("provider") or ""), (item.get("sessionId") or "")))
+    return out
+
+
+def _principal_can_access_session(principal: RequestAuthPrincipal, session_id: str) -> bool:
+    sid = session_id.strip() if isinstance(session_id, str) else ""
+    if not sid:
+        return False
+    if principal.kind == "admin_token":
+        return True
+    user_id = principal.user_id
+    if not isinstance(user_id, int) or user_id <= 0:
+        return False
+    automation: Optional[AutomationManager] = getattr(app.state, "automation", None)
+    if automation is None:
+        return False
+    return automation.can_user_access_session(user_id=user_id, session_id=sid)
+
+
 def _fugue_workspace_enabled(session_id: Optional[str] = None) -> bool:
     if isinstance(session_id, str) and session_id.strip():
         return isinstance(_runtime_provisioner_for_session(session_id), FugueRuntimeProvisioner)
@@ -12639,6 +13426,60 @@ def _admin_token() -> Optional[str]:
     return os.getenv("ARGUS_TOKEN") or None
 
 
+@dataclass(frozen=True)
+class RequestAuthPrincipal:
+    kind: str
+    user: Optional[PersistedConsoleUser] = None
+    session: Optional[PersistedConsoleSession] = None
+
+    @property
+    def is_admin(self) -> bool:
+        if self.kind == "admin_token":
+            return True
+        return bool(self.user is not None and self.user.is_admin)
+
+    @property
+    def user_id(self) -> Optional[int]:
+        if self.user is None:
+            return None
+        return int(self.user.user_id)
+
+
+def _resolve_auth_principal_from_token(token: Any) -> Optional[RequestAuthPrincipal]:
+    provided = str(token or "").strip()
+    if not provided:
+        return None
+    expected_admin = _admin_token()
+    if expected_admin is not None and hmac.compare_digest(provided, expected_admin):
+        return RequestAuthPrincipal(kind="admin_token")
+    automation: Optional[AutomationManager] = getattr(app.state, "automation", None)
+    if automation is None:
+        return None
+    resolved = automation.resolve_console_session(provided)
+    if resolved is None:
+        return None
+    user, session = resolved
+    return RequestAuthPrincipal(kind="console_session", user=user, session=session)
+
+
+def _http_optional_auth(request: Request) -> Optional[RequestAuthPrincipal]:
+    return _resolve_auth_principal_from_token(_extract_token_http(request))
+
+
+def _http_require_auth(request: Request) -> RequestAuthPrincipal:
+    principal = _http_optional_auth(request)
+    if principal is None:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+    return principal
+
+
+def _http_require_admin(request: Request) -> RequestAuthPrincipal:
+    principal = _http_require_auth(request)
+    if principal.is_admin:
+        return principal
+    raise HTTPException(status_code=403, detail="Forbidden")
+
+
 def _host_agent_device_auth(token: Any) -> Optional[PersistedHostEnrollment]:
     host_id, secret = _parse_prefixed_token(token, HOST_AGENT_DEVICE_TOKEN_PREFIX)
     hid = _normalize_runtime_host_id(host_id)
@@ -12661,8 +13502,8 @@ def _host_agent_device_auth(token: Any) -> Optional[PersistedHostEnrollment]:
 
 def _http_require_host_agent_or_admin(request: Request) -> tuple[str, Optional[PersistedHostEnrollment]]:
     provided = _extract_token_http(request)
-    expected_admin = _admin_token()
-    if expected_admin is not None and provided == expected_admin:
+    principal = _resolve_auth_principal_from_token(provided)
+    if principal is not None and principal.is_admin:
         return "admin", None
     enrollment = _host_agent_device_auth(provided)
     if enrollment is not None:
@@ -12771,6 +13612,261 @@ async def readyz():
 @app.get("/")
 async def index():
     return PlainTextResponse("Argus gateway is running. Optional web UI runs separately (see README.md).")
+
+
+@app.get("/auth/status")
+async def auth_status():
+    automation = _get_automation_or_500()
+    user_count = automation.count_console_users()
+    return {
+        "ok": True,
+        "hasUsers": user_count > 0,
+        "userCount": user_count,
+        "allowRegistration": True,
+    }
+
+
+@app.get("/auth/me")
+async def auth_me(request: Request):
+    principal = _http_require_auth(request)
+    if principal.user is None:
+        raise HTTPException(status_code=403, detail="Console session required")
+    return {"ok": True, "user": principal.user.to_public_json()}
+
+
+@app.post("/auth/register")
+async def auth_register(request: Request):
+    automation = _get_automation_or_500()
+    try:
+        body = await request.json()
+    except Exception as e:
+        raise HTTPException(status_code=400, detail="Invalid JSON body") from e
+    if not isinstance(body, dict):
+        raise HTTPException(status_code=400, detail="Invalid JSON body")
+
+    email = str(body.get("email") or "")
+    password = body.get("password")
+    try:
+        user = await automation.register_console_user(email=email, password=password)
+        _session, token = await automation.issue_console_session(user_id=user.user_id)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    return {"ok": True, "user": user.to_public_json(), "sessionToken": token}
+
+
+@app.post("/auth/login")
+async def auth_login(request: Request):
+    automation = _get_automation_or_500()
+    try:
+        body = await request.json()
+    except Exception as e:
+        raise HTTPException(status_code=400, detail="Invalid JSON body") from e
+    if not isinstance(body, dict):
+        raise HTTPException(status_code=400, detail="Invalid JSON body")
+
+    email = str(body.get("email") or "")
+    password = body.get("password")
+    try:
+        user = automation.authenticate_console_user(email=email, password=password)
+        _session, token = await automation.issue_console_session(user_id=user.user_id)
+    except PermissionError as e:
+        raise HTTPException(status_code=401, detail=str(e)) from e
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    user_after = automation.get_console_user(user.user_id) or user
+    return {"ok": True, "user": user_after.to_public_json(), "sessionToken": token}
+
+
+@app.post("/auth/logout")
+async def auth_logout(request: Request):
+    principal = _http_require_auth(request)
+    if principal.session is None:
+        raise HTTPException(status_code=403, detail="Console session required")
+    token = _extract_token_http(request)
+    await _get_automation_or_500().revoke_console_session(token=token)
+    return {"ok": True}
+
+
+@app.get("/me/channels")
+async def me_channels(request: Request):
+    principal = _http_require_auth(request)
+    if principal.user_id is None:
+        raise HTTPException(status_code=403, detail="Console session required")
+    automation = _get_automation_or_500()
+    return automation.list_channels_for_user(user_id=principal.user_id)
+
+
+@app.post("/me/channels")
+async def me_channel_create(request: Request):
+    principal = _http_require_auth(request)
+    if principal.user_id is None:
+        raise HTTPException(status_code=403, detail="Console session required")
+    automation = _get_automation_or_500()
+    try:
+        body = await request.json()
+    except Exception as e:
+        raise HTTPException(status_code=400, detail="Invalid JSON body") from e
+    if not isinstance(body, dict):
+        raise HTTPException(status_code=400, detail="Invalid JSON body")
+    try:
+        created = await automation.create_user_channel(
+            user_id=principal.user_id,
+            name=str(body.get("name") or body.get("channelName") or ""),
+            base_url=str(body.get("baseUrl") or ""),
+            api_key=str(body.get("apiKey") or ""),
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    listed = automation.list_channels_for_user(user_id=principal.user_id)
+    created_entry = next(
+        (dict(item) for item in listed.get("channels", []) if isinstance(item, dict) and item.get("channelId") == created.channel_id),
+        None,
+    )
+    return {"ok": True, "channel": created_entry, **listed}
+
+
+@app.post("/me/channels/{channel_id}/select")
+async def me_channel_select(channel_id: str, request: Request):
+    principal = _http_require_auth(request)
+    if principal.user_id is None:
+        raise HTTPException(status_code=403, detail="Console session required")
+    automation = _get_automation_or_500()
+    try:
+        await automation.select_user_channel(user_id=principal.user_id, channel_id=channel_id)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    listed = automation.list_channels_for_user(user_id=principal.user_id)
+    return {"ok": True, **listed}
+
+
+@app.patch("/me/channels/{channel_id}")
+async def me_channel_rename(channel_id: str, request: Request):
+    principal = _http_require_auth(request)
+    if principal.user_id is None:
+        raise HTTPException(status_code=403, detail="Console session required")
+    automation = _get_automation_or_500()
+    try:
+        body = await request.json()
+    except Exception as e:
+        raise HTTPException(status_code=400, detail="Invalid JSON body") from e
+    if not isinstance(body, dict):
+        raise HTTPException(status_code=400, detail="Invalid JSON body")
+    try:
+        updated = await automation.rename_user_channel(
+            user_id=principal.user_id,
+            channel_id=channel_id,
+            new_name=str(body.get("newName") or body.get("name") or ""),
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    listed = automation.list_channels_for_user(user_id=principal.user_id)
+    updated_entry = next(
+        (dict(item) for item in listed.get("channels", []) if isinstance(item, dict) and item.get("channelId") == updated.channel_id),
+        None,
+    )
+    return {"ok": True, "channel": updated_entry, **listed}
+
+
+@app.delete("/me/channels/{channel_id}")
+async def me_channel_delete(channel_id: str, request: Request):
+    principal = _http_require_auth(request)
+    if principal.user_id is None:
+        raise HTTPException(status_code=403, detail="Console session required")
+    automation = _get_automation_or_500()
+    try:
+        deleted = await automation.delete_user_channel(user_id=principal.user_id, channel_id=channel_id)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    listed = automation.list_channels_for_user(user_id=principal.user_id)
+    return {"ok": True, **deleted, **listed}
+
+
+@app.put("/me/channels/{channel_id}/key")
+async def me_channel_key_set(channel_id: str, request: Request):
+    principal = _http_require_auth(request)
+    if principal.user_id is None:
+        raise HTTPException(status_code=403, detail="Console session required")
+    automation = _get_automation_or_500()
+    try:
+        body = await request.json()
+    except Exception as e:
+        raise HTTPException(status_code=400, detail="Invalid JSON body") from e
+    if not isinstance(body, dict):
+        raise HTTPException(status_code=400, detail="Invalid JSON body")
+    try:
+        result = await automation.set_user_channel_api_key(
+            user_id=principal.user_id,
+            channel_id=channel_id,
+            api_key=str(body.get("apiKey") or ""),
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    listed = automation.list_channels_for_user(user_id=principal.user_id)
+    return {"ok": True, **result, **listed}
+
+
+@app.delete("/me/channels/{channel_id}/key")
+async def me_channel_key_clear(channel_id: str, request: Request):
+    principal = _http_require_auth(request)
+    if principal.user_id is None:
+        raise HTTPException(status_code=403, detail="Console session required")
+    automation = _get_automation_or_500()
+    try:
+        result = await automation.clear_user_channel_api_key(user_id=principal.user_id, channel_id=channel_id)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    listed = automation.list_channels_for_user(user_id=principal.user_id)
+    return {"ok": True, **result, **listed}
+
+
+@app.get("/me/usage")
+async def me_usage(request: Request):
+    principal = _http_require_auth(request)
+    if principal.user_id is None or principal.user is None:
+        raise HTTPException(status_code=403, detail="Console session required")
+    usage_store = _get_usage_store_or_500()
+
+    agent_id = str(request.query_params.get("agent_id") or "").strip() or None
+    session_id = str(request.query_params.get("session_id") or "").strip() or None
+    channel_id = str(request.query_params.get("channel_id") or "").strip() or None
+    since_ms = _admin_usage_since_ms(request)
+    raw_limit = request.query_params.get("limit") or ""
+    try:
+        limit = int(raw_limit) if raw_limit else 100
+    except Exception as e:
+        raise HTTPException(status_code=400, detail="Invalid 'limit'") from e
+
+    summary = await asyncio.to_thread(
+        usage_store.summarize,
+        owner_user_id=principal.user_id,
+        agent_id=agent_id,
+        session_id=session_id,
+        channel_id=channel_id,
+        since_ms=since_ms,
+    )
+    events = await asyncio.to_thread(
+        usage_store.list_events,
+        owner_user_id=principal.user_id,
+        agent_id=agent_id,
+        session_id=session_id,
+        channel_id=channel_id,
+        since_ms=since_ms,
+        limit=limit,
+    )
+    return {
+        "ok": True,
+        "user": principal.user.to_public_json(),
+        "filters": {
+            "userId": principal.user_id,
+            "agentId": agent_id,
+            "sessionId": session_id,
+            "channelId": channel_id,
+            "sinceMs": since_ms,
+            "limit": max(1, min(limit, 500)),
+        },
+        "summary": summary,
+        "events": events,
+    }
 
 
 @app.get("/chat")
@@ -14639,12 +15735,7 @@ async def _mcp_handle_single_message(request: Request, body: dict[str, Any]) -> 
 
 
 def _http_require_token(request: Request):
-    expected = _admin_token()
-    if expected is None:
-        return
-    provided = _extract_token_http(request)
-    if provided != expected:
-        raise HTTPException(status_code=401, detail="Unauthorized")
+    _http_require_admin(request)
 
 
 SUPPORTED_MCP_PROTOCOL_VERSIONS = [
@@ -16513,14 +17604,18 @@ async def _ensure_live_native_session(session_id: str, *, allow_create: bool) ->
 
 @app.get("/sessions")
 async def list_sessions(request: Request):
-    _http_require_token(request)
+    principal = _http_require_auth(request)
     if not _provisioner_manages_runtime_sessions():
         raise HTTPException(
             status_code=400,
             detail=f"Managed sessions are not available in provision mode '{_provisioner_mode_name()}'",
         )
     try:
-        sessions = await _list_managed_sessions()
+        if principal.kind == "admin_token":
+            sessions = await _list_managed_sessions()
+        else:
+            user_id = principal.user_id
+            sessions = await _list_managed_sessions_for_user(user_id or 0)
     except Exception as e:
         log.exception("Failed to list managed sessions")
         raise HTTPException(status_code=500, detail=str(e)) from e
@@ -16831,20 +17926,24 @@ async def runtime_host_token(request: Request):
 
 @app.get("/sessions/{session_id}/placement")
 async def get_session_placement(session_id: str, request: Request):
-    _http_require_token(request)
+    principal = _http_require_auth(request)
     sid = _normalize_runtime_session_id(session_id)
     if not sid:
         raise HTTPException(status_code=400, detail="Invalid sessionId")
+    if not _principal_can_access_session(principal, sid):
+        raise HTTPException(status_code=404, detail="Session not found")
     placement = _effective_session_placement(sid)
     return {"ok": True, "sessionId": sid, "placement": placement.to_json()}
 
 
 @app.put("/sessions/{session_id}/placement")
 async def put_session_placement(session_id: str, request: Request):
-    _http_require_token(request)
+    principal = _http_require_auth(request)
     sid = _normalize_runtime_session_id(session_id)
     if not sid:
         raise HTTPException(status_code=400, detail="Invalid sessionId")
+    if not _principal_can_access_session(principal, sid):
+        raise HTTPException(status_code=404, detail="Session not found")
     try:
         body = await request.json()
     except Exception as e:
@@ -18734,22 +19833,30 @@ async def automation_heartbeat_now(request: Request):
 
 @app.delete("/sessions/{session_id}")
 async def delete_session(session_id: str, request: Request):
-    _http_require_token(request)
+    principal = _http_require_auth(request)
+    sid = _normalize_runtime_session_id(session_id)
+    if not sid:
+        raise HTTPException(status_code=400, detail="Invalid sessionId")
+    if not _principal_can_access_session(principal, sid):
+        raise HTTPException(status_code=404, detail="Session not found")
     if not _provisioner_manages_runtime_sessions(session_id):
         raise HTTPException(
             status_code=400,
             detail=f"Managed sessions are not available for session '{session_id}'",
         )
     try:
-        await _delete_managed_session(session_id)
+        await _delete_managed_session(sid)
+        automation: Optional[AutomationManager] = getattr(app.state, "automation", None)
+        if principal.kind != "admin_token" and automation is not None:
+            await automation.delete_persisted_session_if_unreferenced(session_id=sid)
     except KeyError as e:
         raise HTTPException(status_code=404, detail="Session not found") from e
     except HTTPException:
         raise
     except Exception as e:
-        log.exception("Failed to delete managed session %s", session_id)
+        log.exception("Failed to delete managed session %s", sid)
         raise HTTPException(status_code=500, detail=str(e)) from e
-    return {"ok": True, "sessionId": session_id}
+    return {"ok": True, "sessionId": sid}
 
 
 def _format_node_system_event_text(
@@ -19359,8 +20466,8 @@ async def ws_proxy(ws: WebSocket):
     requested_placement = _requested_session_placement_from_query(ws, provisional_session_id)
 
     if _ws_request_uses_managed_session(requested_session=requested_session, requested_placement=requested_placement):
-        expected = os.getenv("ARGUS_TOKEN")
-        if expected and provided != expected:
+        principal = _resolve_auth_principal_from_token(provided)
+        if principal is None:
             await ws.accept()
             await ws.close(code=1008, reason="Unauthorized")
             return
@@ -19368,6 +20475,9 @@ async def ws_proxy(ws: WebSocket):
         await ws.accept()
         session_id = provisional_session_id
         try:
+            if requested_session and not _principal_can_access_session(principal, requested_session):
+                await ws.close(code=1008, reason="Forbidden")
+                return
             allow_create = not bool(requested_session)
             if requested_session:
                 # If the client asked for an explicit session and it's already known in persisted automation state,
@@ -19390,6 +20500,16 @@ async def ws_proxy(ws: WebSocket):
                     )
                     if derived and Path(derived).is_dir():
                         allow_create = True
+            automation = getattr(app.state, "automation", None)
+            if principal.kind != "admin_token":
+                if automation is None or principal.user_id is None:
+                    await ws.close(code=1008, reason="Unauthorized")
+                    return
+                try:
+                    await automation.set_session_owner_user_id(session_id=session_id, user_id=principal.user_id)
+                except PermissionError:
+                    await ws.close(code=1008, reason="Forbidden")
+                    return
             if isinstance(requested_placement, SessionPlacement):
                 await _persist_session_placement(session_id, requested_placement)
             live, created = await _ensure_live_session(session_id, allow_create=allow_create)

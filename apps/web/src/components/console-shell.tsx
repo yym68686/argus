@@ -2,6 +2,7 @@ import type { ReactNode } from "react";
 import Link from "next/link";
 import { PlugZap } from "lucide-react";
 
+import { ConsoleSidebarAccount } from "@/components/console-sidebar-account";
 import { ConsoleNav } from "@/components/console-nav";
 import { cn } from "@/lib/utils";
 
@@ -84,6 +85,10 @@ function ConsoleSidebar() {
 
         <div className="px-3 pb-5">
           <ConsoleNav />
+        </div>
+
+        <div className="mt-auto">
+          <ConsoleSidebarAccount />
         </div>
       </div>
     </aside>

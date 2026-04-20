@@ -46,6 +46,12 @@ Run from saved config later:
 ./argus daemon
 ```
 
+Refresh the local CLI from the enrolled gateway:
+
+```bash
+./argus upgrade
+```
+
 Inspect or revoke the local enrollment:
 
 ```bash

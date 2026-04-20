@@ -4,24 +4,27 @@ import Link from "next/link";
 import { usePathname } from "next/navigation";
 import { Gauge, KeyRound, MessagesSquare, RadioTower, Settings2, Users2 } from "lucide-react";
 
+import { useAuth } from "@/components/admin-gate";
 import { cn } from "@/lib/utils";
 
 const NAV_ITEMS = [
-  { href: "/", label: "Workbench", icon: MessagesSquare },
-  { href: "/users", label: "Users", icon: Users2 },
-  { href: "/usage", label: "Usage", icon: Gauge },
-  { href: "/api-keys", label: "API Key", icon: KeyRound },
-  { href: "/nodes", label: "Nodes", icon: RadioTower },
-  { href: "/settings", label: "Settings", icon: Settings2 },
+  { href: "/", label: "Workbench", icon: MessagesSquare, adminOnly: false },
+  { href: "/usage", label: "Usage", icon: Gauge, adminOnly: false },
+  { href: "/api-keys", label: "API Keys", icon: KeyRound, adminOnly: false },
+  { href: "/users", label: "Users", icon: Users2, adminOnly: true },
+  { href: "/nodes", label: "Nodes", icon: RadioTower, adminOnly: true },
+  { href: "/settings", label: "Settings", icon: Settings2, adminOnly: true },
 ];
 
 export function ConsoleNav({ compact = false }: { compact?: boolean }) {
   void compact;
   const pathname = usePathname() || "/";
+  const { user } = useAuth();
+  const items = NAV_ITEMS.filter((item) => !item.adminOnly || Boolean(user?.isAdmin));
 
   return (
     <nav className="flex flex-col gap-1.5">
-      {NAV_ITEMS.map((item) => {
+      {items.map((item) => {
         const Icon = item.icon;
         const active =
           item.href === "/" ? pathname === "/" : pathname === item.href || pathname.startsWith(`${item.href}/`);

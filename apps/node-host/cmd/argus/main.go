@@ -51,6 +51,8 @@ func dispatch(args []string) error {
 		return runConnect(args[1:])
 	case "daemon":
 		return runDaemon(args[1:])
+	case "upgrade":
+		return runUpgrade(args[1:])
 	case "status":
 		return runStatus(args[1:])
 	case "disconnect":
@@ -77,6 +79,7 @@ func printUsage() {
 Usage:
   argus connect --gateway <url> --enroll-token <token> [--default]
   argus daemon [--config <path>]
+  argus upgrade [--gateway <url>] [--config <path>]
   argus status [--config <path>]
   argus disconnect [--config <path>]
 
@@ -128,6 +131,42 @@ func runDaemon(args []string) error {
 		return err
 	}
 	return runStoredHostAgent(*configPath)
+}
+
+func runUpgrade(args []string) error {
+	fs := flag.NewFlagSet("upgrade", flag.ContinueOnError)
+	configPath := fs.String("config", defaultConfigPath(), "host-agent config path")
+	gateway := fs.String("gateway", os.Getenv("ARGUS_GATEWAY_URL"), "gateway base URL")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+
+	gatewayBase := strings.TrimSpace(*gateway)
+	if gatewayBase == "" {
+		if stored, err := hostagent.LoadStoredConfig(*configPath); err == nil && stored != nil {
+			gatewayBase = strings.TrimSpace(stored.GatewayBaseURL)
+		}
+	}
+	if gatewayBase == "" {
+		return fmt.Errorf("missing gateway base URL; pass --gateway or ensure %s exists", *configPath)
+	}
+	currentPath, err := hostagent.CurrentBinaryPath()
+	if err != nil {
+		return err
+	}
+	target, err := hostagent.CurrentDownloadTarget()
+	if err != nil {
+		return err
+	}
+	if _, err := hostagent.UpgradeBinary(gatewayBase); err != nil {
+		return err
+	}
+	if strings.HasPrefix(strings.ToLower(target), "windows") {
+		fmt.Fprintf(os.Stderr, "Scheduled upgrade for %s via %s. Restart argus after this process exits.\n", currentPath, gatewayBase)
+		return nil
+	}
+	fmt.Fprintf(os.Stderr, "Upgraded %s from %s.\n", currentPath, strings.TrimRight(gatewayBase, "/"))
+	return nil
 }
 
 func runConnect(args []string) error {

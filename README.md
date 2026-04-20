@@ -169,6 +169,12 @@ go build -o argus ./cmd/argus
 
 This claims a one-time enrollment token, saves a local device credential, and starts a unified host-agent over `/host-agent/ws`.
 
+After the first install, you can refresh the local CLI without re-running the original curl/bootstrap command:
+
+```bash
+./argus upgrade
+```
+
 Legacy `/nodes/ws` and `/runtime-host/ws` binaries still exist for compatibility, but the primary path is now `argus connect`.
 
 You normally do **not** need the legacy node-only flags below unless you are explicitly running the old `/nodes/ws` control plane by itself.

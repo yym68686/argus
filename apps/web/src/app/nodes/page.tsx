@@ -7,7 +7,7 @@ import { ConsoleShell } from "@/components/console-shell";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Textarea } from "@/components/ui/textarea";
-import { summarizeHttpFailure, useStoredGatewayWsUrl } from "@/lib/gateway";
+import { gatewayFetchJson, useGatewayWsUrlState } from "@/lib/gateway";
 import { cn } from "@/lib/utils";
 
 type NodeInfo = {
@@ -21,32 +21,6 @@ type NodeInfo = {
   lastSeenMs?: number | null;
 };
 
-function httpBaseFromWsUrl(url: string): string {
-  try {
-    const parsed = new URL(url);
-    const proto = parsed.protocol === "wss:" ? "https:" : "http:";
-    return `${proto}//${parsed.host}`;
-  } catch {
-    return "";
-  }
-}
-
-function nodeApiUrl(httpBase: string, path: string): URL {
-  const trimmed = path.startsWith("/") ? path.slice(1) : path;
-  const suffix = trimmed ? `/${trimmed}` : "";
-  return new URL(`/api/nodes${suffix}`, httpBase);
-}
-
-function extractTokenFromWsUrl(url: string): string {
-  try {
-    const parsed = new URL(url);
-    const token = parsed.searchParams.get("token");
-    return token && token.trim() ? token : "";
-  } catch {
-    return "";
-  }
-}
-
 function safeParseJson(text: string): unknown | null {
   try {
     return JSON.parse(text);
@@ -55,8 +29,7 @@ function safeParseJson(text: string): unknown | null {
   }
 }
 
-function extractJobIdFromResponse(text: string): string {
-  const parsed = safeParseJson(text);
+function extractJobIdFromResponse(parsed: unknown): string {
   if (!parsed || typeof parsed !== "object") return "";
 
   const payload = (parsed as { payload?: unknown }).payload;
@@ -91,10 +64,7 @@ function formatStamp(value?: number | null): string {
 }
 
 export default function NodesPage() {
-  const storedWsUrl = useStoredGatewayWsUrl();
-  const [wsUrl, setWsUrl] = React.useState<string | null>(null);
-  const [httpBase, setHttpBase] = React.useState<string | null>(null);
-  const [token, setToken] = React.useState<string | null>(null);
+  const [wsUrl, setWsUrl] = useGatewayWsUrlState();
 
   const [loading, setLoading] = React.useState(false);
   const [nodes, setNodes] = React.useState<NodeInfo[]>([]);
@@ -117,34 +87,19 @@ export default function NodesPage() {
   const [pasteText, setPasteText] = React.useState<string>("");
   const [pasteBracketed, setPasteBracketed] = React.useState<boolean>(true);
 
-  const effectiveWsUrl = wsUrl ?? storedWsUrl;
-  const effectiveHttpBase = httpBase ?? httpBaseFromWsUrl(effectiveWsUrl);
-  const effectiveToken = token ?? extractTokenFromWsUrl(effectiveWsUrl);
-
-  function syncFromWsUrl(nextWsUrl: string): void {
-    setWsUrl(nextWsUrl);
-    const derived = httpBaseFromWsUrl(nextWsUrl);
-    if (derived) setHttpBase(derived);
-    setToken(extractTokenFromWsUrl(nextWsUrl));
-  }
-
   React.useEffect(() => {
-    if (!effectiveHttpBase) return;
+    if (!wsUrl.trim()) return;
     void refreshNodes();
     // Intentionally keyed to the derived connection target rather than the function identity.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [effectiveHttpBase, effectiveToken]);
+  }, [wsUrl]);
 
   async function refreshNodes(): Promise<void> {
+    if (!wsUrl.trim()) return;
     setLoading(true);
     setInventoryError(null);
     try {
-      const url = nodeApiUrl(effectiveHttpBase, "");
-      if (effectiveToken) url.searchParams.set("token", effectiveToken);
-      const res = await fetch(url.toString(), { cache: "no-store" });
-      const text = await res.text();
-      if (!res.ok) throw new Error(summarizeHttpFailure(res, text, "Node inventory request"));
-      const data = (safeParseJson(text) ?? {}) as { nodes?: NodeInfo[] };
+      const data = await gatewayFetchJson<{ nodes?: NodeInfo[] }>(wsUrl, "/api/nodes");
       const nextNodes = Array.isArray(data.nodes) ? data.nodes : [];
       setNodes(nextNodes);
       if (!nodePick && nextNodes.length) setNodePick(nextNodes[0].nodeId);
@@ -178,22 +133,19 @@ export default function NodesPage() {
 
     setLoading(true);
     try {
-      const url = nodeApiUrl(effectiveHttpBase, "invoke");
-      if (effectiveToken) url.searchParams.set("token", effectiveToken);
-      const res = await fetch(url.toString(), {
+      const result = await gatewayFetchJson<Record<string, unknown>>(wsUrl, "/api/nodes/invoke", {
         method: "POST",
-        headers: { "content-type": "application/json" },
         body: JSON.stringify(body),
       });
-      const text = await res.text();
-      setInvokeOut(text);
-
-      const nextJobId = extractJobIdFromResponse(text);
+      setInvokeOut(JSON.stringify(result, null, 2));
+      const nextJobId = extractJobIdFromResponse(result);
       if (nextJobId) {
         setJobId(nextJobId);
       }
-
-      if (!res.ok) throw new Error(summarizeHttpFailure(res, text, "Node invoke request"));
+      if (result.ok === false) {
+        const nextError = typeof result.error === "string" && result.error.trim() ? result.error.trim() : "Node invoke request failed";
+        throw new Error(nextError);
+      }
     } catch (event) {
       setInvokeError((event as Error)?.message || String(event));
     } finally {
@@ -227,12 +179,12 @@ export default function NodesPage() {
       actions={
         <div className="flex flex-wrap items-center gap-2">
           <Input
-            value={effectiveWsUrl}
-            onChange={(event) => syncFromWsUrl(event.target.value)}
+            value={wsUrl}
+            onChange={(event) => setWsUrl(event.target.value)}
             className="w-[min(30rem,100%)]"
             placeholder="Gateway wss://.../ws"
           />
-          <Button type="button" variant="secondary" onClick={refreshNodes} disabled={loading || !effectiveHttpBase}>
+          <Button type="button" variant="secondary" onClick={refreshNodes} disabled={loading || !wsUrl.trim()}>
             {loading ? "Loading…" : "Refresh nodes"}
           </Button>
         </div>
@@ -302,24 +254,6 @@ export default function NodesPage() {
         </section>
 
         <section className="space-y-4">
-          <PanelCard
-            eyebrow="Transport"
-            title="Node API wiring"
-            subtitle="The browser derives the REST base and bearer token from the saved gateway WebSocket URL. Override either field if the node proxy lives elsewhere."
-            className="argus-data-grid"
-          >
-            <div className="grid gap-4 lg:grid-cols-2">
-              <div className="grid gap-2">
-                <label className="argus-surface-label">HTTP base</label>
-                <Input value={effectiveHttpBase} onChange={(event) => setHttpBase(event.target.value)} />
-              </div>
-              <div className="grid gap-2">
-                <label className="argus-surface-label">Token (optional)</label>
-                <Input value={effectiveToken} onChange={(event) => setToken(event.target.value)} />
-              </div>
-            </div>
-          </PanelCard>
-
           <div className="grid gap-4 xl:grid-cols-[1.1fr_0.9fr]">
             <PanelCard
               eyebrow="Invoke"
