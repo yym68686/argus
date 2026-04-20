@@ -207,7 +207,24 @@ func (c *StoredConfig) WSURL() (string, error) {
 	if err != nil {
 		return "", err
 	}
-	return resolved.GatewayBaseURL + "/host-agent/ws?token=" + url.QueryEscape(resolved.DeviceToken), nil
+	u, err := url.Parse(resolved.GatewayBaseURL)
+	if err != nil {
+		return "", err
+	}
+	switch strings.ToLower(strings.TrimSpace(u.Scheme)) {
+	case "https":
+		u.Scheme = "wss"
+	case "http":
+		u.Scheme = "ws"
+	case "ws", "wss":
+	default:
+		return "", fmt.Errorf("unsupported gateway base URL scheme: %s", u.Scheme)
+	}
+	u.Path = strings.TrimRight(u.Path, "/") + "/host-agent/ws"
+	q := u.Query()
+	q.Set("token", resolved.DeviceToken)
+	u.RawQuery = q.Encode()
+	return u.String(), nil
 }
 
 func (c *StoredConfig) RuntimeConfig() (*Config, error) {

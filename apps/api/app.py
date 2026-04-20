@@ -16449,6 +16449,14 @@ async def host_agent_enroll_token(request: Request):
     command = f'argus connect --gateway "{gateway_base}" --enroll-token "{enroll_token}"'
     if host_id_hint:
         command += f' --host-id "{host_id_hint}"'
+    if pending.workspace_base_path:
+        command += f' --workspace-base "{pending.workspace_base_path}"'
+    if pending.scope_type == HOST_BINDING_SCOPE_GLOBAL and pending.scope_id == "default":
+        command += " --default"
+    elif pending.scope_type:
+        command += f' --scope-type "{pending.scope_type}"'
+        if pending.scope_id:
+            command += f' --scope-id "{pending.scope_id}"'
     return {
         "ok": True,
         "token": enroll_token,
