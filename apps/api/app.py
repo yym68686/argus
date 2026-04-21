@@ -2465,7 +2465,7 @@ TELEGRAM_PRIVATE_CHAT_ID_RE = re.compile(r"^[1-9]\d{0,19}$")
 CONSOLE_EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 CONSOLE_SESSION_ID_RE = re.compile(r"^[a-f0-9]{24}$")
 DEVELOPER_API_KEY_ID_RE = re.compile(r"^[a-f0-9]{16}$")
-AUTOMATION_STATE_VERSION = 10
+AUTOMATION_STATE_VERSION = 11
 ARGUS_AGENT_MODEL_DEFAULT = "gpt-5.4"
 ARGUS_GATEWAY_AGENT_MODELS = ("gpt-5.2", "gpt-5.4")
 ARGUS_GATEWAY_AGENT_MODELS_SET = frozenset(ARGUS_GATEWAY_AGENT_MODELS)
@@ -2477,6 +2477,16 @@ CHANNEL_ID_ZERO_ZERO_PRO = "0-0.pro"
 CHANNEL_IDS_BUILTIN = frozenset((CHANNEL_ID_GATEWAY, CHANNEL_ID_ZERO_ZERO_PRO))
 CHANNEL_ZERO_ZERO_PRO_BASE_URL = "https://api.0-0.pro/v1"
 CHANNEL_ZERO_ZERO_PRO_PROMO_URL = "https://0-0.pro"
+BUILTIN_ACCESS_MODE_INHERIT = "inherit"
+BUILTIN_ACCESS_MODE_ALLOW = "allow"
+BUILTIN_ACCESS_MODE_DENY = "deny"
+BUILTIN_ACCESS_MODES = frozenset(
+    (
+        BUILTIN_ACCESS_MODE_INHERIT,
+        BUILTIN_ACCESS_MODE_ALLOW,
+        BUILTIN_ACCESS_MODE_DENY,
+    )
+)
 CONSOLE_SESSION_TOKEN_PREFIX = "argus-console-v1"
 DEVELOPER_API_KEY_TOKEN_PREFIX = "argus-dev-v1"
 CONSOLE_PASSWORD_HASH_KIND = "pbkdf2_sha256"
@@ -2504,6 +2514,19 @@ def _normalize_bool_flag(raw: Any, *, default: bool = False) -> bool:
 
 def _env_bool(name: str, default: bool) -> bool:
     return _normalize_bool_flag(os.getenv(name), default=default)
+
+
+def _normalize_builtin_access_mode(raw: Any, *, allow_inherit: bool = False) -> Optional[str]:
+    value = str(raw or "").strip().lower()
+    if not value:
+        return BUILTIN_ACCESS_MODE_INHERIT if allow_inherit else None
+    if value in {"allow", "allowed", "enable", "enabled", "on", "true", "1"}:
+        return BUILTIN_ACCESS_MODE_ALLOW
+    if value in {"deny", "denied", "disable", "disabled", "off", "false", "0", "block", "blocked"}:
+        return BUILTIN_ACCESS_MODE_DENY
+    if allow_inherit and value in {"inherit", "default", "reset", "auto"}:
+        return BUILTIN_ACCESS_MODE_INHERIT
+    return None
 
 
 def _env_optional_int(name: str, *, default: Optional[int] = None, minimum: Optional[int] = None) -> Optional[int]:
@@ -3656,6 +3679,7 @@ class PersistedUserChannelState:
     current_channel_id: str = CHANNEL_ID_GATEWAY
     custom_channels: dict[str, PersistedUserChannel] = field(default_factory=dict)
     builtin_api_keys: dict[str, str] = field(default_factory=dict)
+    builtin_access_overrides: dict[str, str] = field(default_factory=dict)
     disabled_builtin_channels: list[str] = field(default_factory=list)
 
     def to_json(self, *, redact_secrets: bool = False) -> dict[str, Any]:
@@ -3674,11 +3698,27 @@ class PersistedUserChannelState:
             if not stored_key and not resolved_key:
                 continue
             builtin_api_keys[cid] = _mask_secret(resolved_key) if redact_secrets else stored_key
+        builtin_access_overrides: dict[str, str] = {}
+        for raw_channel_id, raw_mode in (self.builtin_access_overrides or {}).items():
+            cid = _normalize_channel_id(raw_channel_id)
+            mode = _normalize_builtin_access_mode(raw_mode)
+            if cid not in CHANNEL_IDS_BUILTIN or mode is None:
+                continue
+            builtin_access_overrides[cid] = mode
         disabled_builtin_channels: list[str] = []
         seen_disabled_builtin_channels: set[str] = set()
         for raw_channel_id in (self.disabled_builtin_channels or []):
             cid = _normalize_channel_id(raw_channel_id)
-            if cid not in CHANNEL_IDS_BUILTIN or cid in seen_disabled_builtin_channels:
+            if (
+                cid not in CHANNEL_IDS_BUILTIN
+                or cid in seen_disabled_builtin_channels
+                or builtin_access_overrides.get(cid) == BUILTIN_ACCESS_MODE_ALLOW
+            ):
+                continue
+            seen_disabled_builtin_channels.add(cid)
+            disabled_builtin_channels.append(cid)
+        for cid, mode in builtin_access_overrides.items():
+            if mode != BUILTIN_ACCESS_MODE_DENY or cid in seen_disabled_builtin_channels:
                 continue
             seen_disabled_builtin_channels.add(cid)
             disabled_builtin_channels.append(cid)
@@ -3686,6 +3726,7 @@ class PersistedUserChannelState:
             "currentChannelId": _normalize_channel_id(self.current_channel_id) or CHANNEL_ID_GATEWAY,
             "customChannels": custom_channels,
             "builtinApiKeys": builtin_api_keys,
+            "builtinAccessOverrides": builtin_access_overrides,
             "disabledBuiltinChannels": disabled_builtin_channels,
         }
 
@@ -3717,6 +3758,15 @@ class PersistedUserChannelState:
                 if not api_key:
                     continue
                 builtin_api_keys[channel_id] = api_key
+        builtin_access_overrides_raw = obj.get("builtinAccessOverrides")
+        builtin_access_overrides: dict[str, str] = {}
+        if isinstance(builtin_access_overrides_raw, dict):
+            for raw_channel_id, raw_mode in builtin_access_overrides_raw.items():
+                channel_id = _normalize_channel_id(raw_channel_id)
+                mode = _normalize_builtin_access_mode(raw_mode)
+                if channel_id not in CHANNEL_IDS_BUILTIN or mode is None:
+                    continue
+                builtin_access_overrides[channel_id] = mode
         disabled_builtin_channels_raw = obj.get("disabledBuiltinChannels")
         disabled_builtin_channels: list[str] = []
         if isinstance(disabled_builtin_channels_raw, list):
@@ -3727,10 +3777,13 @@ class PersistedUserChannelState:
                     continue
                 seen_disabled_builtin_channels.add(channel_id)
                 disabled_builtin_channels.append(channel_id)
+                if channel_id not in builtin_access_overrides:
+                    builtin_access_overrides[channel_id] = BUILTIN_ACCESS_MODE_DENY
         return PersistedUserChannelState(
             current_channel_id=current_channel_id,
             custom_channels=custom_channels,
             builtin_api_keys=builtin_api_keys,
+            builtin_access_overrides=builtin_access_overrides,
             disabled_builtin_channels=disabled_builtin_channels,
         )
 
@@ -3969,6 +4022,7 @@ class PersistedGatewayAutomationState:
     agents: dict[str, PersistedAgentRuntime] = field(default_factory=dict)
     chat_bindings: dict[str, str] = field(default_factory=dict)
     user_channels: dict[str, PersistedUserChannelState] = field(default_factory=dict)
+    gateway_openai_default_enabled: bool = True
     console_users: dict[str, PersistedConsoleUser] = field(default_factory=dict)
     console_sessions: dict[str, PersistedConsoleSession] = field(default_factory=dict)
     host_enrollments: dict[str, PersistedHostEnrollment] = field(default_factory=dict)
@@ -3986,6 +4040,7 @@ class PersistedGatewayAutomationState:
                 for user_id, channel_state in (self.user_channels or {}).items()
                 if isinstance(user_id, str) and user_id.strip() and isinstance(channel_state, PersistedUserChannelState)
             },
+            "gatewayOpenaiDefaultEnabled": bool(self.gateway_openai_default_enabled),
             "consoleUsers": {
                 user_id: user.to_json(redact_secrets=redact_secrets)
                 for user_id, user in (self.console_users or {}).items()
@@ -4067,6 +4122,7 @@ class PersistedGatewayAutomationState:
                 if user_id_int <= 0:
                     continue
                 user_channels[str(user_id_int)] = PersistedUserChannelState.from_json(raw_state)
+        gateway_openai_default_enabled = _normalize_bool_flag(obj.get("gatewayOpenaiDefaultEnabled"), default=True)
 
         console_users_raw = obj.get("consoleUsers")
         console_users: dict[str, PersistedConsoleUser] = {}
@@ -4138,6 +4194,7 @@ class PersistedGatewayAutomationState:
             agents=agents,
             chat_bindings=chat_bindings,
             user_channels=user_channels,
+            gateway_openai_default_enabled=gateway_openai_default_enabled,
             console_users=console_users,
             console_sessions=console_sessions,
             host_enrollments=host_enrollments,
@@ -4240,6 +4297,20 @@ class _SQLiteAutomationStateStore:
                         updated_at_ms = excluded.updated_at_ms
                     """,
                     ("version", str(max(int(getattr(state, "version", 1) or 1), AUTOMATION_STATE_VERSION)), now_ms),
+                )
+                conn.execute(
+                    """
+                    INSERT INTO automation_state_meta (key, value_text, updated_at_ms)
+                    VALUES (?, ?, ?)
+                    ON CONFLICT(key) DO UPDATE SET
+                        value_text = excluded.value_text,
+                        updated_at_ms = excluded.updated_at_ms
+                    """,
+                    (
+                        "gateway_openai_default_enabled",
+                        "true" if _normalize_bool_flag(getattr(state, "gateway_openai_default_enabled", True), default=True) else "false",
+                        now_ms,
+                    ),
                 )
 
                 conn.execute("DELETE FROM automation_sessions")
@@ -4508,6 +4579,16 @@ class _SQLiteAutomationStateStore:
                 version = max(int(meta_row["value_text"] or AUTOMATION_STATE_VERSION), 1)
             except Exception:
                 version = AUTOMATION_STATE_VERSION
+        gateway_openai_default_enabled = True
+        gateway_default_row = conn.execute(
+            "SELECT value_text FROM automation_state_meta WHERE key = ? LIMIT 1",
+            ("gateway_openai_default_enabled",),
+        ).fetchone()
+        if gateway_default_row is not None:
+            gateway_openai_default_enabled = _normalize_bool_flag(
+                gateway_default_row["value_text"],
+                default=True,
+            )
 
         sessions: dict[str, PersistedSessionAutomation] = {}
         for row in conn.execute("SELECT session_id, payload_json FROM automation_sessions"):
@@ -4636,6 +4717,7 @@ class _SQLiteAutomationStateStore:
             agents=agents,
             chat_bindings=chat_bindings,
             user_channels=user_channels,
+            gateway_openai_default_enabled=gateway_openai_default_enabled,
             console_users=console_users,
             console_sessions=console_sessions,
             host_enrollments=host_enrollments,
@@ -5281,6 +5363,20 @@ class _PostgresAutomationStateStore:
                     """,
                     ("version", str(max(int(getattr(state, "version", 1) or 1), AUTOMATION_STATE_VERSION)), now_ms),
                 )
+                conn.execute(
+                    """
+                    INSERT INTO automation_state_meta (key, value_text, updated_at_ms)
+                    VALUES (%s, %s, %s)
+                    ON CONFLICT(key) DO UPDATE SET
+                        value_text = EXCLUDED.value_text,
+                        updated_at_ms = EXCLUDED.updated_at_ms
+                    """,
+                    (
+                        "gateway_openai_default_enabled",
+                        "true" if _normalize_bool_flag(getattr(state, "gateway_openai_default_enabled", True), default=True) else "false",
+                        now_ms,
+                    ),
+                )
 
                 with conn.cursor() as cur:
                     cur.execute("DELETE FROM automation_sessions")
@@ -5567,6 +5663,16 @@ class _PostgresAutomationStateStore:
                 version = max(int(meta_row["value_text"] or AUTOMATION_STATE_VERSION), 1)
             except Exception:
                 version = AUTOMATION_STATE_VERSION
+        gateway_openai_default_enabled = True
+        gateway_default_row = conn.execute(
+            "SELECT value_text FROM automation_state_meta WHERE key = %s LIMIT 1",
+            ("gateway_openai_default_enabled",),
+        ).fetchone()
+        if gateway_default_row is not None:
+            gateway_openai_default_enabled = _normalize_bool_flag(
+                gateway_default_row["value_text"],
+                default=True,
+            )
 
         sessions: dict[str, PersistedSessionAutomation] = {}
         for row in conn.execute("SELECT session_id, payload_json FROM automation_sessions").fetchall():
@@ -5695,6 +5801,7 @@ class _PostgresAutomationStateStore:
             agents=agents,
             chat_bindings=chat_bindings,
             user_channels=user_channels,
+            gateway_openai_default_enabled=gateway_openai_default_enabled,
             console_users=console_users,
             console_sessions=console_sessions,
             host_enrollments=host_enrollments,
@@ -7424,19 +7531,91 @@ class AutomationManager:
                 return channel.channel_id
         return ""
 
+    def _gateway_openai_default_enabled(self) -> bool:
+        st = self._store.state
+        return _normalize_bool_flag(getattr(st, "gateway_openai_default_enabled", True), default=True)
+
+    def _builtin_channel_access_override_for_user_state(
+        self,
+        *,
+        user_state: PersistedUserChannelState,
+        channel_id: str,
+    ) -> Optional[str]:
+        normalized_channel_id = _normalize_channel_id(channel_id)
+        if normalized_channel_id not in CHANNEL_IDS_BUILTIN:
+            return None
+        overrides = getattr(user_state, "builtin_access_overrides", None)
+        if isinstance(overrides, dict):
+            override = _normalize_builtin_access_mode(overrides.get(normalized_channel_id))
+            if override in {BUILTIN_ACCESS_MODE_ALLOW, BUILTIN_ACCESS_MODE_DENY}:
+                return override
+        disabled = getattr(user_state, "disabled_builtin_channels", None)
+        if isinstance(disabled, list):
+            for raw_channel_id in disabled:
+                if _normalize_channel_id(raw_channel_id) == normalized_channel_id:
+                    return BUILTIN_ACCESS_MODE_DENY
+        return None
+
+    def _builtin_channel_access_policy_for_user_state(
+        self,
+        *,
+        user_state: PersistedUserChannelState,
+        channel_id: str,
+    ) -> dict[str, Any]:
+        normalized_channel_id = _normalize_channel_id(channel_id)
+        if normalized_channel_id not in CHANNEL_IDS_BUILTIN:
+            return {
+                "enabled": True,
+                "accessMode": BUILTIN_ACCESS_MODE_INHERIT,
+                "accessSource": "non-builtin",
+                "defaultEnabled": True,
+            }
+        override = self._builtin_channel_access_override_for_user_state(
+            user_state=user_state,
+            channel_id=normalized_channel_id,
+        )
+        if normalized_channel_id == CHANNEL_ID_GATEWAY:
+            default_enabled = self._gateway_openai_default_enabled()
+            if override == BUILTIN_ACCESS_MODE_ALLOW:
+                return {
+                    "enabled": True,
+                    "accessMode": BUILTIN_ACCESS_MODE_ALLOW,
+                    "accessSource": "user-override",
+                    "defaultEnabled": default_enabled,
+                }
+            if override == BUILTIN_ACCESS_MODE_DENY:
+                return {
+                    "enabled": False,
+                    "accessMode": BUILTIN_ACCESS_MODE_DENY,
+                    "accessSource": "user-override",
+                    "defaultEnabled": default_enabled,
+                }
+            return {
+                "enabled": bool(default_enabled),
+                "accessMode": BUILTIN_ACCESS_MODE_INHERIT,
+                "accessSource": "global-default",
+                "defaultEnabled": bool(default_enabled),
+            }
+        enabled = override != BUILTIN_ACCESS_MODE_DENY
+        return {
+            "enabled": enabled,
+            "accessMode": BUILTIN_ACCESS_MODE_DENY if override == BUILTIN_ACCESS_MODE_DENY else BUILTIN_ACCESS_MODE_INHERIT,
+            "accessSource": "user-override" if override == BUILTIN_ACCESS_MODE_DENY else "builtin-default",
+            "defaultEnabled": True,
+        }
+
     def _is_builtin_channel_enabled_for_user_state(
         self,
         *,
         user_state: PersistedUserChannelState,
         channel_id: str,
     ) -> bool:
-        normalized_channel_id = _normalize_channel_id(channel_id)
-        if normalized_channel_id not in CHANNEL_IDS_BUILTIN:
-            return True
-        disabled = getattr(user_state, "disabled_builtin_channels", None)
-        if not isinstance(disabled, list):
-            return True
-        return normalized_channel_id not in disabled
+        return bool(
+            self._builtin_channel_access_policy_for_user_state(
+                user_state=user_state,
+                channel_id=channel_id,
+            ).get("enabled")
+        )
 
     def _current_channel_id_for_user_state(self, *, user_state: PersistedUserChannelState) -> str:
         channel_id = _normalize_channel_id(getattr(user_state, "current_channel_id", None))
@@ -7467,15 +7646,20 @@ class AutomationManager:
         normalized_channel_id = _normalize_channel_id(channel_id)
         if normalized_channel_id == CHANNEL_ID_GATEWAY:
             api_key = _gateway_openai_api_key()
-            enabled = self._is_builtin_channel_enabled_for_user_state(
+            policy = self._builtin_channel_access_policy_for_user_state(
                 user_state=user_state,
                 channel_id=CHANNEL_ID_GATEWAY,
             )
+            enabled = bool(policy.get("enabled"))
             ready = bool(api_key) and enabled
             base_url = _base_url_from_responses_url(_gateway_openai_responses_upstream_url())
             reason: Optional[str] = None
             if not enabled:
-                reason = "Disabled by admin"
+                reason = (
+                    "Blocked for user"
+                    if policy.get("accessMode") == BUILTIN_ACCESS_MODE_DENY
+                    else "Blocked by default"
+                )
             elif not api_key:
                 reason = "Gateway OPENAI_API_KEY is not configured"
             return {
@@ -7493,6 +7677,9 @@ class AutomationManager:
                 "enabledForUser": enabled,
                 "disabledByAdmin": not enabled,
                 "canAdminToggleAccess": True,
+                "accessMode": str(policy.get("accessMode") or BUILTIN_ACCESS_MODE_INHERIT),
+                "accessSource": str(policy.get("accessSource") or "global-default"),
+                "gatewayOpenaiDefaultEnabled": bool(policy.get("defaultEnabled")),
                 "ready": ready,
                 "reason": reason,
                 "canRename": False,
@@ -8086,13 +8273,51 @@ class AutomationManager:
             "currentChannelId": listed.get("currentChannelId"),
         }
 
-    async def set_user_builtin_channel_access(self, *, user_id: int, channel_id: str, enabled: bool) -> dict[str, Any]:
+    def get_gateway_openai_access_settings(self) -> dict[str, Any]:
+        st = self._store.state
+        default_enabled = self._gateway_openai_default_enabled()
+        allow_override_count = 0
+        deny_override_count = 0
+        for user_state in (getattr(st, "user_channels", None) or {}).values():
+            if not isinstance(user_state, PersistedUserChannelState):
+                continue
+            override = self._builtin_channel_access_override_for_user_state(
+                user_state=user_state,
+                channel_id=CHANNEL_ID_GATEWAY,
+            )
+            if override == BUILTIN_ACCESS_MODE_ALLOW:
+                allow_override_count += 1
+            elif override == BUILTIN_ACCESS_MODE_DENY:
+                deny_override_count += 1
+        return {
+            "ok": True,
+            "gatewayOpenaiDefaultEnabled": default_enabled,
+            "allowOverrideCount": allow_override_count,
+            "denyOverrideCount": deny_override_count,
+        }
+
+    async def set_gateway_openai_default_enabled(self, *, enabled: bool) -> dict[str, Any]:
+        enabled_flag = bool(enabled)
+
+        def _write(st: PersistedGatewayAutomationState) -> None:
+            st.version = max(int(getattr(st, "version", 1) or 1), AUTOMATION_STATE_VERSION)
+            st.gateway_openai_default_enabled = enabled_flag
+
+        await self._store.update(_write)
+        self._invalidate_model_catalog_cache()
+        for user_id in _admin_collect_user_ids(self):
+            await self._sync_user_agent_models_for_current_channel(user_id=user_id)
+        return self.get_gateway_openai_access_settings()
+
+    async def set_user_builtin_channel_access(self, *, user_id: int, channel_id: str, access_mode: str) -> dict[str, Any]:
         if not isinstance(user_id, int) or user_id <= 0:
             raise ValueError("Invalid userId")
         normalized_channel_id = _normalize_channel_id(channel_id)
         if normalized_channel_id != CHANNEL_ID_GATEWAY:
             raise ValueError(f"Unsupported builtin channel: {channel_id}")
-        enabled_flag = bool(enabled)
+        normalized_access_mode = _normalize_builtin_access_mode(access_mode, allow_inherit=True)
+        if normalized_access_mode not in BUILTIN_ACCESS_MODES:
+            raise ValueError("Invalid access mode")
 
         def _write(st: PersistedGatewayAutomationState) -> None:
             st.version = max(int(getattr(st, "version", 1) or 1), AUTOMATION_STATE_VERSION)
@@ -8101,21 +8326,26 @@ class AutomationManager:
             if not isinstance(user_state, PersistedUserChannelState):
                 user_state = PersistedUserChannelState()
                 st.user_channels[user_key] = user_state
+            overrides = {
+                cid: mode
+                for cid, mode in (user_state.builtin_access_overrides or {}).items()
+                if _normalize_channel_id(cid) in CHANNEL_IDS_BUILTIN
+                and _normalize_builtin_access_mode(mode) in {BUILTIN_ACCESS_MODE_ALLOW, BUILTIN_ACCESS_MODE_DENY}
+            }
+            if normalized_access_mode == BUILTIN_ACCESS_MODE_INHERIT:
+                overrides.pop(normalized_channel_id, None)
+            else:
+                overrides[normalized_channel_id] = normalized_access_mode
+            user_state.builtin_access_overrides = overrides
             disabled = [
                 cid
                 for cid in (user_state.disabled_builtin_channels or [])
                 if _normalize_channel_id(cid) in CHANNEL_IDS_BUILTIN
             ]
-            if enabled_flag:
-                disabled = [cid for cid in disabled if cid != normalized_channel_id]
-            elif normalized_channel_id not in disabled:
+            disabled = [cid for cid in disabled if cid != normalized_channel_id]
+            if normalized_access_mode == BUILTIN_ACCESS_MODE_DENY:
                 disabled.append(normalized_channel_id)
             user_state.disabled_builtin_channels = disabled
-            if (
-                not enabled_flag
-                and _normalize_channel_id(getattr(user_state, "current_channel_id", None)) == normalized_channel_id
-            ):
-                user_state.current_channel_id = self._best_channel_fallback_id_for_user_state(user_state=user_state)
 
         await self._store.update(_write)
         self._invalidate_model_catalog_cache(user_id=user_id, channel_id=normalized_channel_id)
@@ -8132,7 +8362,8 @@ class AutomationManager:
         )
         return {
             "channelId": normalized_channel_id,
-            "enabled": enabled_flag,
+            "accessMode": normalized_access_mode,
+            "enabled": bool(selected_channel.get("enabledForUser")) if isinstance(selected_channel, dict) else None,
             "channel": selected_channel,
             "currentChannel": listed.get("currentChannel"),
             "currentChannelId": listed.get("currentChannelId"),
@@ -19941,6 +20172,39 @@ async def admin_overview(request: Request):
     }
 
 
+@app.get("/admin/settings/gateway-api-access")
+async def admin_gateway_api_access_get(request: Request):
+    _http_require_token(request)
+    automation = _get_automation_or_500()
+    return automation.get_gateway_openai_access_settings()
+
+
+@app.put("/admin/settings/gateway-api-access")
+async def admin_gateway_api_access_set(request: Request):
+    _http_require_token(request)
+    automation = _get_automation_or_500()
+    try:
+        body = await request.json()
+    except Exception as e:
+        raise HTTPException(status_code=400, detail="Invalid JSON body") from e
+    if not isinstance(body, dict):
+        raise HTTPException(status_code=400, detail="Invalid JSON body")
+    raw_enabled = body.get("enabled")
+    if isinstance(raw_enabled, bool):
+        enabled = raw_enabled
+    elif isinstance(raw_enabled, str):
+        lowered = raw_enabled.strip().lower()
+        if lowered in {"true", "1", "yes", "on"}:
+            enabled = True
+        elif lowered in {"false", "0", "no", "off"}:
+            enabled = False
+        else:
+            raise HTTPException(status_code=400, detail="Invalid 'enabled'")
+    else:
+        raise HTTPException(status_code=400, detail="Invalid 'enabled'")
+    return await automation.set_gateway_openai_default_enabled(enabled=enabled)
+
+
 @app.get("/admin/users")
 async def admin_users(request: Request):
     _http_require_token(request)
@@ -20316,24 +20580,33 @@ async def admin_user_channel_access_set(user_id: int, channel_id: str, request: 
         raise HTTPException(status_code=400, detail="Invalid JSON body") from e
     if not isinstance(body, dict):
         raise HTTPException(status_code=400, detail="Invalid JSON body")
-    raw_enabled = body.get("enabled")
-    if isinstance(raw_enabled, bool):
-        enabled = raw_enabled
-    elif isinstance(raw_enabled, str):
-        lowered = raw_enabled.strip().lower()
-        if lowered in {"true", "1", "yes", "on"}:
-            enabled = True
-        elif lowered in {"false", "0", "no", "off"}:
-            enabled = False
+    raw_mode = body.get("mode") or body.get("accessMode")
+    access_mode = _normalize_builtin_access_mode(raw_mode, allow_inherit=True) if raw_mode is not None else None
+    if access_mode is None:
+        raw_enabled = body.get("enabled")
+        if isinstance(raw_enabled, bool):
+            enabled = raw_enabled
+        elif isinstance(raw_enabled, str):
+            lowered = raw_enabled.strip().lower()
+            if lowered in {"true", "1", "yes", "on"}:
+                enabled = True
+            elif lowered in {"false", "0", "no", "off"}:
+                enabled = False
+            else:
+                raise HTTPException(status_code=400, detail="Invalid 'enabled'")
         else:
-            raise HTTPException(status_code=400, detail="Invalid 'enabled'")
+            raise HTTPException(status_code=400, detail="Missing 'mode' or 'enabled'")
+        default_enabled = automation.get_gateway_openai_access_settings().get("gatewayOpenaiDefaultEnabled") is True
+        access_mode = BUILTIN_ACCESS_MODE_INHERIT if enabled == default_enabled else (
+            BUILTIN_ACCESS_MODE_ALLOW if enabled else BUILTIN_ACCESS_MODE_DENY
+        )
     else:
-        raise HTTPException(status_code=400, detail="Invalid 'enabled'")
+        access_mode = str(access_mode)
     try:
         result = await automation.set_user_builtin_channel_access(
             user_id=user_id,
             channel_id=channel_id,
-            enabled=enabled,
+            access_mode=access_mode,
         )
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e)) from e

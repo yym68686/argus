@@ -1,7 +1,7 @@
 "use client";
 
 import React from "react";
-import { Plus, KeyRound, Trash2, UserRoundCheck, Pencil, Bot, RadioTower } from "lucide-react";
+import { Plus, KeyRound, Trash2, UserRoundCheck, Pencil, Bot, RadioTower, RefreshCw } from "lucide-react";
 import { toast } from "sonner";
 
 import { Badge, EmptyState, Fact, InfoPill, InlineError, PanelCard, Skeleton } from "@/components/console-primitives";
@@ -133,15 +133,6 @@ export default function UsersPage() {
     },
     [detail, selectedUserId],
   );
-
-  const getFallbackChannel = React.useCallback((channels: AdminChannelEntry[]) => {
-    return (
-      channels.find((channel) => channel.ready && channel.enabledForUser !== false && channel.channelId !== "gateway") ??
-      channels.find((channel) => channel.ready && channel.enabledForUser !== false) ??
-      channels[0] ??
-      null
-    );
-  }, []);
 
   React.useEffect(() => {
     if (!wsUrl.trim()) return;
@@ -467,98 +458,34 @@ export default function UsersPage() {
     }
   }
 
-  async function setBuiltinChannelAccess(channel: AdminChannelEntry, enabled: boolean): Promise<void> {
+  async function setBuiltinChannelAccess(
+    channel: AdminChannelEntry,
+    mode: "inherit" | "allow" | "deny",
+  ): Promise<void> {
     if (!selectedUserId) return;
     const actionKey = `channel-access:${channel.channelId}`;
-    const previousUsers = users;
-    const previousDetail = detail;
-    const nextGatewayChannels =
-      previousDetail?.user.userId === selectedUserId
-        ? previousDetail.channels.channels.map((entry) =>
-            entry.channelId !== channel.channelId
-              ? entry
-              : {
-                  ...entry,
-                  enabledForUser: enabled,
-                  disabledByAdmin: !enabled,
-                  ready: enabled && Boolean(entry.hasApiKey),
-                  reason: enabled
-                    ? entry.hasApiKey
-                      ? null
-                      : "Gateway OPENAI_API_KEY is not configured"
-                    : "Disabled by admin",
-                },
-          )
-        : null;
-    const summaryFallbackChannel = nextGatewayChannels ? getFallbackChannel(nextGatewayChannels) : null;
     setPendingAction(actionKey, true);
-    updateUserDetail(selectedUserId, (current) => {
-      const nextChannels = current.channels.channels.map((entry) =>
-        entry.channelId !== channel.channelId
-          ? entry
-          : {
-              ...entry,
-              enabledForUser: enabled,
-              disabledByAdmin: !enabled,
-              ready: enabled && Boolean(entry.hasApiKey),
-              reason: enabled ? (entry.hasApiKey ? null : entry.reason || "Gateway OPENAI_API_KEY is not configured") : "Disabled by admin",
-            },
-      );
-      const fallbackChannel = getFallbackChannel(nextChannels);
-      const isCurrent = current.user.currentChannelId === channel.channelId;
-      const nextCurrentChannel =
-        isCurrent && !enabled
-          ? fallbackChannel
-          : nextChannels.find((entry) => entry.channelId === current.user.currentChannelId) || fallbackChannel;
-      return {
-        ...current,
-        user: {
-          ...current.user,
-          currentChannelId: nextCurrentChannel?.channelId || current.user.currentChannelId,
-          currentChannel: nextCurrentChannel || current.user.currentChannel,
-        },
-        channels: {
-          ...current.channels,
-          currentChannelId: nextCurrentChannel?.channelId || current.channels.currentChannelId,
-          currentChannel: nextCurrentChannel || current.channels.currentChannel,
-          channels: nextChannels,
-        },
-      };
-    });
-    updateUserSummary(selectedUserId, (user) => {
-      const nextCurrentChannel =
-        user.currentChannelId === channel.channelId && !enabled
-          ? summaryFallbackChannel
-          : user.currentChannelId === channel.channelId
-            ? { ...(user.currentChannel || channel), enabledForUser: enabled, disabledByAdmin: !enabled }
-            : user.currentChannel;
-      return {
-        ...user,
-        currentChannelId: nextCurrentChannel?.channelId || user.currentChannelId,
-        currentChannel: nextCurrentChannel || user.currentChannel,
-      };
-    });
     try {
       await gatewayFetchJson(
         wsUrl,
         `/admin/users/${selectedUserId}/channels/${encodeURIComponent(channel.channelId)}/access`,
         {
           method: "PUT",
-          body: JSON.stringify({ enabled }),
+          body: JSON.stringify({ mode }),
         },
       );
       toast.success(
-        enabled
-          ? `${channel.name || channel.channelId} enabled for this user`
-          : `${channel.name || channel.channelId} blocked for this user`,
+        mode === "allow"
+          ? `${channel.name || channel.channelId} allowed`
+          : mode === "deny"
+            ? `${channel.name || channel.channelId} denied`
+            : `${channel.name || channel.channelId} reset to default`,
       );
       await Promise.all([
         refreshUsers({ preserveSelection: true }),
         refreshDetail(selectedUserId, { keepVisible: true }),
       ]);
     } catch (error) {
-      setUsers(previousUsers);
-      setDetail(previousDetail);
       toast.error((error as Error)?.message || String(error));
     } finally {
       setPendingAction(actionKey, false);
@@ -572,70 +499,125 @@ export default function UsersPage() {
     return fromObjects;
   }, [detail]);
 
+  const showUsersSkeleton = usersBusy && !users.length && !usersError;
   const showDetailSkeleton = Boolean(selectedUserId && detailBusy && !detail);
   const rosterTitle = users.length ? `Users (${users.length})` : "Users";
 
   return (
     <ConsoleShell title="Users">
-      <div className="grid gap-4 xl:grid-cols-[320px_minmax(0,1fr)]">
-        <section className="space-y-4">
-          <PanelCard
-            eyebrow="Fleet roster"
-            title={rosterTitle}
-            action={
-              <div className="grid gap-2 md:grid-cols-[minmax(0,1fr)_auto]">
-                <Input
-                  value={bootstrapUserId}
-                  onChange={(event) => setBootstrapUserId(event.target.value)}
-                  placeholder="User id"
-                  spellCheck={false}
-                />
-                <Button type="button" onClick={() => void bootstrapUser()}>
-                  <Plus className="h-4 w-4" />
-                  Bootstrap
-                </Button>
-              </div>
-            }
-          >
-            {usersError ? <InlineError message={usersError} /> : null}
-            <div className="space-y-2">
-              {users.map((user) => {
-                const active = user.userId === selectedUserId;
-                return (
-                  <button
-                    key={user.userId}
-                    type="button"
-                    onClick={() => selectUser(user.userId)}
-                    className={cn(
-                      "argus-row-shell w-full rounded-[16px] px-4 py-3 text-left",
-                      active ? "border-primary/28 bg-primary/10" : "hover:border-border hover:bg-background/36",
-                    )}
-                  >
-                    <div className="flex items-start justify-between gap-3">
-                      <div className="min-w-0">
-                        <div className="font-medium text-foreground">User {user.userId}</div>
-                        <div className="mt-1 text-xs leading-5 text-muted-foreground">
-                          {user.currentChannel?.name || user.currentChannelId || "gateway"} · {user.currentModel || "gpt-5.4"}
-                        </div>
-                      </div>
-                      <span className="rounded-md border border-border/70 px-2 py-1 text-[10px] font-medium uppercase tracking-[0.08em] text-muted-foreground">
-                        {formatCompact(user.usage24h.totalTokens)} tok/24h
-                      </span>
-                    </div>
-                    <div className="mt-3 flex flex-wrap gap-2">
-                      <InfoPill label="agents" value={String(user.agentCount)} />
-                      <InfoPill label="channels" value={String(user.channelCount)} />
-                      <InfoPill label="last active" value={formatRelative(user.lastActiveMs)} />
-                    </div>
-                  </button>
-                );
-              })}
-              {!users.length && !usersError ? (
-                <EmptyState title="No users" />
-              ) : null}
+      <div className="space-y-6">
+        <PanelCard
+          eyebrow="Fleet roster"
+          title={rosterTitle}
+          action={
+            <div className="grid gap-2 lg:grid-cols-[auto_minmax(0,1fr)_auto]">
+              <Button
+                type="button"
+                variant="secondary"
+                disabled={usersBusy}
+                onClick={() => void refreshUsers({ preserveSelection: true, notify: true })}
+              >
+                <RefreshCw className={cn("h-4 w-4", usersBusy ? "animate-spin" : null)} />
+                Refresh
+              </Button>
+              <Input
+                value={bootstrapUserId}
+                onChange={(event) => setBootstrapUserId(event.target.value)}
+                placeholder="Telegram user id"
+                spellCheck={false}
+              />
+              <Button type="button" onClick={() => void bootstrapUser()}>
+                <Plus className="h-4 w-4" />
+                Bootstrap
+              </Button>
             </div>
-          </PanelCard>
-        </section>
+          }
+        >
+          {usersError ? <InlineError message={usersError} /> : null}
+          {showUsersSkeleton ? (
+            <UsersRosterSkeleton />
+          ) : users.length ? (
+            <div className="argus-table-shell rounded-[20px]">
+              <table className="min-w-[980px] w-full border-collapse text-sm">
+                <thead className="argus-table-head text-left text-[10px] uppercase tracking-[0.12em] text-muted-foreground">
+                  <tr>
+                    <th className="px-4 py-3">User</th>
+                    <th className="px-4 py-3">Status</th>
+                    <th className="px-4 py-3">Current agent</th>
+                    <th className="px-4 py-3">Channel</th>
+                    <th className="px-4 py-3">Model</th>
+                    <th className="px-4 py-3 text-right">Agents</th>
+                    <th className="px-4 py-3 text-right">Channels</th>
+                    <th className="px-4 py-3 text-right">Sessions</th>
+                    <th className="px-4 py-3 text-right">24h tokens</th>
+                    <th className="px-4 py-3">Last active</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {users.map((user) => {
+                    const active = user.userId === selectedUserId;
+                    return (
+                      <tr
+                        key={user.userId}
+                        role="button"
+                        tabIndex={0}
+                        onClick={() => selectUser(user.userId)}
+                        onKeyDown={(event) => {
+                          if (event.key === "Enter" || event.key === " ") {
+                            event.preventDefault();
+                            selectUser(user.userId);
+                          }
+                        }}
+                        className={cn(
+                          "cursor-pointer border-t border-border/60 align-top transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary/30",
+                          active ? "bg-primary/10" : "hover:bg-background/36",
+                        )}
+                      >
+                        <td className="px-4 py-3">
+                          <div className="flex flex-wrap items-center gap-2">
+                            <span className="font-medium text-foreground">User {user.userId}</span>
+                            {active ? <Badge tone="primary">selected</Badge> : null}
+                          </div>
+                          <div className="mt-1 font-mono text-[12.5px] text-muted-foreground">{user.privateChatKey}</div>
+                        </td>
+                        <td className="px-4 py-3">
+                          <Badge tone={user.initialized ? "success" : "warning"}>
+                            {user.initialized ? "initialized" : "pending"}
+                          </Badge>
+                        </td>
+                        <td className="px-4 py-3 font-mono text-[12.5px]">{user.currentAgentId || user.defaultAgentId || "—"}</td>
+                        <td className="px-4 py-3">
+                          <div>{user.currentChannel?.name || user.currentChannelId || "gateway"}</div>
+                          <div className="mt-1 text-[12px] text-muted-foreground">
+                            {user.readyChannelCount}/{user.channelCount} ready
+                          </div>
+                        </td>
+                        <td className="px-4 py-3 font-mono text-[12.5px]">{user.currentModel || "—"}</td>
+                        <td className="px-4 py-3 text-right font-medium">{formatInt(user.agentCount)}</td>
+                        <td className="px-4 py-3 text-right font-medium">{formatInt(user.channelCount)}</td>
+                        <td className="px-4 py-3 text-right font-medium">{formatInt(user.sessionCount)}</td>
+                        <td className="px-4 py-3 text-right font-medium">{formatCompact(user.usage24h.totalTokens)}</td>
+                        <td className="px-4 py-3">
+                          <div>{formatRelative(user.lastActiveMs)}</div>
+                          <div className="mt-1 text-[12px] text-muted-foreground">{formatWhen(user.lastActiveMs)}</div>
+                        </td>
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+            </div>
+          ) : (
+            <EmptyState title="No users" />
+          )}
+
+          {selectedUserId ? (
+            <div className="mt-3 flex flex-wrap items-center gap-2 text-xs text-muted-foreground">
+              <Badge tone="default">selected user {selectedUserId}</Badge>
+              <InfoPill label="users" value={String(users.length)} />
+            </div>
+          ) : null}
+        </PanelCard>
 
         <section className="space-y-6">
           {usersError && !selectedUserId ? (
@@ -768,7 +750,7 @@ export default function UsersPage() {
                 <PanelCard
                   eyebrow="Upstreams"
                   title="Channels"
-                  subtitle="Switch upstreams, rotate per-user keys, and explicitly allow or block the built-in gateway API."
+                  subtitle="Switch upstreams and set gateway access."
                   action={
                     <div className="grid gap-2 md:grid-cols-2">
                       <Input
@@ -803,6 +785,9 @@ export default function UsersPage() {
                             <div className="flex flex-wrap items-center gap-2">
                               <div className="font-medium text-foreground">{channel.name}</div>
                               {channel.selected ? <Badge tone="primary">selected</Badge> : null}
+                              {channel.channelId === "gateway" ? (
+                                <Badge tone={gatewayAccessBadge(channel).tone}>{gatewayAccessBadge(channel).label}</Badge>
+                              ) : null}
                               {channel.disabledByAdmin ? (
                                 <Badge tone="warning">blocked</Badge>
                               ) : channel.ready ? (
@@ -832,21 +817,20 @@ export default function UsersPage() {
                               <RadioTower className="h-4 w-4" />
                               {pendingActions[`channel-select:${channel.channelId}`] ? "Switching…" : "Select"}
                             </Button>
-                            {channel.canAdminToggleAccess ? (
-                              <Button
-                                type="button"
-                                size="sm"
-                                variant={channel.enabledForUser === false ? "secondary" : "destructive"}
-                                disabled={Boolean(pendingActions[`channel-access:${channel.channelId}`])}
-                                onClick={() => void setBuiltinChannelAccess(channel, channel.enabledForUser === false)}
-                              >
-                                {pendingActions[`channel-access:${channel.channelId}`]
-                                  ? "Saving…"
-                                  : channel.enabledForUser === false
-                                    ? "Enable gateway API"
-                                    : "Block gateway API"}
-                              </Button>
-                            ) : null}
+                            {channel.canAdminToggleAccess
+                              ? gatewayAccessActions(channel).map((action) => (
+                                  <Button
+                                    key={`${channel.channelId}:${action.mode}`}
+                                    type="button"
+                                    size="sm"
+                                    variant={action.variant}
+                                    disabled={Boolean(pendingActions[`channel-access:${channel.channelId}`])}
+                                    onClick={() => void setBuiltinChannelAccess(channel, action.mode)}
+                                  >
+                                    {pendingActions[`channel-access:${channel.channelId}`] ? "Saving…" : action.label}
+                                  </Button>
+                                ))
+                              : null}
                             {channel.canRename ? (
                               <Button type="button" size="sm" variant="secondary" onClick={() => void renameChannel(channel)}>
                                 <Pencil className="h-4 w-4" />
@@ -931,6 +915,98 @@ export default function UsersPage() {
         </section>
       </div>
     </ConsoleShell>
+  );
+}
+
+function gatewayAccessBadge(channel: AdminChannelEntry): { label: string; tone: "default" | "success" | "warning" } {
+  const accessMode = channel.accessMode ?? "inherit";
+  const defaultEnabled = channel.gatewayOpenaiDefaultEnabled !== false;
+  if (accessMode === "allow") {
+    return { label: "allow", tone: "success" };
+  }
+  if (accessMode === "deny") {
+    return { label: "deny", tone: "warning" };
+  }
+  return {
+    label: defaultEnabled ? "default on" : "default off",
+    tone: defaultEnabled ? "default" : "warning",
+  };
+}
+
+function gatewayAccessActions(
+  channel: AdminChannelEntry,
+): Array<{ mode: "inherit" | "allow" | "deny"; label: string; variant: "secondary" | "destructive" }> {
+  const actions: Array<{ mode: "inherit" | "allow" | "deny"; label: string; variant: "secondary" | "destructive" }> = [];
+  const enabled = channel.enabledForUser !== false;
+  actions.push({
+    mode: enabled ? "deny" : "allow",
+    label: enabled ? "Deny" : "Allow",
+    variant: enabled ? "destructive" : "secondary",
+  });
+  if ((channel.accessMode ?? "inherit") !== "inherit") {
+    actions.push({
+      mode: "inherit",
+      label: "Default",
+      variant: "secondary",
+    });
+  }
+  return actions;
+}
+
+function UsersRosterSkeleton() {
+  return (
+    <div className="argus-table-shell rounded-[20px]">
+      <table className="min-w-[980px] w-full border-collapse text-sm">
+        <thead className="argus-table-head text-left text-[10px] uppercase tracking-[0.12em] text-muted-foreground">
+          <tr>
+            {["User", "Status", "Current agent", "Channel", "Model", "Agents", "Channels", "Sessions", "24h tokens", "Last active"].map((label) => (
+              <th key={label} className="px-4 py-3">
+                {label}
+              </th>
+            ))}
+          </tr>
+        </thead>
+        <tbody>
+          {Array.from({ length: 6 }).map((_, index) => (
+            <tr key={index} className="border-t border-border/60">
+              <td className="px-4 py-3">
+                <Skeleton className="h-4 w-28" />
+                <Skeleton className="mt-2 h-3 w-40" />
+              </td>
+              <td className="px-4 py-3">
+                <Skeleton className="h-6 w-24" />
+              </td>
+              <td className="px-4 py-3">
+                <Skeleton className="h-4 w-28" />
+              </td>
+              <td className="px-4 py-3">
+                <Skeleton className="h-4 w-24" />
+                <Skeleton className="mt-2 h-3 w-16" />
+              </td>
+              <td className="px-4 py-3">
+                <Skeleton className="h-4 w-24" />
+              </td>
+              <td className="px-4 py-3">
+                <Skeleton className="ml-auto h-4 w-8" />
+              </td>
+              <td className="px-4 py-3">
+                <Skeleton className="ml-auto h-4 w-8" />
+              </td>
+              <td className="px-4 py-3">
+                <Skeleton className="ml-auto h-4 w-8" />
+              </td>
+              <td className="px-4 py-3">
+                <Skeleton className="ml-auto h-4 w-16" />
+              </td>
+              <td className="px-4 py-3">
+                <Skeleton className="h-4 w-20" />
+                <Skeleton className="mt-2 h-3 w-28" />
+              </td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
   );
 }
 

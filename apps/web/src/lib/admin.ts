@@ -28,6 +28,9 @@ export interface AdminChannelEntry {
   enabledForUser?: boolean;
   disabledByAdmin?: boolean;
   canAdminToggleAccess?: boolean;
+  accessMode?: "inherit" | "allow" | "deny" | null;
+  accessSource?: string | null;
+  gatewayOpenaiDefaultEnabled?: boolean;
   ready?: boolean;
   reason?: string | null;
   canRename?: boolean;
@@ -81,6 +84,13 @@ export interface AdminOverviewResponse {
   };
   usage24h: UsageSummary;
   usageTotal: UsageSummary;
+}
+
+export interface GatewayApiAccessSettingsResponse {
+  ok: true;
+  gatewayOpenaiDefaultEnabled: boolean;
+  allowOverrideCount?: number;
+  denyOverrideCount?: number;
 }
 
 export interface AdminUsersResponse {
@@ -185,6 +195,20 @@ export async function fetchAdminOverview(wsUrl: string): Promise<AdminOverviewRe
 
 export async function fetchAdminUsers(wsUrl: string): Promise<AdminUsersResponse> {
   return gatewayFetchJson<AdminUsersResponse>(wsUrl, "/admin/users");
+}
+
+export async function fetchGatewayApiAccessSettings(wsUrl: string): Promise<GatewayApiAccessSettingsResponse> {
+  return gatewayFetchJson<GatewayApiAccessSettingsResponse>(wsUrl, "/admin/settings/gateway-api-access");
+}
+
+export async function updateGatewayApiAccessSettings(
+  wsUrl: string,
+  enabled: boolean,
+): Promise<GatewayApiAccessSettingsResponse> {
+  return gatewayFetchJson<GatewayApiAccessSettingsResponse>(wsUrl, "/admin/settings/gateway-api-access", {
+    method: "PUT",
+    body: JSON.stringify({ enabled }),
+  });
 }
 
 export async function fetchAdminUserDetail(wsUrl: string, userId: number): Promise<AdminUserDetailResponse> {

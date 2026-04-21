@@ -8,7 +8,13 @@ import { EmptyState, Fact, InlineError, PanelCard, Skeleton, StatCard } from "@/
 import { ConsoleShell } from "@/components/console-shell";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
-import { type AdminOverviewResponse, fetchAdminOverview } from "@/lib/admin";
+import {
+  type AdminOverviewResponse,
+  type GatewayApiAccessSettingsResponse,
+  fetchAdminOverview,
+  fetchGatewayApiAccessSettings,
+  updateGatewayApiAccessSettings,
+} from "@/lib/admin";
 import { formatInt } from "@/lib/format";
 import { gatewayFetchJson, useGatewayWsUrlState } from "@/lib/gateway";
 import { cn } from "@/lib/utils";
@@ -20,22 +26,26 @@ interface GatewayHealth {
 export default function SettingsPage() {
   const [wsUrl, setWsUrl] = useGatewayWsUrlState();
   const [overview, setOverview] = React.useState<AdminOverviewResponse | null>(null);
+  const [gatewayAccess, setGatewayAccess] = React.useState<GatewayApiAccessSettingsResponse | null>(null);
   const [health, setHealth] = React.useState<GatewayHealth | null>(null);
   const [loading, setLoading] = React.useState(false);
+  const [gatewayAccessBusy, setGatewayAccessBusy] = React.useState(false);
   const [error, setError] = React.useState<string | null>(null);
-  const showSkeleton = loading && !overview && !health;
+  const showSkeleton = loading && !overview && !health && !gatewayAccess;
 
   const refresh = React.useCallback(async (opts?: { notify?: boolean }) => {
     if (!wsUrl.trim()) return;
     setLoading(true);
     setError(null);
     try {
-      const [nextOverview, nextHealth] = await Promise.all([
+      const [nextOverview, nextHealth, nextGatewayAccess] = await Promise.all([
         fetchAdminOverview(wsUrl),
         gatewayFetchJson<GatewayHealth>(wsUrl, "/healthz"),
+        fetchGatewayApiAccessSettings(wsUrl),
       ]);
       setOverview(nextOverview);
       setHealth(nextHealth);
+      setGatewayAccess(nextGatewayAccess);
     } catch (err) {
       const message = (err as Error)?.message || String(err);
       setError(message);
@@ -55,6 +65,25 @@ export default function SettingsPage() {
     };
     void run();
   }, [refresh, wsUrl]);
+
+  const toggleGatewayAccessDefault = React.useCallback(async () => {
+    if (!wsUrl.trim()) return;
+    if (!gatewayAccess) {
+      toast.error("Gateway access state unavailable");
+      return;
+    }
+    const nextEnabled = !gatewayAccess.gatewayOpenaiDefaultEnabled;
+    setGatewayAccessBusy(true);
+    try {
+      const next = await updateGatewayApiAccessSettings(wsUrl, nextEnabled);
+      setGatewayAccess(next);
+      toast.success(nextEnabled ? "Gateway API default enabled" : "Gateway API default disabled");
+    } catch (err) {
+      toast.error((err as Error)?.message || String(err));
+    } finally {
+      setGatewayAccessBusy(false);
+    }
+  }, [gatewayAccess, wsUrl]);
 
   return (
     <ConsoleShell
@@ -103,6 +132,59 @@ export default function SettingsPage() {
 
         <div className="grid gap-4 xl:grid-cols-[minmax(0,1fr)_380px]">
           <section className="space-y-4">
+            <PanelCard
+              title="Gateway API"
+              action={
+                <Button
+                  type="button"
+                  variant={gatewayAccess?.gatewayOpenaiDefaultEnabled ? "destructive" : "secondary"}
+                  disabled={gatewayAccessBusy || !gatewayAccess}
+                  onClick={() => void toggleGatewayAccessDefault()}
+                >
+                  {gatewayAccessBusy
+                    ? "Saving…"
+                    : gatewayAccess?.gatewayOpenaiDefaultEnabled
+                      ? "Disable default"
+                      : "Enable default"}
+                </Button>
+              }
+            >
+              {showSkeleton ? (
+                <div className="grid gap-3 lg:grid-cols-2">
+                  {Array.from({ length: 2 }).map((_, index) => (
+                    <div
+                      key={index}
+                      className="rounded-[16px] border border-border/70 bg-background/24 px-3.5 py-3"
+                    >
+                      <Skeleton className="h-3 w-20 rounded-full" />
+                      <Skeleton className="mt-3 h-5 w-24" />
+                    </div>
+                  ))}
+                </div>
+              ) : (
+                <div className="grid gap-3 lg:grid-cols-2">
+                  <Fact
+                    label="Telegram default"
+                    value={
+                      gatewayAccess
+                        ? gatewayAccess.gatewayOpenaiDefaultEnabled
+                          ? "on"
+                          : "off"
+                        : "unknown"
+                    }
+                  />
+                  <Fact
+                    label="Overrides"
+                    value={
+                      gatewayAccess
+                        ? `${formatInt(gatewayAccess.allowOverrideCount)} allow · ${formatInt(gatewayAccess.denyOverrideCount)} deny`
+                        : "unknown"
+                    }
+                  />
+                </div>
+              )}
+            </PanelCard>
+
             <PanelCard title="Connection" className="argus-data-grid">
               {showSkeleton ? (
                 <div className="grid gap-3 lg:grid-cols-2">
