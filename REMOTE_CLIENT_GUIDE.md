@@ -5,6 +5,75 @@
 > - 建议立刻**更换网关 Token**（用随机字符串，不要用任何 API Key）并只用私密渠道发给同伴。
 > - 本文档里用 `<ARGUS_TOKEN>` 占位；把真实 token 通过私信/密码管理器/一次性消息发给同伴即可。
 
+## 0. 普通开发者用户怎么接入（推荐）
+
+如果你是 Argus 的**普通开发者用户**，而不是 operator/admin，请不要直接使用网关 master token（`ARGUS_TOKEN`）。
+
+推荐流程是：
+
+1. 在前端注册/登录，或调用：
+
+```bash
+curl -sS \
+  -H 'Content-Type: application/json' \
+  -X POST "http://$HOST:8080/auth/register" \
+  -d '{"email":"dev@example.com","password":"strong-password","inviteCode":"<OPTIONAL_INVITE>"}'
+```
+
+或：
+
+```bash
+curl -sS \
+  -H 'Content-Type: application/json' \
+  -X POST "http://$HOST:8080/auth/login" \
+  -d '{"email":"dev@example.com","password":"strong-password"}'
+```
+
+返回里会有：
+
+- `sessionToken`：给 Web 控制台 / 账户管理接口使用
+- `issuedDeveloperApiKey.token`：仅首次注册时返回，一次性展示，给你的应用接入使用
+
+2. 用 `sessionToken` 或 developer API key 调用自助接口：
+
+- `GET /me/developer-keys`
+- `POST /me/developer-keys`
+- `DELETE /me/developer-keys/{keyId}`
+- `GET /me/agents`
+- `POST /me/agents`
+- `POST /me/agents/{agentId}/use`
+- `PATCH /me/agents/{agentId}`
+- `PUT /me/agents/{agentId}/model`
+- `DELETE /me/agents/{agentId}`
+- `GET /me/agents/{agentId}/connection`
+
+3. 推荐先创建/选择一个 agent，再获取连接包：
+
+```bash
+curl -sS \
+  -H "Authorization: Bearer <DEVELOPER_API_KEY>" \
+  "http://$HOST:8080/me/agents/<AGENT_ID>/connection"
+```
+
+返回里会包含：
+
+- `ws.url`：该 agent 当前 session 对应的 `/ws?session=...` 地址
+- `openai.url` + `openai.token`：给 `/openai/v1/responses` 用的 session 级派生 token
+- `mcp.token` / `node.token`：分别给 `/mcp` 和 `/nodes/ws` 用的 session 级派生 token（如果 operator 配置了对应 master secret）
+
+4. 你的应用接入方式：
+
+- 直连 `/ws`：
+  - 使用 `ws.url`
+  - 用 developer API key 做 `Authorization: Bearer ...`
+  - 浏览器若不能加 header，可把同一个 developer API key 放在 `?token=...`
+- 直连 `/openai/v1/responses`：
+  - 使用 `openai.url`
+  - 用 `openai.token` 做 `Authorization: Bearer ...`
+  - 这里**不要**直接传 developer API key；应该使用返回的 session 级派生 token
+
+这个模式适合“用户在 Argus 前端创建账号，拿到 key，然后把 agent 接进自己的应用”。
+
 ## 1. 你要连的服务器信息
 
 先在本地准备环境变量（不要把 token 写进代码仓库/截图/URL）：

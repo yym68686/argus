@@ -55,6 +55,26 @@ docker compose --profile tg up --build
 docker compose down
 ```
 
+## 开发者自助模式
+
+Argus 现在已经具备一套基础的开发者自助流程：
+
+- 用户可以直接在前端通过 `/auth/register` 注册、通过 `/auth/login` 登录。
+- 新账号创建时，系统会同时返回控制台 `sessionToken` 和一次性展示的 developer API key。
+- 每个用户都可以在 **Agents** 页面自助创建、重命名、切换、删除自己的托管 agent，并为 agent 固定模型。
+- **API Keys** 页面现在分成两类密钥：
+  - Argus 自己签发的 gateway access key，用于把 agent 接进你的应用
+  - 用户自带的上游 provider key，用于 OpenAI-compatible 渠道
+- `GET /me/agents/{agentId}/connection` 会返回某个 agent 的接入包，包括：
+  - 该 agent 对应 session 的 `/ws` 地址
+  - 派生后的 `/openai/v1/responses`、`/mcp`、`/nodes/ws` token（若这些能力已启用）
+
+建议这样分工：
+
+- 控制台 `sessionToken` 用于 Web UI 和账户管理。
+- developer API key 用于你自己的后端、前端应用、移动端或 SDK。
+- 如果你想直接打 `/openai/v1/responses`，请使用 `/me/agents/{agentId}/connection` 返回的 session 级派生 token，而不是直接复用 developer API key。
+
 ## 环境变量
 
 `docker compose` 会自动读取仓库根目录下的 `.env`。建议先从示例文件开始：
@@ -82,6 +102,21 @@ cp .env.example .env
 | `ARGUS_CORS_ORIGINS` | 可选 | `*` | 逗号分隔的 HTTP 允许来源，例如 `https://app.example.com,https://admin.example.com`。如果你要把 HTTP API 暴露给浏览器，建议收紧。 |
 | `ARGUS_GC_DELETE_ORPHAN_RUNTIMES` | 可选 | `delete` | 控制 gateway 启动时是否清理未被状态库引用的托管 runtime。`docker` 模式下清理的是 session 容器，`fugue` 模式下清理的是配置项目里的 session app。若设置了 `ARGUS_DATABASE_URL`，引用集合来自 PostgreSQL；否则来自本地 sqlite 回退文件。支持：`off`、`dry-run`、`delete`（也接受 `true` / `yes` / `on`）。 |
 | `ARGUS_STUCK_TURN_TIMEOUT_S` | 可选 | `900` | 防止某个上游 turn 永远不返回 `turn/completed`，导致 lane 一直卡在 `busy`。设为 `0` 可关闭这层保护。 |
+
+### 开发者自助控制项
+
+| 变量 | 是否必需 | 默认值 | 作用 / 注意事项 |
+| --- | --- | --- | --- |
+| `ARGUS_ALLOW_REGISTRATION` | 可选 | `true` | 是否允许前端通过 `/auth/register` 自助注册。设为 `false` 后，登录页不再提供公开注册入口。 |
+| `ARGUS_REGISTRATION_INVITE_CODE` | 可选 | 未设置 | `/auth/register` 要求的共享邀请码。设置后，前端注册页会显示邀请码输入框。 |
+| `ARGUS_AUTH_RATE_LIMIT_PER_MINUTE` | 可选 | `20` | 鉴权接口（如 `/auth/login`、`/auth/register`）按客户端 IP 做的固定窗口限流，单位为“每分钟请求数”。设为 `0` 可关闭。 |
+| `ARGUS_USER_API_RATE_LIMIT_PER_MINUTE` | 可选 | `300` | 已登录用户调用自助 API 和附着 `/ws` 时使用的固定窗口限流，按用户维度统计。设为 `0` 可关闭。 |
+| `ARGUS_DEVELOPER_MAX_API_KEYS` | 可选 | `10` | 每个用户最多可拥有的活跃 developer API key 数量。 |
+| `ARGUS_DEVELOPER_MAX_AGENTS` | 可选 | `20` | 每个用户最多可创建的托管 agent 数量。 |
+| `ARGUS_DEVELOPER_MAX_MANAGED_SESSIONS` | 可选 | `20` | 每个用户最多可拥有的活跃托管 session 数量；新的 `/ws` 挂载和自助 agent 创建都会检查这个上限。 |
+| `ARGUS_DEVELOPER_API_KEY_TTL_DAYS` | 可选 | `0` | 新签发 developer API key 的有效期天数。`0` 表示不过期。 |
+| `ARGUS_DEVELOPER_MONTHLY_TOKEN_QUOTA` | 可选 | `0` | 每个用户每月总 token 配额；在 `/openai/v1/responses` 层面执行。`0` 表示不限制。 |
+| `ARGUS_STATE_ENCRYPTION_KEY` | 可选，但如果允许用户保存自己的上游 provider key，强烈建议设置 | 未设置 | 为 gateway 状态库中的用户上游 API key 启用 AES-GCM 落盘加密。提供一个 32 字节的 base64 或 base64url 密钥即可。已有明文 secret 会在下一次被重写时自动转成密文。 |
 
 ### Docker runtime 创建与资源控制
 

@@ -9,6 +9,18 @@ export interface ConsoleUser {
   createdAtMs: number;
   updatedAtMs: number;
   lastLoginAtMs?: number | null;
+  developerApiKeyCount?: number;
+}
+
+export interface IssuedDeveloperApiKey {
+  keyId: string;
+  name: string;
+  token: string;
+  tokenPreview?: string | null;
+  createdAtMs?: number | null;
+  expiresAtMs?: number | null;
+  revokedAtMs?: number | null;
+  active?: boolean;
 }
 
 export interface AuthStatusResponse {
@@ -16,6 +28,7 @@ export interface AuthStatusResponse {
   hasUsers: boolean;
   userCount: number;
   allowRegistration: boolean;
+  requireInvite?: boolean;
 }
 
 export interface AuthMeResponse {
@@ -27,6 +40,7 @@ export interface AuthSessionResponse {
   ok: true;
   user: ConsoleUser;
   sessionToken: string;
+  issuedDeveloperApiKey?: IssuedDeveloperApiKey | null;
 }
 
 function buildAuthHeaders(token?: string | null, extra?: HeadersInit): Headers {
@@ -93,7 +107,7 @@ export function loginWithPassword(
 
 export function registerWithPassword(
   wsUrl: string,
-  body: { email: string; password: string }
+  body: { email: string; password: string; inviteCode?: string }
 ): Promise<AuthSessionResponse> {
   return fetchJson<AuthSessionResponse>(
     wsUrl,

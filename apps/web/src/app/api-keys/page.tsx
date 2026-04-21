@@ -1,7 +1,7 @@
 "use client";
 
 import * as React from "react";
-import { Check, KeyRound, Pencil, Plus, Trash2 } from "lucide-react";
+import { Check, Copy, KeyRound, Pencil, Plus, Trash2 } from "lucide-react";
 import { toast } from "sonner";
 
 import { useAuth } from "@/components/admin-gate";
@@ -10,15 +10,22 @@ import { ConsoleShell } from "@/components/console-shell";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import type { AdminChannelEntry } from "@/lib/admin";
-import { useGatewayWsUrlState } from "@/lib/gateway";
+import type { IssuedDeveloperApiKey } from "@/lib/auth";
+import { formatWhen } from "@/lib/format";
+import { consumeJustIssuedDeveloperKey, useGatewayWsUrlState } from "@/lib/gateway";
 import {
+  createMyDeveloperKey,
   clearMyChannelKey,
   createMyChannel,
   deleteMyChannel,
+  fetchMyDeveloperKeys,
   fetchMyChannels,
   renameMyChannel,
+  revokeMyDeveloperKey,
   selectMyChannel,
   setMyChannelKey,
+  type DeveloperKeyEntry,
+  type SelfDeveloperKeysResponse,
   type SelfChannelsResponse,
 } from "@/lib/self";
 import { cn } from "@/lib/utils";
@@ -38,11 +45,17 @@ export default function ApiKeysPage() {
   const { user } = useAuth();
   const [wsUrl] = useGatewayWsUrlState();
   const [channelsState, setChannelsState] = React.useState<SelfChannelsResponse | null>(null);
+  const [developerKeysState, setDeveloperKeysState] = React.useState<SelfDeveloperKeysResponse | null>(null);
   const [selectedChannelId, setSelectedChannelId] = React.useState("");
   const selectedChannelIdRef = React.useRef("");
   const [loading, setLoading] = React.useState(false);
   const [saving, setSaving] = React.useState(false);
   const [error, setError] = React.useState<string | null>(null);
+  const [developerKeyName, setDeveloperKeyName] = React.useState("default");
+  const [revealedKey, setRevealedKey] = React.useState<(DeveloperKeyEntry & { token: string }) | null>(() => {
+    const justIssued = consumeJustIssuedDeveloperKey<IssuedDeveloperApiKey>();
+    return justIssued?.token ? justIssued : null;
+  });
 
   const [nameDraft, setNameDraft] = React.useState("");
   const [keyDraft, setKeyDraft] = React.useState("");
@@ -51,6 +64,7 @@ export default function ApiKeysPage() {
   const [newApiKey, setNewApiKey] = React.useState("");
 
   const channels = React.useMemo(() => channelsState?.channels ?? [], [channelsState?.channels]);
+  const developerKeys = React.useMemo(() => developerKeysState?.keys ?? [], [developerKeysState?.keys]);
   const currentChannelId = channelsState?.currentChannelId ?? "";
   const readyCount = channels.filter((channel) => channel.ready).length;
   const customCount = channels.filter((channel) => !channel.isBuiltin).length;
@@ -101,14 +115,26 @@ export default function ApiKeysPage() {
     setKeyDraft("");
   }, []);
 
+  const copyText = React.useCallback((text: string, label: string) => {
+    if (!text.trim()) return;
+    void navigator.clipboard.writeText(text).then(
+      () => toast.success(`${label} copied`),
+      () => toast.error("Copy failed")
+    );
+  }, []);
+
   const refresh = React.useCallback(
     async (opts?: { notify?: boolean }) => {
       if (!wsUrl.trim()) return;
       setLoading(true);
       setError(null);
       try {
-        const nextState = await fetchMyChannels(wsUrl);
-        applyChannels(nextState);
+        const [nextChannelsState, nextDeveloperKeysState] = await Promise.all([
+          fetchMyChannels(wsUrl),
+          fetchMyDeveloperKeys(wsUrl),
+        ]);
+        applyChannels(nextChannelsState);
+        setDeveloperKeysState(nextDeveloperKeysState);
         if (opts?.notify) {
           toast.success("Refreshed");
         }
@@ -133,6 +159,44 @@ export default function ApiKeysPage() {
     };
     void run();
   }, [refresh, wsUrl]);
+
+  const createDeveloperKey = React.useCallback(async () => {
+    if (!wsUrl.trim()) return;
+    setSaving(true);
+    setError(null);
+    try {
+      const result = await createMyDeveloperKey(wsUrl, { name: developerKeyName });
+      setDeveloperKeysState(result);
+      if (result.issuedKey) {
+        setRevealedKey(result.issuedKey);
+      }
+      toast.success("Developer key created");
+    } catch (nextError) {
+      const message = (nextError as Error)?.message || String(nextError);
+      setError(message);
+      toast.error(message);
+    } finally {
+      setSaving(false);
+    }
+  }, [developerKeyName, wsUrl]);
+
+  const revokeDeveloperKey = React.useCallback(async (keyId: string) => {
+    if (!wsUrl.trim()) return;
+    if (!window.confirm("Revoke this developer key?")) return;
+    setSaving(true);
+    setError(null);
+    try {
+      const result = await revokeMyDeveloperKey(wsUrl, keyId);
+      setDeveloperKeysState(result);
+      toast.success("Developer key revoked");
+    } catch (nextError) {
+      const message = (nextError as Error)?.message || String(nextError);
+      setError(message);
+      toast.error(message);
+    } finally {
+      setSaving(false);
+    }
+  }, [wsUrl]);
 
   const createChannel = React.useCallback(async () => {
     if (!wsUrl.trim()) return;
@@ -267,12 +331,79 @@ export default function ApiKeysPage() {
 
       <div className="grid gap-4">
         <PanelCard title={user.email} className="argus-data-grid">
-          <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-4">
+          <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-5">
             <Fact label="Current" value={channelsState?.currentChannel?.name || "—"} />
             <Fact label="Channels" value={String(channels.length)} />
             <Fact label="Ready" value={`${readyCount}/${channels.length || 0}`} />
-            <Fact label="Keys" value={String(keyedCount)} />
+            <Fact label="Upstream keys" value={String(keyedCount)} />
+            <Fact label="Access keys" value={String(developerKeysState?.counts.apiKeys ?? developerKeys.length)} />
           </div>
+        </PanelCard>
+
+        {revealedKey ? (
+          <PanelCard
+            title="New developer key"
+            action={
+              <Button type="button" size="sm" variant="secondary" onClick={() => copyText(revealedKey.token, "Developer key")}>
+                <Copy className="h-4 w-4" />
+                Copy
+              </Button>
+            }
+          >
+            <div className="grid gap-3">
+              <div className="rounded-[16px] border border-primary/28 bg-primary/10 px-4 py-3 text-sm text-foreground">
+                This token is shown once. Save it in your application config now.
+              </div>
+              <Fact label={revealedKey.name || "Developer key"} value={revealedKey.token} mono />
+            </div>
+          </PanelCard>
+        ) : null}
+
+        <PanelCard
+          title="Gateway access keys"
+          action={
+            <div className="flex flex-wrap items-center gap-2">
+              <Input
+                value={developerKeyName}
+                onChange={(event) => setDeveloperKeyName(event.target.value)}
+                placeholder="key name"
+                className="w-[13rem]"
+              />
+              <Button type="button" disabled={loading || saving} onClick={() => void createDeveloperKey()}>
+                <Plus className="h-4 w-4" />
+                Create
+              </Button>
+            </div>
+          }
+        >
+          {developerKeys.length ? (
+            <div className="space-y-2">
+              {developerKeys.map((key) => (
+                <div key={key.keyId} className="argus-row-shell flex flex-col gap-3 rounded-[16px] px-4 py-3 md:flex-row md:items-center md:justify-between">
+                  <div className="min-w-0">
+                    <div className="truncate font-medium text-foreground">{key.name}</div>
+                    <div className="mt-1 truncate text-xs text-muted-foreground">{key.keyId}</div>
+                    <div className="mt-2 flex flex-wrap gap-2">
+                      <Badge tone={key.active ? "success" : "default"}>{key.active ? "active" : "revoked"}</Badge>
+                      {key.tokenPreview ? <Badge tone="default">{key.tokenPreview}</Badge> : null}
+                      {key.lastUsedAtMs ? <Badge tone="default">used {formatWhen(key.lastUsedAtMs)}</Badge> : null}
+                      {key.expiresAtMs ? <Badge tone="warning">expires {formatWhen(key.expiresAtMs)}</Badge> : null}
+                    </div>
+                  </div>
+                  <div className="flex shrink-0 items-center gap-2">
+                    {!key.active ? null : (
+                      <Button type="button" size="sm" variant="destructive" disabled={loading || saving} onClick={() => void revokeDeveloperKey(key.keyId)}>
+                        <Trash2 className="h-4 w-4" />
+                        Revoke
+                      </Button>
+                    )}
+                  </div>
+                </div>
+              ))}
+            </div>
+          ) : (
+            <EmptyState title="No developer keys" />
+          )}
         </PanelCard>
 
         <div className="grid gap-4 xl:grid-cols-[320px_minmax(0,1fr)]">

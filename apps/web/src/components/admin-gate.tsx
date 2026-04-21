@@ -4,9 +4,15 @@ import * as React from "react";
 import { usePathname, useRouter } from "next/navigation";
 import { AtSign, LockKeyhole, PlugZap } from "lucide-react";
 
-import type { ConsoleUser } from "@/lib/auth";
+import type { ConsoleUser, IssuedDeveloperApiKey } from "@/lib/auth";
 import { fetchAuthMe, fetchAuthStatus, loginWithPassword, logoutSession, registerWithPassword } from "@/lib/auth";
-import { clearGatewayAuthToken, storeGatewayAuthToken, useStoredGatewayAuthToken, useStoredGatewayWsUrl } from "@/lib/gateway";
+import {
+  clearGatewayAuthToken,
+  storeGatewayAuthToken,
+  storeJustIssuedDeveloperKey,
+  useStoredGatewayAuthToken,
+  useStoredGatewayWsUrl,
+} from "@/lib/gateway";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { cn } from "@/lib/utils";
@@ -19,6 +25,7 @@ interface AuthContextValue {
   user: ConsoleUser | null;
   token: string;
   hasUsers: boolean;
+  allowRegistration: boolean;
   loading: boolean;
   logout: () => Promise<void>;
 }
@@ -44,11 +51,14 @@ export function AdminGate({ children }: AdminGateProps) {
   const hydrated = React.useSyncExternalStore(NOOP_SUBSCRIBE, () => true, () => false);
   const [user, setUser] = React.useState<ConsoleUser | null>(null);
   const [hasUsers, setHasUsers] = React.useState(false);
+  const [allowRegistration, setAllowRegistration] = React.useState(true);
+  const [requireInvite, setRequireInvite] = React.useState(false);
   const [loading, setLoading] = React.useState(true);
   const [submitting, setSubmitting] = React.useState(false);
   const [mode, setMode] = React.useState<"login" | "register">("login");
   const [email, setEmail] = React.useState("");
   const [password, setPassword] = React.useState("");
+  const [inviteCode, setInviteCode] = React.useState("");
   const [error, setError] = React.useState<string | null>(null);
 
   const adminRouteRequested = React.useMemo(
@@ -66,10 +76,12 @@ export function AdminGate({ children }: AdminGateProps) {
       try {
         const statusResult = await fetchAuthStatus(wsUrl);
         setHasUsers(Boolean(statusResult.hasUsers));
+        setAllowRegistration(Boolean(statusResult.allowRegistration));
+        setRequireInvite(Boolean(statusResult.requireInvite));
 
         if (!effectiveToken) {
           setUser(null);
-          setMode(statusResult.hasUsers ? "login" : "register");
+          setMode(statusResult.hasUsers || !statusResult.allowRegistration ? "login" : "register");
           setError(null);
           return;
         }
@@ -84,7 +96,9 @@ export function AdminGate({ children }: AdminGateProps) {
         const fallbackStatus = await fetchAuthStatus(wsUrl).catch(() => null);
         if (fallbackStatus) {
           setHasUsers(Boolean(fallbackStatus.hasUsers));
-          setMode(fallbackStatus.hasUsers ? "login" : "register");
+          setAllowRegistration(Boolean(fallbackStatus.allowRegistration));
+          setRequireInvite(Boolean(fallbackStatus.requireInvite));
+          setMode(fallbackStatus.hasUsers || !fallbackStatus.allowRegistration ? "login" : "register");
         }
         setError(null);
       } finally {
@@ -117,7 +131,10 @@ export function AdminGate({ children }: AdminGateProps) {
       setSubmitting(true);
       setError(null);
       try {
-        const body = { email: email.trim(), password };
+        if (mode === "register" && !allowRegistration) {
+          throw new Error("Registration is currently disabled");
+        }
+        const body = mode === "register" ? { email: email.trim(), password, inviteCode: inviteCode.trim() } : { email: email.trim(), password };
         const result =
           mode === "register"
             ? await registerWithPassword(wsUrl, body)
@@ -126,13 +143,17 @@ export function AdminGate({ children }: AdminGateProps) {
         setUser(result.user);
         setHasUsers(true);
         setPassword("");
+        if (mode === "register" && result.issuedDeveloperApiKey) {
+          storeJustIssuedDeveloperKey(result.issuedDeveloperApiKey as IssuedDeveloperApiKey);
+          router.replace("/api-keys");
+        }
       } catch (nextError) {
         setError((nextError as Error)?.message || String(nextError));
       } finally {
         setSubmitting(false);
       }
     },
-    [email, mode, password, wsUrl]
+    [allowRegistration, email, inviteCode, mode, password, router, wsUrl]
   );
 
   const logout = React.useCallback(async () => {
@@ -147,20 +168,21 @@ export function AdminGate({ children }: AdminGateProps) {
       clearGatewayAuthToken();
       setUser(null);
       setPassword("");
-      setMode(hasUsers ? "login" : "register");
+      setMode(hasUsers || !allowRegistration ? "login" : "register");
       router.replace("/");
     }
-  }, [hasUsers, router, storedToken, wsUrl]);
+  }, [allowRegistration, hasUsers, router, storedToken, wsUrl]);
 
   const contextValue = React.useMemo<AuthContextValue>(
     () => ({
       user,
       token: storedToken,
       hasUsers,
+      allowRegistration,
       loading: loading || !hydrated,
       logout,
     }),
-    [hasUsers, hydrated, loading, logout, storedToken, user]
+    [allowRegistration, hasUsers, hydrated, loading, logout, storedToken, user]
   );
 
   if (!hydrated || loading) {
@@ -211,7 +233,9 @@ export function AdminGate({ children }: AdminGateProps) {
                   size="sm"
                   variant={mode === "register" ? "default" : "secondary"}
                   className="min-w-[8rem]"
+                  disabled={!allowRegistration}
                   onClick={() => {
+                    if (!allowRegistration) return;
                     setMode("register");
                     setError(null);
                   }}
@@ -219,6 +243,12 @@ export function AdminGate({ children }: AdminGateProps) {
                   Create account
                 </Button>
               </div>
+
+              {!allowRegistration ? (
+                <div className="mt-4 rounded-[18px] border border-border/70 bg-background/24 px-4 py-3 text-sm leading-6 text-muted-foreground">
+                  Registration is disabled on this gateway. Sign in with an existing account.
+                </div>
+              ) : null}
 
               <form className="mt-6 space-y-4" onSubmit={handleSubmit}>
                 <div className="grid gap-1.5">
@@ -251,13 +281,34 @@ export function AdminGate({ children }: AdminGateProps) {
                   />
                 </div>
 
+                {mode === "register" && requireInvite ? (
+                  <div className="grid gap-1.5">
+                    <label className="argus-surface-label" htmlFor="argus-invite">
+                      Invite Code
+                    </label>
+                    <Input
+                      id="argus-invite"
+                      value={inviteCode}
+                      onChange={(event) => setInviteCode(event.target.value)}
+                      placeholder="invite code"
+                      autoComplete="off"
+                      spellCheck={false}
+                    />
+                  </div>
+                ) : null}
+
                 {error ? (
                   <div className="rounded-[18px] border border-destructive/36 bg-destructive/10 px-4 py-3 text-sm leading-6 text-destructive">
                     {error}
                   </div>
                 ) : null}
 
-                <Button type="submit" size="lg" className="w-full justify-center" disabled={submitting}>
+                <Button
+                  type="submit"
+                  size="lg"
+                  className="w-full justify-center"
+                  disabled={submitting || (mode === "register" && !allowRegistration)}
+                >
                   {mode === "register" ? <AtSign className="h-4 w-4" /> : <LockKeyhole className="h-4 w-4" />}
                   <span className={cn(submitting ? "opacity-80" : null)}>
                     {submitting ? "Working…" : mode === "register" ? "Create account" : "Sign in"}

@@ -2,7 +2,7 @@
 
 import Link from "next/link";
 import { usePathname } from "next/navigation";
-import { Gauge, KeyRound, Laptop, MessagesSquare, RadioTower, Settings2, Users2 } from "lucide-react";
+import { Bot, Gauge, KeyRound, Laptop, MessagesSquare, RadioTower, Settings2, Users2 } from "lucide-react";
 
 import { useAuth } from "@/components/admin-gate";
 import { cn } from "@/lib/utils";
@@ -10,6 +10,7 @@ import { cn } from "@/lib/utils";
 const NAV_ITEMS = [
   { href: "/", label: "Workbench", icon: MessagesSquare, adminOnly: false },
   { href: "/usage", label: "Usage", icon: Gauge, adminOnly: false },
+  { href: "/agents", label: "Agents", icon: Bot, adminOnly: false },
   { href: "/api-keys", label: "API Keys", icon: KeyRound, adminOnly: false },
   { href: "/devices", label: "Devices", icon: Laptop, adminOnly: true },
   { href: "/users", label: "Users", icon: Users2, adminOnly: true },

@@ -55,6 +55,26 @@ Stop:
 docker compose down
 ```
 
+## Developer Self-Serve
+
+Argus now supports a basic developer-user flow in the built-in web console:
+
+- Users can register from the front-end with `/auth/register` and sign in with `/auth/login`.
+- A new account automatically receives one one-time developer API key in addition to its console `sessionToken`.
+- The **Agents** page lets each user create, rename, select, delete, and pin models for their own managed agents.
+- The **API Keys** page now separates:
+  - gateway access keys issued by Argus for app integration
+  - upstream provider keys that the user brings for OpenAI-compatible channels
+- `GET /me/agents/{agentId}/connection` returns a ready-to-use connection bundle for that agent, including:
+  - the managed `/ws` URL for the agent session
+  - derived `/openai/v1/responses`, `/mcp`, and `/nodes/ws` tokens when those surfaces are enabled
+
+Recommended split:
+
+- Use the console `sessionToken` for the web UI and other interactive account management.
+- Use developer API keys for your own backend, browser app, mobile app, or SDK integration.
+- Use the derived per-session proxy token from `/me/agents/{agentId}/connection` when you want to call `/openai/v1/responses` directly.
+
 ## Environment variables
 
 `docker compose` automatically reads `.env` from the repo root. Start from the example file:
@@ -83,6 +103,21 @@ How changes take effect:
 | `ARGUS_CORS_ORIGINS` | Optional | `*` | Comma-separated list of allowed HTTP origins, for example `https://app.example.com,https://admin.example.com`. Tighten this when exposing the HTTP APIs to browsers. |
 | `ARGUS_GC_DELETE_ORPHAN_RUNTIMES` | Optional | `delete` | Controls startup garbage collection for managed runtimes not referenced by gateway state. In `docker` mode this targets session containers; in `fugue` mode it targets session apps inside the configured project. The reference set comes from PostgreSQL when `ARGUS_DATABASE_URL` is set, otherwise from the local sqlite fallback. Supported values: `off`, `dry-run`, `delete` (also `true` / `yes` / `on`). |
 | `ARGUS_STUCK_TURN_TIMEOUT_S` | Optional | `900` | Safety timeout for lanes stuck in `busy` state because an upstream turn never completed. Set `0` to disable the reset logic. |
+
+### Developer self-serve controls
+
+| Variable | Required? | Default | What it does / notes |
+| --- | --- | --- | --- |
+| `ARGUS_ALLOW_REGISTRATION` | Optional | `true` | Enables or disables front-end self-registration through `/auth/register`. When `false`, the login page stops offering public sign-up. |
+| `ARGUS_REGISTRATION_INVITE_CODE` | Optional | unset | Shared invite code required by `/auth/register`. When set, the login page shows an invite-code field for new accounts. |
+| `ARGUS_AUTH_RATE_LIMIT_PER_MINUTE` | Optional | `20` | Fixed-window rate limit for auth endpoints such as `/auth/login` and `/auth/register`, applied per client IP. Set `0` to disable. |
+| `ARGUS_USER_API_RATE_LIMIT_PER_MINUTE` | Optional | `300` | Fixed-window rate limit for authenticated self-serve APIs and WebSocket attachment, applied per user. Set `0` to disable. |
+| `ARGUS_DEVELOPER_MAX_API_KEYS` | Optional | `10` | Maximum active developer API keys per user. |
+| `ARGUS_DEVELOPER_MAX_AGENTS` | Optional | `20` | Maximum managed agents each user can create. |
+| `ARGUS_DEVELOPER_MAX_MANAGED_SESSIONS` | Optional | `20` | Maximum live managed sessions owned by one user. New `/ws` attachments and self-serve agent provisioning enforce this limit. |
+| `ARGUS_DEVELOPER_API_KEY_TTL_DAYS` | Optional | `0` | Optional lifetime for newly issued developer API keys. `0` means no expiry. |
+| `ARGUS_DEVELOPER_MONTHLY_TOKEN_QUOTA` | Optional | `0` | Optional per-user monthly total-token quota enforced on `/openai/v1/responses`. `0` means disabled. |
+| `ARGUS_STATE_ENCRYPTION_KEY` | Optional, but strongly recommended when users store their own upstream provider keys | unset | Enables AES-GCM encryption-at-rest for user-supplied upstream API keys in the gateway state store. Supply a 32-byte key in base64 or base64url form. Existing plaintext secrets are sealed the next time they are rewritten. |
 
 ### Docker runtime provisioning
 

@@ -62,10 +62,7 @@ export default function DevicesPage() {
   const autoLoadedForRef = React.useRef<string>("");
 
   const httpBase = React.useMemo(() => httpBaseFromWsUrl(wsUrl), [wsUrl]);
-  const command = React.useMemo(() => {
-    if (!httpBase || !tokenInfo?.token) return "";
-    return buildInstallCommand(httpBase, tokenInfo.token, platform);
-  }, [httpBase, platform, tokenInfo?.token]);
+  const command = httpBase && tokenInfo?.token ? buildInstallCommand(httpBase, tokenInfo.token, platform) : "";
 
   const refresh = React.useCallback(
     async (opts?: { notify?: boolean }) => {
@@ -101,10 +98,6 @@ export default function DevicesPage() {
     },
     [wsUrl]
   );
-
-  React.useEffect(() => {
-    setPlatform(detectClientPlatform());
-  }, []);
 
   React.useEffect(() => {
     const trimmed = wsUrl.trim();

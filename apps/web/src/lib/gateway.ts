@@ -3,6 +3,7 @@ import * as React from "react";
 export const GATEWAY_WS_STORAGE_KEY = "argus.gateway.wsUrl";
 export const GATEWAY_ADMIN_TOKEN_STORAGE_KEY = "argus.gateway.adminToken";
 export const GATEWAY_AUTH_TOKEN_STORAGE_KEY = "argus.auth.sessionToken";
+export const JUST_ISSUED_DEVELOPER_KEY_STORAGE_KEY = "argus.developer.justIssued";
 
 export function sanitizeGatewayWsUrl(url: string): string {
   try {
@@ -124,6 +125,42 @@ export function storeGatewayAuthToken(token: string): void {
     // ignore
   }
   window.dispatchEvent(new Event("argus-auth-token"));
+}
+
+export function storeJustIssuedDeveloperKey(payload: unknown): void {
+  if (typeof window === "undefined") return;
+  try {
+    if (payload == null) {
+      window.sessionStorage.removeItem(JUST_ISSUED_DEVELOPER_KEY_STORAGE_KEY);
+      return;
+    }
+    window.sessionStorage.setItem(JUST_ISSUED_DEVELOPER_KEY_STORAGE_KEY, JSON.stringify(payload));
+  } catch {
+    // ignore
+  }
+}
+
+export function loadJustIssuedDeveloperKey<T>(): T | null {
+  if (typeof window === "undefined") return null;
+  try {
+    const raw = window.sessionStorage.getItem(JUST_ISSUED_DEVELOPER_KEY_STORAGE_KEY);
+    if (!raw) return null;
+    return JSON.parse(raw) as T;
+  } catch {
+    return null;
+  }
+}
+
+export function consumeJustIssuedDeveloperKey<T>(): T | null {
+  const payload = loadJustIssuedDeveloperKey<T>();
+  if (typeof window !== "undefined") {
+    try {
+      window.sessionStorage.removeItem(JUST_ISSUED_DEVELOPER_KEY_STORAGE_KEY);
+    } catch {
+      // ignore
+    }
+  }
+  return payload;
 }
 
 export function clearGatewayAuthToken(): void {

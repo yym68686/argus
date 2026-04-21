@@ -38,6 +38,11 @@ except Exception:
     psycopg = None
     psycopg_dict_row = None
 
+try:
+    from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+except Exception:
+    AESGCM = None
+
 
 log = logging.getLogger("argus_gateway")
 
@@ -169,6 +174,33 @@ def _event_log(level: str, event: str, **fields: Any) -> None:
         log.error(line)
     else:
         log.info(line)
+
+
+class FixedWindowRateLimiter:
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._buckets: dict[str, dict[str, int]] = {}
+
+    def allow(self, *, key: str, limit: int, window_ms: int) -> tuple[bool, int, int]:
+        if limit <= 0 or window_ms <= 0:
+            return True, 0, 0
+        now_ms = _now_ms()
+        window_start = now_ms - (now_ms % window_ms)
+        reset_at_ms = window_start + window_ms
+        with self._lock:
+            bucket = self._buckets.get(key)
+            if bucket is None or int(bucket.get("windowStartMs") or 0) != window_start:
+                bucket = {"windowStartMs": window_start, "count": 0}
+                self._buckets[key] = bucket
+            count = int(bucket.get("count") or 0)
+            if count >= limit:
+                retry_after_ms = max(0, reset_at_ms - now_ms)
+                return False, retry_after_ms, count
+            bucket["count"] = count + 1
+            return True, max(0, reset_at_ms - now_ms), bucket["count"]
+
+
+_RATE_LIMITER = FixedWindowRateLimiter()
 
 
 def _chat_key_hash(raw: Any) -> Optional[str]:
@@ -2423,7 +2455,8 @@ CHANNEL_ID_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,63}$")
 TELEGRAM_PRIVATE_CHAT_ID_RE = re.compile(r"^[1-9]\d{0,19}$")
 CONSOLE_EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 CONSOLE_SESSION_ID_RE = re.compile(r"^[a-f0-9]{24}$")
-AUTOMATION_STATE_VERSION = 9
+DEVELOPER_API_KEY_ID_RE = re.compile(r"^[a-f0-9]{16}$")
+AUTOMATION_STATE_VERSION = 10
 ARGUS_AGENT_MODEL_DEFAULT = "gpt-5.4"
 ARGUS_GATEWAY_AGENT_MODELS = ("gpt-5.2", "gpt-5.4")
 ARGUS_GATEWAY_AGENT_MODELS_SET = frozenset(ARGUS_GATEWAY_AGENT_MODELS)
@@ -2436,9 +2469,165 @@ CHANNEL_IDS_BUILTIN = frozenset((CHANNEL_ID_GATEWAY, CHANNEL_ID_ZERO_ZERO_PRO))
 CHANNEL_ZERO_ZERO_PRO_BASE_URL = "https://api.0-0.pro/v1"
 CHANNEL_ZERO_ZERO_PRO_PROMO_URL = "https://0-0.pro"
 CONSOLE_SESSION_TOKEN_PREFIX = "argus-console-v1"
+DEVELOPER_API_KEY_TOKEN_PREFIX = "argus-dev-v1"
 CONSOLE_PASSWORD_HASH_KIND = "pbkdf2_sha256"
 CONSOLE_PASSWORD_PBKDF2_ITERATIONS = 600_000
 CONSOLE_SESSION_TTL_MS = 30 * 24 * 60 * 60 * 1000
+STATE_SECRET_SEAL_PREFIX = "argus-seal-v1"
+AUTH_RATE_LIMIT_WINDOW_MS = 60_000
+USER_RATE_LIMIT_WINDOW_MS = 60_000
+
+
+def _normalize_bool_flag(raw: Any, *, default: bool = False) -> bool:
+    if raw is None:
+        return default
+    if isinstance(raw, bool):
+        return raw
+    value = str(raw).strip().lower()
+    if not value:
+        return default
+    if value in {"1", "true", "yes", "on"}:
+        return True
+    if value in {"0", "false", "no", "off"}:
+        return False
+    return default
+
+
+def _env_bool(name: str, default: bool) -> bool:
+    return _normalize_bool_flag(os.getenv(name), default=default)
+
+
+def _env_optional_int(name: str, *, default: Optional[int] = None, minimum: Optional[int] = None) -> Optional[int]:
+    raw = os.getenv(name)
+    if raw is None or not raw.strip():
+        return default
+    try:
+        value = int(raw)
+    except Exception:
+        return default
+    if minimum is not None and value < minimum:
+        return minimum
+    return value
+
+
+def _allow_registration() -> bool:
+    return _env_bool("ARGUS_ALLOW_REGISTRATION", True)
+
+
+def _registration_invite_code() -> Optional[str]:
+    value = str(os.getenv("ARGUS_REGISTRATION_INVITE_CODE") or "").strip()
+    return value or None
+
+
+def _registration_requires_invite() -> bool:
+    return bool(_registration_invite_code())
+
+
+def _auth_rate_limit_per_minute() -> int:
+    return max(0, int(_env_optional_int("ARGUS_AUTH_RATE_LIMIT_PER_MINUTE", default=20, minimum=0) or 0))
+
+
+def _user_api_rate_limit_per_minute() -> int:
+    return max(0, int(_env_optional_int("ARGUS_USER_API_RATE_LIMIT_PER_MINUTE", default=300, minimum=0) or 0))
+
+
+def _developer_max_agents() -> Optional[int]:
+    return _env_optional_int("ARGUS_USER_MAX_AGENTS", default=20, minimum=1)
+
+
+def _developer_max_managed_sessions() -> Optional[int]:
+    return _env_optional_int("ARGUS_USER_MAX_MANAGED_SESSIONS", default=20, minimum=1)
+
+
+def _developer_max_api_keys() -> Optional[int]:
+    return _env_optional_int("ARGUS_USER_MAX_API_KEYS", default=10, minimum=1)
+
+
+def _developer_monthly_token_quota() -> Optional[int]:
+    value = _env_optional_int("ARGUS_USER_MONTHLY_TOKEN_QUOTA", default=0, minimum=0)
+    if value is None or value <= 0:
+        return None
+    return value
+
+
+def _developer_api_key_ttl_days() -> Optional[int]:
+    value = _env_optional_int("ARGUS_DEVELOPER_API_KEY_TTL_DAYS", default=0, minimum=0)
+    if value is None or value <= 0:
+        return None
+    return value
+
+
+def _state_encryption_key_material() -> Optional[bytes]:
+    raw = str(os.getenv("ARGUS_STATE_ENCRYPTION_KEY") or "").strip()
+    if not raw:
+        return None
+    return hashlib.sha256(raw.encode("utf-8")).digest()
+
+
+def _state_encryption_enabled() -> bool:
+    return _state_encryption_key_material() is not None
+
+
+def _state_require_encryption_backend() -> None:
+    if _state_encryption_enabled() and AESGCM is None:
+        raise RuntimeError("ARGUS_STATE_ENCRYPTION_KEY requires the 'cryptography' package")
+
+
+def _secret_storage_is_sealed(raw: Any) -> bool:
+    value = str(raw or "").strip()
+    return bool(value and value.startswith(f"{STATE_SECRET_SEAL_PREFIX}."))
+
+
+def _secret_storage_prepare(raw: Any) -> Optional[str]:
+    value = _normalize_channel_api_key(raw)
+    if not value:
+        return None
+    if _secret_storage_is_sealed(value):
+        return value
+    key = _state_encryption_key_material()
+    if key is None:
+        return value
+    if AESGCM is None:
+        raise RuntimeError("ARGUS_STATE_ENCRYPTION_KEY requires the 'cryptography' package")
+    nonce = secrets.token_bytes(12)
+    aes = AESGCM(key)
+    ciphertext = aes.encrypt(nonce, value.encode("utf-8"), None)
+    payload = _b64url_no_pad(nonce + ciphertext)
+    return f"{STATE_SECRET_SEAL_PREFIX}.{payload}"
+
+
+def _secret_storage_resolve(raw: Any) -> tuple[Optional[str], Optional[str]]:
+    value = _normalize_channel_api_key(raw)
+    if not value:
+        return None, None
+    if not _secret_storage_is_sealed(value):
+        return value, None
+    key = _state_encryption_key_material()
+    if key is None:
+        return None, "ARGUS_STATE_ENCRYPTION_KEY is required to decrypt stored secrets"
+    if AESGCM is None:
+        return None, "The 'cryptography' package is required to decrypt stored secrets"
+    try:
+        payload = value.split(".", 1)[1]
+        data = base64.urlsafe_b64decode(payload + "=" * (-len(payload) % 4))
+        if len(data) <= 12:
+            return None, "Stored secret payload is invalid"
+        nonce = data[:12]
+        ciphertext = data[12:]
+        aes = AESGCM(key)
+        plaintext = aes.decrypt(nonce, ciphertext, None).decode("utf-8")
+        normalized = _normalize_channel_api_key(plaintext)
+        if not normalized:
+            return None, "Stored secret payload is empty"
+        return normalized, None
+    except Exception:
+        return None, "Stored secret could not be decrypted"
+
+
+def _month_start_ms(now_ms: Optional[int] = None) -> int:
+    now = _ms_to_dt_utc(now_ms if isinstance(now_ms, int) and now_ms > 0 else _now_ms())
+    month_start = datetime(year=now.year, month=now.month, day=1, tzinfo=timezone.utc)
+    return int(month_start.timestamp() * 1000)
 
 
 def _normalize_runtime_session_id(raw: Any) -> str:
@@ -2551,6 +2740,34 @@ def _issue_console_session_token() -> tuple[str, str, int]:
     return session_id, token, expires_at_ms
 
 
+def _hash_developer_api_key_token(token: Any) -> str:
+    return hashlib.sha256(str(token or "").encode("utf-8")).hexdigest()
+
+
+def _parse_developer_api_key_token(token: Any) -> Optional[str]:
+    raw = str(token or "").strip()
+    if not raw:
+        return None
+    parts = raw.split(".", 2)
+    if len(parts) != 3:
+        return None
+    prefix, key_id, _secret = parts
+    if prefix != DEVELOPER_API_KEY_TOKEN_PREFIX:
+        return None
+    if not DEVELOPER_API_KEY_ID_RE.match(key_id):
+        return None
+    return key_id
+
+
+def _issue_developer_api_key_token() -> tuple[str, str, Optional[int]]:
+    key_id = uuid.uuid4().hex[:16]
+    secret = _b64url_no_pad(secrets.token_bytes(24))
+    token = f"{DEVELOPER_API_KEY_TOKEN_PREFIX}.{key_id}.{secret}"
+    ttl_days = _developer_api_key_ttl_days()
+    expires_at_ms = _now_ms() + ttl_days * 24 * 60 * 60 * 1000 if isinstance(ttl_days, int) and ttl_days > 0 else None
+    return key_id, token, expires_at_ms
+
+
 def _is_missing_thread_for_archive_error(msg: str) -> bool:
     s = str(msg or "").strip().lower()
     if not s:
@@ -2613,6 +2830,17 @@ def _normalize_channel_id(raw: Any) -> str:
 
 def _normalize_channel_name(raw: Any) -> str:
     return _normalize_channel_id(raw)
+
+
+def _normalize_developer_api_key_name(raw: Any) -> str:
+    if raw is None:
+        return "default"
+    value = " ".join(str(raw).strip().split())
+    if not value:
+        return "default"
+    if len(value) > 64:
+        value = value[:64].rstrip()
+    return value or "default"
 
 
 def _normalize_channel_api_key(raw: Any) -> Optional[str]:
@@ -3369,12 +3597,13 @@ class PersistedUserChannel:
     updated_at_ms: int = field(default_factory=_now_ms)
 
     def to_json(self, *, redact_secrets: bool = False) -> dict[str, Any]:
-        api_key = _normalize_channel_api_key(self.api_key)
+        api_key, _err = _secret_storage_resolve(self.api_key)
+        stored_api_key = _secret_storage_prepare(self.api_key)
         return {
             "channelId": self.channel_id,
             "name": self.name,
             "baseUrl": self.base_url,
-            "apiKey": _mask_secret(api_key) if redact_secrets else api_key,
+            "apiKey": _mask_secret(api_key) if redact_secrets else stored_api_key,
             "createdAtMs": int(self.created_at_ms),
             "updatedAtMs": int(self.updated_at_ms),
         }
@@ -3431,10 +3660,11 @@ class PersistedUserChannelState:
             cid = _normalize_channel_id(channel_id)
             if cid not in CHANNEL_IDS_BUILTIN or cid == CHANNEL_ID_GATEWAY:
                 continue
-            normalized_key = _normalize_channel_api_key(api_key)
-            if not normalized_key:
+            resolved_key, _err = _secret_storage_resolve(api_key)
+            stored_key = _secret_storage_prepare(api_key)
+            if not stored_key and not resolved_key:
                 continue
-            builtin_api_keys[cid] = _mask_secret(normalized_key) if redact_secrets else normalized_key
+            builtin_api_keys[cid] = _mask_secret(resolved_key) if redact_secrets else stored_key
         disabled_builtin_channels: list[str] = []
         seen_disabled_builtin_channels: set[str] = set()
         for raw_channel_id in (self.disabled_builtin_channels or []):
@@ -3497,6 +3727,76 @@ class PersistedUserChannelState:
 
 
 @dataclass
+class PersistedDeveloperApiKey:
+    key_id: str
+    name: str
+    token_hash: str
+    token_preview: Optional[str] = None
+    created_at_ms: int = field(default_factory=_now_ms)
+    updated_at_ms: int = field(default_factory=_now_ms)
+    last_used_at_ms: Optional[int] = None
+    expires_at_ms: Optional[int] = None
+    revoked_at_ms: Optional[int] = None
+
+    def is_active(self) -> bool:
+        if isinstance(self.revoked_at_ms, int) and self.revoked_at_ms > 0:
+            return False
+        if isinstance(self.expires_at_ms, int) and self.expires_at_ms > 0:
+            return self.expires_at_ms > _now_ms()
+        return True
+
+    def to_json(self, *, redact_secrets: bool = False) -> dict[str, Any]:
+        return {
+            "keyId": self.key_id,
+            "name": self.name,
+            "tokenHash": None if redact_secrets else str(self.token_hash or "").strip(),
+            "tokenPreview": self.token_preview,
+            "createdAtMs": int(self.created_at_ms or 0),
+            "updatedAtMs": int(self.updated_at_ms or 0),
+            "lastUsedAtMs": int(self.last_used_at_ms) if isinstance(self.last_used_at_ms, int) and self.last_used_at_ms > 0 else None,
+            "expiresAtMs": int(self.expires_at_ms) if isinstance(self.expires_at_ms, int) and self.expires_at_ms > 0 else None,
+            "revokedAtMs": int(self.revoked_at_ms) if isinstance(self.revoked_at_ms, int) and self.revoked_at_ms > 0 else None,
+        }
+
+    def to_public_json(self) -> dict[str, Any]:
+        out = self.to_json(redact_secrets=True)
+        out["active"] = self.is_active()
+        return out
+
+    @staticmethod
+    def from_json(obj: Any) -> Optional["PersistedDeveloperApiKey"]:
+        if not isinstance(obj, dict):
+            return None
+        key_id = str(obj.get("keyId") or "").strip().lower()
+        if not DEVELOPER_API_KEY_ID_RE.match(key_id):
+            return None
+        name = _normalize_developer_api_key_name(obj.get("name"))
+        token_hash = str(obj.get("tokenHash") or "").strip()
+        if not name or not token_hash:
+            return None
+        def _opt_int(name_raw: str) -> Optional[int]:
+            try:
+                value = obj.get(name_raw)
+                return int(value) if value is not None else None
+            except Exception:
+                return None
+        now_ms = _now_ms()
+        created_at_ms = _opt_int("createdAtMs") or now_ms
+        updated_at_ms = _opt_int("updatedAtMs") or created_at_ms
+        return PersistedDeveloperApiKey(
+            key_id=key_id,
+            name=name,
+            token_hash=token_hash,
+            token_preview=str(obj.get("tokenPreview") or "").strip() or None,
+            created_at_ms=created_at_ms,
+            updated_at_ms=updated_at_ms,
+            last_used_at_ms=_opt_int("lastUsedAtMs"),
+            expires_at_ms=_opt_int("expiresAtMs"),
+            revoked_at_ms=_opt_int("revokedAtMs"),
+        )
+
+
+@dataclass
 class PersistedConsoleUser:
     user_id: int
     email: str
@@ -3505,6 +3805,7 @@ class PersistedConsoleUser:
     created_at_ms: int = field(default_factory=_now_ms)
     updated_at_ms: int = field(default_factory=_now_ms)
     last_login_at_ms: Optional[int] = None
+    developer_api_keys: dict[str, PersistedDeveloperApiKey] = field(default_factory=dict)
 
     def to_json(self, *, redact_secrets: bool = False) -> dict[str, Any]:
         return {
@@ -3515,6 +3816,11 @@ class PersistedConsoleUser:
             "createdAtMs": int(self.created_at_ms),
             "updatedAtMs": int(self.updated_at_ms),
             "lastLoginAtMs": int(self.last_login_at_ms) if isinstance(self.last_login_at_ms, int) and self.last_login_at_ms > 0 else None,
+            "developerApiKeys": {
+                key_id: api_key.to_json(redact_secrets=redact_secrets)
+                for key_id, api_key in (self.developer_api_keys or {}).items()
+                if isinstance(key_id, str) and key_id.strip() and isinstance(api_key, PersistedDeveloperApiKey)
+            },
         }
 
     def to_public_json(self) -> dict[str, Any]:
@@ -3525,6 +3831,9 @@ class PersistedConsoleUser:
             "createdAtMs": int(self.created_at_ms),
             "updatedAtMs": int(self.updated_at_ms),
             "lastLoginAtMs": int(self.last_login_at_ms) if isinstance(self.last_login_at_ms, int) and self.last_login_at_ms > 0 else None,
+            "developerApiKeyCount": sum(
+                1 for api_key in (self.developer_api_keys or {}).values() if isinstance(api_key, PersistedDeveloperApiKey) and api_key.is_active()
+            ),
         }
 
     @staticmethod
@@ -3553,6 +3862,15 @@ class PersistedConsoleUser:
             last_login_at_ms = int(obj.get("lastLoginAtMs")) if obj.get("lastLoginAtMs") is not None else None
         except Exception:
             last_login_at_ms = None
+        developer_api_keys_raw = obj.get("developerApiKeys")
+        developer_api_keys: dict[str, PersistedDeveloperApiKey] = {}
+        if isinstance(developer_api_keys_raw, dict):
+            for raw_key_id, raw_api_key in developer_api_keys_raw.items():
+                api_key = PersistedDeveloperApiKey.from_json(raw_api_key)
+                key_id = str(raw_key_id or "").strip().lower()
+                if api_key is None:
+                    continue
+                developer_api_keys[key_id or api_key.key_id] = api_key
         return PersistedConsoleUser(
             user_id=user_id,
             email=email,
@@ -3561,6 +3879,7 @@ class PersistedConsoleUser:
             created_at_ms=created_at_ms,
             updated_at_ms=updated_at_ms,
             last_login_at_ms=last_login_at_ms,
+            developer_api_keys=developer_api_keys,
         )
 
 
@@ -6724,6 +7043,185 @@ class AutomationManager:
         out.sort(key=lambda item: (str(item.get("email") or ""), int(item.get("userId") or 0)))
         return out
 
+    def developer_limits_for_user(self, *, user_id: int) -> dict[str, Any]:
+        return {
+            "maxApiKeys": _developer_max_api_keys(),
+            "maxAgents": _developer_max_agents(),
+            "maxManagedSessions": _developer_max_managed_sessions(),
+            "apiRequestsPerMinute": _user_api_rate_limit_per_minute() or None,
+            "monthlyTokenQuota": _developer_monthly_token_quota(),
+        }
+
+    def developer_counts_for_user(self, *, user_id: int) -> dict[str, int]:
+        agent_count = 0
+        for agent in (self._store.state.agents or {}).values():
+            if not isinstance(agent, PersistedAgentRuntime):
+                continue
+            if isinstance(agent.owner_user_id, int) and agent.owner_user_id == user_id:
+                agent_count += 1
+        return {
+            "apiKeys": self.count_active_developer_api_keys(user_id=user_id),
+            "agents": agent_count,
+            "sessions": len(self.list_session_ids_for_user(user_id=user_id)),
+        }
+
+    def count_active_developer_api_keys(self, *, user_id: int) -> int:
+        user = self.get_console_user(user_id)
+        if user is None:
+            return 0
+        return sum(
+            1
+            for api_key in (user.developer_api_keys or {}).values()
+            if isinstance(api_key, PersistedDeveloperApiKey) and api_key.is_active()
+        )
+
+    def list_developer_api_keys(self, *, user_id: int) -> list[dict[str, Any]]:
+        user = self.get_console_user(user_id)
+        if user is None:
+            return []
+        keys = [
+            api_key.to_public_json()
+            for api_key in (user.developer_api_keys or {}).values()
+            if isinstance(api_key, PersistedDeveloperApiKey)
+        ]
+        keys.sort(
+            key=lambda item: (
+                bool(item.get("revokedAtMs")),
+                -int(item.get("createdAtMs") or 0),
+                str(item.get("name") or ""),
+            )
+        )
+        return keys
+
+    async def issue_developer_api_key(self, *, user_id: int, name: str) -> tuple[PersistedDeveloperApiKey, str]:
+        if not isinstance(user_id, int) or user_id <= 0:
+            raise ValueError("Invalid userId")
+        user = self.get_console_user(user_id)
+        if user is None:
+            raise ValueError("Unknown user")
+        normalized_name = _normalize_developer_api_key_name(name)
+        max_api_keys = _developer_max_api_keys()
+        if isinstance(max_api_keys, int) and max_api_keys > 0 and self.count_active_developer_api_keys(user_id=user_id) >= max_api_keys:
+            raise ValueError(f"Developer API key quota exceeded ({max_api_keys})")
+
+        created: Optional[PersistedDeveloperApiKey] = None
+        issued_token: Optional[str] = None
+        now_ms = _now_ms()
+
+        def _write(st: PersistedGatewayAutomationState) -> None:
+            nonlocal created, issued_token
+            st.version = max(int(getattr(st, "version", 1) or 1), AUTOMATION_STATE_VERSION)
+            current = st.console_users.get(str(user_id))
+            if not isinstance(current, PersistedConsoleUser):
+                raise ValueError("Unknown user")
+            active_count = sum(
+                1
+                for api_key in (current.developer_api_keys or {}).values()
+                if isinstance(api_key, PersistedDeveloperApiKey) and api_key.is_active()
+            )
+            if isinstance(max_api_keys, int) and max_api_keys > 0 and active_count >= max_api_keys:
+                raise ValueError(f"Developer API key quota exceeded ({max_api_keys})")
+            key_id, token, expires_at_ms = _issue_developer_api_key_token()
+            developer_api_key = PersistedDeveloperApiKey(
+                key_id=key_id,
+                name=normalized_name,
+                token_hash=_hash_developer_api_key_token(token),
+                token_preview=_mask_secret(token),
+                created_at_ms=now_ms,
+                updated_at_ms=now_ms,
+                last_used_at_ms=None,
+                expires_at_ms=expires_at_ms,
+                revoked_at_ms=None,
+            )
+            next_keys = dict(current.developer_api_keys or {})
+            next_keys[key_id] = developer_api_key
+            st.console_users[str(user_id)] = replace(current, updated_at_ms=now_ms, developer_api_keys=next_keys)
+            created = developer_api_key
+            issued_token = token
+
+        await self._store.update(_write)
+        if created is None or issued_token is None:
+            raise RuntimeError("Failed to create developer API key")
+        return created, issued_token
+
+    def resolve_developer_api_key(self, token: Any) -> Optional[tuple[PersistedConsoleUser, PersistedDeveloperApiKey]]:
+        key_id = _parse_developer_api_key_token(token)
+        if not key_id:
+            return None
+        token_hash = _hash_developer_api_key_token(token)
+        for user in (self._store.state.console_users or {}).values():
+            if not isinstance(user, PersistedConsoleUser):
+                continue
+            api_key = (user.developer_api_keys or {}).get(key_id)
+            if not isinstance(api_key, PersistedDeveloperApiKey):
+                continue
+            if not api_key.is_active():
+                continue
+            if not hmac.compare_digest(str(api_key.token_hash or ""), token_hash):
+                continue
+            return user, api_key
+        return None
+
+    async def note_developer_api_key_used(self, *, user_id: int, key_id: str) -> None:
+        if not isinstance(user_id, int) or user_id <= 0:
+            return
+        key_norm = str(key_id or "").strip().lower()
+        if not DEVELOPER_API_KEY_ID_RE.match(key_norm):
+            return
+        now_ms = _now_ms()
+
+        def _write(st: PersistedGatewayAutomationState) -> None:
+            current = st.console_users.get(str(user_id))
+            if not isinstance(current, PersistedConsoleUser):
+                return
+            current_api_key = (current.developer_api_keys or {}).get(key_norm)
+            if not isinstance(current_api_key, PersistedDeveloperApiKey):
+                return
+            last_used = current_api_key.last_used_at_ms or 0
+            if last_used > 0 and now_ms - last_used < 30_000:
+                return
+            next_keys = dict(current.developer_api_keys or {})
+            next_keys[key_norm] = replace(current_api_key, last_used_at_ms=now_ms, updated_at_ms=now_ms)
+            st.console_users[str(user_id)] = replace(current, updated_at_ms=now_ms, developer_api_keys=next_keys)
+
+        await self._store.update(_write)
+
+    async def revoke_developer_api_key(self, *, user_id: int, key_id: str) -> bool:
+        if not isinstance(user_id, int) or user_id <= 0:
+            raise ValueError("Invalid userId")
+        key_norm = str(key_id or "").strip().lower()
+        if not DEVELOPER_API_KEY_ID_RE.match(key_norm):
+            raise ValueError("Invalid keyId")
+        revoked = False
+        now_ms = _now_ms()
+
+        def _write(st: PersistedGatewayAutomationState) -> None:
+            nonlocal revoked
+            current = st.console_users.get(str(user_id))
+            if not isinstance(current, PersistedConsoleUser):
+                raise ValueError("Unknown user")
+            current_api_key = (current.developer_api_keys or {}).get(key_norm)
+            if not isinstance(current_api_key, PersistedDeveloperApiKey):
+                raise ValueError("Unknown keyId")
+            if current_api_key.revoked_at_ms is not None:
+                return
+            next_keys = dict(current.developer_api_keys or {})
+            next_keys[key_norm] = replace(current_api_key, revoked_at_ms=now_ms, updated_at_ms=now_ms)
+            st.console_users[str(user_id)] = replace(current, updated_at_ms=now_ms, developer_api_keys=next_keys)
+            revoked = True
+
+        await self._store.update(_write)
+        return revoked
+
+    def _assert_user_can_create_agent(self, *, user_id: int) -> None:
+        max_agents = _developer_max_agents()
+        counts = self.developer_counts_for_user(user_id=user_id)
+        if isinstance(max_agents, int) and max_agents > 0 and counts["agents"] >= max_agents:
+            raise ValueError(f"Agent quota exceeded ({max_agents})")
+        max_sessions = _developer_max_managed_sessions()
+        if isinstance(max_sessions, int) and max_sessions > 0 and counts["sessions"] >= max_sessions:
+            raise ValueError(f"Managed session quota exceeded ({max_sessions})")
+
     async def register_console_user(self, *, email: str, password: str) -> PersistedConsoleUser:
         normalized_email = _normalize_console_email(email)
         if not normalized_email:
@@ -6995,7 +7493,7 @@ class AutomationManager:
                 "websiteUrl": None,
             }
         if normalized_channel_id == CHANNEL_ID_ZERO_ZERO_PRO:
-            api_key = _normalize_channel_api_key((user_state.builtin_api_keys or {}).get(CHANNEL_ID_ZERO_ZERO_PRO))
+            api_key, api_key_error = _secret_storage_resolve((user_state.builtin_api_keys or {}).get(CHANNEL_ID_ZERO_ZERO_PRO))
             enabled = self._is_builtin_channel_enabled_for_user_state(
                 user_state=user_state,
                 channel_id=CHANNEL_ID_ZERO_ZERO_PRO,
@@ -7005,6 +7503,8 @@ class AutomationManager:
             reason: Optional[str] = None
             if not enabled:
                 reason = "Disabled by admin"
+            elif api_key_error:
+                reason = api_key_error
             elif not api_key:
                 reason = "Missing apiKey"
             return {
@@ -7033,7 +7533,7 @@ class AutomationManager:
         channel = (user_state.custom_channels or {}).get(normalized_channel_id)
         if not isinstance(channel, PersistedUserChannel):
             raise ValueError(f"Unknown channel: {channel_id}")
-        api_key = _normalize_channel_api_key(channel.api_key)
+        api_key, api_key_error = _secret_storage_resolve(channel.api_key)
         ready = bool(channel.base_url and api_key)
         missing: list[str] = []
         if not channel.base_url:
@@ -7056,7 +7556,7 @@ class AutomationManager:
             "disabledByAdmin": False,
             "canAdminToggleAccess": False,
             "ready": ready,
-            "reason": None if ready else f"Missing {'/'.join(missing)}",
+            "reason": None if ready else (api_key_error or f"Missing {'/'.join(missing)}"),
             "canRename": True,
             "canDelete": True,
             "canSetKey": True,
@@ -7169,16 +7669,20 @@ class AutomationManager:
             base_url = _base_url_from_responses_url(_gateway_openai_responses_upstream_url())
             responses_url = _gateway_openai_responses_upstream_url()
         elif resolved_channel_id == CHANNEL_ID_ZERO_ZERO_PRO:
-            api_key = _normalize_channel_api_key((user_state.builtin_api_keys or {}).get(CHANNEL_ID_ZERO_ZERO_PRO))
+            api_key, api_key_error = _secret_storage_resolve((user_state.builtin_api_keys or {}).get(CHANNEL_ID_ZERO_ZERO_PRO))
             base_url = CHANNEL_ZERO_ZERO_PRO_BASE_URL
             responses_url = _responses_url_from_base_url(base_url)
+            if api_key_error:
+                raise RuntimeError(api_key_error)
         else:
             channel = (user_state.custom_channels or {}).get(resolved_channel_id)
             if not isinstance(channel, PersistedUserChannel):
                 raise RuntimeError(f"Unknown channel: {resolved_channel_id}")
-            api_key = _normalize_channel_api_key(channel.api_key)
+            api_key, api_key_error = _secret_storage_resolve(channel.api_key)
             base_url = channel.base_url
             responses_url = _responses_url_from_base_url(base_url)
+            if api_key_error:
+                raise RuntimeError(api_key_error)
 
         if not api_key:
             raise RuntimeError(f"Channel '{channel_entry.get('name') or resolved_channel_id}' is missing apiKey")
@@ -7777,6 +8281,7 @@ class AutomationManager:
             existing = st.agents.get(aid)
             if isinstance(existing, PersistedAgentRuntime):
                 return
+            self._assert_user_can_create_agent(user_id=user_id)
             created = True
             session_id = uuid.uuid4().hex[:12]
             placement = _default_session_placement(session_id)
@@ -7815,6 +8320,7 @@ class AutomationManager:
             raise RuntimeError("ARGUS_HOME_HOST_PATH is required to create user agents")
         if not isinstance(user_id, int) or user_id <= 0:
             raise ValueError("Invalid userId")
+        self._assert_user_can_create_agent(user_id=user_id)
         name = _normalize_agent_short_name(short_name)
         if not name:
             raise ValueError("Invalid agent name")
@@ -13426,11 +13932,66 @@ def _admin_token() -> Optional[str]:
     return os.getenv("ARGUS_TOKEN") or None
 
 
+def _request_client_ip(request: Request) -> str:
+    try:
+        return request.client.host if request.client and request.client.host else "unknown"
+    except Exception:
+        return "unknown"
+
+
+def _websocket_client_ip(ws: WebSocket) -> str:
+    try:
+        return ws.client.host if ws.client and ws.client.host else "unknown"
+    except Exception:
+        return "unknown"
+
+
+def _enforce_fixed_window_limit(*, key: str, limit: int, window_ms: int, detail: str) -> None:
+    allowed, retry_after_ms, _count = _RATE_LIMITER.allow(key=key, limit=limit, window_ms=window_ms)
+    if allowed:
+        return
+    retry_after_s = max(1, int((retry_after_ms + 999) / 1000))
+    raise HTTPException(
+        status_code=429,
+        detail=detail,
+        headers={"Retry-After": str(retry_after_s)},
+    )
+
+
+def _enforce_auth_rate_limit(*, request: Request, action: str) -> None:
+    limit = _auth_rate_limit_per_minute()
+    if limit <= 0:
+        return
+    ip = _request_client_ip(request)
+    _enforce_fixed_window_limit(
+        key=f"auth:{action}:{ip}",
+        limit=limit,
+        window_ms=AUTH_RATE_LIMIT_WINDOW_MS,
+        detail="Authentication rate limit exceeded",
+    )
+
+
+def _enforce_principal_rate_limit(*, principal: "RequestAuthPrincipal", scope: str) -> None:
+    if principal.kind == "admin_token":
+        return
+    user_id = principal.user_id
+    limit = _user_api_rate_limit_per_minute()
+    if not isinstance(user_id, int) or user_id <= 0 or limit <= 0:
+        return
+    _enforce_fixed_window_limit(
+        key=f"user:{scope}:{user_id}",
+        limit=limit,
+        window_ms=USER_RATE_LIMIT_WINDOW_MS,
+        detail="Developer API rate limit exceeded",
+    )
+
+
 @dataclass(frozen=True)
 class RequestAuthPrincipal:
     kind: str
     user: Optional[PersistedConsoleUser] = None
     session: Optional[PersistedConsoleSession] = None
+    api_key: Optional[PersistedDeveloperApiKey] = None
 
     @property
     def is_admin(self) -> bool:
@@ -13456,20 +14017,40 @@ def _resolve_auth_principal_from_token(token: Any) -> Optional[RequestAuthPrinci
     if automation is None:
         return None
     resolved = automation.resolve_console_session(provided)
-    if resolved is None:
+    if resolved is not None:
+        user, session = resolved
+        return RequestAuthPrincipal(kind="console_session", user=user, session=session)
+    resolved_api_key = automation.resolve_developer_api_key(provided)
+    if resolved_api_key is None:
         return None
-    user, session = resolved
-    return RequestAuthPrincipal(kind="console_session", user=user, session=session)
+    user, api_key = resolved_api_key
+    return RequestAuthPrincipal(kind="developer_api_key", user=user, api_key=api_key)
 
 
 def _http_optional_auth(request: Request) -> Optional[RequestAuthPrincipal]:
-    return _resolve_auth_principal_from_token(_extract_token_http(request))
+    principal = _resolve_auth_principal_from_token(_extract_token_http(request))
+    if principal is not None and principal.api_key is not None and principal.user_id is not None:
+        automation: Optional[AutomationManager] = getattr(app.state, "automation", None)
+        if automation is not None:
+            try:
+                loop = asyncio.get_running_loop()
+            except RuntimeError:
+                loop = None
+            if loop is not None:
+                loop.create_task(
+                    automation.note_developer_api_key_used(
+                        user_id=principal.user_id,
+                        key_id=principal.api_key.key_id,
+                    )
+                )
+    return principal
 
 
 def _http_require_auth(request: Request) -> RequestAuthPrincipal:
     principal = _http_optional_auth(request)
     if principal is None:
         raise HTTPException(status_code=401, detail="Unauthorized")
+    _enforce_principal_rate_limit(principal=principal, scope="http")
     return principal
 
 
@@ -13527,6 +14108,7 @@ app.add_middleware(
 
 @app.on_event("startup")
 async def _startup():
+    _state_require_encryption_backend()
     mode_resolution = _resolve_provision_mode()
     app.state.runtime_provisioners = _runtime_provisioners()
     app.state.sessions_lock = asyncio.Lock()
@@ -13622,7 +14204,8 @@ async def auth_status():
         "ok": True,
         "hasUsers": user_count > 0,
         "userCount": user_count,
-        "allowRegistration": True,
+        "allowRegistration": _allow_registration(),
+        "requireInvite": _registration_requires_invite(),
     }
 
 
@@ -13636,7 +14219,10 @@ async def auth_me(request: Request):
 
 @app.post("/auth/register")
 async def auth_register(request: Request):
+    _enforce_auth_rate_limit(request=request, action="register")
     automation = _get_automation_or_500()
+    if not _allow_registration():
+        raise HTTPException(status_code=403, detail="Registration is disabled")
     try:
         body = await request.json()
     except Exception as e:
@@ -13646,16 +14232,30 @@ async def auth_register(request: Request):
 
     email = str(body.get("email") or "")
     password = body.get("password")
+    invite_code = str(body.get("inviteCode") or "").strip() or None
+    expected_invite = _registration_invite_code()
+    if expected_invite is not None and not hmac.compare_digest(invite_code or "", expected_invite):
+        raise HTTPException(status_code=403, detail="Invalid invite code")
     try:
         user = await automation.register_console_user(email=email, password=password)
         _session, token = await automation.issue_console_session(user_id=user.user_id)
+        developer_api_key, developer_token = await automation.issue_developer_api_key(user_id=user.user_id, name="default")
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e)) from e
-    return {"ok": True, "user": user.to_public_json(), "sessionToken": token}
+    return {
+        "ok": True,
+        "user": user.to_public_json(),
+        "sessionToken": token,
+        "issuedDeveloperApiKey": {
+            **developer_api_key.to_public_json(),
+            "token": developer_token,
+        },
+    }
 
 
 @app.post("/auth/login")
 async def auth_login(request: Request):
+    _enforce_auth_rate_limit(request=request, action="login")
     automation = _get_automation_or_500()
     try:
         body = await request.json()
@@ -13685,6 +14285,258 @@ async def auth_logout(request: Request):
     token = _extract_token_http(request)
     await _get_automation_or_500().revoke_console_session(token=token)
     return {"ok": True}
+
+
+@app.get("/me/developer-keys")
+async def me_developer_keys(request: Request):
+    principal = _http_require_auth(request)
+    if principal.user_id is None:
+        raise HTTPException(status_code=403, detail="Console session or developer API key required")
+    automation = _get_automation_or_500()
+    return {
+        "ok": True,
+        "userId": principal.user_id,
+        "keys": automation.list_developer_api_keys(user_id=principal.user_id),
+        **_developer_limits_and_counts_payload(automation, user_id=principal.user_id),
+    }
+
+
+@app.post("/me/developer-keys")
+async def me_developer_key_create(request: Request):
+    principal = _http_require_auth(request)
+    if principal.user_id is None:
+        raise HTTPException(status_code=403, detail="Console session or developer API key required")
+    automation = _get_automation_or_500()
+    try:
+        body = await request.json()
+    except Exception as e:
+        raise HTTPException(status_code=400, detail="Invalid JSON body") from e
+    if not isinstance(body, dict):
+        raise HTTPException(status_code=400, detail="Invalid JSON body")
+    try:
+        api_key, raw_token = await automation.issue_developer_api_key(
+            user_id=principal.user_id,
+            name=str(body.get("name") or "default"),
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    return {
+        "ok": True,
+        "userId": principal.user_id,
+        "keys": automation.list_developer_api_keys(user_id=principal.user_id),
+        "issuedKey": {
+            **api_key.to_public_json(),
+            "token": raw_token,
+        },
+        **_developer_limits_and_counts_payload(automation, user_id=principal.user_id),
+    }
+
+
+@app.delete("/me/developer-keys/{key_id}")
+async def me_developer_key_delete(key_id: str, request: Request):
+    principal = _http_require_auth(request)
+    if principal.user_id is None:
+        raise HTTPException(status_code=403, detail="Console session or developer API key required")
+    automation = _get_automation_or_500()
+    try:
+        await automation.revoke_developer_api_key(user_id=principal.user_id, key_id=key_id)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    return {
+        "ok": True,
+        "userId": principal.user_id,
+        "keys": automation.list_developer_api_keys(user_id=principal.user_id),
+        **_developer_limits_and_counts_payload(automation, user_id=principal.user_id),
+    }
+
+
+@app.get("/me/agents")
+async def me_agents(request: Request):
+    principal = _http_require_auth(request)
+    if principal.user_id is None:
+        raise HTTPException(status_code=403, detail="Console session or developer API key required")
+    automation = _get_automation_or_500()
+    try:
+        context = await _self_bootstrap_user_agent_context(automation, user_id=principal.user_id)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    except RuntimeError as e:
+        raise HTTPException(status_code=500, detail=str(e)) from e
+    return {
+        "ok": True,
+        "userId": principal.user_id,
+        "agents": automation.list_agents_for_user(user_id=principal.user_id),
+        **context,
+        **_developer_limits_and_counts_payload(automation, user_id=principal.user_id),
+    }
+
+
+@app.post("/me/agents")
+async def me_agent_create(request: Request):
+    principal = _http_require_auth(request)
+    if principal.user_id is None:
+        raise HTTPException(status_code=403, detail="Console session or developer API key required")
+    automation = _get_automation_or_500()
+    try:
+        body = await request.json()
+    except Exception as e:
+        raise HTTPException(status_code=400, detail="Invalid JSON body") from e
+    if not isinstance(body, dict):
+        raise HTTPException(status_code=400, detail="Invalid JSON body")
+    try:
+        agent = await automation.create_user_agent(user_id=principal.user_id, short_name=str(body.get("name") or body.get("agentId") or ""))
+    except PermissionError as e:
+        raise HTTPException(status_code=403, detail=str(e)) from e
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    model_info = await _automation_model_payload(automation, agent=agent, user_id=principal.user_id)
+    return {
+        "ok": True,
+        "userId": principal.user_id,
+        "agent": agent.to_json(),
+        "agents": automation.list_agents_for_user(user_id=principal.user_id),
+        "availableModels": model_info.get("availableModels"),
+        "models": model_info.get("models"),
+        "modelSource": model_info.get("source"),
+        "modelError": model_info.get("error"),
+        **_developer_limits_and_counts_payload(automation, user_id=principal.user_id),
+    }
+
+
+@app.post("/me/agents/{agent_id}/use")
+async def me_agent_use(agent_id: str, request: Request):
+    principal = _http_require_auth(request)
+    if principal.user_id is None:
+        raise HTTPException(status_code=403, detail="Console session or developer API key required")
+    automation = _get_automation_or_500()
+    normalized_agent_id = _self_normalize_agent_id_for_user(principal.user_id, agent_id)
+    try:
+        agent = await automation.bind_private_user_to_agent(
+            user_id=principal.user_id,
+            chat_key=_admin_private_chat_key_for_user(principal.user_id),
+            agent_id=normalized_agent_id,
+        )
+    except PermissionError as e:
+        raise HTTPException(status_code=403, detail=str(e)) from e
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    context = await _self_bootstrap_user_agent_context(automation, user_id=principal.user_id)
+    return {
+        "ok": True,
+        "userId": principal.user_id,
+        "agent": agent.to_json(),
+        "agents": automation.list_agents_for_user(user_id=principal.user_id),
+        **context,
+        **_developer_limits_and_counts_payload(automation, user_id=principal.user_id),
+    }
+
+
+@app.put("/me/agents/{agent_id}/model")
+async def me_agent_model_set(agent_id: str, request: Request):
+    principal = _http_require_auth(request)
+    if principal.user_id is None:
+        raise HTTPException(status_code=403, detail="Console session or developer API key required")
+    automation = _get_automation_or_500()
+    try:
+        body = await request.json()
+    except Exception as e:
+        raise HTTPException(status_code=400, detail="Invalid JSON body") from e
+    if not isinstance(body, dict):
+        raise HTTPException(status_code=400, detail="Invalid JSON body")
+    normalized_agent_id = _self_normalize_agent_id_for_user(principal.user_id, agent_id)
+    try:
+        agent, synced = await automation.set_user_agent_model(
+            user_id=principal.user_id,
+            agent_id=normalized_agent_id,
+            model=str(body.get("model") or ""),
+        )
+    except PermissionError as e:
+        raise HTTPException(status_code=403, detail=str(e)) from e
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    model_info = await _automation_model_payload(automation, agent=agent, user_id=principal.user_id)
+    return {
+        "ok": True,
+        "userId": principal.user_id,
+        "agent": agent.to_json(),
+        "liveModelSynced": synced,
+        "agents": automation.list_agents_for_user(user_id=principal.user_id),
+        "availableModels": model_info.get("availableModels"),
+        "models": model_info.get("models"),
+        "modelSource": model_info.get("source"),
+        "modelError": model_info.get("error"),
+        **_developer_limits_and_counts_payload(automation, user_id=principal.user_id),
+    }
+
+
+@app.patch("/me/agents/{agent_id}")
+async def me_agent_rename(agent_id: str, request: Request):
+    principal = _http_require_auth(request)
+    if principal.user_id is None:
+        raise HTTPException(status_code=403, detail="Console session or developer API key required")
+    automation = _get_automation_or_500()
+    try:
+        body = await request.json()
+    except Exception as e:
+        raise HTTPException(status_code=400, detail="Invalid JSON body") from e
+    if not isinstance(body, dict):
+        raise HTTPException(status_code=400, detail="Invalid JSON body")
+    normalized_agent_id = _self_normalize_agent_id_for_user(principal.user_id, agent_id)
+    try:
+        agent = await automation.rename_user_agent(
+            user_id=principal.user_id,
+            agent_id=normalized_agent_id,
+            new_short_name=str(body.get("name") or body.get("newName") or ""),
+        )
+    except PermissionError as e:
+        raise HTTPException(status_code=403, detail=str(e)) from e
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    return {
+        "ok": True,
+        "userId": principal.user_id,
+        "agent": agent.to_json(),
+        "agents": automation.list_agents_for_user(user_id=principal.user_id),
+        **_developer_limits_and_counts_payload(automation, user_id=principal.user_id),
+    }
+
+
+@app.delete("/me/agents/{agent_id}")
+async def me_agent_delete(agent_id: str, request: Request):
+    principal = _http_require_auth(request)
+    if principal.user_id is None:
+        raise HTTPException(status_code=403, detail="Console session or developer API key required")
+    automation = _get_automation_or_500()
+    normalized_agent_id = _self_normalize_agent_id_for_user(principal.user_id, agent_id)
+    try:
+        result = await automation.delete_user_agent(
+            user_id=principal.user_id,
+            chat_key=_admin_private_chat_key_for_user(principal.user_id),
+            agent_id=normalized_agent_id,
+        )
+    except PermissionError as e:
+        raise HTTPException(status_code=403, detail=str(e)) from e
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    return {
+        "ok": True,
+        "userId": principal.user_id,
+        **(result or {}),
+        "agents": automation.list_agents_for_user(user_id=principal.user_id),
+        **_developer_limits_and_counts_payload(automation, user_id=principal.user_id),
+    }
+
+
+@app.get("/me/agents/{agent_id}/connection")
+async def me_agent_connection(agent_id: str, request: Request):
+    principal = _http_require_auth(request)
+    if principal.user_id is None:
+        raise HTTPException(status_code=403, detail="Console session or developer API key required")
+    automation = _get_automation_or_500()
+    try:
+        return await _self_agent_connection_payload(automation, request=request, user_id=principal.user_id, agent_id=agent_id)
+    except RuntimeError as e:
+        raise HTTPException(status_code=500, detail=str(e)) from e
 
 
 @app.get("/me/channels")
@@ -13904,6 +14756,31 @@ def _build_openai_proxy_usage_context(
     }
 
 
+def _enforce_openai_proxy_limits(*, target: dict[str, Any]) -> None:
+    owner_user_id = _usage_int(target.get("ownerUserId")) or None
+    if not isinstance(owner_user_id, int) or owner_user_id <= 0:
+        return
+    rate_limit = _user_api_rate_limit_per_minute()
+    if rate_limit > 0:
+        _enforce_fixed_window_limit(
+            key=f"user:responses:{owner_user_id}",
+            limit=rate_limit,
+            window_ms=USER_RATE_LIMIT_WINDOW_MS,
+            detail="Developer API rate limit exceeded",
+        )
+    monthly_quota = _developer_monthly_token_quota()
+    if not isinstance(monthly_quota, int) or monthly_quota <= 0:
+        return
+    usage_store = _get_usage_store_or_500()
+    summary = usage_store.summarize(owner_user_id=owner_user_id, since_ms=_month_start_ms())
+    total_tokens = int(summary.get("totalTokens") or 0)
+    if total_tokens >= monthly_quota:
+        raise HTTPException(
+            status_code=429,
+            detail=f"Monthly token quota exceeded ({monthly_quota})",
+        )
+
+
 def _record_openai_proxy_usage(event: dict[str, Any], payload: Any = None) -> None:
     usage_store: Optional[UsageLedgerStore] = getattr(app.state, "usage_store", None)
     if usage_store is None:
@@ -13937,6 +14814,7 @@ def openai_responses_proxy(request: Request, body: Any = Body(...)):
         raise HTTPException(status_code=400, detail=str(e)) from e
     except RuntimeError as e:
         raise HTTPException(status_code=503, detail=str(e)) from e
+    _enforce_openai_proxy_limits(target=target)
 
     upstream_url = str(target.get("upstreamUrl") or "").strip()
     openai_api_key = _normalize_channel_api_key(target.get("apiKey"))
@@ -18066,8 +18944,116 @@ def _get_usage_store_or_500() -> UsageLedgerStore:
     return usage_store
 
 
+def _developer_limits_and_counts_payload(automation: AutomationManager, *, user_id: int) -> dict[str, Any]:
+    return {
+        "limits": automation.developer_limits_for_user(user_id=user_id),
+        "counts": automation.developer_counts_for_user(user_id=user_id),
+    }
+
+
 def _admin_private_chat_key_for_user(user_id: int) -> str:
     return str(int(user_id))
+
+
+def _self_normalize_agent_id_for_user(user_id: int, raw_agent_id: Any) -> str:
+    aid_raw = _normalize_agent_id(raw_agent_id)
+    if not aid_raw:
+        raise HTTPException(status_code=400, detail="Invalid 'agentId'")
+    if re.match(r"^u\d+-", aid_raw):
+        return aid_raw
+    return _user_agent_id(user_id=user_id, short_name=aid_raw)
+
+
+async def _self_bootstrap_user_agent_context(automation: AutomationManager, *, user_id: int) -> dict[str, Any]:
+    agent, created_main = await automation.ensure_user_main_agent(user_id=user_id)
+    chat_key = _admin_private_chat_key_for_user(user_id)
+    st = automation._store.state
+    bound = st.chat_bindings.get(chat_key) if isinstance(getattr(st, "chat_bindings", None), dict) else None
+    current_agent_id = bound if isinstance(bound, str) and bound.strip() else None
+    if current_agent_id and not automation.can_user_access_agent_id(user_id=user_id, agent_id=current_agent_id):
+        current_agent_id = None
+    if not current_agent_id:
+        await automation.bind_private_user_to_agent(user_id=user_id, chat_key=chat_key, agent_id=agent.agent_id)
+        current_agent_id = agent.agent_id
+    current_session_id = automation.resolve_agent_session_id(current_agent_id) if current_agent_id else None
+    current_agent = automation._get_agent(current_agent_id) if current_agent_id else agent
+    model_info = await _automation_model_payload(automation, agent=current_agent, user_id=user_id)
+    current_channel = automation.get_current_channel_for_user(user_id=user_id)
+    return {
+        "createdMain": created_main,
+        "currentAgentId": current_agent_id,
+        "currentSessionId": current_session_id,
+        "currentAgent": current_agent.to_json() if isinstance(current_agent, PersistedAgentRuntime) else None,
+        "currentChannelId": current_channel.get("channelId") if isinstance(current_channel, dict) else None,
+        "currentChannel": current_channel,
+        "availableModels": model_info.get("availableModels"),
+        "models": model_info.get("models"),
+        "modelSource": model_info.get("source"),
+        "modelError": model_info.get("error"),
+    }
+
+
+async def _self_agent_connection_payload(
+    automation: AutomationManager,
+    *,
+    request: Request,
+    user_id: int,
+    agent_id: str,
+) -> dict[str, Any]:
+    normalized_agent_id = _self_normalize_agent_id_for_user(user_id, agent_id)
+    if not automation.can_user_access_agent_id(user_id=user_id, agent_id=normalized_agent_id):
+        raise HTTPException(status_code=404, detail="Agent not found")
+    agent = automation._get_agent(normalized_agent_id)
+    if agent is None:
+        raise HTTPException(status_code=404, detail="Agent not found")
+    session_id = automation.resolve_agent_session_id(normalized_agent_id)
+    if not session_id:
+        raise HTTPException(status_code=500, detail="Agent has no sessionId")
+    live, created = await _ensure_live_session(session_id, allow_create=True)
+    try:
+        gateway_base = _public_gateway_base_url().rstrip("/")
+    except Exception:
+        gateway_base = str(request.base_url).rstrip("/")
+    encoded_session_id = urllib.parse.quote(session_id, safe="")
+    mcp_master = os.getenv("ARGUS_MCP_TOKEN") or os.getenv("ARGUS_TOKEN") or None
+    openai_master = os.getenv("ARGUS_OPENAI_TOKEN") or os.getenv("ARGUS_TOKEN") or None
+    node_master = os.getenv("ARGUS_NODE_TOKEN") or os.getenv("ARGUS_TOKEN") or None
+    current_channel = automation.get_current_channel_for_user(user_id=user_id)
+    return {
+        "ok": True,
+        "userId": user_id,
+        "agentId": normalized_agent_id,
+        "agent": agent.to_json(),
+        "sessionId": session_id,
+        "provider": live.provider,
+        "createdSession": created,
+        "model": automation.get_effective_model_for_session(session_id),
+        "currentChannelId": current_channel.get("channelId") if isinstance(current_channel, dict) else None,
+        "currentChannel": current_channel,
+        "placement": _effective_session_placement(session_id).to_json(),
+        "gatewayBaseUrl": gateway_base,
+        "ws": {
+            "path": "/ws",
+            "url": f"{gateway_base}/ws?session={encoded_session_id}",
+            "sessionId": session_id,
+            "requiresBearerToken": True,
+        },
+        "mcp": {
+            "path": "/mcp",
+            "url": f"{gateway_base}/mcp",
+            "token": _mcp_derive_session_token(mcp_master, session_id) if mcp_master else None,
+        },
+        "node": {
+            "path": "/nodes/ws",
+            "url": f"{gateway_base}/nodes/ws",
+            "token": _node_derive_session_token(node_master, session_id) if node_master else None,
+        },
+        "openai": {
+            "path": "/openai/v1/responses",
+            "url": f"{gateway_base}/openai/v1/responses",
+            "token": _openai_proxy_derive_session_token(openai_master, session_id) if openai_master else None,
+        },
+    }
 
 
 def _admin_collect_user_ids(automation: AutomationManager) -> list[int]:
@@ -20471,6 +21457,18 @@ async def ws_proxy(ws: WebSocket):
             await ws.accept()
             await ws.close(code=1008, reason="Unauthorized")
             return
+        if principal.kind != "admin_token" and principal.user_id is not None:
+            limit = _user_api_rate_limit_per_minute()
+            if limit > 0:
+                allowed, _retry_after_ms, _count = _RATE_LIMITER.allow(
+                    key=f"user:ws:{principal.user_id}",
+                    limit=limit,
+                    window_ms=USER_RATE_LIMIT_WINDOW_MS,
+                )
+                if not allowed:
+                    await ws.accept()
+                    await ws.close(code=1008, reason="Developer API rate limit exceeded")
+                    return
 
         await ws.accept()
         session_id = provisional_session_id
@@ -20501,10 +21499,29 @@ async def ws_proxy(ws: WebSocket):
                     if derived and Path(derived).is_dir():
                         allow_create = True
             automation = getattr(app.state, "automation", None)
+            if (
+                automation is not None
+                and principal.api_key is not None
+                and isinstance(principal.user_id, int)
+                and principal.user_id > 0
+            ):
+                asyncio.create_task(
+                    automation.note_developer_api_key_used(
+                        user_id=principal.user_id,
+                        key_id=principal.api_key.key_id,
+                    )
+                )
             if principal.kind != "admin_token":
                 if automation is None or principal.user_id is None:
                     await ws.close(code=1008, reason="Unauthorized")
                     return
+                if not requested_session:
+                    max_sessions = _developer_max_managed_sessions()
+                    if isinstance(max_sessions, int) and max_sessions > 0:
+                        existing_session_ids = automation.list_session_ids_for_user(user_id=principal.user_id)
+                        if len(existing_session_ids) >= max_sessions:
+                            await ws.close(code=1008, reason="Managed session quota exceeded")
+                            return
                 try:
                     await automation.set_session_owner_user_id(session_id=session_id, user_id=principal.user_id)
                 except PermissionError:

@@ -4,3 +4,4 @@ docker>=7.0
 croniter>=2.0
 requests>=2.31
 psycopg[binary]>=3.2
+cryptography>=43
