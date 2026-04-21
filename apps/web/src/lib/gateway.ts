@@ -106,23 +106,7 @@ export function loadGatewayAuthToken(): string {
   } catch {
     // ignore
   }
-
-  try {
-    const saved = window.localStorage.getItem(GATEWAY_ADMIN_TOKEN_STORAGE_KEY);
-    if (saved && saved.trim()) return saved.trim();
-  } catch {
-    // ignore
-  }
-
-  try {
-    const savedWsUrl = window.localStorage.getItem(GATEWAY_WS_STORAGE_KEY);
-    const savedToken = extractTokenFromWsUrl(savedWsUrl ?? "");
-    if (savedToken) return savedToken;
-  } catch {
-    // ignore
-  }
-
-  return extractTokenFromWsUrl(defaultWsUrl()) ?? "";
+  return "";
 }
 
 export function storeGatewayAuthToken(token: string): void {
@@ -156,12 +140,7 @@ export function clearGatewayAuthToken(): void {
 function subscribeGatewayAuthToken(onStoreChange: () => void): () => void {
   if (typeof window === "undefined") return () => {};
   const onStorage = (event: StorageEvent) => {
-    if (
-      event.key &&
-      event.key !== GATEWAY_AUTH_TOKEN_STORAGE_KEY &&
-      event.key !== GATEWAY_ADMIN_TOKEN_STORAGE_KEY &&
-      event.key !== GATEWAY_WS_STORAGE_KEY
-    ) {
+    if (event.key && event.key !== GATEWAY_AUTH_TOKEN_STORAGE_KEY) {
       return;
     }
     onStoreChange();
@@ -235,7 +214,7 @@ export function httpBaseFromWsUrl(url: string): string | null {
 
 export function buildGatewayHeaders(wsUrl: string, extra?: HeadersInit): Headers {
   const headers = new Headers(extra ?? {});
-  const token = extractTokenFromWsUrl(wsUrl) ?? loadGatewayAuthToken();
+  const token = loadGatewayAuthToken() || extractTokenFromWsUrl(wsUrl);
   if (token && !headers.has("Authorization")) {
     headers.set("Authorization", `Bearer ${token}`);
   }

@@ -25,6 +25,7 @@ interface AuthContextValue {
 
 const AuthContext = React.createContext<AuthContextValue | null>(null);
 const ADMIN_ONLY_PATH_PREFIXES = ["/users", "/settings", "/nodes", "/devices"];
+const NOOP_SUBSCRIBE = () => () => {};
 
 export function useAuth(): AuthContextValue {
   const value = React.useContext(AuthContext);
@@ -40,6 +41,7 @@ export function AdminGate({ children }: AdminGateProps) {
   const pathname = usePathname() || "/";
   const router = useRouter();
 
+  const hydrated = React.useSyncExternalStore(NOOP_SUBSCRIBE, () => true, () => false);
   const [user, setUser] = React.useState<ConsoleUser | null>(null);
   const [hasUsers, setHasUsers] = React.useState(false);
   const [loading, setLoading] = React.useState(true);
@@ -84,10 +86,7 @@ export function AdminGate({ children }: AdminGateProps) {
           setHasUsers(Boolean(fallbackStatus.hasUsers));
           setMode(fallbackStatus.hasUsers ? "login" : "register");
         }
-        const message = (nextError as Error)?.message || String(nextError);
-        if (effectiveToken) {
-          setError(message);
-        }
+        setError(null);
       } finally {
         setLoading(false);
       }
@@ -96,12 +95,13 @@ export function AdminGate({ children }: AdminGateProps) {
   );
 
   React.useEffect(() => {
+    if (!hydrated) return;
     const run = async () => {
       await Promise.resolve();
       await refreshSession();
     };
     void run();
-  }, [refreshSession]);
+  }, [hydrated, refreshSession]);
 
   React.useEffect(() => {
     if (loading) return;
@@ -157,13 +157,13 @@ export function AdminGate({ children }: AdminGateProps) {
       user,
       token: storedToken,
       hasUsers,
-      loading,
+      loading: loading || !hydrated,
       logout,
     }),
-    [hasUsers, loading, logout, storedToken, user]
+    [hasUsers, hydrated, loading, logout, storedToken, user]
   );
 
-  if (loading) {
+  if (!hydrated || loading) {
     return (
       <div className="grid min-h-dvh place-items-center px-4 py-6">
         <main className="w-full max-w-[22rem]">

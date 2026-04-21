@@ -22,6 +22,7 @@ import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { toast } from "sonner";
 
+import { useAuth } from "@/components/admin-gate";
 import { ConsoleFrame } from "@/components/console-shell";
 import { cn } from "@/lib/utils";
 import { Button } from "@/components/ui/button";
@@ -685,6 +686,7 @@ function turnsToChatMessages(turns: unknown): ChatMessage[] {
 
 export default function Page() {
   type ActivePane = "chat" | "connection";
+  const { user, loading: authLoading } = useAuth();
 
   const [wsUrl, setWsUrl] = useGatewayWsUrlState();
   const [cwd, setCwd] = React.useState<string>("/workspace");
@@ -823,6 +825,7 @@ export default function Page() {
 
   // This bootstrap effect is intentionally one-shot per page load; the ref prevents reconnect churn.
   React.useEffect(() => {
+    if (authLoading || !user) return;
     if (autoConnectAttemptedRef.current) return;
     const base = stripSessionFromWsUrl(wsUrl);
     if (!base.trim()) return;
@@ -846,7 +849,7 @@ export default function Page() {
       }
     })();
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [wsUrl]);
+  }, [authLoading, user, wsUrl]);
 
   React.useEffect(() => {
     if (!activeSessionId || autoExpandedRef.current) return;
@@ -2166,6 +2169,7 @@ export default function Page() {
 	  }
 
   async function refreshSessions(opts?: { silent?: boolean; throwOnError?: boolean }): Promise<SessionRow[]> {
+    if (authLoading || !user) return [];
     setSessionsBusy(true);
     setSessionsError(null);
     try {
