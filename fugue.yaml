@@ -14,6 +14,7 @@ services:
       ARGUS_DATABASE_URL: postgresql://argus:argus@postgres:5432/argus
       ARGUS_FUGUE_HOME_PATH: /data/argus
       ARGUS_FUGUE_WORKSPACE_STORAGE_SIZE: 1Gi
+      ARGUS_PUBLIC_BASE_URL: https://argus.fugue.pro
       ARGUS_FUGUE_GATEWAY_COMPOSE_SERVICE: gateway
       ARGUS_FUGUE_RUNTIME_COMPOSE_SERVICE: runtime
       ARGUS_RUNTIME_CMD: codex app-server

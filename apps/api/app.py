@@ -356,11 +356,20 @@ def _configured_native_runtime_host_id() -> Optional[str]:
     return host_id or None
 
 
-def _public_gateway_base_url() -> str:
+def _public_gateway_base_url(request: Optional[Request] = None) -> str:
     raw = (os.getenv("ARGUS_PUBLIC_BASE_URL") or "").strip().rstrip("/")
-    if not raw:
-        raise RuntimeError("ARGUS_PUBLIC_BASE_URL is required for native runtime sessions")
-    return raw
+    if raw:
+        return raw
+    if request is not None:
+        forwarded_proto = str(request.headers.get("x-forwarded-proto") or request.url.scheme or "").strip()
+        forwarded_host = str(
+            request.headers.get("x-forwarded-host") or request.headers.get("host") or request.url.netloc or ""
+        ).strip()
+        proto = forwarded_proto.split(",", 1)[0].strip()
+        host = forwarded_host.split(",", 1)[0].strip().rstrip("/")
+        if proto and host:
+            return f"{proto}://{host}"
+    raise RuntimeError("ARGUS_PUBLIC_BASE_URL is required when no public request context is available")
 
 
 def _host_agent_dist_dir() -> Path:
@@ -422,8 +431,8 @@ def _powershell_quote(raw: str) -> str:
     return "'" + str(raw).replace("'", "''") + "'"
 
 
-def _render_host_agent_install_sh(enroll_token: str) -> str:
-    gateway_base = _public_gateway_base_url()
+def _render_host_agent_install_sh(enroll_token: str, request: Optional[Request] = None) -> str:
+    gateway_base = _public_gateway_base_url(request)
     return f"""#!/usr/bin/env bash
 set -euo pipefail
 
@@ -465,8 +474,8 @@ exec "$BIN_PATH" connect --gateway "$ARGUS_GATEWAY_BASE" --enroll-token "$ARGUS_
 """
 
 
-def _render_host_agent_install_ps1(enroll_token: str) -> str:
-    gateway_base = _public_gateway_base_url()
+def _render_host_agent_install_ps1(enroll_token: str, request: Optional[Request] = None) -> str:
+    gateway_base = _public_gateway_base_url(request)
     return f"""$ErrorActionPreference = "Stop"
 
 $GatewayBaseUrl = {_powershell_quote(gateway_base)}
@@ -18568,7 +18577,7 @@ async def host_agent_enroll_token(request: Request):
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e)) from e
 
-    gateway_base = _public_gateway_base_url()
+    gateway_base = _public_gateway_base_url(request)
     command = f'argus connect --gateway "{gateway_base}" --enroll-token "{enroll_token}"'
     if host_id_hint:
         command += f' --host-id "{host_id_hint}"'
@@ -18605,24 +18614,24 @@ async def host_agent_download_binary(target: str):
 
 
 @app.get("/host-agent/install.sh")
-async def host_agent_install_sh(token: Optional[str] = None):
+async def host_agent_install_sh(request: Request, token: Optional[str] = None):
     enroll_token = str(token or "").strip()
     if not enroll_token:
         raise HTTPException(status_code=400, detail="Missing 'token'")
     return PlainTextResponse(
-        _render_host_agent_install_sh(enroll_token),
+        _render_host_agent_install_sh(enroll_token, request),
         media_type="text/x-shellscript",
         headers={"Cache-Control": "no-store, max-age=0"},
     )
 
 
 @app.get("/host-agent/install.ps1")
-async def host_agent_install_ps1(token: Optional[str] = None):
+async def host_agent_install_ps1(request: Request, token: Optional[str] = None):
     enroll_token = str(token or "").strip()
     if not enroll_token:
         raise HTTPException(status_code=400, detail="Missing 'token'")
     return PlainTextResponse(
-        _render_host_agent_install_ps1(enroll_token),
+        _render_host_agent_install_ps1(enroll_token, request),
         media_type="text/plain",
         headers={"Cache-Control": "no-store, max-age=0"},
     )
@@ -18674,7 +18683,7 @@ async def host_agent_claim(request: Request):
         "displayName": enrollment.display_name,
         "token": device_token,
         "wsPath": "/host-agent/ws",
-        "gatewayBaseUrl": _public_gateway_base_url(),
+        "gatewayBaseUrl": _public_gateway_base_url(request),
         "binding": binding.to_json() if isinstance(binding, PersistedHostBinding) else None,
     }
 

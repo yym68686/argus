@@ -144,7 +144,7 @@ export default function DevicesPage() {
     >
       {error ? <InlineError message={error} /> : null}
 
-      <div className="grid gap-4 xl:grid-cols-[minmax(0,1fr)_360px]">
+      <div className="grid gap-4">
         <section className="space-y-4">
           <PanelCard
             title="One-Step Connect"
@@ -243,32 +243,6 @@ export default function DevicesPage() {
               </div>
             ) : (
               <EmptyState title="No devices connected yet" />
-            )}
-          </PanelCard>
-        </section>
-
-        <section className="space-y-4">
-          <PanelCard title="Enrollment Token">
-            {showSkeleton ? (
-              <div className="space-y-3">
-                <Skeleton className="h-4 w-32 rounded-full" />
-                <Skeleton className="h-24 rounded-[18px]" />
-              </div>
-            ) : (
-              <div className="space-y-3">
-                <Fact label="Expires at" value={formatStamp(tokenInfo?.expiresAtMs)} />
-                <Fact label="Installer" value={platform === "windows" ? "install.ps1" : "install.sh"} mono />
-                <Fact label="Upgrade path" value="argus upgrade" mono />
-                <div className="rounded-[18px] border border-border/70 bg-background/18 p-3">
-                  <div className="mb-2 text-sm font-medium text-foreground">Token</div>
-                  <Textarea
-                    readOnly
-                    value={tokenInfo?.token ?? ""}
-                    rows={6}
-                    className="font-mono text-[12px] leading-6"
-                  />
-                </div>
-              </div>
             )}
           </PanelCard>
         </section>
