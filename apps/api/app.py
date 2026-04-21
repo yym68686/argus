@@ -13270,7 +13270,7 @@ async def _list_managed_sessions_for_user(user_id: int) -> list[dict[str, Any]]:
     return out
 
 
-def _principal_can_access_session(principal: RequestAuthPrincipal, session_id: str) -> bool:
+def _principal_can_access_session(principal: "RequestAuthPrincipal", session_id: str) -> bool:
     sid = session_id.strip() if isinstance(session_id, str) else ""
     if not sid:
         return False
