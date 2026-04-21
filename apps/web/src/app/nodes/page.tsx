@@ -105,7 +105,11 @@ export default function NodesPage() {
 
   React.useEffect(() => {
     if (!wsUrl.trim()) return;
-    void refreshNodes();
+    const run = async () => {
+      await Promise.resolve();
+      await refreshNodes();
+    };
+    void run();
   }, [refreshNodes, wsUrl]);
 
   async function invokeRequest(nextCommand: string, nextParams: unknown): Promise<void> {
