@@ -64,7 +64,7 @@ function formatStamp(value?: number | null): string {
 }
 
 export default function NodesPage() {
-  const [wsUrl, setWsUrl] = useGatewayWsUrlState();
+  const [wsUrl] = useGatewayWsUrlState();
 
   const [loading, setLoading] = React.useState(false);
   const [nodes, setNodes] = React.useState<NodeInfo[]>([]);
@@ -87,14 +87,7 @@ export default function NodesPage() {
   const [pasteText, setPasteText] = React.useState<string>("");
   const [pasteBracketed, setPasteBracketed] = React.useState<boolean>(true);
 
-  React.useEffect(() => {
-    if (!wsUrl.trim()) return;
-    void refreshNodes();
-    // Intentionally keyed to the derived connection target rather than the function identity.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [wsUrl]);
-
-  async function refreshNodes(): Promise<void> {
+  const refreshNodes = React.useCallback(async (): Promise<void> => {
     if (!wsUrl.trim()) return;
     setLoading(true);
     setInventoryError(null);
@@ -102,13 +95,18 @@ export default function NodesPage() {
       const data = await gatewayFetchJson<{ nodes?: NodeInfo[] }>(wsUrl, "/api/nodes");
       const nextNodes = Array.isArray(data.nodes) ? data.nodes : [];
       setNodes(nextNodes);
-      if (!nodePick && nextNodes.length) setNodePick(nextNodes[0].nodeId);
+      setNodePick((current) => current || nextNodes[0]?.nodeId || "");
     } catch (event) {
       setInventoryError((event as Error)?.message || String(event));
     } finally {
       setLoading(false);
     }
-  }
+  }, [wsUrl]);
+
+  React.useEffect(() => {
+    if (!wsUrl.trim()) return;
+    void refreshNodes();
+  }, [refreshNodes, wsUrl]);
 
   async function invokeRequest(nextCommand: string, nextParams: unknown): Promise<void> {
     setInvokeOut("");
@@ -174,22 +172,7 @@ export default function NodesPage() {
   const selected = nodes.find((node) => node.nodeId === nodePick) ?? null;
 
   return (
-    <ConsoleShell
-      title="Nodes"
-      actions={
-        <div className="flex flex-wrap items-center gap-2">
-          <Input
-            value={wsUrl}
-            onChange={(event) => setWsUrl(event.target.value)}
-            className="w-[min(30rem,100%)]"
-            placeholder="Gateway wss://.../ws"
-          />
-          <Button type="button" variant="secondary" onClick={refreshNodes} disabled={loading || !wsUrl.trim()}>
-            {loading ? "Loading…" : "Refresh nodes"}
-          </Button>
-        </div>
-      }
-    >
+    <ConsoleShell title="Nodes">
       <div className="grid gap-4 xl:grid-cols-[320px_minmax(0,1fr)]">
         <section className="space-y-4">
           <PanelCard
@@ -227,7 +210,7 @@ export default function NodesPage() {
                 ))}
               </div>
             ) : (
-              <EmptyState title="No nodes" body="Start node-host on a machine, then refresh this page to discover it." />
+              <EmptyState title="No nodes" body="Start node-host on a machine and it will appear here once the gateway sees it." />
             )}
           </PanelCard>
 
@@ -246,7 +229,7 @@ export default function NodesPage() {
                 <Fact label="Commands" value={String((selected.commands || []).length)} />
               </div>
             ) : inventoryError ? (
-              <EmptyState title="Inventory unavailable" body="Refresh once the gateway node API is responding again." />
+              <EmptyState title="Inventory unavailable" body="Node inventory will reappear here once the gateway node API is responding again." />
             ) : (
               <EmptyState title="No selection" body="Pick a node from the inventory to inspect metadata and target commands." />
             )}

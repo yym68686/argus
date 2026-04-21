@@ -24,7 +24,7 @@ interface AuthContextValue {
 }
 
 const AuthContext = React.createContext<AuthContextValue | null>(null);
-const ADMIN_ONLY_PATH_PREFIXES = ["/users", "/settings", "/nodes"];
+const ADMIN_ONLY_PATH_PREFIXES = ["/users", "/settings", "/nodes", "/devices"];
 
 export function useAuth(): AuthContextValue {
   const value = React.useContext(AuthContext);

@@ -1,7 +1,7 @@
 "use client";
 
 import React from "react";
-import { RefreshCw, Plus, KeyRound, Trash2, UserRoundCheck, Pencil, Bot, RadioTower } from "lucide-react";
+import { Plus, KeyRound, Trash2, UserRoundCheck, Pencil, Bot, RadioTower } from "lucide-react";
 import { toast } from "sonner";
 
 import { Badge, EmptyState, Fact, InfoPill, InlineError, PanelCard, Skeleton } from "@/components/console-primitives";
@@ -21,7 +21,7 @@ import { cn } from "@/lib/utils";
 import { gatewayFetchJson, useGatewayWsUrlState } from "@/lib/gateway";
 
 export default function UsersPage() {
-  const [wsUrl, setWsUrl] = useGatewayWsUrlState();
+  const [wsUrl] = useGatewayWsUrlState();
   const [users, setUsers] = React.useState<AdminUserSummary[]>([]);
   const [usersBusy, setUsersBusy] = React.useState(false);
   const [usersError, setUsersError] = React.useState<string | null>(null);
@@ -576,24 +576,7 @@ export default function UsersPage() {
   const rosterTitle = users.length ? `Users (${users.length})` : "Users";
 
   return (
-    <ConsoleShell
-      title="Users"
-      actions={
-        <div className="flex flex-wrap items-center gap-2">
-          <Input
-            value={wsUrl}
-            onChange={(event) => setWsUrl(event.target.value)}
-            className="w-[min(30rem,100%)]"
-            placeholder="Gateway wss://.../ws"
-            spellCheck={false}
-          />
-          <Button type="button" variant="secondary" onClick={() => void refreshUsers({ notify: true })} disabled={usersBusy}>
-            <RefreshCw className={cn("h-4 w-4", usersBusy ? "animate-spin" : null)} />
-            Refresh
-          </Button>
-        </div>
-      }
-    >
+    <ConsoleShell title="Users">
       <div className="grid gap-4 xl:grid-cols-[320px_minmax(0,1fr)]">
         <section className="space-y-4">
           <PanelCard

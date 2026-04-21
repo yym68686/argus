@@ -1,7 +1,7 @@
 "use client";
 
 import * as React from "react";
-import { Check, KeyRound, Pencil, Plus, RefreshCw, Trash2 } from "lucide-react";
+import { Check, KeyRound, Pencil, Plus, Trash2 } from "lucide-react";
 import { toast } from "sonner";
 
 import { useAuth } from "@/components/admin-gate";
@@ -36,7 +36,7 @@ function channelKind(channel: AdminChannelEntry): string {
 
 export default function ApiKeysPage() {
   const { user } = useAuth();
-  const [wsUrl, setWsUrl] = useGatewayWsUrlState();
+  const [wsUrl] = useGatewayWsUrlState();
   const [channelsState, setChannelsState] = React.useState<SelfChannelsResponse | null>(null);
   const [selectedChannelId, setSelectedChannelId] = React.useState("");
   const selectedChannelIdRef = React.useRef("");
@@ -262,24 +262,7 @@ export default function ApiKeysPage() {
   if (!user) return null;
 
   return (
-    <ConsoleShell
-      title="API Keys"
-      actions={
-        <div className="flex flex-wrap items-center gap-2">
-          <Input
-            value={wsUrl}
-            onChange={(event) => setWsUrl(event.target.value)}
-            className="w-[min(30rem,100%)]"
-            placeholder="Gateway wss://.../ws"
-            spellCheck={false}
-          />
-          <Button type="button" variant="secondary" disabled={loading || saving} onClick={() => void refresh({ notify: true })}>
-            <RefreshCw className={cn("h-4 w-4", loading ? "animate-spin" : null)} />
-            Refresh
-          </Button>
-        </div>
-      }
-    >
+    <ConsoleShell title="API Keys">
       {error ? <InlineError message={error} /> : null}
 
       <div className="grid gap-4">

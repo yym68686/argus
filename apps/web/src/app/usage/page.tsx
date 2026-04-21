@@ -1,13 +1,11 @@
 "use client";
 
 import React from "react";
-import { RefreshCw } from "lucide-react";
 import { toast } from "sonner";
 
 import { useAuth } from "@/components/admin-gate";
 import { Badge, EmptyState, Fact, InlineError, PanelCard, Skeleton, StatCard } from "@/components/console-primitives";
 import { ConsoleShell } from "@/components/console-shell";
-import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import {
   type AdminOverviewResponse,
@@ -34,7 +32,7 @@ export default function UsagePage() {
 }
 
 function SelfUsagePage({ user }: { user: ConsoleUser }) {
-  const [wsUrl, setWsUrl] = useGatewayWsUrlState();
+  const [wsUrl] = useGatewayWsUrlState();
   const [usage, setUsage] = React.useState<SelfUsageResponse | null>(null);
   const [loading, setLoading] = React.useState(false);
   const [error, setError] = React.useState<string | null>(null);
@@ -81,24 +79,7 @@ function SelfUsagePage({ user }: { user: ConsoleUser }) {
   const showSkeleton = loading && !usage && !error;
 
   return (
-    <ConsoleShell
-      title="Usage"
-      actions={
-        <div className="flex flex-wrap items-center gap-2">
-          <Input
-            value={wsUrl}
-            onChange={(event) => setWsUrl(event.target.value)}
-            className="w-[min(30rem,100%)]"
-            placeholder="Gateway wss://.../ws"
-            spellCheck={false}
-          />
-          <Button type="button" variant="secondary" disabled={loading} onClick={() => void refresh({ notify: true })}>
-            <RefreshCw className={cn("h-4 w-4", loading ? "animate-spin" : null)} />
-            Refresh
-          </Button>
-        </div>
-      }
-    >
+    <ConsoleShell title="Usage">
       {error ? <InlineError message={error} /> : null}
 
       <div className="grid gap-4">
@@ -216,7 +197,7 @@ function SelfUsagePage({ user }: { user: ConsoleUser }) {
 }
 
 function AdminUsagePage() {
-  const [wsUrl, setWsUrl] = useGatewayWsUrlState();
+  const [wsUrl] = useGatewayWsUrlState();
   const [overview, setOverview] = React.useState<AdminOverviewResponse | null>(null);
   const [users, setUsers] = React.useState<AdminUserSummary[]>([]);
   const [usage, setUsage] = React.useState<AdminUsageResponse | null>(null);
@@ -299,24 +280,7 @@ function AdminUsagePage() {
   const usersUnavailable = Boolean(usersError && !loading && !users.length);
 
   return (
-    <ConsoleShell
-      title="Usage"
-      actions={
-        <div className="flex flex-wrap items-center gap-2">
-          <Input
-            value={wsUrl}
-            onChange={(event) => setWsUrl(event.target.value)}
-            className="w-[min(30rem,100%)]"
-            placeholder="Gateway wss://.../ws"
-            spellCheck={false}
-          />
-          <Button type="button" variant="secondary" disabled={loading} onClick={() => void refresh({ notify: true })}>
-            <RefreshCw className={cn("h-4 w-4", loading ? "animate-spin" : null)} />
-            Refresh
-          </Button>
-        </div>
-      }
-    >
+    <ConsoleShell title="Usage">
       <div className="grid gap-4">
         <PanelCard
           title={selectedUser ? `User ${selectedUser.userId}` : "Global"}
