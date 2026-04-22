@@ -51,6 +51,11 @@ export interface AdminAgentEntry {
   model?: string | null;
   isOwner?: boolean;
   isDefault?: boolean;
+  provisioningState?: string | null;
+  provisioningError?: string | null;
+  provisioningUpdatedAtMs?: number | null;
+  lastReadyAtMs?: number | null;
+  retryCount?: number | null;
 }
 
 export interface AdminUserSummary {

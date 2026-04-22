@@ -20,6 +20,34 @@ import { formatCompact, formatInt, formatRelative, formatWhen } from "@/lib/form
 import { cn } from "@/lib/utils";
 import { gatewayFetchJson, useGatewayWsUrlState } from "@/lib/gateway";
 
+function agentProvisioningState(agent: Pick<AdminAgentEntry, "provisioningState">): "pending" | "ready" | "failed" {
+  const normalized = String(agent.provisioningState || "").trim().toLowerCase();
+  if (normalized === "pending" || normalized === "failed") return normalized;
+  return "ready";
+}
+
+function agentProvisioningTone(agent: Pick<AdminAgentEntry, "provisioningState">): "warning" | "success" | "default" {
+  const state = agentProvisioningState(agent);
+  if (state === "pending") return "warning";
+  if (state === "failed") return "default";
+  return "success";
+}
+
+function agentProvisioningLabel(agent: Pick<AdminAgentEntry, "provisioningState">): string {
+  const state = agentProvisioningState(agent);
+  if (state === "pending") return "provisioning";
+  if (state === "failed") return "failed";
+  return "ready";
+}
+
+function agentMutationToast(agent: AdminAgentEntry | null | undefined, created?: boolean, fallback = "Agent updated"): string {
+  if (!agent) return fallback;
+  const state = agentProvisioningState(agent);
+  if (state === "pending") return "Agent provisioning started";
+  if (state === "failed") return "Agent provisioning failed";
+  return created === false ? "Agent already exists" : fallback;
+}
+
 export default function UsersPage() {
   const [wsUrl] = useGatewayWsUrlState();
   const [users, setUsers] = React.useState<AdminUserSummary[]>([]);
@@ -151,6 +179,17 @@ export default function UsersPage() {
     void run();
   }, [selectedUserId, refreshDetail]);
 
+  React.useEffect(() => {
+    if (!selectedUserId || !detail?.agents.some((agent) => agentProvisioningState(agent) === "pending")) return;
+    const timer = window.setTimeout(() => {
+      void Promise.all([
+        refreshUsers({ preserveSelection: true }),
+        refreshDetail(selectedUserId, { keepVisible: true }),
+      ]);
+    }, 3000);
+    return () => window.clearTimeout(timer);
+  }, [detail, refreshDetail, refreshUsers, selectedUserId]);
+
   async function bootstrapUser(): Promise<void> {
     const value = bootstrapUserId.trim();
     const userId = Number(value);
@@ -181,11 +220,15 @@ export default function UsersPage() {
       return;
     }
     try {
-      await gatewayFetchJson(wsUrl, `/admin/users/${selectedUserId}/agents`, {
-        method: "POST",
-        body: JSON.stringify({ name: newAgentName.trim() }),
-      });
-      toast.success("Agent created");
+      const response = await gatewayFetchJson<{ agent?: AdminAgentEntry | null; created?: boolean }>(
+        wsUrl,
+        `/admin/users/${selectedUserId}/agents`,
+        {
+          method: "POST",
+          body: JSON.stringify({ name: newAgentName.trim() }),
+        },
+      );
+      toast.success(agentMutationToast(response.agent, response.created, "Agent created"));
       setNewAgentName("");
       await Promise.all([
         refreshUsers({ preserveSelection: true }),
@@ -217,6 +260,10 @@ export default function UsersPage() {
 
   async function activateAgent(agent: AdminAgentEntry): Promise<void> {
     if (!selectedUserId) return;
+    if (agentProvisioningState(agent) !== "ready") {
+      toast.error("Agent is not ready yet");
+      return;
+    }
     const actionKey = `agent-use:${agent.agentId}`;
     const previousUsers = users;
     const previousDetail = detail;
@@ -264,6 +311,24 @@ export default function UsersPage() {
         method: "DELETE",
       });
       toast.success("Agent deleted");
+      await Promise.all([
+        refreshUsers({ preserveSelection: true }),
+        refreshDetail(selectedUserId, { keepVisible: true }),
+      ]);
+    } catch (error) {
+      toast.error((error as Error)?.message || String(error));
+    }
+  }
+
+  async function retryAgent(agent: AdminAgentEntry): Promise<void> {
+    if (!selectedUserId) return;
+    try {
+      const response = await gatewayFetchJson<{ agent?: AdminAgentEntry | null }>(
+        wsUrl,
+        `/admin/users/${selectedUserId}/agents/${encodeURIComponent(agent.agentId)}/retry`,
+        { method: "POST" },
+      );
+      toast.success(agentMutationToast(response.agent, true, "Agent provisioning started"));
       await Promise.all([
         refreshUsers({ preserveSelection: true }),
         refreshDetail(selectedUserId, { keepVisible: true }),
@@ -689,10 +754,16 @@ export default function UsersPage() {
                               <div className="font-medium text-foreground">{agent.shortName || agent.agentId}</div>
                               {agent.isDefault ? <Badge tone="primary">main</Badge> : null}
                               {detail.user.currentAgentId === agent.agentId ? <Badge tone="success">current</Badge> : null}
+                              <Badge tone={agentProvisioningTone(agent)}>{agentProvisioningLabel(agent)}</Badge>
                             </div>
                             <div className="mt-2 text-xs leading-5 text-muted-foreground">
-                              session <code className="font-mono">{agent.sessionId || "—"}</code> · created {formatWhen(agent.createdAtMs)}
+                              session <code className="font-mono">{agent.sessionId || "—"}</code> · created {formatWhen(agent.createdAtMs)} · updated {formatWhen(agent.provisioningUpdatedAtMs || agent.lastReadyAtMs)}
                             </div>
+                            {agent.provisioningError ? (
+                              <div className="mt-2 text-xs leading-5 text-destructive">
+                                {agent.provisioningError}
+                              </div>
+                            ) : null}
                           </div>
 
                           <div className="flex flex-wrap gap-2">
@@ -700,13 +771,25 @@ export default function UsersPage() {
                               type="button"
                               size="sm"
                               variant="secondary"
-                              disabled={Boolean(pendingActions[`agent-use:${agent.agentId}`])}
+                              disabled={Boolean(pendingActions[`agent-use:${agent.agentId}`]) || agentProvisioningState(agent) !== "ready"}
                               onClick={() => void activateAgent(agent)}
                             >
                               <UserRoundCheck className="h-4 w-4" />
                               {pendingActions[`agent-use:${agent.agentId}`] ? "Switching…" : "Use"}
                             </Button>
-                            <Button type="button" size="sm" variant="secondary" onClick={() => void renameAgent(agent)}>
+                            {agentProvisioningState(agent) === "failed" ? (
+                              <Button type="button" size="sm" variant="secondary" onClick={() => void retryAgent(agent)}>
+                                <RefreshCw className="h-4 w-4" />
+                                Retry
+                              </Button>
+                            ) : null}
+                            <Button
+                              type="button"
+                              size="sm"
+                              variant="secondary"
+                              disabled={agentProvisioningState(agent) === "pending"}
+                              onClick={() => void renameAgent(agent)}
+                            >
                               <Pencil className="h-4 w-4" />
                               Rename
                             </Button>

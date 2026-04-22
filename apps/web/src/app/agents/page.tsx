@@ -18,6 +18,7 @@ import {
   fetchMyAgentConnection,
   fetchMyAgents,
   renameMyAgent,
+  retryMyAgent,
   setMyAgentModel,
   type SelfAgentConnectionResponse,
   type SelfAgentsResponse,
@@ -28,6 +29,39 @@ function agentBadgeTone(agent: { isDefault?: boolean; agentId?: string | null },
   if (agent.agentId && currentAgentId && agent.agentId === currentAgentId) return "primary";
   if (agent.isDefault) return "success";
   return "default";
+}
+
+function agentProvisioningState(agent: { provisioningState?: string | null }): "pending" | "ready" | "failed" {
+  const normalized = String(agent.provisioningState || "").trim().toLowerCase();
+  if (normalized === "pending" || normalized === "failed") return normalized;
+  return "ready";
+}
+
+function agentProvisioningTone(agent: { provisioningState?: string | null }): "warning" | "success" | "default" {
+  const state = agentProvisioningState(agent);
+  if (state === "pending") return "warning";
+  if (state === "failed") return "default";
+  return "success";
+}
+
+function agentProvisioningLabel(agent: { provisioningState?: string | null }): string {
+  const state = agentProvisioningState(agent);
+  if (state === "pending") return "provisioning";
+  if (state === "failed") return "failed";
+  return "ready";
+}
+
+function agentIsReady(agent: { provisioningState?: string | null }): boolean {
+  return agentProvisioningState(agent) === "ready";
+}
+
+function agentProvisioningToast(state: SelfAgentsResponse, fallback = "Agent updated"): string {
+  const agent = state.agent;
+  if (!agent) return fallback;
+  const status = agentProvisioningState(agent);
+  if (status === "pending") return "Agent provisioning started";
+  if (status === "failed") return "Agent provisioning failed";
+  return state.created === false ? "Agent already exists" : fallback;
 }
 
 export default function AgentsPage() {
@@ -43,7 +77,7 @@ export default function AgentsPage() {
   const [saving, setSaving] = React.useState(false);
   const [error, setError] = React.useState<string | null>(null);
 
-  const agents = agentsState?.agents ?? [];
+  const agents = React.useMemo(() => agentsState?.agents ?? [], [agentsState?.agents]);
 
   const selectedAgent = (() => {
     if (selectedAgentId) {
@@ -118,6 +152,15 @@ export default function AgentsPage() {
     void run();
   }, [refresh, wsUrl]);
 
+  React.useEffect(() => {
+    if (!wsUrl.trim()) return;
+    if (!agents.some((agent) => agentProvisioningState(agent) === "pending")) return;
+    const timer = window.setTimeout(() => {
+      void refresh({ notify: false });
+    }, 3000);
+    return () => window.clearTimeout(timer);
+  }, [agents, refresh, wsUrl]);
+
   const createAgent = React.useCallback(async () => {
     if (!wsUrl.trim()) return;
     if (!createName.trim()) {
@@ -130,7 +173,7 @@ export default function AgentsPage() {
       const result = await createMyAgent(wsUrl, { name: createName });
       applyAgents(result, result.agent?.agentId ?? null);
       setCreateName("");
-      toast.success("Agent created");
+      toast.success(agentProvisioningToast(result, "Agent created"));
     } catch (nextError) {
       const message = (nextError as Error)?.message || String(nextError);
       setError(message);
@@ -139,6 +182,24 @@ export default function AgentsPage() {
       setSaving(false);
     }
   }, [applyAgents, createName, wsUrl]);
+
+  const retryAgent = React.useCallback(async () => {
+    if (!selectedAgent || !wsUrl.trim()) return;
+    setSaving(true);
+    setError(null);
+    try {
+      const result = await retryMyAgent(wsUrl, selectedAgent.agentId);
+      applyAgents(result, selectedAgent.agentId);
+      setConnection((current) => (current?.agentId === selectedAgent.agentId ? null : current));
+      toast.success(agentProvisioningToast(result, "Agent provisioning started"));
+    } catch (nextError) {
+      const message = (nextError as Error)?.message || String(nextError);
+      setError(message);
+      toast.error(message);
+    } finally {
+      setSaving(false);
+    }
+  }, [applyAgents, selectedAgent, wsUrl]);
 
   const activateAgent = React.useCallback(async () => {
     if (!selectedAgent || !wsUrl.trim()) return;
@@ -224,7 +285,10 @@ export default function AgentsPage() {
     setSaving(true);
     setError(null);
     try {
-      const result = await fetchMyAgentConnection(wsUrl, selectedAgent.agentId);
+      const result = await fetchMyAgentConnection(wsUrl, selectedAgent.agentId, {
+        wait: true,
+        timeoutMs: 30000,
+      });
       setConnection(result);
       toast.success("Connection info generated");
     } catch (nextError) {
@@ -288,7 +352,10 @@ export default function AgentsPage() {
                             <div className="truncate font-medium text-foreground">{agent.shortName || agent.agentId}</div>
                             <div className="mt-1 truncate text-xs text-muted-foreground">{agent.agentId}</div>
                           </div>
-                          <Badge tone={agentBadgeTone(agent, agentsState?.currentAgentId)}>{current ? "current" : agent.isDefault ? "main" : "agent"}</Badge>
+                          <div className="flex flex-wrap justify-end gap-2">
+                            <Badge tone={agentBadgeTone(agent, agentsState?.currentAgentId)}>{current ? "current" : agent.isDefault ? "main" : "agent"}</Badge>
+                            <Badge tone={agentProvisioningTone(agent)}>{agentProvisioningLabel(agent)}</Badge>
+                          </div>
                         </div>
                         <div className="mt-3 flex flex-wrap gap-2">
                           {agent.sessionId ? <Badge tone="default">{agent.sessionId}</Badge> : null}
@@ -321,14 +388,25 @@ export default function AgentsPage() {
                 selectedAgent ? (
                   <div className="flex flex-wrap items-center gap-2">
                     {selectedAgent.agentId !== agentsState?.currentAgentId ? (
-                      <Button type="button" size="sm" disabled={loading || saving} onClick={() => void activateAgent()}>
+                      <Button
+                        type="button"
+                        size="sm"
+                        disabled={loading || saving || !agentIsReady(selectedAgent)}
+                        onClick={() => void activateAgent()}
+                      >
                         <Check className="h-4 w-4" />
                         Use
                       </Button>
                     ) : null}
+                    {agentProvisioningState(selectedAgent) === "failed" ? (
+                      <Button type="button" size="sm" disabled={loading || saving} onClick={() => void retryAgent()}>
+                        <RefreshCw className="h-4 w-4" />
+                        Retry
+                      </Button>
+                    ) : null}
                     <Button type="button" size="sm" variant="secondary" disabled={loading || saving} onClick={() => void loadConnection()}>
                       <Link2 className="h-4 w-4" />
-                      Connection
+                      {agentProvisioningState(selectedAgent) === "pending" ? "Wait for ready" : "Connection"}
                     </Button>
                     {!selectedAgent.isDefault ? (
                       <Button type="button" size="sm" variant="destructive" disabled={loading || saving} onClick={() => void removeAgent()}>
@@ -342,10 +420,31 @@ export default function AgentsPage() {
             >
               {selectedAgent ? (
                 <div className="grid gap-4">
+                  <div className="flex flex-wrap gap-2">
+                    <Badge tone={agentProvisioningTone(selectedAgent)}>{agentProvisioningLabel(selectedAgent)}</Badge>
+                    {selectedAgent.isDefault ? <Badge tone="success">main</Badge> : null}
+                    {selectedAgent.agentId === agentsState?.currentAgentId ? <Badge tone="primary">current</Badge> : null}
+                  </div>
+
+                  {agentProvisioningState(selectedAgent) === "pending" ? (
+                    <div className="rounded-[16px] border border-amber-500/28 bg-amber-500/10 px-4 py-3 text-sm text-amber-200">
+                      Provisioning is still running. You can wait for the connection endpoint, or refresh again in a few seconds.
+                    </div>
+                  ) : null}
+
+                  {agentProvisioningState(selectedAgent) === "failed" ? (
+                    <InlineError message={selectedAgent.provisioningError || "Provisioning failed"} />
+                  ) : null}
+
                   {!selectedAgent.isDefault ? (
                     <div className="grid gap-2 md:grid-cols-[minmax(0,1fr)_auto]">
                       <Input value={renameName} onChange={(event) => setRenameName(event.target.value)} placeholder="agent name" />
-                      <Button type="button" variant="secondary" disabled={loading || saving || !renameName.trim()} onClick={() => void saveRename()}>
+                      <Button
+                        type="button"
+                        variant="secondary"
+                        disabled={loading || saving || !renameName.trim() || agentProvisioningState(selectedAgent) === "pending"}
+                        onClick={() => void saveRename()}
+                      >
                         <Pencil className="h-4 w-4" />
                         Rename
                       </Button>
@@ -374,6 +473,8 @@ export default function AgentsPage() {
                     <Fact label="Session" value={selectedAgent.sessionId || "—"} mono />
                     <Fact label="Workspace" value={selectedAgent.workspaceHostPath || "—"} mono />
                     <Fact label="Created" value={formatWhen(selectedAgent.createdAtMs)} />
+                    <Fact label="Provisioning" value={agentProvisioningLabel(selectedAgent)} />
+                    <Fact label="Updated" value={formatWhen(selectedAgent.provisioningUpdatedAtMs || selectedAgent.lastReadyAtMs)} />
                   </div>
                 </div>
               ) : (
@@ -408,11 +509,17 @@ export default function AgentsPage() {
               ) : (
                 <div className="grid gap-3">
                   <div className="rounded-[16px] border border-border/70 bg-background/24 px-4 py-3 text-sm text-muted-foreground">
-                    Generate session-scoped connection details for the selected agent.
+                    {selectedAgent
+                      ? agentProvisioningState(selectedAgent) === "failed"
+                        ? "Provisioning failed. Retry the agent before generating connection details."
+                        : agentProvisioningState(selectedAgent) === "pending"
+                          ? "Provisioning is still running. Generate will wait briefly for the agent to become ready."
+                          : "Generate session-scoped connection details for the selected agent."
+                      : "Generate session-scoped connection details for the selected agent."}
                   </div>
                   <Button type="button" variant="secondary" disabled={!selectedAgent || loading || saving} onClick={() => void loadConnection()}>
                     <Link2 className="h-4 w-4" />
-                    Generate
+                    {selectedAgent && agentProvisioningState(selectedAgent) === "pending" ? "Wait and generate" : "Generate"}
                   </Button>
                 </div>
               )}

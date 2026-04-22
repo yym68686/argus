@@ -3140,6 +3140,29 @@ def _effective_agent_model(agent: Optional["PersistedAgentRuntime"]) -> str:
     return ARGUS_AGENT_MODEL_DEFAULT
 
 
+AGENT_PROVISIONING_STATE_PENDING = "pending"
+AGENT_PROVISIONING_STATE_READY = "ready"
+AGENT_PROVISIONING_STATE_FAILED = "failed"
+AGENT_PROVISIONING_STATES = {
+    AGENT_PROVISIONING_STATE_PENDING,
+    AGENT_PROVISIONING_STATE_READY,
+    AGENT_PROVISIONING_STATE_FAILED,
+}
+
+
+def _normalize_agent_provisioning_state(raw: Any, *, default: str = AGENT_PROVISIONING_STATE_READY) -> str:
+    state = str(raw or "").strip().lower()
+    if state in AGENT_PROVISIONING_STATES:
+        return state
+    return default
+
+
+def _agent_is_ready(agent: Optional["PersistedAgentRuntime"]) -> bool:
+    if not isinstance(agent, PersistedAgentRuntime):
+        return False
+    return _normalize_agent_provisioning_state(getattr(agent, "provisioning_state", None)) == AGENT_PROVISIONING_STATE_READY
+
+
 @dataclass
 class PersistedAgentRuntime:
     agent_id: str
@@ -3150,9 +3173,14 @@ class PersistedAgentRuntime:
     short_name: Optional[str] = None
     allowed_user_ids: list[int] = field(default_factory=list)
     model: str = ARGUS_AGENT_MODEL_DEFAULT
+    provisioning_state: str = AGENT_PROVISIONING_STATE_READY
+    provisioning_error: Optional[str] = None
+    provisioning_updated_at_ms: Optional[int] = None
+    last_ready_at_ms: Optional[int] = None
+    retry_count: int = 0
 
     def to_json(self) -> dict[str, Any]:
-        return {
+        out = {
             "agentId": self.agent_id,
             "sessionId": self.session_id,
             "workspaceHostPath": self.workspace_host_path,
@@ -3161,7 +3189,17 @@ class PersistedAgentRuntime:
             "shortName": self.short_name,
             "allowedUserIds": list(self.allowed_user_ids or []),
             "model": _effective_agent_model(self),
+            "provisioningState": _normalize_agent_provisioning_state(self.provisioning_state),
+            "provisioningUpdatedAtMs": int(self.provisioning_updated_at_ms)
+            if self.provisioning_updated_at_ms is not None
+            else int(self.created_at_ms),
+            "retryCount": max(0, int(self.retry_count or 0)),
         }
+        if isinstance(self.provisioning_error, str) and self.provisioning_error.strip():
+            out["provisioningError"] = self.provisioning_error.strip()
+        if self.last_ready_at_ms is not None:
+            out["lastReadyAtMs"] = int(self.last_ready_at_ms)
+        return out
 
     @staticmethod
     def from_json(obj: Any) -> Optional["PersistedAgentRuntime"]:
@@ -3199,6 +3237,29 @@ class PersistedAgentRuntime:
             created_at_int = int(created_at_ms) if created_at_ms is not None else _now_ms()
         except Exception:
             created_at_int = _now_ms()
+        provisioning_state = _normalize_agent_provisioning_state(obj.get("provisioningState"))
+        provisioning_error = str(obj.get("provisioningError") or "").strip() or None
+        provisioning_updated_at_ms = obj.get("provisioningUpdatedAtMs")
+        if provisioning_updated_at_ms is not None:
+            try:
+                provisioning_updated_at_ms = int(provisioning_updated_at_ms)
+            except Exception:
+                provisioning_updated_at_ms = created_at_int
+        else:
+            provisioning_updated_at_ms = created_at_int
+        last_ready_at_ms = obj.get("lastReadyAtMs")
+        if last_ready_at_ms is not None:
+            try:
+                last_ready_at_ms = int(last_ready_at_ms)
+            except Exception:
+                last_ready_at_ms = None
+        elif provisioning_state == AGENT_PROVISIONING_STATE_READY:
+            last_ready_at_ms = created_at_int
+        retry_count = obj.get("retryCount")
+        try:
+            retry_count_int = max(0, int(retry_count)) if retry_count is not None else 0
+        except Exception:
+            retry_count_int = 0
         if not agent_id or not session_id or not workspace_host_path:
             return None
         return PersistedAgentRuntime(
@@ -3210,6 +3271,11 @@ class PersistedAgentRuntime:
             short_name=short_name,
             allowed_user_ids=allowed_user_ids,
             model=model,
+            provisioning_state=provisioning_state,
+            provisioning_error=provisioning_error,
+            provisioning_updated_at_ms=provisioning_updated_at_ms,
+            last_ready_at_ms=last_ready_at_ms,
+            retry_count=retry_count_int,
         )
 
 
@@ -6473,6 +6539,7 @@ class AutomationManager:
         self._isolated_cron_context_by_key: dict[tuple[str, str, str], IsolatedCronTurnContext] = {}
         self._session_restart_locks: dict[str, asyncio.Lock] = {}
         self._model_catalog_cache: dict[tuple[int, str], dict[str, Any]] = {}
+        self._agent_provision_tasks: dict[str, asyncio.Task[None]] = {}
 
     async def start(self) -> None:
         await self._store.load()
@@ -6480,6 +6547,7 @@ class AutomationManager:
         await self._ensure_agent_model_files()
         await self._gc_orphan_runtime_containers()
         await self._prune_persisted_sessions()
+        await self._resume_pending_user_agent_provisioning()
         self._tasks.append(asyncio.create_task(self._cron_loop()))
         self._tasks.append(asyncio.create_task(self._heartbeat_loop()))
         self._tasks.append(asyncio.create_task(self._lane_watchdog_loop()))
@@ -8448,6 +8516,8 @@ class AutomationManager:
                 root = Path(workspace_host_path)
                 await self._ensure_workspace_files_for_session(agent.session_id, root)
                 await self._write_agent_model_for_session(agent.session_id, root, model)
+                if not _agent_is_ready(agent):
+                    continue
                 await _sync_session_workspace_file(
                     agent.session_id,
                     root,
@@ -8474,7 +8544,6 @@ class AutomationManager:
             try:
                 await self._ensure_workspace_files_for_session(agent.session_id, root)
                 await self._write_agent_model_for_session(agent.session_id, root, self._channel_adjusted_agent_model(agent))
-                await _sync_session_workspace_snapshot(agent.session_id, root)
             except Exception as e:
                 log.warning("Failed to persist model file for agent %s at %s: %s", agent.agent_id, str(root), str(e))
 
@@ -8504,14 +8573,95 @@ class AutomationManager:
             log.exception("Failed to sync live model for session %s", sid)
             return False
 
-    async def ensure_user_main_agent(self, *, user_id: int) -> tuple[PersistedAgentRuntime, bool]:
-        _require_user_agent_support()
-        if not self._home_host_path and _default_runtime_provisioner().name != SESSION_PLACEMENT_KIND_NATIVE:
-            raise RuntimeError("ARGUS_HOME_HOST_PATH is required to create user agents")
-        if not isinstance(user_id, int) or user_id <= 0:
-            raise ValueError("Invalid userId")
+    def _session_lock_for_agent_session(self, session_id: str) -> asyncio.Lock:
+        sid = session_id.strip() if isinstance(session_id, str) else ""
+        lock = self._session_restart_locks.get(sid)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._session_restart_locks[sid] = lock
+        return lock
 
-        aid = self._user_main_agent_id(user_id=user_id)
+    def _user_agent_workspace_host_path(self, *, session_id: str, user_id: int, short_name: str, placement: SessionPlacement) -> str:
+        return placement.workspace_path or _default_native_workspace_path(session_id) or (
+            str((Path(self._home_host_path) / f"workspace-{user_id}-{short_name}").resolve()) if self._home_host_path else ""
+        )
+
+    async def _set_agent_provisioning_pending(
+        self,
+        agent_id: str,
+        *,
+        clear_error: bool,
+    ) -> Optional[PersistedAgentRuntime]:
+        aid = _normalize_agent_id(agent_id)
+        if not aid:
+            return None
+        now_ms = _now_ms()
+
+        def _write(st: PersistedGatewayAutomationState) -> None:
+            agent = st.agents.get(aid)
+            if not isinstance(agent, PersistedAgentRuntime):
+                return
+            st.version = max(int(getattr(st, "version", 1) or 1), AUTOMATION_STATE_VERSION)
+            st.agents[aid] = replace(
+                agent,
+                provisioning_state=AGENT_PROVISIONING_STATE_PENDING,
+                provisioning_error=None if clear_error else agent.provisioning_error,
+                provisioning_updated_at_ms=now_ms,
+            )
+
+        await self._store.update(_write)
+        return self._get_agent(aid)
+
+    async def _set_agent_provisioning_ready(self, agent_id: str) -> Optional[PersistedAgentRuntime]:
+        aid = _normalize_agent_id(agent_id)
+        if not aid:
+            return None
+        now_ms = _now_ms()
+
+        def _write(st: PersistedGatewayAutomationState) -> None:
+            agent = st.agents.get(aid)
+            if not isinstance(agent, PersistedAgentRuntime):
+                return
+            st.version = max(int(getattr(st, "version", 1) or 1), AUTOMATION_STATE_VERSION)
+            st.agents[aid] = replace(
+                agent,
+                provisioning_state=AGENT_PROVISIONING_STATE_READY,
+                provisioning_error=None,
+                provisioning_updated_at_ms=now_ms,
+                last_ready_at_ms=now_ms,
+                retry_count=0,
+            )
+
+        await self._store.update(_write)
+        return self._get_agent(aid)
+
+    async def _set_agent_provisioning_failed(self, agent_id: str, *, error_message: str) -> Optional[PersistedAgentRuntime]:
+        aid = _normalize_agent_id(agent_id)
+        if not aid:
+            return None
+        now_ms = _now_ms()
+        normalized_error = str(error_message or "").strip() or "Provisioning failed"
+        if len(normalized_error) > 2000:
+            normalized_error = normalized_error[:2000]
+
+        def _write(st: PersistedGatewayAutomationState) -> None:
+            agent = st.agents.get(aid)
+            if not isinstance(agent, PersistedAgentRuntime):
+                return
+            st.version = max(int(getattr(st, "version", 1) or 1), AUTOMATION_STATE_VERSION)
+            st.agents[aid] = replace(
+                agent,
+                provisioning_state=AGENT_PROVISIONING_STATE_FAILED,
+                provisioning_error=normalized_error,
+                provisioning_updated_at_ms=now_ms,
+                retry_count=max(0, int(agent.retry_count or 0)) + 1,
+            )
+
+        await self._store.update(_write)
+        return self._get_agent(aid)
+
+    async def _reserve_user_agent_record(self, *, user_id: int, short_name: str) -> tuple[PersistedAgentRuntime, bool]:
+        aid = _user_agent_id(user_id=user_id, short_name=short_name)
         created_at_ms = _now_ms()
         created = False
 
@@ -8525,8 +8675,11 @@ class AutomationManager:
             created = True
             session_id = uuid.uuid4().hex[:12]
             placement = _default_session_placement(session_id)
-            workspace_host_path = placement.workspace_path or _default_native_workspace_path(session_id) or (
-                str((Path(self._home_host_path) / f"workspace-{user_id}-main").resolve()) if self._home_host_path else ""
+            workspace_host_path = self._user_agent_workspace_host_path(
+                session_id=session_id,
+                user_id=user_id,
+                short_name=short_name,
+                placement=placement,
             )
             st.agents[aid] = PersistedAgentRuntime(
                 agent_id=aid,
@@ -8534,9 +8687,11 @@ class AutomationManager:
                 workspace_host_path=workspace_host_path,
                 created_at_ms=created_at_ms,
                 owner_user_id=user_id,
-                short_name="main",
+                short_name=short_name,
                 allowed_user_ids=[],
                 model=ARGUS_AGENT_MODEL_DEFAULT,
+                provisioning_state=AGENT_PROVISIONING_STATE_PENDING,
+                provisioning_updated_at_ms=created_at_ms,
             )
             if session_id not in st.sessions:
                 st.sessions[session_id] = PersistedSessionAutomation(placement=placement)
@@ -8546,15 +8701,147 @@ class AutomationManager:
         await self._store.update(_write)
         agent = self._get_agent(aid)
         if agent is None:
-            raise RuntimeError("Failed to persist user main agent")
-        root = Path(agent.workspace_host_path)
-        await self._ensure_workspace_files_for_session(agent.session_id, root)
-        await self._write_agent_model_for_session(agent.session_id, root, self._channel_adjusted_agent_model(agent))
-        await _sync_session_workspace_snapshot(agent.session_id, root)
-        await _ensure_live_session(agent.session_id, allow_create=True)
+            raise RuntimeError("Failed to persist user agent")
         return agent, created
 
-    async def create_user_agent(self, *, user_id: int, short_name: str) -> PersistedAgentRuntime:
+    def _enqueue_agent_provisioning(self, agent_id: str, *, force: bool = False) -> bool:
+        aid = _normalize_agent_id(agent_id)
+        if not aid:
+            return False
+        agent = self._get_agent(aid)
+        if not isinstance(agent, PersistedAgentRuntime):
+            return False
+        state = _normalize_agent_provisioning_state(agent.provisioning_state)
+        if state == AGENT_PROVISIONING_STATE_READY and not force:
+            return False
+        existing = self._agent_provision_tasks.get(aid)
+        if existing is not None and not existing.done():
+            return False
+
+        async def _runner() -> None:
+            try:
+                await self._provision_user_agent(aid)
+            finally:
+                current = self._agent_provision_tasks.get(aid)
+                if current is task:
+                    self._agent_provision_tasks.pop(aid, None)
+
+        task = asyncio.create_task(_runner())
+        self._agent_provision_tasks[aid] = task
+        return True
+
+    async def _resume_pending_user_agent_provisioning(self) -> None:
+        for agent in list((self._store.state.agents or {}).values()):
+            if not isinstance(agent, PersistedAgentRuntime):
+                continue
+            if _normalize_agent_provisioning_state(agent.provisioning_state) != AGENT_PROVISIONING_STATE_PENDING:
+                continue
+            self._enqueue_agent_provisioning(agent.agent_id)
+
+    async def _provision_user_agent(self, agent_id: str) -> None:
+        aid = _normalize_agent_id(agent_id)
+        if not aid:
+            return
+        agent = self._get_agent(aid)
+        if not isinstance(agent, PersistedAgentRuntime):
+            return
+        session_id = str(agent.session_id or "").strip()
+        if not session_id:
+            await self._set_agent_provisioning_failed(aid, error_message="Agent has no sessionId")
+            return
+        lock = self._session_lock_for_agent_session(session_id)
+        async with lock:
+            current = self._get_agent(aid)
+            if not isinstance(current, PersistedAgentRuntime):
+                return
+            if _normalize_agent_provisioning_state(current.provisioning_state) == AGENT_PROVISIONING_STATE_READY:
+                return
+            await self._set_agent_provisioning_pending(aid, clear_error=True)
+            current = self._get_agent(aid)
+            if not isinstance(current, PersistedAgentRuntime):
+                return
+            try:
+                root = Path(current.workspace_host_path)
+                await self._ensure_workspace_files_for_session(current.session_id, root)
+                await self._write_agent_model_for_session(
+                    current.session_id,
+                    root,
+                    self._channel_adjusted_agent_model(current),
+                )
+                await _ensure_live_session(current.session_id, allow_create=True)
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                await self._set_agent_provisioning_failed(aid, error_message=str(e))
+                log.warning(
+                    "Failed to provision user agent %s (session=%s): %s",
+                    aid,
+                    current.session_id,
+                    str(e),
+                )
+                return
+            await self._set_agent_provisioning_ready(aid)
+
+    async def wait_for_user_agent_provisioning(self, *, agent_id: str, timeout_ms: int) -> Optional[PersistedAgentRuntime]:
+        aid = _normalize_agent_id(agent_id)
+        if not aid:
+            return None
+        timeout_s = max(0.0, float(max(0, int(timeout_ms))) / 1000.0)
+        deadline = asyncio.get_running_loop().time() + timeout_s
+        while True:
+            agent = self._get_agent(aid)
+            if not isinstance(agent, PersistedAgentRuntime):
+                return None
+            state = _normalize_agent_provisioning_state(agent.provisioning_state)
+            if state in {AGENT_PROVISIONING_STATE_READY, AGENT_PROVISIONING_STATE_FAILED}:
+                return agent
+            if timeout_s <= 0 or asyncio.get_running_loop().time() >= deadline:
+                return agent
+            await asyncio.sleep(0.25)
+
+    async def retry_user_agent_provisioning(self, *, user_id: int, agent_id: str) -> PersistedAgentRuntime:
+        aid = _normalize_agent_id(agent_id)
+        if not aid:
+            raise ValueError("Invalid agentId")
+        current = self._get_agent(aid)
+        if current is None:
+            raise ValueError(f"Unknown agent: {aid}")
+        if not (isinstance(current.owner_user_id, int) and current.owner_user_id == user_id):
+            raise PermissionError("Forbidden")
+        if _agent_is_ready(current):
+            return current
+        session_id = str(current.session_id or "").strip()
+        if not session_id:
+            raise RuntimeError("Agent has no sessionId")
+
+        await self._set_agent_provisioning_pending(aid, clear_error=True)
+        try:
+            await self._force_close_live_session(session_id)
+        except Exception:
+            pass
+        if _provisioner_manages_runtime_sessions(session_id):
+            try:
+                await _remove_managed_runtime(session_id)
+            except Exception as e:
+                log.warning("Failed to clear runtime before retrying agent %s (session=%s): %s", aid, session_id, str(e))
+        self._clear_session_backoff(session_id)
+        self._enqueue_agent_provisioning(aid, force=True)
+        updated = self._get_agent(aid)
+        if updated is None:
+            raise RuntimeError("Agent not found after retry")
+        return updated
+
+    async def ensure_user_main_agent(self, *, user_id: int) -> tuple[PersistedAgentRuntime, bool]:
+        _require_user_agent_support()
+        if not self._home_host_path and _default_runtime_provisioner().name != SESSION_PLACEMENT_KIND_NATIVE:
+            raise RuntimeError("ARGUS_HOME_HOST_PATH is required to create user agents")
+        if not isinstance(user_id, int) or user_id <= 0:
+            raise ValueError("Invalid userId")
+        agent, created = await self._reserve_user_agent_record(user_id=user_id, short_name="main")
+        self._enqueue_agent_provisioning(agent.agent_id)
+        return agent, created
+
+    async def create_user_agent(self, *, user_id: int, short_name: str) -> tuple[PersistedAgentRuntime, bool]:
         _require_user_agent_support()
         if not self._home_host_path and _default_runtime_provisioner().name != SESSION_PLACEMENT_KIND_NATIVE:
             raise RuntimeError("ARGUS_HOME_HOST_PATH is required to create user agents")
@@ -8570,43 +8857,9 @@ class AutomationManager:
         aid = _user_agent_id(user_id=user_id, short_name=name)
         if not AGENT_ID_RE.match(aid):
             raise ValueError("Invalid agent name (too long)")
-
-        created_at_ms = _now_ms()
-
-        def _write(st: PersistedGatewayAutomationState) -> None:
-            st.version = max(int(getattr(st, "version", 1) or 1), AUTOMATION_STATE_VERSION)
-            if aid in st.agents:
-                raise ValueError(f"Agent already exists: {name}")
-            session_id = uuid.uuid4().hex[:12]
-            placement = _default_session_placement(session_id)
-            workspace_host_path = placement.workspace_path or _default_native_workspace_path(session_id) or (
-                str((Path(self._home_host_path) / f"workspace-{user_id}-{name}").resolve()) if self._home_host_path else ""
-            )
-            st.agents[aid] = PersistedAgentRuntime(
-                agent_id=aid,
-                session_id=session_id,
-                workspace_host_path=workspace_host_path,
-                created_at_ms=created_at_ms,
-                owner_user_id=user_id,
-                short_name=name,
-                allowed_user_ids=[],
-                model=ARGUS_AGENT_MODEL_DEFAULT,
-            )
-            if session_id not in st.sessions:
-                st.sessions[session_id] = PersistedSessionAutomation(placement=placement)
-            elif st.sessions[session_id].placement is None:
-                st.sessions[session_id].placement = placement
-
-        await self._store.update(_write)
-        agent = self._get_agent(aid)
-        if agent is None:
-            raise RuntimeError("Failed to persist user agent")
-        root = Path(agent.workspace_host_path)
-        await self._ensure_workspace_files_for_session(agent.session_id, root)
-        await self._write_agent_model_for_session(agent.session_id, root, self._channel_adjusted_agent_model(agent))
-        await _sync_session_workspace_snapshot(agent.session_id, root)
-        await _ensure_live_session(agent.session_id, allow_create=True)
-        return agent
+        agent, created = await self._reserve_user_agent_record(user_id=user_id, short_name=name)
+        self._enqueue_agent_provisioning(agent.agent_id)
+        return agent, created
 
     async def rename_user_agent(self, *, user_id: int, agent_id: str, new_short_name: str) -> PersistedAgentRuntime:
         _require_user_agent_support()
@@ -8621,6 +8874,8 @@ class AutomationManager:
             raise ValueError(f"Unknown agent: {old_aid}")
         if not (isinstance(old_agent.owner_user_id, int) and old_agent.owner_user_id == user_id):
             raise PermissionError("Forbidden")
+        if _normalize_agent_provisioning_state(old_agent.provisioning_state) == AGENT_PROVISIONING_STATE_PENDING:
+            raise ValueError("Agent is still provisioning")
         if old_aid == self._user_main_agent_id(user_id=user_id):
             raise ValueError("main agent cannot be renamed")
 
@@ -8699,7 +8954,11 @@ class AutomationManager:
                 raise RuntimeError("Agent not found after rename")
             root = Path(agent2.workspace_host_path)
             await self._write_agent_model_for_session(agent2.session_id, root, self._channel_adjusted_agent_model(agent2))
-            await _sync_session_workspace_snapshot(agent2.session_id, root)
+            if _agent_is_ready(agent2):
+                try:
+                    await _sync_session_workspace_snapshot(agent2.session_id, root)
+                except Exception as e:
+                    log.warning("Failed to sync renamed agent workspace for %s: %s", new_aid, str(e))
 
             if _provisioner_requires_runtime_recreation_on_workspace_change():
                 try:
@@ -8900,9 +9159,16 @@ class AutomationManager:
         root = Path(updated.workspace_host_path)
         await self._ensure_workspace_files_for_session(updated.session_id, root)
         await self._write_agent_model_for_session(updated.session_id, root, effective_model)
-        await _sync_session_workspace_file(updated.session_id, root, self._agent_model_file_for_workspace(root))
+        if not _agent_is_ready(updated):
+            return updated, False
+        workspace_synced = True
+        try:
+            await _sync_session_workspace_file(updated.session_id, root, self._agent_model_file_for_workspace(root))
+        except Exception as e:
+            workspace_synced = False
+            log.warning("Failed to sync model file for agent %s (session=%s): %s", aid, updated.session_id, str(e))
         synced = await self._sync_live_session_default_model(session_id=updated.session_id, model=effective_model)
-        return updated, synced
+        return updated, bool(workspace_synced and synced)
 
     async def bind_private_user_to_agent(self, *, user_id: int, chat_key: str, agent_id: str) -> PersistedAgentRuntime:
         ck = chat_key.strip() if isinstance(chat_key, str) else ""
@@ -9252,6 +9518,15 @@ class AutomationManager:
                 await t
             except Exception:
                 pass
+        pending = list(self._agent_provision_tasks.values())
+        for task in pending:
+            task.cancel()
+        for task in pending:
+            try:
+                await task
+            except Exception:
+                pass
+        self._agent_provision_tasks.clear()
 
     def lane(self, session_id: str, thread_id: str) -> ThreadLane:
         key = (session_id, thread_id)
@@ -14624,16 +14899,20 @@ async def me_agent_create(request: Request):
     if not isinstance(body, dict):
         raise HTTPException(status_code=400, detail="Invalid JSON body")
     try:
-        agent = await automation.create_user_agent(user_id=principal.user_id, short_name=str(body.get("name") or body.get("agentId") or ""))
+        agent, created = await automation.create_user_agent(
+            user_id=principal.user_id,
+            short_name=str(body.get("name") or body.get("agentId") or ""),
+        )
     except PermissionError as e:
         raise HTTPException(status_code=403, detail=str(e)) from e
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e)) from e
     model_info = await _automation_model_payload(automation, agent=agent, user_id=principal.user_id)
-    return {
+    payload = {
         "ok": True,
         "userId": principal.user_id,
         "agent": agent.to_json(),
+        "created": created,
         "agents": automation.list_agents_for_user(user_id=principal.user_id),
         "availableModels": model_info.get("availableModels"),
         "models": model_info.get("models"),
@@ -14641,6 +14920,7 @@ async def me_agent_create(request: Request):
         "modelError": model_info.get("error"),
         **_developer_limits_and_counts_payload(automation, user_id=principal.user_id),
     }
+    return JSONResponse(status_code=_agent_create_response_status(agent), content=payload)
 
 
 @app.post("/me/agents/{agent_id}/use")
@@ -14707,6 +14987,31 @@ async def me_agent_model_set(agent_id: str, request: Request):
         "modelError": model_info.get("error"),
         **_developer_limits_and_counts_payload(automation, user_id=principal.user_id),
     }
+
+
+@app.post("/me/agents/{agent_id}/retry")
+async def me_agent_retry(agent_id: str, request: Request):
+    principal = _http_require_auth(request)
+    if principal.user_id is None:
+        raise HTTPException(status_code=403, detail="Console session or developer API key required")
+    automation = _get_automation_or_500()
+    normalized_agent_id = _self_normalize_agent_id_for_user(principal.user_id, agent_id)
+    try:
+        agent = await automation.retry_user_agent_provisioning(user_id=principal.user_id, agent_id=normalized_agent_id)
+    except PermissionError as e:
+        raise HTTPException(status_code=403, detail=str(e)) from e
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    return JSONResponse(
+        status_code=_agent_create_response_status(agent),
+        content={
+            "ok": True,
+            "userId": principal.user_id,
+            "agent": agent.to_json(),
+            "agents": automation.list_agents_for_user(user_id=principal.user_id),
+            **_developer_limits_and_counts_payload(automation, user_id=principal.user_id),
+        },
+    )
 
 
 @app.patch("/me/agents/{agent_id}")
@@ -18406,7 +18711,6 @@ async def _ensure_live_fugue_session(session_id: str, *, allow_create: bool) -> 
         log.warning("Failed to create local workspace mirror for session %s at %s: %s", session_id, workspace_host_path, str(e))
 
     app_data, created = await asyncio.to_thread(_fugue_ensure_session_app_ready_sync, cfg, session_id, allow_create)
-    await asyncio.to_thread(_fugue_push_workspace_snapshot_sync, cfg, session_id, workspace_root)
     host, port = _fugue_internal_service_target(app_data)
     reader, writer = await _wait_for_tcp(host, port, cfg.connect_timeout_s)
 
@@ -18438,6 +18742,10 @@ async def _ensure_live_fugue_session(session_id: str, *, allow_create: bool) -> 
         turn_owners_by_thread={},
     )
     live = await _activate_live_session(live)
+    try:
+        await _sync_remote_workspace_templates(live, session_id=session_id, workspace_path=cfg.workspace_mount_path)
+    except Exception as e:
+        log.warning("Failed to seed minimal Fugue workspace for session %s: %s", session_id, str(e))
     return live, created
 
 
@@ -19191,6 +19499,24 @@ def _developer_limits_and_counts_payload(automation: AutomationManager, *, user_
     }
 
 
+def _agent_create_response_status(agent: Optional[PersistedAgentRuntime]) -> int:
+    if isinstance(agent, PersistedAgentRuntime) and _normalize_agent_provisioning_state(agent.provisioning_state) == AGENT_PROVISIONING_STATE_PENDING:
+        return 202
+    return 200
+
+
+def _agent_provisioning_message(agent: PersistedAgentRuntime) -> str:
+    state = _normalize_agent_provisioning_state(agent.provisioning_state)
+    if state == AGENT_PROVISIONING_STATE_PENDING:
+        return f"Agent {agent.agent_id} is still provisioning"
+    if state == AGENT_PROVISIONING_STATE_FAILED:
+        detail = str(agent.provisioning_error or "").strip()
+        if detail:
+            return f"Agent {agent.agent_id} provisioning failed: {detail}"
+        return f"Agent {agent.agent_id} provisioning failed"
+    return f"Agent {agent.agent_id} is ready"
+
+
 def _admin_private_chat_key_for_user(user_id: int) -> str:
     return str(int(user_id))
 
@@ -19246,6 +19572,28 @@ async def _self_agent_connection_payload(
     agent = automation._get_agent(normalized_agent_id)
     if agent is None:
         raise HTTPException(status_code=404, detail="Agent not found")
+    if not _agent_is_ready(agent):
+        wait_requested = _normalize_bool_flag(request.query_params.get("wait"), default=False)
+        timeout_raw = request.query_params.get("timeoutMs")
+        try:
+            timeout_ms = int(timeout_raw) if timeout_raw is not None else 30_000
+        except Exception as e:
+            raise HTTPException(status_code=400, detail="Invalid timeoutMs") from e
+        timeout_ms = min(max(timeout_ms, 0), 120_000)
+        if wait_requested:
+            waited = await automation.wait_for_user_agent_provisioning(agent_id=normalized_agent_id, timeout_ms=timeout_ms)
+            if isinstance(waited, PersistedAgentRuntime):
+                agent = waited
+        if not _agent_is_ready(agent):
+            return JSONResponse(
+                status_code=409,
+                content={
+                    "ok": False,
+                    "message": _agent_provisioning_message(agent),
+                    "agent": agent.to_json(),
+                    "userId": user_id,
+                },
+            )
     session_id = automation.resolve_agent_session_id(normalized_agent_id)
     if not session_id:
         raise HTTPException(status_code=500, detail="Agent has no sessionId")
@@ -19703,20 +20051,24 @@ async def automation_agent_create(request: Request):
         raise HTTPException(status_code=400, detail="Not initialized (run /start)")
 
     try:
-        agent = await automation.create_user_agent(user_id=user_id, short_name=str(raw_name or ""))
+        agent, created = await automation.create_user_agent(user_id=user_id, short_name=str(raw_name or ""))
     except PermissionError as e:
         raise HTTPException(status_code=403, detail=str(e)) from e
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e)) from e
     model_info = await _automation_model_payload(automation, agent=agent, user_id=user_id)
-    return {
-        "ok": True,
-        "agent": agent.to_json(),
-        "availableModels": model_info.get("availableModels"),
-        "models": model_info.get("models"),
-        "modelSource": model_info.get("source"),
-        "modelError": model_info.get("error"),
-    }
+    return JSONResponse(
+        status_code=_agent_create_response_status(agent),
+        content={
+            "ok": True,
+            "agent": agent.to_json(),
+            "created": created,
+            "availableModels": model_info.get("availableModels"),
+            "models": model_info.get("models"),
+            "modelSource": model_info.get("source"),
+            "modelError": model_info.get("error"),
+        },
+    )
 
 
 @app.post("/automation/agent/use")
@@ -20318,21 +20670,25 @@ async def admin_user_agent_create(user_id: int, request: Request):
         raise HTTPException(status_code=400, detail="Invalid JSON body")
     raw_name = body.get("agentId") or body.get("name")
     try:
-        agent = await automation.create_user_agent(user_id=user_id, short_name=str(raw_name or ""))
+        agent, created = await automation.create_user_agent(user_id=user_id, short_name=str(raw_name or ""))
     except PermissionError as e:
         raise HTTPException(status_code=403, detail=str(e)) from e
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e)) from e
     model_info = await _automation_model_payload(automation, agent=agent, user_id=user_id)
-    return {
-        "ok": True,
-        "agent": agent.to_json(),
-        "agents": automation.list_agents_for_user(user_id=user_id),
-        "availableModels": model_info.get("availableModels"),
-        "models": model_info.get("models"),
-        "modelSource": model_info.get("source"),
-        "modelError": model_info.get("error"),
-    }
+    return JSONResponse(
+        status_code=_agent_create_response_status(agent),
+        content={
+            "ok": True,
+            "agent": agent.to_json(),
+            "created": created,
+            "agents": automation.list_agents_for_user(user_id=user_id),
+            "availableModels": model_info.get("availableModels"),
+            "models": model_info.get("models"),
+            "modelSource": model_info.get("source"),
+            "modelError": model_info.get("error"),
+        },
+    )
 
 
 @app.post("/admin/users/{user_id}/agents/{agent_id}/use")
@@ -20400,6 +20756,34 @@ async def admin_user_agent_model_set(user_id: int, agent_id: str, request: Reque
         "modelSource": model_info.get("source"),
         "modelError": model_info.get("error"),
     }
+
+
+@app.post("/admin/users/{user_id}/agents/{agent_id}/retry")
+async def admin_user_agent_retry(user_id: int, agent_id: str, request: Request):
+    _http_require_token(request)
+    automation = _get_automation_or_500()
+    if user_id <= 0:
+        raise HTTPException(status_code=400, detail="Invalid userId")
+    normalized_agent_id = _admin_normalize_agent_id_for_user(user_id, agent_id)
+    try:
+        agent = await automation.retry_user_agent_provisioning(user_id=user_id, agent_id=normalized_agent_id)
+    except PermissionError as e:
+        raise HTTPException(status_code=403, detail=str(e)) from e
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    model_info = await _automation_model_payload(automation, agent=agent, user_id=user_id)
+    return JSONResponse(
+        status_code=_agent_create_response_status(agent),
+        content={
+            "ok": True,
+            "agent": agent.to_json(),
+            "agents": automation.list_agents_for_user(user_id=user_id),
+            "availableModels": model_info.get("availableModels"),
+            "models": model_info.get("models"),
+            "modelSource": model_info.get("source"),
+            "modelError": model_info.get("error"),
+        },
+    )
 
 
 @app.patch("/admin/users/{user_id}/agents/{agent_id}")
@@ -22106,8 +22490,16 @@ async def ws_proxy(ws: WebSocket):
                             main_id = _user_agent_id(user_id=user_id, short_name="main")
                             if not automation.can_user_access_agent_id(user_id=user_id, agent_id=main_id):
                                 raise ValueError("Not initialized (run /start)")
-                            agent = await automation.create_user_agent(user_id=user_id, short_name=str(raw_name or ""))
-                            result = {"ok": True, "agent": agent.to_json()}
+                            agent, created = await automation.create_user_agent(
+                                user_id=user_id,
+                                short_name=str(raw_name or ""),
+                            )
+                            result = {
+                                "ok": True,
+                                "agent": agent.to_json(),
+                                "created": created,
+                                "statusCode": _agent_create_response_status(agent),
+                            }
                             if has_id:
                                 await ws.send_text(json.dumps({"id": req_id, "result": result}))
                             continue

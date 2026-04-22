@@ -42,6 +42,7 @@ export interface SelfAgentsResponse {
   userId: number;
   agents: AdminAgentEntry[];
   agent?: AdminAgentEntry | null;
+  created?: boolean;
   currentAgentId?: string | null;
   currentSessionId?: string | null;
   currentAgent?: AdminAgentEntry | null;
@@ -92,6 +93,11 @@ export interface SelfAgentConnectionResponse {
     url?: string;
     token?: string | null;
   };
+}
+
+export interface SelfAgentConnectionOptions {
+  wait?: boolean;
+  timeoutMs?: number;
 }
 
 export interface SelfChannelsResponse {
@@ -189,11 +195,26 @@ export function setMyAgentModel(
   });
 }
 
+export function retryMyAgent(wsUrl: string, agentId: string): Promise<SelfAgentsResponse> {
+  return gatewayFetchJson<SelfAgentsResponse>(wsUrl, `/me/agents/${encodeURIComponent(agentId)}/retry`, {
+    method: "POST",
+  });
+}
+
 export function fetchMyAgentConnection(
   wsUrl: string,
-  agentId: string
+  agentId: string,
+  options?: SelfAgentConnectionOptions,
 ): Promise<SelfAgentConnectionResponse> {
-  return gatewayFetchJson<SelfAgentConnectionResponse>(wsUrl, `/me/agents/${encodeURIComponent(agentId)}/connection`);
+  const query = new URLSearchParams();
+  if (options?.wait) {
+    query.set("wait", "true");
+  }
+  if (typeof options?.timeoutMs === "number" && Number.isFinite(options.timeoutMs)) {
+    query.set("timeoutMs", String(Math.max(0, Math.trunc(options.timeoutMs))));
+  }
+  const suffix = query.toString() ? `?${query.toString()}` : "";
+  return gatewayFetchJson<SelfAgentConnectionResponse>(wsUrl, `/me/agents/${encodeURIComponent(agentId)}/connection${suffix}`);
 }
 
 export function createMyChannel(
