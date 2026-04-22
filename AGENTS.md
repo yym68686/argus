@@ -45,6 +45,10 @@ A skill is a set of local instructions to follow that is stored in a `SKILL.md` 
 
 ## 关键约定 / 易踩坑
 
+- 环境变量文件分工必须区分清楚：
+  - `.env.fugue`：仅用于 Fugue 远程部署的 Argus 网关/项目环境变量来源。
+  - `.env`：仅用于本地 Docker / `docker compose` 版 Argus。
+  - 排查或修复 Fugue 线上配置时，默认以 `.env.fugue` 为准，不要把 `.env` 里的本地部署变量写回 Fugue 线上 app。
 - runtime 容器内默认以 `root` 用户运行（UID `0`）
   - 挂载目录通常不会再遇到 “UID `1000` 不可写” 的问题，但会产生 root-owned 文件；如果你希望宿主机的非 root 用户可直接读写，建议改成宿主机同 UID/GID 或显式调整权限。
 - 网关的“自动创建容器”模式需要挂载宿主机 `docker.sock`
