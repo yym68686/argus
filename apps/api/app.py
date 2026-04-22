@@ -3148,6 +3148,7 @@ AGENT_PROVISIONING_STATES = {
     AGENT_PROVISIONING_STATE_READY,
     AGENT_PROVISIONING_STATE_FAILED,
 }
+PUBLIC_AGENT_CONNECTION_WAIT_MAX_MS = 30_000
 
 
 def _normalize_agent_provisioning_state(raw: Any, *, default: str = AGENT_PROVISIONING_STATE_READY) -> str:
@@ -6540,6 +6541,7 @@ class AutomationManager:
         self._session_restart_locks: dict[str, asyncio.Lock] = {}
         self._model_catalog_cache: dict[tuple[int, str], dict[str, Any]] = {}
         self._agent_provision_tasks: dict[str, asyncio.Task[None]] = {}
+        self._agent_cleanup_tasks: set[asyncio.Task[None]] = set()
 
     async def start(self) -> None:
         await self._store.load()
@@ -8799,6 +8801,58 @@ class AutomationManager:
                 return agent
             await asyncio.sleep(0.25)
 
+    def _drop_session_lane_state(self, session_id: str) -> None:
+        sid = session_id.strip() if isinstance(session_id, str) else ""
+        if not sid:
+            return
+        for key in list(self._lanes.keys()):
+            if key[0] == sid:
+                self._lanes.pop(key, None)
+        for key in list(self._last_heartbeat_run_at_ms.keys()):
+            if key[0] == sid:
+                self._last_heartbeat_run_at_ms.pop(key, None)
+        for key in list(self._turn_text_by_key.keys()):
+            if key[0] == sid:
+                self._pop_turn_text_entry(key)
+        for key in list(self._isolated_cron_context_by_key.keys()):
+            if key[0] == sid:
+                self._isolated_cron_context_by_key.pop(key, None)
+        self._main_thread_locks.pop(sid, None)
+
+    def _schedule_user_agent_cleanup(self, *, agent_id: str, session_id: str) -> None:
+        aid = _normalize_agent_id(agent_id)
+        sid = session_id.strip() if isinstance(session_id, str) else ""
+        if not aid or not sid:
+            return
+
+        async def _cleanup() -> None:
+            try:
+                await self._force_close_live_session(sid)
+            except Exception:
+                pass
+            if _provisioner_manages_runtime_sessions(sid):
+                try:
+                    await _remove_managed_runtime(sid)
+                except Exception as e:
+                    log.warning("Failed to remove runtime for deleted agent %s (session=%s): %s", aid, sid, str(e))
+            self._clear_session_backoff(sid)
+            self._drop_session_lane_state(sid)
+            self._session_restart_locks.pop(sid, None)
+
+        task = asyncio.create_task(_cleanup())
+        self._agent_cleanup_tasks.add(task)
+
+        def _done(done_task: asyncio.Task[None]) -> None:
+            self._agent_cleanup_tasks.discard(done_task)
+            try:
+                done_task.result()
+            except asyncio.CancelledError:
+                pass
+            except Exception:
+                log.exception("Background cleanup failed for deleted agent %s (session=%s)", aid, sid)
+
+        task.add_done_callback(_done)
+
     async def retry_user_agent_provisioning(self, *, user_id: int, agent_id: str) -> PersistedAgentRuntime:
         aid = _normalize_agent_id(agent_id)
         if not aid:
@@ -9000,99 +9054,72 @@ class AutomationManager:
         if not self._home_host_path and not remote_workspace:
             raise RuntimeError("ARGUS_HOME_HOST_PATH is required to delete user agents")
 
-        lock = self._session_restart_locks.get(session_id)
-        if lock is None:
-            lock = asyncio.Lock()
-            self._session_restart_locks[session_id] = lock
-
-        deleted_container = False
         archived_workspace_host_path: Optional[str] = None
+        home_root = Path(self._home_host_path).resolve() if self._home_host_path else None
+        main_id = self._user_main_agent_id(user_id=user_id)
+        cleanup_scheduled = False
 
-        async with lock:
-            home_root = Path(self._home_host_path).resolve()
-            main_id = self._user_main_agent_id(user_id=user_id)
+        provision_task = self._agent_provision_tasks.get(aid)
+        if provision_task is not None and not provision_task.done():
+            provision_task.cancel()
 
-            def _write(st: PersistedGatewayAutomationState) -> None:
-                nonlocal archived_workspace_host_path
-                st.version = max(int(getattr(st, "version", 1) or 1), AUTOMATION_STATE_VERSION)
-                current = st.agents.get(aid)
-                if not isinstance(current, PersistedAgentRuntime):
-                    raise ValueError(f"Unknown agent: {aid}")
-                if not (isinstance(current.owner_user_id, int) and current.owner_user_id == user_id):
-                    raise PermissionError("Forbidden")
+        def _write(st: PersistedGatewayAutomationState) -> None:
+            nonlocal archived_workspace_host_path, cleanup_scheduled
+            st.version = max(int(getattr(st, "version", 1) or 1), AUTOMATION_STATE_VERSION)
+            current = st.agents.get(aid)
+            if not isinstance(current, PersistedAgentRuntime):
+                raise ValueError(f"Unknown agent: {aid}")
+            if not (isinstance(current.owner_user_id, int) and current.owner_user_id == user_id):
+                raise PermissionError("Forbidden")
 
-                sid = str(current.session_id or "").strip()
-                if sid:
-                    ws_raw = str(current.workspace_host_path or "").strip()
-                    if ws_raw and not remote_workspace:
-                        try:
-                            old_ws = Path(ws_raw).resolve()
-                            if str(old_ws).startswith(str(home_root) + os.sep) and old_ws.exists() and old_ws.is_dir():
-                                cand = old_ws.with_name(f"{old_ws.name}.deleted-{sid}")
-                                if cand.exists():
-                                    cand = old_ws.with_name(f"{old_ws.name}.deleted-{sid}-{_now_ms()}")
-                                old_ws.rename(cand)
-                                archived_workspace_host_path = str(cand)
-                        except Exception as e:
-                            log.warning("Failed to archive workspace for deleted agent %s: %s", aid, str(e))
+            sid = str(current.session_id or "").strip()
+            if sid:
+                ws_raw = str(current.workspace_host_path or "").strip()
+                if ws_raw and not remote_workspace and home_root is not None:
+                    try:
+                        old_ws = Path(ws_raw).resolve()
+                        if str(old_ws).startswith(str(home_root) + os.sep) and old_ws.exists() and old_ws.is_dir():
+                            cand = old_ws.with_name(f"{old_ws.name}.deleted-{sid}")
+                            if cand.exists():
+                                cand = old_ws.with_name(f"{old_ws.name}.deleted-{sid}-{_now_ms()}")
+                            old_ws.rename(cand)
+                            archived_workspace_host_path = str(cand)
+                    except Exception as e:
+                        log.warning("Failed to archive workspace for deleted agent %s: %s", aid, str(e))
 
-                # Rebind the caller's private chat back to main; unbind other chats/topics.
-                for bound_ck, bound_aid in list(st.chat_bindings.items()):
-                    if bound_aid != aid:
-                        continue
-                    if aid == main_id:
-                        # Deleting main means the user has no default agent to fall back to.
-                        st.chat_bindings.pop(bound_ck, None)
-                        continue
-                    if bound_ck != ck:
-                        st.chat_bindings.pop(bound_ck, None)
-                        continue
-                    if main_id in st.agents:
-                        st.chat_bindings[bound_ck] = main_id
-                    else:
-                        st.chat_bindings.pop(bound_ck, None)
+            # Rebind the caller's private chat back to main; unbind other chats/topics.
+            for bound_ck, bound_aid in list(st.chat_bindings.items()):
+                if bound_aid != aid:
+                    continue
+                if aid == main_id:
+                    # Deleting main means the user has no default agent to fall back to.
+                    st.chat_bindings.pop(bound_ck, None)
+                    continue
+                if bound_ck != ck:
+                    st.chat_bindings.pop(bound_ck, None)
+                    continue
+                if main_id in st.agents:
+                    st.chat_bindings[bound_ck] = main_id
+                else:
+                    st.chat_bindings.pop(bound_ck, None)
 
-                st.agents.pop(aid, None)
+            st.agents.pop(aid, None)
 
-                # Remove session automation state only if no other agent references it.
-                if sid:
-                    referenced_elsewhere = False
-                    for a2 in st.agents.values():
-                        if isinstance(a2, PersistedAgentRuntime) and str(a2.session_id or "").strip() == sid:
-                            referenced_elsewhere = True
-                            break
-                    if not referenced_elsewhere:
-                        st.sessions.pop(sid, None)
+            # Remove session automation state only if no other agent references it.
+            if sid:
+                referenced_elsewhere = False
+                for a2 in st.agents.values():
+                    if isinstance(a2, PersistedAgentRuntime) and str(a2.session_id or "").strip() == sid:
+                        referenced_elsewhere = True
+                        break
+                cleanup_scheduled = not referenced_elsewhere
+                if cleanup_scheduled:
+                    st.sessions.pop(sid, None)
 
-            await self._store.update(_write)
+        await self._store.update(_write)
 
-            try:
-                await self._force_close_live_session(session_id)
-            except Exception:
-                pass
-
-            if _provisioner_manages_runtime_sessions():
-                try:
-                    deleted_container = await _remove_managed_runtime(session_id)
-                except Exception as e:
-                    log.warning("Failed to remove runtime for deleted agent %s (session=%s): %s", aid, session_id, str(e))
-
-            self._clear_session_backoff(session_id)
-
-            # Drop in-memory lane state for the deleted session to avoid retrying followups.
-            for (sid, tid) in list(self._lanes.keys()):
-                if sid == session_id:
-                    self._lanes.pop((sid, tid), None)
-            for key in list(self._last_heartbeat_run_at_ms.keys()):
-                if key[0] == session_id:
-                    self._last_heartbeat_run_at_ms.pop(key, None)
-            for key in list(self._turn_text_by_key.keys()):
-                if key[0] == session_id:
-                    self._pop_turn_text_entry(key)
-            for key in list(self._isolated_cron_context_by_key.keys()):
-                if key[0] == session_id:
-                    self._isolated_cron_context_by_key.pop(key, None)
-            self._main_thread_locks.pop(session_id, None)
+        if cleanup_scheduled:
+            self._schedule_user_agent_cleanup(agent_id=aid, session_id=session_id)
 
         main_agent = self._get_agent(main_id)
         current_agent_id = main_agent.agent_id if main_agent is not None else None
@@ -9101,8 +9128,9 @@ class AutomationManager:
             "deletedAgentId": aid,
             "deletedSessionId": session_id,
             "archivedWorkspaceHostPath": archived_workspace_host_path,
-            "deletedRuntime": deleted_container,
-            "deletedContainer": deleted_container,
+            "deletedRuntime": False,
+            "deletedContainer": False,
+            "cleanupScheduled": cleanup_scheduled,
             "currentAgentId": current_agent_id,
             "currentSessionId": current_session_id,
         }
@@ -9516,7 +9544,7 @@ class AutomationManager:
         for t in self._tasks:
             try:
                 await t
-            except Exception:
+            except BaseException:
                 pass
         pending = list(self._agent_provision_tasks.values())
         for task in pending:
@@ -9524,9 +9552,18 @@ class AutomationManager:
         for task in pending:
             try:
                 await task
-            except Exception:
+            except BaseException:
                 pass
         self._agent_provision_tasks.clear()
+        cleanup_tasks = list(self._agent_cleanup_tasks)
+        for task in cleanup_tasks:
+            task.cancel()
+        for task in cleanup_tasks:
+            try:
+                await task
+            except BaseException:
+                pass
+        self._agent_cleanup_tasks.clear()
 
     def lane(self, session_id: str, thread_id: str) -> ThreadLane:
         key = (session_id, thread_id)
@@ -19579,7 +19616,7 @@ async def _self_agent_connection_payload(
             timeout_ms = int(timeout_raw) if timeout_raw is not None else 30_000
         except Exception as e:
             raise HTTPException(status_code=400, detail="Invalid timeoutMs") from e
-        timeout_ms = min(max(timeout_ms, 0), 120_000)
+        timeout_ms = min(max(timeout_ms, 0), PUBLIC_AGENT_CONNECTION_WAIT_MAX_MS)
         if wait_requested:
             waited = await automation.wait_for_user_agent_provisioning(agent_id=normalized_agent_id, timeout_ms=timeout_ms)
             if isinstance(waited, PersistedAgentRuntime):

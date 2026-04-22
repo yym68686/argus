@@ -204,6 +204,75 @@ class UserAgentProvisioningTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(payload.get("agentId"), agent.agent_id)
         self.assertEqual(payload.get("provider"), "fake")
 
+    async def test_connection_payload_caps_wait_timeout(self) -> None:
+        gate = asyncio.Event()
+
+        async def fake_ensure_live_session(session_id: str, *, allow_create: bool):
+            self.assertTrue(allow_create)
+            self.assertTrue(session_id)
+            await gate.wait()
+            return types.SimpleNamespace(provider="fake"), True
+
+        with (
+            mock.patch.object(argus_app, "_require_user_agent_support", return_value=None),
+            mock.patch.object(argus_app, "_ensure_live_session", side_effect=fake_ensure_live_session),
+            mock.patch.object(argus_app, "PUBLIC_AGENT_CONNECTION_WAIT_MAX_MS", 25),
+            mock.patch.object(
+                self.manager,
+                "wait_for_user_agent_provisioning",
+                new=mock.AsyncMock(side_effect=self.manager.wait_for_user_agent_provisioning),
+            ) as wait_for_provisioning,
+        ):
+            agent, _ = await self.manager.create_user_agent(user_id=1, short_name="capped")
+            response = await argus_app._self_agent_connection_payload(
+                self.manager,
+                request=make_request("wait=true&timeoutMs=120000"),
+                user_id=1,
+                agent_id=agent.agent_id,
+            )
+            gate.set()
+            await self.manager.wait_for_user_agent_provisioning(agent_id=agent.agent_id, timeout_ms=2000)
+
+        self.assertIsInstance(response, argus_app.JSONResponse)
+        self.assertEqual(response.status_code, 409)
+        wait_for_provisioning.assert_any_await(agent_id=agent.agent_id, timeout_ms=25)
+
+    async def test_delete_user_agent_returns_before_cleanup_finishes(self) -> None:
+        provision_gate = asyncio.Event()
+        cleanup_gate = asyncio.Event()
+
+        async def fake_ensure_live_session(session_id: str, *, allow_create: bool):
+            self.assertTrue(allow_create)
+            self.assertTrue(session_id)
+            await provision_gate.wait()
+            return types.SimpleNamespace(provider="fake"), True
+
+        async def fake_remove_managed_runtime(session_id: str):
+            await cleanup_gate.wait()
+            return True
+
+        with (
+            mock.patch.object(argus_app, "_require_user_agent_support", return_value=None),
+            mock.patch.object(argus_app, "_ensure_live_session", side_effect=fake_ensure_live_session),
+            mock.patch.object(argus_app, "_provisioner_manages_runtime_sessions", return_value=True),
+            mock.patch.object(argus_app, "_remove_managed_runtime", side_effect=fake_remove_managed_runtime),
+            mock.patch.object(self.manager, "_force_close_live_session", new=mock.AsyncMock()),
+        ):
+            agent, _ = await self.manager.create_user_agent(user_id=1, short_name="delete-pending")
+            result = await asyncio.wait_for(
+                self.manager.delete_user_agent(
+                    user_id=1,
+                    chat_key="user:1:private",
+                    agent_id=agent.agent_id,
+                ),
+                timeout=0.5,
+            )
+            self.assertTrue(result.get("cleanupScheduled"))
+            self.assertIsNone(self.manager._get_agent(agent.agent_id))
+            self.assertTrue(self.manager._agent_cleanup_tasks)
+            cleanup_gate.set()
+            await asyncio.wait_for(asyncio.gather(*list(self.manager._agent_cleanup_tasks)), timeout=1.0)
+
 
 if __name__ == "__main__":
     unittest.main()
