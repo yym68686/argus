@@ -31,7 +31,7 @@ interface AuthContextValue {
 }
 
 const AuthContext = React.createContext<AuthContextValue | null>(null);
-const ADMIN_ONLY_PATH_PREFIXES = ["/users", "/settings", "/nodes", "/devices"];
+const ADMIN_ONLY_PATH_PREFIXES = ["/users", "/settings", "/nodes", "/devices", "/session-fleet"];
 const NOOP_SUBSCRIBE = () => () => {};
 
 export function useAuth(): AuthContextValue {

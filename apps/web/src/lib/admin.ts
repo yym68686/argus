@@ -157,6 +157,21 @@ export interface AdminUsageResponse {
   events: UsageEventEntry[];
 }
 
+export interface AdminSessionRow {
+  sessionId?: string;
+  containerId?: string;
+  name?: string;
+  status?: string;
+  provider?: string | null;
+  ownerUserId?: number | null;
+  agentId?: string | null;
+}
+
+export interface AdminSessionsResponse {
+  ok: true;
+  sessions: AdminSessionRow[];
+}
+
 export interface HostAgentEnrollTokenResponse {
   ok: true;
   token: string;
@@ -223,6 +238,23 @@ export async function fetchAdminUserDetail(wsUrl: string, userId: number): Promi
 export async function fetchAdminUsage(wsUrl: string, query?: URLSearchParams): Promise<AdminUsageResponse> {
   const suffix = query && query.toString() ? `?${query.toString()}` : "";
   return gatewayFetchJson<AdminUsageResponse>(wsUrl, `/admin/usage${suffix}`);
+}
+
+export async function fetchAdminSessions(wsUrl: string): Promise<AdminSessionsResponse> {
+  return gatewayFetchJson<AdminSessionsResponse>(wsUrl, "/admin/sessions");
+}
+
+export async function deleteAdminSession(
+  wsUrl: string,
+  sessionId: string,
+): Promise<{ ok: true; sessionId: string }> {
+  return gatewayFetchJson<{ ok: true; sessionId: string }>(
+    wsUrl,
+    `/admin/sessions/${encodeURIComponent(sessionId)}`,
+    {
+      method: "DELETE",
+    },
+  );
 }
 
 export async function issueHostAgentEnrollToken(

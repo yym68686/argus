@@ -14260,6 +14260,7 @@ async def _ensure_live_session(session_id: str, *, allow_create: bool) -> tuple[
 async def _list_managed_sessions() -> list[dict[str, Any]]:
     out: list[dict[str, Any]] = []
     seen: set[tuple[str, str]] = set()
+    automation: Optional[AutomationManager] = getattr(app.state, "automation", None)
     for mode in sorted(_active_runtime_provider_modes()):
         provider = _runtime_provisioner_for_mode(mode)
         if not provider.manages_runtime_sessions:
@@ -14281,7 +14282,19 @@ async def _list_managed_sessions() -> list[dict[str, Any]]:
             if key in seen:
                 continue
             seen.add(key)
-            out.append(row)
+            enriched = dict(row)
+            if sid and automation is not None:
+                agent = automation.get_agent_for_session(sid)
+                if isinstance(agent, PersistedAgentRuntime):
+                    if isinstance(agent.short_name, str) and agent.short_name.strip():
+                        enriched["name"] = agent.short_name.strip()
+                    enriched["agentId"] = agent.agent_id
+                    enriched["ownerUserId"] = agent.owner_user_id
+                else:
+                    owner_user_id = automation.get_owner_user_id_for_session(sid)
+                    if isinstance(owner_user_id, int) and owner_user_id > 0:
+                        enriched["ownerUserId"] = owner_user_id
+            out.append(enriched)
     out.sort(key=lambda item: ((item.get("provider") or ""), (item.get("sessionId") or "")))
     return out
 
@@ -14315,15 +14328,7 @@ async def _list_managed_sessions_for_user(user_id: int) -> list[dict[str, Any]]:
         session_id = str(row.get("sessionId") or "").strip()
         if not session_id or session_id not in visible_ids:
             continue
-        enriched = dict(row)
-        agent = automation.get_agent_for_session(session_id)
-        if isinstance(agent, PersistedAgentRuntime):
-            if isinstance(agent.short_name, str) and agent.short_name.strip():
-                enriched["name"] = agent.short_name.strip()
-            enriched["ownerUserId"] = agent.owner_user_id
-        else:
-            enriched["ownerUserId"] = automation.get_owner_user_id_for_session(session_id)
-        out.append(enriched)
+        out.append(dict(row))
     out.sort(key=lambda item: ((item.get("provider") or ""), (item.get("sessionId") or "")))
     return out
 
@@ -20559,6 +20564,48 @@ async def admin_overview(request: Request):
         "usage24h": usage_24h,
         "usageTotal": usage_total,
     }
+
+
+@app.get("/admin/sessions")
+async def admin_sessions(request: Request):
+    _http_require_token(request)
+    if not _provisioner_manages_runtime_sessions():
+        raise HTTPException(
+            status_code=400,
+            detail=f"Managed sessions are not available in provision mode '{_provisioner_mode_name()}'",
+        )
+    try:
+        sessions = await _list_managed_sessions()
+    except Exception as e:
+        log.exception("Failed to list managed sessions for admin")
+        raise HTTPException(status_code=500, detail=str(e)) from e
+    return {"ok": True, "sessions": sessions}
+
+
+@app.delete("/admin/sessions/{session_id}")
+async def admin_delete_session(session_id: str, request: Request):
+    _http_require_token(request)
+    sid = _normalize_runtime_session_id(session_id)
+    if not sid:
+        raise HTTPException(status_code=400, detail="Invalid sessionId")
+    if not _provisioner_manages_runtime_sessions(session_id):
+        raise HTTPException(
+            status_code=400,
+            detail=f"Managed sessions are not available for session '{session_id}'",
+        )
+    try:
+        await _delete_managed_session(sid)
+        automation: Optional[AutomationManager] = getattr(app.state, "automation", None)
+        if automation is not None:
+            await automation.delete_persisted_session_if_unreferenced(session_id=sid)
+    except KeyError as e:
+        raise HTTPException(status_code=404, detail="Session not found") from e
+    except HTTPException:
+        raise
+    except Exception as e:
+        log.exception("Failed to delete managed session %s", sid)
+        raise HTTPException(status_code=500, detail=str(e)) from e
+    return {"ok": True, "sessionId": sid}
 
 
 @app.get("/admin/settings/gateway-api-access")
