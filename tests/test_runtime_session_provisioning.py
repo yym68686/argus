@@ -115,6 +115,56 @@ class RuntimeSessionProvisioningTests(unittest.IsolatedAsyncioTestCase):
         self.assertIs(first_live, second_live)
         self.assertEqual(first_live.runtime_id, "app_123")
 
+    async def test_fugue_session_discovery_handles_suffixed_app_names(self) -> None:
+        cfg = argus_app.FugueProvisionConfig(
+            base_url="https://fugue.invalid",
+            token="token",
+            project_id="project_123",
+            runtime_id="runtime_123",
+            gateway_internal_host="gateway.internal",
+            runtime_cmd="codex serve",
+            connect_timeout_s=1.0,
+        )
+        apps = [
+            {
+                "id": "app_123",
+                "project_id": "project_123",
+                "name": "argus-session-3416ab8781ab-meadow",
+                "status": {"phase": "deployed"},
+                "updated_at": "2026-04-23T05:24:55Z",
+            },
+            {
+                "id": "app_other",
+                "project_id": "project_123",
+                "name": "argus-session-1234567890ab-river",
+                "status": {"phase": "failed"},
+                "updated_at": "2026-04-23T05:20:00Z",
+            },
+        ]
+        delete_calls: list[tuple[str, str, dict[str, str] | None]] = []
+
+        def fake_request_json_sync(patched_cfg, method, path, **kwargs):
+            self.assertIs(patched_cfg, cfg)
+            delete_calls.append((method, path, kwargs.get("params")))
+            return {}
+
+        with (
+            mock.patch.object(argus_app, "_fugue_cfg", return_value=cfg),
+            mock.patch.object(argus_app, "_fugue_list_apps_sync", return_value=apps),
+            mock.patch.object(argus_app, "_fugue_request_json_sync", side_effect=fake_request_json_sync),
+        ):
+            listed = argus_app._fugue_list_argus_sessions_sync()
+            found = argus_app._fugue_find_session_app_sync(cfg, "3416ab8781ab")
+            deleted = argus_app._fugue_delete_session_sync("3416ab8781ab", True)
+
+        self.assertEqual(len(listed), 2)
+        self.assertEqual(listed[0]["sessionId"], "1234567890ab")
+        self.assertEqual(listed[1]["sessionId"], "3416ab8781ab")
+        self.assertIsNotNone(found)
+        self.assertEqual(found["id"], "app_123")
+        self.assertTrue(deleted)
+        self.assertEqual(delete_calls, [("DELETE", "/v1/apps/app_123", {"force": "true"})])
+
 
 if __name__ == "__main__":
     unittest.main()

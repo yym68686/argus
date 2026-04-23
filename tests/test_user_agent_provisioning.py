@@ -273,6 +273,28 @@ class UserAgentProvisioningTests(unittest.IsolatedAsyncioTestCase):
             cleanup_gate.set()
             await asyncio.wait_for(asyncio.gather(*list(self.manager._agent_cleanup_tasks)), timeout=1.0)
 
+    async def test_delete_session_references_removes_main_agent_and_private_binding(self) -> None:
+        async def fake_ensure_live_session(session_id: str, *, allow_create: bool):
+            self.assertTrue(allow_create)
+            self.assertTrue(session_id)
+            return types.SimpleNamespace(provider="fake"), True
+
+        with (
+            mock.patch.object(argus_app, "_require_user_agent_support", return_value=None),
+            mock.patch.object(argus_app, "_ensure_live_session", side_effect=fake_ensure_live_session),
+            mock.patch.object(self.manager, "_force_close_live_session", new=mock.AsyncMock()),
+        ):
+            agent, _ = await self.manager.ensure_user_main_agent(user_id=1)
+            await self.manager.bind_private_user_to_agent(user_id=1, chat_key="1", agent_id=agent.agent_id)
+            await self.manager.wait_for_user_agent_provisioning(agent_id=agent.agent_id, timeout_ms=2000)
+
+            result = await self.manager.delete_session_references(session_id=agent.session_id)
+
+        self.assertEqual(result.get("deletedAgentIds"), [agent.agent_id])
+        self.assertEqual(self.manager.list_agents_for_user(user_id=1), [])
+        self.assertEqual(self.manager.resolve_agent_for_chat_key("1"), "")
+        self.assertNotIn(agent.session_id, self.manager._store.state.sessions)
+
 
 if __name__ == "__main__":
     unittest.main()

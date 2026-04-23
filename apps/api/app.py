@@ -7869,6 +7869,105 @@ class AutomationManager:
         await self._store.update(_write)
         return removed
 
+    async def delete_session_references(self, *, session_id: str) -> dict[str, Any]:
+        sid = session_id.strip() if isinstance(session_id, str) else ""
+        if not sid:
+            return {
+                "deletedSessionId": None,
+                "deletedAgentIds": [],
+                "deletedChatBindingCount": 0,
+                "deletedSessionState": False,
+                "archivedWorkspaceHostPaths": [],
+            }
+
+        st0 = self._store.state
+        affected_agent_ids = [
+            aid
+            for aid, agent in (st0.agents or {}).items()
+            if isinstance(agent, PersistedAgentRuntime) and str(agent.session_id or "").strip() == sid
+        ]
+        for aid in affected_agent_ids:
+            provision_task = self._agent_provision_tasks.get(aid)
+            if provision_task is not None and not provision_task.done():
+                provision_task.cancel()
+
+        archived_workspace_host_paths: list[str] = []
+        deleted_agent_ids: list[str] = []
+        deleted_chat_binding_count = 0
+        deleted_session_state = False
+        home_root = Path(self._home_host_path).resolve() if self._home_host_path else None
+
+        def _write(st: PersistedGatewayAutomationState) -> None:
+            nonlocal deleted_chat_binding_count, deleted_session_state
+            st.version = max(int(getattr(st, "version", 1) or 1), AUTOMATION_STATE_VERSION)
+
+            removed_agent_meta: dict[str, dict[str, Any]] = {}
+            for aid, current in list((st.agents or {}).items()):
+                if not isinstance(current, PersistedAgentRuntime):
+                    continue
+                if str(current.session_id or "").strip() != sid:
+                    continue
+                deleted_agent_ids.append(aid)
+                owner_user_id = current.owner_user_id if isinstance(current.owner_user_id, int) and current.owner_user_id > 0 else None
+                main_id = _user_agent_id(user_id=owner_user_id, short_name="main") if owner_user_id is not None else None
+                removed_agent_meta[aid] = {
+                    "ownerUserId": owner_user_id,
+                    "mainAgentId": main_id,
+                }
+                ws_raw = str(current.workspace_host_path or "").strip()
+                if ws_raw and home_root is not None and not _session_uses_remote_workspace(sid):
+                    try:
+                        old_ws = Path(ws_raw).resolve()
+                        if str(old_ws).startswith(str(home_root) + os.sep) and old_ws.exists() and old_ws.is_dir():
+                            cand = old_ws.with_name(f"{old_ws.name}.deleted-{sid}")
+                            if cand.exists():
+                                cand = old_ws.with_name(f"{old_ws.name}.deleted-{sid}-{_now_ms()}")
+                            old_ws.rename(cand)
+                            archived_workspace_host_paths.append(str(cand))
+                    except Exception as e:
+                        log.warning("Failed to archive workspace for deleted session %s agent %s: %s", sid, aid, str(e))
+                st.agents.pop(aid, None)
+
+            for bound_ck, bound_aid in list((st.chat_bindings or {}).items()):
+                if not isinstance(bound_aid, str) or bound_aid not in removed_agent_meta:
+                    continue
+                meta = removed_agent_meta.get(bound_aid) or {}
+                owner_user_id = meta.get("ownerUserId")
+                main_agent_id = meta.get("mainAgentId")
+                private_user_id = _parse_telegram_private_user_id(bound_ck) if isinstance(bound_ck, str) else None
+                if (
+                    isinstance(owner_user_id, int)
+                    and private_user_id == owner_user_id
+                    and isinstance(main_agent_id, str)
+                    and bound_aid != main_agent_id
+                    and main_agent_id in (st.agents or {})
+                ):
+                    st.chat_bindings[bound_ck] = main_agent_id
+                    continue
+                st.chat_bindings.pop(bound_ck, None)
+                deleted_chat_binding_count += 1
+
+            if sid in st.sessions:
+                st.sessions.pop(sid, None)
+                deleted_session_state = True
+
+        await self._store.update(_write)
+        self._clear_session_backoff(sid)
+        self._drop_session_lane_state(sid)
+        self._session_restart_locks.pop(sid, None)
+        try:
+            await self._force_close_live_session(sid)
+        except Exception:
+            pass
+
+        return {
+            "deletedSessionId": sid,
+            "deletedAgentIds": deleted_agent_ids,
+            "deletedChatBindingCount": deleted_chat_binding_count,
+            "deletedSessionState": deleted_session_state,
+            "archivedWorkspaceHostPaths": archived_workspace_host_paths,
+        }
+
     def _get_user_channel_state_for_user(self, *, user_id: int) -> PersistedUserChannelState:
         if not isinstance(user_id, int) or user_id <= 0:
             return PersistedUserChannelState()
@@ -18837,15 +18936,56 @@ def _fugue_list_apps_sync(cfg: FugueProvisionConfig) -> list[dict[str, Any]]:
     return [app for app in apps if isinstance(app, dict)] if isinstance(apps, list) else []
 
 
-def _fugue_find_session_app_sync(cfg: FugueProvisionConfig, session_id: str) -> Optional[dict[str, Any]]:
+def _fugue_extract_session_id_from_app_name(prefix: str, app_name: Any) -> str:
+    name = str(app_name or "").strip().lower()
+    if not name:
+        return ""
+    prefix_norm = re.sub(r"[^a-z0-9-]+", "-", (prefix or "").strip().lower()).strip("-") or "argus-session"
+    expected_prefix = f"{prefix_norm}-"
+    if not name.startswith(expected_prefix):
+        return ""
+    remainder = name[len(expected_prefix) :]
+    if len(remainder) < 12:
+        return ""
+    sid = _normalize_runtime_session_id(remainder[:12])
+    if not sid:
+        return ""
+    suffix = remainder[12:]
+    if suffix and not re.match(r"^-[a-z0-9-]+$", suffix):
+        return ""
+    return sid
+
+
+def _fugue_session_app_sort_key(cfg: FugueProvisionConfig, session_id: str, app_data: dict[str, Any]) -> tuple[int, int, str]:
     expected_name = _fugue_app_name(cfg, session_id)
+    actual_name = str(app_data.get("name") or "").strip().lower()
+    status = app_data.get("status") if isinstance(app_data.get("status"), dict) else {}
+    phase = str(status.get("phase") or "").strip().lower()
+    ready_rank = 1 if phase in ("deployed", "scaled", "migrated", "failed-over") else 0
+    exact_rank = 1 if actual_name == expected_name else 0
+    updated_rank = str(app_data.get("updated_at") or app_data.get("created_at") or "")
+    return (ready_rank, exact_rank, updated_rank)
+
+
+def _fugue_find_session_apps_sync(cfg: FugueProvisionConfig, session_id: str) -> list[dict[str, Any]]:
+    sid = _normalize_runtime_session_id(session_id)
+    if not sid:
+        return []
+    matches: list[dict[str, Any]] = []
     for app_data in _fugue_list_apps_sync(cfg):
         if str(app_data.get("project_id") or "").strip() != cfg.project_id:
             continue
-        if str(app_data.get("name") or "").strip() != expected_name:
+        matched_sid = _fugue_extract_session_id_from_app_name(cfg.app_name_prefix, app_data.get("name"))
+        if matched_sid != sid:
             continue
-        return app_data
-    return None
+        matches.append(app_data)
+    matches.sort(key=lambda item: _fugue_session_app_sort_key(cfg, sid, item), reverse=True)
+    return matches
+
+
+def _fugue_find_session_app_sync(cfg: FugueProvisionConfig, session_id: str) -> Optional[dict[str, Any]]:
+    matches = _fugue_find_session_apps_sync(cfg, session_id)
+    return matches[0] if matches else None
 
 
 def _fugue_find_app_by_name_sync(cfg: FugueProvisionConfig, app_name: str) -> Optional[dict[str, Any]]:
@@ -19040,18 +19180,21 @@ def _fugue_session_record_from_app(session_id: str, app_data: dict[str, Any]) ->
 
 def _fugue_list_argus_sessions_sync() -> list[dict[str, Any]]:
     cfg = _fugue_cfg()
-    prefix = _fugue_app_name(cfg, "000000000000")[:-12]
+    best_app_by_session_id: dict[str, dict[str, Any]] = {}
     out: list[dict[str, Any]] = []
     for app_data in _fugue_list_apps_sync(cfg):
         if str(app_data.get("project_id") or "").strip() != cfg.project_id:
             continue
-        name = str(app_data.get("name") or "").strip()
-        if not name.startswith(prefix):
-            continue
-        sid = name[len(prefix) :]
-        sid = _normalize_runtime_session_id(sid)
+        sid = _fugue_extract_session_id_from_app_name(cfg.app_name_prefix, app_data.get("name"))
         if not sid:
             continue
+        current_best = best_app_by_session_id.get(sid)
+        if current_best is None:
+            best_app_by_session_id[sid] = app_data
+            continue
+        if _fugue_session_app_sort_key(cfg, sid, app_data) > _fugue_session_app_sort_key(cfg, sid, current_best):
+            best_app_by_session_id[sid] = app_data
+    for sid, app_data in best_app_by_session_id.items():
         out.append(_fugue_session_record_from_app(sid, app_data))
     out.sort(key=lambda item: str(item.get("name") or ""))
     return out
@@ -19059,20 +19202,23 @@ def _fugue_list_argus_sessions_sync() -> list[dict[str, Any]]:
 
 def _fugue_delete_session_sync(session_id: str, force: bool) -> bool:
     cfg = _fugue_cfg()
-    app_data = _fugue_find_session_app_sync(cfg, session_id)
-    if app_data is None:
+    matches = _fugue_find_session_apps_sync(cfg, session_id)
+    if not matches:
         return False
-    app_id = str(app_data.get("id") or "").strip()
-    if not app_id:
-        return False
-    _fugue_request_json_sync(
-        cfg,
-        "DELETE",
-        f"/v1/apps/{app_id}",
-        params={"force": "true" if force else "false"},
-        expected_statuses=(202,),
-    )
-    return True
+    deleted = False
+    for app_data in matches:
+        app_id = str(app_data.get("id") or "").strip()
+        if not app_id:
+            continue
+        _fugue_request_json_sync(
+            cfg,
+            "DELETE",
+            f"/v1/apps/{app_id}",
+            params={"force": "true" if force else "false"},
+            expected_statuses=(202,),
+        )
+        deleted = True
+    return deleted
 
 
 def _fugue_restart_session_sync(session_id: str) -> bool:
@@ -21178,8 +21324,9 @@ async def admin_delete_session(session_id: str, request: Request):
     try:
         await _delete_managed_session(sid)
         automation: Optional[AutomationManager] = getattr(app.state, "automation", None)
+        cleanup_result = None
         if automation is not None:
-            await automation.delete_persisted_session_if_unreferenced(session_id=sid)
+            cleanup_result = await automation.delete_session_references(session_id=sid)
     except KeyError as e:
         raise HTTPException(status_code=404, detail="Session not found") from e
     except HTTPException:
@@ -21187,7 +21334,7 @@ async def admin_delete_session(session_id: str, request: Request):
     except Exception as e:
         log.exception("Failed to delete managed session %s", sid)
         raise HTTPException(status_code=500, detail=str(e)) from e
-    return {"ok": True, "sessionId": sid}
+    return {"ok": True, "sessionId": sid, **(cleanup_result or {})}
 
 
 @app.get("/admin/settings/gateway-api-access")
@@ -22185,8 +22332,9 @@ async def delete_session(session_id: str, request: Request):
     try:
         await _delete_managed_session(sid)
         automation: Optional[AutomationManager] = getattr(app.state, "automation", None)
-        if principal.kind != "admin_token" and automation is not None:
-            await automation.delete_persisted_session_if_unreferenced(session_id=sid)
+        cleanup_result = None
+        if automation is not None:
+            cleanup_result = await automation.delete_session_references(session_id=sid)
     except KeyError as e:
         raise HTTPException(status_code=404, detail="Session not found") from e
     except HTTPException:
@@ -22194,7 +22342,7 @@ async def delete_session(session_id: str, request: Request):
     except Exception as e:
         log.exception("Failed to delete managed session %s", sid)
         raise HTTPException(status_code=500, detail=str(e)) from e
-    return {"ok": True, "sessionId": sid}
+    return {"ok": True, "sessionId": sid, **(cleanup_result or {})}
 
 
 def _format_node_system_event_text(
