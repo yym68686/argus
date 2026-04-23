@@ -2465,7 +2465,7 @@ TELEGRAM_PRIVATE_CHAT_ID_RE = re.compile(r"^[1-9]\d{0,19}$")
 CONSOLE_EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 CONSOLE_SESSION_ID_RE = re.compile(r"^[a-f0-9]{24}$")
 DEVELOPER_API_KEY_ID_RE = re.compile(r"^[a-f0-9]{16}$")
-AUTOMATION_STATE_VERSION = 11
+AUTOMATION_STATE_VERSION = 12
 ARGUS_AGENT_MODEL_DEFAULT = "gpt-5.4"
 ARGUS_GATEWAY_AGENT_MODELS = ("gpt-5.2", "gpt-5.4")
 ARGUS_GATEWAY_AGENT_MODELS_SET = frozenset(ARGUS_GATEWAY_AGENT_MODELS)
@@ -2682,6 +2682,22 @@ def _normalize_console_email(raw: Any) -> str:
     if not CONSOLE_EMAIL_RE.match(email):
         return ""
     return email
+
+
+def _normalize_telegram_profile_text(raw: Any, *, max_len: int = 256) -> Optional[str]:
+    if not isinstance(raw, str):
+        return None
+    value = raw.strip()
+    if not value:
+        return None
+    return value[:max_len]
+
+
+def _normalize_telegram_username(raw: Any) -> Optional[str]:
+    value = _normalize_telegram_profile_text(raw, max_len=64)
+    if not value:
+        return None
+    return value.lstrip("@") or None
 
 
 def _normalize_console_password(raw: Any) -> str:
@@ -3926,6 +3942,67 @@ class PersistedDeveloperApiKey:
 
 
 @dataclass
+class PersistedTelegramUserProfile:
+    user_id: int
+    username: Optional[str] = None
+    first_name: Optional[str] = None
+    last_name: Optional[str] = None
+    created_at_ms: int = field(default_factory=_now_ms)
+    updated_at_ms: int = field(default_factory=_now_ms)
+
+    def display_name(self) -> Optional[str]:
+        parts = [part for part in (self.first_name, self.last_name) if isinstance(part, str) and part.strip()]
+        if parts:
+            return " ".join(parts)
+        if isinstance(self.username, str) and self.username.strip():
+            return f"@{self.username.strip()}"
+        return None
+
+    def to_json(self) -> dict[str, Any]:
+        return {
+            "userId": int(self.user_id),
+            "username": self.username,
+            "firstName": self.first_name,
+            "lastName": self.last_name,
+            "createdAtMs": int(self.created_at_ms),
+            "updatedAtMs": int(self.updated_at_ms),
+        }
+
+    def to_public_json(self) -> dict[str, Any]:
+        return {
+            **self.to_json(),
+            "displayName": self.display_name(),
+        }
+
+    @staticmethod
+    def from_json(obj: Any) -> Optional["PersistedTelegramUserProfile"]:
+        if not isinstance(obj, dict):
+            return None
+        try:
+            user_id = int(obj.get("userId"))
+        except Exception:
+            return None
+        if user_id <= 0:
+            return None
+        try:
+            created_at_ms = int(obj.get("createdAtMs")) if obj.get("createdAtMs") is not None else _now_ms()
+        except Exception:
+            created_at_ms = _now_ms()
+        try:
+            updated_at_ms = int(obj.get("updatedAtMs")) if obj.get("updatedAtMs") is not None else created_at_ms
+        except Exception:
+            updated_at_ms = created_at_ms
+        return PersistedTelegramUserProfile(
+            user_id=user_id,
+            username=_normalize_telegram_username(obj.get("username")),
+            first_name=_normalize_telegram_profile_text(obj.get("firstName")),
+            last_name=_normalize_telegram_profile_text(obj.get("lastName")),
+            created_at_ms=created_at_ms,
+            updated_at_ms=updated_at_ms,
+        )
+
+
+@dataclass
 class PersistedConsoleUser:
     user_id: int
     email: str
@@ -4090,6 +4167,7 @@ class PersistedGatewayAutomationState:
     chat_bindings: dict[str, str] = field(default_factory=dict)
     user_channels: dict[str, PersistedUserChannelState] = field(default_factory=dict)
     gateway_openai_default_enabled: bool = True
+    telegram_user_profiles: dict[str, PersistedTelegramUserProfile] = field(default_factory=dict)
     console_users: dict[str, PersistedConsoleUser] = field(default_factory=dict)
     console_sessions: dict[str, PersistedConsoleSession] = field(default_factory=dict)
     host_enrollments: dict[str, PersistedHostEnrollment] = field(default_factory=dict)
@@ -4108,6 +4186,11 @@ class PersistedGatewayAutomationState:
                 if isinstance(user_id, str) and user_id.strip() and isinstance(channel_state, PersistedUserChannelState)
             },
             "gatewayOpenaiDefaultEnabled": bool(self.gateway_openai_default_enabled),
+            "telegramUserProfiles": {
+                user_id: profile.to_json()
+                for user_id, profile in (self.telegram_user_profiles or {}).items()
+                if isinstance(user_id, str) and user_id.strip() and isinstance(profile, PersistedTelegramUserProfile)
+            },
             "consoleUsers": {
                 user_id: user.to_json(redact_secrets=redact_secrets)
                 for user_id, user in (self.console_users or {}).items()
@@ -4191,6 +4274,21 @@ class PersistedGatewayAutomationState:
                 user_channels[str(user_id_int)] = PersistedUserChannelState.from_json(raw_state)
         gateway_openai_default_enabled = _normalize_bool_flag(obj.get("gatewayOpenaiDefaultEnabled"), default=True)
 
+        telegram_user_profiles_raw = obj.get("telegramUserProfiles")
+        telegram_user_profiles: dict[str, PersistedTelegramUserProfile] = {}
+        if isinstance(telegram_user_profiles_raw, dict):
+            for raw_user_id, raw_profile in telegram_user_profiles_raw.items():
+                profile = PersistedTelegramUserProfile.from_json(raw_profile)
+                if profile is None:
+                    continue
+                key = str(profile.user_id)
+                if isinstance(raw_user_id, str) and raw_user_id.strip():
+                    try:
+                        key = str(int(raw_user_id))
+                    except Exception:
+                        key = str(profile.user_id)
+                telegram_user_profiles[key] = profile
+
         console_users_raw = obj.get("consoleUsers")
         console_users: dict[str, PersistedConsoleUser] = {}
         if isinstance(console_users_raw, dict):
@@ -4262,6 +4360,7 @@ class PersistedGatewayAutomationState:
             chat_bindings=chat_bindings,
             user_channels=user_channels,
             gateway_openai_default_enabled=gateway_openai_default_enabled,
+            telegram_user_profiles=telegram_user_profiles,
             console_users=console_users,
             console_sessions=console_sessions,
             host_enrollments=host_enrollments,
@@ -4477,6 +4576,26 @@ class _SQLiteAutomationStateStore:
                         ],
                     )
 
+                conn.execute("DELETE FROM automation_telegram_user_profiles")
+                if state.telegram_user_profiles:
+                    conn.executemany(
+                        """
+                        INSERT INTO automation_telegram_user_profiles (user_id, payload_json, updated_at_ms)
+                        VALUES (?, ?, ?)
+                        """,
+                        [
+                            (
+                                user_id,
+                                json.dumps(profile.to_json(), ensure_ascii=False, separators=(",", ":")),
+                                now_ms,
+                            )
+                            for user_id, profile in state.telegram_user_profiles.items()
+                            if isinstance(user_id, str)
+                            and user_id.strip()
+                            and isinstance(profile, PersistedTelegramUserProfile)
+                        ],
+                    )
+
                 conn.execute("DELETE FROM automation_console_sessions")
                 if state.console_sessions:
                     conn.executemany(
@@ -4593,6 +4712,11 @@ class _SQLiteAutomationStateStore:
                 payload_json TEXT NOT NULL,
                 updated_at_ms INTEGER NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS automation_telegram_user_profiles (
+                user_id TEXT PRIMARY KEY,
+                payload_json TEXT NOT NULL,
+                updated_at_ms INTEGER NOT NULL
+            );
             CREATE TABLE IF NOT EXISTS automation_console_sessions (
                 session_id TEXT PRIMARY KEY,
                 payload_json TEXT NOT NULL,
@@ -4625,6 +4749,7 @@ class _SQLiteAutomationStateStore:
             "automation_chat_bindings",
             "automation_user_channels",
             "automation_console_users",
+            "automation_telegram_user_profiles",
             "automation_console_sessions",
             "automation_host_enrollments",
             "automation_host_bindings",
@@ -4723,6 +4848,25 @@ class _SQLiteAutomationStateStore:
                 key = str(user.user_id)
             console_users[key] = user
 
+        telegram_user_profiles: dict[str, PersistedTelegramUserProfile] = {}
+        for row in conn.execute("SELECT user_id, payload_json FROM automation_telegram_user_profiles"):
+            user_id = str(row["user_id"] or "").strip()
+            if not user_id:
+                continue
+            try:
+                payload = json.loads(str(row["payload_json"] or "{}"))
+            except Exception:
+                continue
+            profile = PersistedTelegramUserProfile.from_json(payload)
+            if profile is None:
+                continue
+            key = user_id
+            try:
+                key = str(int(user_id))
+            except Exception:
+                key = str(profile.user_id)
+            telegram_user_profiles[key] = profile
+
         console_sessions: dict[str, PersistedConsoleSession] = {}
         for row in conn.execute("SELECT session_id, payload_json FROM automation_console_sessions"):
             try:
@@ -4785,6 +4929,7 @@ class _SQLiteAutomationStateStore:
             chat_bindings=chat_bindings,
             user_channels=user_channels,
             gateway_openai_default_enabled=gateway_openai_default_enabled,
+            telegram_user_profiles=telegram_user_profiles,
             console_users=console_users,
             console_sessions=console_sessions,
             host_enrollments=host_enrollments,
@@ -5543,6 +5688,26 @@ class _PostgresAutomationStateStore:
                             ],
                         )
 
+                    cur.execute("DELETE FROM automation_telegram_user_profiles")
+                    if state.telegram_user_profiles:
+                        cur.executemany(
+                            """
+                            INSERT INTO automation_telegram_user_profiles (user_id, payload_json, updated_at_ms)
+                            VALUES (%s, %s, %s)
+                            """,
+                            [
+                                (
+                                    user_id,
+                                    json.dumps(profile.to_json(), ensure_ascii=False, separators=(",", ":")),
+                                    now_ms,
+                                )
+                                for user_id, profile in state.telegram_user_profiles.items()
+                                if isinstance(user_id, str)
+                                and user_id.strip()
+                                and isinstance(profile, PersistedTelegramUserProfile)
+                            ],
+                        )
+
                     cur.execute("DELETE FROM automation_console_sessions")
                     if state.console_sessions:
                         cur.executemany(
@@ -5670,6 +5835,13 @@ class _PostgresAutomationStateStore:
             )
             """,
             """
+            CREATE TABLE IF NOT EXISTS automation_telegram_user_profiles (
+                user_id TEXT PRIMARY KEY,
+                payload_json TEXT NOT NULL,
+                updated_at_ms BIGINT NOT NULL
+            )
+            """,
+            """
             CREATE TABLE IF NOT EXISTS automation_console_sessions (
                 session_id TEXT PRIMARY KEY,
                 payload_json TEXT NOT NULL,
@@ -5709,6 +5881,7 @@ class _PostgresAutomationStateStore:
             "automation_chat_bindings",
             "automation_user_channels",
             "automation_console_users",
+            "automation_telegram_user_profiles",
             "automation_console_sessions",
             "automation_host_enrollments",
             "automation_host_bindings",
@@ -5807,6 +5980,25 @@ class _PostgresAutomationStateStore:
                 key = str(user.user_id)
             console_users[key] = user
 
+        telegram_user_profiles: dict[str, PersistedTelegramUserProfile] = {}
+        for row in conn.execute("SELECT user_id, payload_json FROM automation_telegram_user_profiles").fetchall():
+            user_id = str(row["user_id"] or "").strip()
+            if not user_id:
+                continue
+            try:
+                payload = json.loads(str(row["payload_json"] or "{}"))
+            except Exception:
+                continue
+            profile = PersistedTelegramUserProfile.from_json(payload)
+            if profile is None:
+                continue
+            key = user_id
+            try:
+                key = str(int(user_id))
+            except Exception:
+                key = str(profile.user_id)
+            telegram_user_profiles[key] = profile
+
         console_sessions: dict[str, PersistedConsoleSession] = {}
         for row in conn.execute("SELECT session_id, payload_json FROM automation_console_sessions").fetchall():
             try:
@@ -5869,6 +6061,7 @@ class _PostgresAutomationStateStore:
             chat_bindings=chat_bindings,
             user_channels=user_channels,
             gateway_openai_default_enabled=gateway_openai_default_enabled,
+            telegram_user_profiles=telegram_user_profiles,
             console_users=console_users,
             console_sessions=console_sessions,
             host_enrollments=host_enrollments,
@@ -7187,6 +7380,17 @@ class AutomationManager:
                 continue
             if user_id > 0:
                 used.add(user_id)
+        for raw_user_id in (st.telegram_user_profiles or {}).keys():
+            try:
+                user_id = int(raw_user_id)
+            except Exception:
+                continue
+            if user_id > 0:
+                used.add(user_id)
+        for chat_key in (st.chat_bindings or {}).keys():
+            user_id = _parse_telegram_private_user_id(chat_key)
+            if isinstance(user_id, int) and user_id > 0:
+                used.add(user_id)
         for agent in (st.agents or {}).values():
             if not isinstance(agent, PersistedAgentRuntime):
                 continue
@@ -7213,6 +7417,12 @@ class AutomationManager:
         raw = self._store.state.console_users.get(str(user_id))
         return raw if isinstance(raw, PersistedConsoleUser) else None
 
+    def get_telegram_user_profile(self, user_id: int) -> Optional[PersistedTelegramUserProfile]:
+        if not isinstance(user_id, int) or user_id <= 0:
+            return None
+        raw = self._store.state.telegram_user_profiles.get(str(user_id))
+        return raw if isinstance(raw, PersistedTelegramUserProfile) else None
+
     def get_console_user_by_email(self, email: str) -> Optional[PersistedConsoleUser]:
         normalized_email = _normalize_console_email(email)
         if not normalized_email:
@@ -7228,6 +7438,61 @@ class AutomationManager:
         out = [user.to_public_json() for user in (self._store.state.console_users or {}).values() if isinstance(user, PersistedConsoleUser)]
         out.sort(key=lambda item: (str(item.get("email") or ""), int(item.get("userId") or 0)))
         return out
+
+    async def upsert_telegram_user_profile(
+        self,
+        *,
+        user_id: int,
+        username: Optional[str] = None,
+        first_name: Optional[str] = None,
+        last_name: Optional[str] = None,
+    ) -> PersistedTelegramUserProfile:
+        if not isinstance(user_id, int) or user_id <= 0:
+            raise ValueError("Invalid userId")
+        username_norm = _normalize_telegram_username(username)
+        first_name_norm = _normalize_telegram_profile_text(first_name)
+        last_name_norm = _normalize_telegram_profile_text(last_name)
+
+        current = self.get_telegram_user_profile(user_id)
+        if (
+            isinstance(current, PersistedTelegramUserProfile)
+            and current.username == username_norm
+            and current.first_name == first_name_norm
+            and current.last_name == last_name_norm
+        ):
+            return current
+
+        stored: Optional[PersistedTelegramUserProfile] = None
+        now_ms = _now_ms()
+
+        def _write(st: PersistedGatewayAutomationState) -> None:
+            nonlocal stored
+            st.version = max(int(getattr(st, "version", 1) or 1), AUTOMATION_STATE_VERSION)
+            existing = st.telegram_user_profiles.get(str(user_id))
+            if (
+                isinstance(existing, PersistedTelegramUserProfile)
+                and existing.username == username_norm
+                and existing.first_name == first_name_norm
+                and existing.last_name == last_name_norm
+            ):
+                stored = existing
+                return
+            created_at_ms = existing.created_at_ms if isinstance(existing, PersistedTelegramUserProfile) else now_ms
+            profile = PersistedTelegramUserProfile(
+                user_id=user_id,
+                username=username_norm,
+                first_name=first_name_norm,
+                last_name=last_name_norm,
+                created_at_ms=created_at_ms,
+                updated_at_ms=now_ms,
+            )
+            st.telegram_user_profiles[str(user_id)] = profile
+            stored = profile
+
+        await self._store.update(_write)
+        if stored is None:
+            raise RuntimeError("Failed to store Telegram user profile")
+        return stored
 
     def developer_limits_for_user(self, *, user_id: int) -> dict[str, Any]:
         return {
@@ -9133,6 +9398,176 @@ class AutomationManager:
             "cleanupScheduled": cleanup_scheduled,
             "currentAgentId": current_agent_id,
             "currentSessionId": current_session_id,
+        }
+
+    async def delete_user(self, *, user_id: int) -> dict[str, Any]:
+        if not isinstance(user_id, int) or user_id <= 0:
+            raise ValueError("Invalid userId")
+
+        st0 = self._store.state
+        owned_agents = [
+            (aid, agent)
+            for aid, agent in (st0.agents or {}).items()
+            if isinstance(agent, PersistedAgentRuntime)
+            and isinstance(agent.owner_user_id, int)
+            and agent.owner_user_id == user_id
+        ]
+        has_state = bool(
+            owned_agents
+            or str(user_id) in (st0.user_channels or {})
+            or str(user_id) in (st0.console_users or {})
+            or str(user_id) in (st0.telegram_user_profiles or {})
+            or any(
+                isinstance(chat_key, str)
+                and (
+                    _parse_telegram_private_user_id(chat_key) == user_id
+                    or (isinstance(agent_id, str) and any(agent_id == aid for aid, _agent in owned_agents))
+                )
+                for chat_key, agent_id in (st0.chat_bindings or {}).items()
+            )
+            or any(
+                isinstance(session, PersistedConsoleSession)
+                and isinstance(session.user_id, int)
+                and session.user_id == user_id
+                for session in (st0.console_sessions or {}).values()
+            )
+            or any(
+                isinstance(session, PersistedSessionAutomation)
+                and isinstance(getattr(session, "owner_user_id", None), int)
+                and getattr(session, "owner_user_id", None) == user_id
+                for session in (st0.sessions or {}).values()
+            )
+        )
+        if not has_state:
+            raise ValueError("Unknown user")
+
+        agent_ids = [aid for aid, _agent in owned_agents]
+        for aid in agent_ids:
+            provision_task = self._agent_provision_tasks.get(aid)
+            if provision_task is not None and not provision_task.done():
+                provision_task.cancel()
+
+        local_owned_agents = [agent for _aid, agent in owned_agents if not _session_uses_remote_workspace(str(agent.session_id or "").strip())]
+        if local_owned_agents and not self._home_host_path:
+            raise RuntimeError("ARGUS_HOME_HOST_PATH is required to delete user agents")
+
+        archived_workspace_host_paths: list[str] = []
+        deleted_agent_ids: list[str] = []
+        deleted_session_ids: list[str] = []
+        deleted_console_session_ids: list[str] = []
+        deleted_chat_binding_count = 0
+        deleted_console_user = False
+        deleted_telegram_profile = False
+        deleted_custom_channel_ids: list[str] = []
+        home_root = Path(self._home_host_path).resolve() if self._home_host_path else None
+        cleanup_session_labels: dict[str, str] = {}
+
+        def _write(st: PersistedGatewayAutomationState) -> None:
+            nonlocal deleted_chat_binding_count, deleted_console_user, deleted_telegram_profile
+            st.version = max(int(getattr(st, "version", 1) or 1), AUTOMATION_STATE_VERSION)
+
+            removed_agent_ids: set[str] = set()
+            candidate_session_ids: set[str] = set()
+
+            current_user_state = st.user_channels.get(str(user_id))
+            if isinstance(current_user_state, PersistedUserChannelState):
+                for channel_id in (current_user_state.custom_channels or {}).keys():
+                    if isinstance(channel_id, str) and channel_id.strip():
+                        deleted_custom_channel_ids.append(channel_id)
+
+            for aid, current in list((st.agents or {}).items()):
+                if not isinstance(current, PersistedAgentRuntime):
+                    continue
+                if not (isinstance(current.owner_user_id, int) and current.owner_user_id == user_id):
+                    continue
+                removed_agent_ids.add(aid)
+                deleted_agent_ids.append(aid)
+                sid = str(current.session_id or "").strip()
+                if sid:
+                    candidate_session_ids.add(sid)
+                    cleanup_session_labels.setdefault(sid, aid)
+                    ws_raw = str(current.workspace_host_path or "").strip()
+                    if ws_raw and home_root is not None and not _session_uses_remote_workspace(sid):
+                        try:
+                            old_ws = Path(ws_raw).resolve()
+                            if str(old_ws).startswith(str(home_root) + os.sep) and old_ws.exists() and old_ws.is_dir():
+                                cand = old_ws.with_name(f"{old_ws.name}.deleted-{sid}")
+                                if cand.exists():
+                                    cand = old_ws.with_name(f"{old_ws.name}.deleted-{sid}-{_now_ms()}")
+                                old_ws.rename(cand)
+                                archived_workspace_host_paths.append(str(cand))
+                        except Exception as e:
+                            log.warning("Failed to archive workspace for deleted user agent %s: %s", aid, str(e))
+                st.agents.pop(aid, None)
+
+            for session_id, session in list((st.sessions or {}).items()):
+                if not isinstance(session_id, str) or not session_id.strip():
+                    continue
+                if not isinstance(session, PersistedSessionAutomation):
+                    continue
+                owner_user_id = getattr(session, "owner_user_id", None)
+                if isinstance(owner_user_id, int) and owner_user_id == user_id:
+                    candidate_session_ids.add(session_id.strip())
+                    cleanup_session_labels.setdefault(session_id.strip(), f"user-{user_id}")
+
+            for bound_ck, bound_aid in list((st.chat_bindings or {}).items()):
+                remove_binding = False
+                if isinstance(bound_ck, str) and _parse_telegram_private_user_id(bound_ck) == user_id:
+                    remove_binding = True
+                if isinstance(bound_aid, str) and bound_aid in removed_agent_ids:
+                    remove_binding = True
+                if not remove_binding:
+                    continue
+                st.chat_bindings.pop(bound_ck, None)
+                deleted_chat_binding_count += 1
+
+            if str(user_id) in (st.user_channels or {}):
+                st.user_channels.pop(str(user_id), None)
+
+            if str(user_id) in (st.console_users or {}):
+                st.console_users.pop(str(user_id), None)
+                deleted_console_user = True
+
+            if str(user_id) in (st.telegram_user_profiles or {}):
+                st.telegram_user_profiles.pop(str(user_id), None)
+                deleted_telegram_profile = True
+
+            for console_session_id, console_session in list((st.console_sessions or {}).items()):
+                if not isinstance(console_session, PersistedConsoleSession):
+                    continue
+                if not (isinstance(console_session.user_id, int) and console_session.user_id == user_id):
+                    continue
+                st.console_sessions.pop(console_session_id, None)
+                deleted_console_session_ids.append(console_session_id)
+
+            for sid in sorted(candidate_session_ids):
+                referenced_elsewhere = False
+                for current in (st.agents or {}).values():
+                    if isinstance(current, PersistedAgentRuntime) and str(current.session_id or "").strip() == sid:
+                        referenced_elsewhere = True
+                        break
+                if referenced_elsewhere:
+                    continue
+                if sid in st.sessions:
+                    st.sessions.pop(sid, None)
+                deleted_session_ids.append(sid)
+
+        await self._store.update(_write)
+
+        for sid in deleted_session_ids:
+            label = cleanup_session_labels.get(sid) or f"user-{user_id}"
+            self._schedule_user_agent_cleanup(agent_id=label, session_id=sid)
+
+        return {
+            "deletedUserId": user_id,
+            "deletedAgentIds": deleted_agent_ids,
+            "deletedSessionIds": deleted_session_ids,
+            "deletedConsoleSessionIds": deleted_console_session_ids,
+            "deletedChatBindingCount": deleted_chat_binding_count,
+            "deletedConsoleUser": deleted_console_user,
+            "deletedTelegramProfile": deleted_telegram_profile,
+            "deletedCustomChannelIds": deleted_custom_channel_ids,
+            "archivedWorkspaceHostPaths": archived_workspace_host_paths,
         }
 
     def can_user_access_agent_id(self, *, user_id: int, agent_id: str) -> bool:
@@ -19697,6 +20132,22 @@ def _admin_collect_user_ids(automation: AutomationManager) -> list[int]:
                 continue
             if user_id > 0:
                 ids.add(user_id)
+    if isinstance(getattr(st, "console_users", None), dict):
+        for raw_user_id in st.console_users.keys():
+            try:
+                user_id = int(raw_user_id)
+            except Exception:
+                continue
+            if user_id > 0:
+                ids.add(user_id)
+    if isinstance(getattr(st, "telegram_user_profiles", None), dict):
+        for raw_user_id in st.telegram_user_profiles.keys():
+            try:
+                user_id = int(raw_user_id)
+            except Exception:
+                continue
+            if user_id > 0:
+                ids.add(user_id)
     for agent in (st.agents or {}).values():
         if not isinstance(agent, PersistedAgentRuntime):
             continue
@@ -19730,6 +20181,14 @@ def _admin_last_active_ms_for_user(automation: AutomationManager, user_id: int) 
                 continue
             latest = max(latest, int(tgt.at_ms or 0))
         latest = max(latest, int(agent.created_at_ms or 0))
+    if latest > 0:
+        return latest
+    console_user = automation.get_console_user(user_id)
+    if isinstance(console_user, PersistedConsoleUser) and isinstance(console_user.last_login_at_ms, int) and console_user.last_login_at_ms > 0:
+        return console_user.last_login_at_ms
+    telegram_profile = automation.get_telegram_user_profile(user_id)
+    if isinstance(telegram_profile, PersistedTelegramUserProfile):
+        return int(telegram_profile.updated_at_ms or 0) or None
     return latest or None
 
 
@@ -19792,6 +20251,8 @@ def _admin_user_summary_payload(
     current_agent_id = _admin_resolve_current_agent_id_for_user(automation, user_id)
     current_agent = automation._get_agent(current_agent_id) if current_agent_id else None
     current_session_id = automation.resolve_agent_session_id(current_agent_id) if current_agent_id else None
+    console_user = automation.get_console_user(user_id)
+    telegram_profile = automation.get_telegram_user_profile(user_id)
     channel_info = automation.list_channels_for_user(user_id=user_id)
     current_channel = channel_info.get("currentChannel") if isinstance(channel_info.get("currentChannel"), dict) else None
     channels = channel_info.get("channels") if isinstance(channel_info.get("channels"), list) else []
@@ -19805,6 +20266,8 @@ def _admin_user_summary_payload(
 
     return {
         "userId": user_id,
+        "email": console_user.email if isinstance(console_user, PersistedConsoleUser) else None,
+        "telegramProfile": telegram_profile.to_public_json() if isinstance(telegram_profile, PersistedTelegramUserProfile) else None,
         "privateChatKey": _admin_private_chat_key_for_user(user_id),
         "agentCount": len(agents),
         "sessionCount": sum(1 for item in agents if isinstance(item, dict) and str(item.get("sessionId") or "").strip()),
@@ -19943,6 +20406,43 @@ async def automation_user_bootstrap(request: Request):
         "currentChannelId": channel_info.get("currentChannelId"),
         "currentChannel": channel_info.get("currentChannel"),
         "agent": agent.to_json(),
+    }
+
+
+@app.post("/automation/user/telegram-profile")
+async def automation_user_telegram_profile(request: Request):
+    _http_require_token(request)
+    automation = _get_automation_or_500()
+    try:
+        body = await request.json()
+    except Exception as e:
+        raise HTTPException(status_code=400, detail="Invalid JSON body") from e
+    if not isinstance(body, dict):
+        raise HTTPException(status_code=400, detail="Invalid JSON body")
+
+    raw_user_id = body.get("userId")
+    try:
+        user_id = int(raw_user_id)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail="Invalid 'userId'") from e
+    if user_id <= 0:
+        raise HTTPException(status_code=400, detail="Invalid 'userId'")
+
+    try:
+        profile = await automation.upsert_telegram_user_profile(
+            user_id=user_id,
+            username=body.get("username"),
+            first_name=body.get("firstName"),
+            last_name=body.get("lastName"),
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    except RuntimeError as e:
+        raise HTTPException(status_code=500, detail=str(e)) from e
+
+    return {
+        "ok": True,
+        "profile": profile.to_public_json(),
     }
 
 
@@ -20738,6 +21238,26 @@ async def admin_user_detail(user_id: int, request: Request):
         "modelError": model_info.get("error"),
         "recentUsage": recent_usage,
     }
+
+
+@app.delete("/admin/users/{user_id}")
+async def admin_user_delete(user_id: int, request: Request):
+    principal = _http_require_admin(request)
+    automation = _get_automation_or_500()
+    if user_id <= 0:
+        raise HTTPException(status_code=400, detail="Invalid userId")
+    if principal.kind == "console_session" and principal.user_id == user_id:
+        raise HTTPException(status_code=400, detail="Cannot delete the current signed-in user")
+    try:
+        result = await automation.delete_user(user_id=user_id)
+    except ValueError as e:
+        message = str(e)
+        if message == "Unknown user":
+            raise HTTPException(status_code=404, detail=message) from e
+        raise HTTPException(status_code=400, detail=message) from e
+    except RuntimeError as e:
+        raise HTTPException(status_code=500, detail=str(e)) from e
+    return {"ok": True, **result}
 
 
 @app.post("/admin/users/{user_id}/agents")

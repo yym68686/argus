@@ -58,8 +58,20 @@ export interface AdminAgentEntry {
   retryCount?: number | null;
 }
 
+export interface AdminTelegramProfile {
+  userId: number;
+  username?: string | null;
+  firstName?: string | null;
+  lastName?: string | null;
+  displayName?: string | null;
+  createdAtMs?: number | null;
+  updatedAtMs?: number | null;
+}
+
 export interface AdminUserSummary {
   userId: number;
+  email?: string | null;
+  telegramProfile?: AdminTelegramProfile | null;
   privateChatKey: string;
   agentCount: number;
   sessionCount: number;

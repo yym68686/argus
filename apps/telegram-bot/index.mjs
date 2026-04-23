@@ -678,6 +678,17 @@ class ArgusClient {
     return await this._httpJson("POST", "/automation/user/bootstrap", { chatKey });
   }
 
+  async automationTelegramProfileUpsert(profile) {
+    const userId = Number(profile?.userId);
+    if (!Number.isFinite(userId) || userId <= 0) throw new Error("Missing userId");
+    return await this._httpJson("POST", "/automation/user/telegram-profile", {
+      userId: Math.trunc(userId),
+      username: isNonEmptyString(profile?.username) ? String(profile.username).trim() : undefined,
+      firstName: isNonEmptyString(profile?.firstName) ? String(profile.firstName).trim() : undefined,
+      lastName: isNonEmptyString(profile?.lastName) ? String(profile.lastName).trim() : undefined
+    });
+  }
+
   async automationAgentList(chatKey) {
     if (!isNonEmptyString(chatKey)) throw new Error("Missing chatKey");
     return await this._httpJson("POST", "/automation/agent/list", { chatKey });
@@ -1158,6 +1169,20 @@ function chatKeyFromMessage(message) {
   const topicId = message?.message_thread_id;
   if (Number.isFinite(topicId)) return `${chatId}:${topicId}`;
   return String(chatId);
+}
+
+function telegramProfileFromUser(user) {
+  const userId = Number(user?.id);
+  if (!Number.isFinite(userId) || userId <= 0 || user?.is_bot) return null;
+  const username = isNonEmptyString(user?.username) ? String(user.username).trim().replace(/^@+/, "") : null;
+  const firstName = isNonEmptyString(user?.first_name) ? String(user.first_name).trim() : null;
+  const lastName = isNonEmptyString(user?.last_name) ? String(user.last_name).trim() : null;
+  return {
+    userId: Math.trunc(userId),
+    username,
+    firstName,
+    lastName
+  };
 }
 
 function sendTargetFromMessage(message) {
@@ -2132,11 +2157,30 @@ async function main() {
 
   // Keep one WS per gateway sessionId to avoid reconnect churn when routing between agents.
   const clients = new Map(); // sessionId -> ArgusClient
+  const syncedTelegramProfileKeysByUserId = new Map(); // userId -> profile cache key
   const lastActiveBySessionThread = new Map(); // `${sessionId}:${threadId}` -> chatKey
   const pendingTurnTargetsBySessionThread = new Map(); // `${sessionId}:${threadId}` -> [chatKey]
   const turnTargetBySessionThreadTurn = new Map(); // `${sessionId}:${threadId}:${turnId}` -> chatKey
   const sessionThreadKey = (sessionId, threadId) => `${sessionId}:${threadId}`;
   const sessionThreadTurnKey = (sessionId, threadId, turnId) => `${sessionId}:${threadId}:${turnId}`;
+
+  function syncTelegramProfile(user) {
+    const profile = telegramProfileFromUser(user);
+    if (!profile) return;
+    const cacheKey = [
+      profile.userId,
+      profile.username || "",
+      profile.firstName || "",
+      profile.lastName || ""
+    ].join("|");
+    if (syncedTelegramProfileKeysByUserId.get(profile.userId) === cacheKey) return;
+    syncedTelegramProfileKeysByUserId.set(profile.userId, cacheKey);
+    void argusHttp.automationTelegramProfileUpsert(profile).catch(() => {
+      if (syncedTelegramProfileKeysByUserId.get(profile.userId) === cacheKey) {
+        syncedTelegramProfileKeysByUserId.delete(profile.userId);
+      }
+    });
+  }
 
   function queuePendingTurnTarget(sessionId, threadId, chatKey) {
     if (!isNonEmptyString(sessionId) || !isNonEmptyString(threadId) || !isNonEmptyString(chatKey)) return;
@@ -3807,6 +3851,8 @@ async function main() {
     const localeHint = detectLocaleFromLanguageCode(callbackQuery?.from?.language_code) || "en";
     const S0 = uiStrings(localeHint);
 
+    syncTelegramProfile(callbackQuery?.from);
+
     if (!isNonEmptyString(cbId) || !isNonEmptyString(data) || !msg || typeof msg !== "object") {
       await safeAnswerCallbackQuery(cbId, S0.msg_unsupported_cb);
       return;
@@ -4965,6 +5011,7 @@ async function main() {
 
       queue.enqueue(async () => {
         const S = uiStrings(locale);
+        syncTelegramProfile(message?.from);
         const actorUserId = Number.isFinite(message?.from?.id) ? Math.trunc(message.from.id) : null;
         const actorChatKey = privateChatKeyForUserId(actorUserId);
         const pendingActorUserId = isGroupChatType(chatType) ? actorUserId : undefined;

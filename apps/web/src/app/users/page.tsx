@@ -48,6 +48,30 @@ function agentMutationToast(agent: AdminAgentEntry | null | undefined, created?:
   return created === false ? "Agent already exists" : fallback;
 }
 
+function formatTelegramIdentity(profile: AdminUserSummary["telegramProfile"] | null | undefined): string | null {
+  if (!profile) return null;
+  const parts: string[] = [];
+  if (typeof profile.userId === "number" && Number.isFinite(profile.userId) && profile.userId > 0) {
+    parts.push(`TG ${profile.userId}`);
+  }
+  if (profile.username) {
+    parts.push(`@${profile.username}`);
+  } else if (profile.displayName) {
+    parts.push(profile.displayName);
+  }
+  return parts.length ? parts.join(" · ") : null;
+}
+
+function userIdentitySubtitle(user: Pick<AdminUserSummary, "email" | "telegramProfile" | "privateChatKey" | "currentChannel" | "currentChannelId">): string {
+  const parts: string[] = [];
+  if (user.email) parts.push(user.email);
+  const telegramIdentity = formatTelegramIdentity(user.telegramProfile);
+  if (telegramIdentity) parts.push(telegramIdentity);
+  parts.push(`Private chat ${user.privateChatKey}`);
+  parts.push(`current channel ${user.currentChannel?.name || user.currentChannelId || "gateway"}`);
+  return parts.join(" · ");
+}
+
 export default function UsersPage() {
   const [wsUrl] = useGatewayWsUrlState();
   const [users, setUsers] = React.useState<AdminUserSummary[]>([]);
@@ -236,6 +260,43 @@ export default function UsersPage() {
       ]);
     } catch (error) {
       toast.error((error as Error)?.message || String(error));
+    }
+  }
+
+  async function deleteUser(): Promise<void> {
+    if (!selectedUserId) return;
+    const currentUser = detail?.user.userId === selectedUserId
+      ? detail.user
+      : users.find((user) => user.userId === selectedUserId) ?? null;
+    const label = currentUser?.email || currentUser?.telegramProfile?.username
+      ? `${currentUser?.email || ""}${currentUser?.email && currentUser?.telegramProfile?.username ? " / " : ""}${currentUser?.telegramProfile?.username ? `@${currentUser.telegramProfile.username}` : ""}`
+      : `User ${selectedUserId}`;
+    if (!window.confirm(`Delete ${label}? This will remove the user's agents, channel settings, Telegram profile, and console sessions.`)) {
+      return;
+    }
+
+    const actionKey = `user-delete:${selectedUserId}`;
+    setPendingAction(actionKey, true);
+    try {
+      const response = await gatewayFetchJson<{
+        deletedUserId: number;
+        deletedAgentIds?: string[];
+        deletedCustomChannelIds?: string[];
+        deletedConsoleSessionIds?: string[];
+      }>(wsUrl, `/admin/users/${selectedUserId}`, {
+        method: "DELETE",
+      });
+      setSelectedUserId(null);
+      setDetail(null);
+      setDetailError(null);
+      await refreshUsers();
+      toast.success(
+        `Deleted user ${response.deletedUserId} (${response.deletedAgentIds?.length ?? 0} agents, ${response.deletedCustomChannelIds?.length ?? 0} custom channels)`,
+      );
+    } catch (error) {
+      toast.error((error as Error)?.message || String(error));
+    } finally {
+      setPendingAction(actionKey, false);
     }
   }
 
@@ -567,6 +628,7 @@ export default function UsersPage() {
   const showUsersSkeleton = usersBusy && !users.length && !usersError;
   const showDetailSkeleton = Boolean(selectedUserId && detailBusy && !detail);
   const rosterTitle = users.length ? `Users (${users.length})` : "Users";
+  const deletingSelectedUser = Boolean(selectedUserId && pendingActions[`user-delete:${selectedUserId}`]);
 
   return (
     <ConsoleShell title="Users">
@@ -641,8 +703,16 @@ export default function UsersPage() {
                         <td className="px-4 py-3">
                           <div className="flex flex-wrap items-center gap-2">
                             <span className="font-medium text-foreground">User {user.userId}</span>
+                            {user.email ? <Badge tone="default">web</Badge> : null}
+                            {user.telegramProfile ? <Badge tone="default">tg</Badge> : null}
                             {active ? <Badge tone="primary">selected</Badge> : null}
                           </div>
+                          {user.email ? <div className="mt-1 text-[12.5px] text-muted-foreground">{user.email}</div> : null}
+                          {user.telegramProfile ? (
+                            <div className="mt-1 text-[12.5px] text-muted-foreground">
+                              {formatTelegramIdentity(user.telegramProfile)}
+                            </div>
+                          ) : null}
                           <div className="mt-1 font-mono text-[12.5px] text-muted-foreground">{user.privateChatKey}</div>
                         </td>
                         <td className="px-4 py-3">
@@ -704,17 +774,38 @@ export default function UsersPage() {
               <PanelCard
                 eyebrow="Selected user"
                 title={`User ${detail.user.userId}`}
-                subtitle={`Private chat ${detail.user.privateChatKey} · current channel ${detail.user.currentChannel?.name || detail.user.currentChannelId || "gateway"}`}
+                subtitle={userIdentitySubtitle(detail.user)}
                 className="argus-data-grid"
                 action={
                   <div className="flex flex-wrap gap-2">
+                    {detail.user.email ? <Badge tone="default">web</Badge> : null}
+                    {detail.user.telegramProfile ? <Badge tone="default">tg</Badge> : null}
                     {detail.user.initialized ? <Badge tone="success">initialized</Badge> : <Badge tone="warning">pending</Badge>}
                     <Badge tone="default">{detail.user.agentCount} agents</Badge>
                     <Badge tone="default">{detail.user.channelCount} channels</Badge>
+                    <Button type="button" size="sm" variant="destructive" disabled={deletingSelectedUser} onClick={() => void deleteUser()}>
+                      <Trash2 className="h-4 w-4" />
+                      {deletingSelectedUser ? "Deleting…" : "Delete user"}
+                    </Button>
                   </div>
                 }
               >
                 <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-4">
+                  <Fact label="Email" value={detail.user.email || "—"} />
+                  <Fact
+                    label="Telegram ID"
+                    value={detail.user.telegramProfile?.userId ? String(detail.user.telegramProfile.userId) : "—"}
+                    mono
+                  />
+                  <Fact
+                    label="Telegram user"
+                    value={
+                      detail.user.telegramProfile?.username
+                        ? `@${detail.user.telegramProfile.username}`
+                        : detail.user.telegramProfile?.displayName || "—"
+                    }
+                  />
+                  <Fact label="Private chat" value={detail.user.privateChatKey} mono />
                   <Fact label="24h tokens" value={formatCompact(detail.user.usage24h.totalTokens)} mono />
                   <Fact label="Total tokens" value={formatCompact(detail.user.usageTotal.totalTokens)} mono />
                   <Fact label="Current agent" value={detail.user.currentAgentId || "—"} mono />
