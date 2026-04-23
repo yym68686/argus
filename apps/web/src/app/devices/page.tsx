@@ -4,7 +4,6 @@ import * as React from "react";
 import { Apple, Copy, KeyRound, Laptop, Monitor, RefreshCw } from "lucide-react";
 import { toast } from "sonner";
 
-import { useAuth } from "@/components/admin-gate";
 import { Badge, EmptyState, Fact, InlineError, PanelCard, Skeleton } from "@/components/console-primitives";
 import { ConsoleShell } from "@/components/console-shell";
 import { Button } from "@/components/ui/button";
@@ -52,7 +51,6 @@ function hostLabel(host: HostAgentSummary): string {
 }
 
 export default function DevicesPage() {
-  const { user } = useAuth();
   const [wsUrl, setWsUrl] = useGatewayWsUrlState();
   const [platform, setPlatform] = React.useState<ClientPlatform>(detectClientPlatform);
   const [tokenInfo, setTokenInfo] = React.useState<HostAgentEnrollTokenResponse | null>(null);
@@ -114,8 +112,6 @@ export default function DevicesPage() {
       () => toast.error("Copy failed")
     );
   }
-
-  if (!user?.isAdmin) return null;
 
   const showSkeleton = loading && !tokenInfo;
 
