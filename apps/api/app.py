@@ -5038,6 +5038,35 @@ def _usage_float(value: Any) -> Optional[float]:
     return parsed
 
 
+def _normalize_recorded_openai_usage(payload: Any) -> dict[str, Any]:
+    if not isinstance(payload, dict):
+        return {}
+
+    # Streaming capture already emits a flattened usage snapshot. Re-running the
+    # raw Responses parser on that shape drops token counts and responseId.
+    if any(key in payload for key in ("responseId", "inputTokens", "outputTokens", "reasoningTokens", "totalTokens")):
+        input_tokens = _usage_int(payload.get("inputTokens"))
+        output_tokens = _usage_int(payload.get("outputTokens"))
+        reasoning_tokens = _usage_int(payload.get("reasoningTokens"))
+        total_tokens = _usage_int(payload.get("totalTokens"))
+        if total_tokens <= 0 and (input_tokens > 0 or output_tokens > 0):
+            total_tokens = max(0, input_tokens + output_tokens)
+        status = str(payload.get("status") or "").strip().lower() or None
+        error = str(payload.get("error") or "").strip() or None
+        return {
+            "responseId": str(payload.get("responseId") or "").strip() or None,
+            "model": str(payload.get("model") or "").strip() or None,
+            "status": status,
+            "error": error,
+            "inputTokens": input_tokens,
+            "outputTokens": output_tokens,
+            "reasoningTokens": reasoning_tokens,
+            "totalTokens": total_tokens,
+        }
+
+    return _extract_openai_usage(payload)
+
+
 def _extract_openai_usage(payload: Any) -> dict[str, Any]:
     if not isinstance(payload, dict):
         return {}
@@ -15105,6 +15134,7 @@ async def _startup():
     app.state.runtime_provisioners = _runtime_provisioners()
     app.state.sessions_lock = asyncio.Lock()
     app.state.sessions: dict[str, LiveRuntimeSession] = {}
+    app.state.session_provision_locks: dict[str, asyncio.Lock] = {}
     app.state.node_registry = NodeRegistry()
     app.state.runtime_host_registry = RuntimeHostRegistry()
     app.state.mcp_lock = asyncio.Lock()
@@ -15808,7 +15838,7 @@ def _record_openai_proxy_usage(event: dict[str, Any], payload: Any = None) -> No
     if usage_store is None:
         return
     try:
-        snapshot = _extract_openai_usage(payload) if payload is not None else {}
+        snapshot = _normalize_recorded_openai_usage(payload) if payload is not None else {}
         recorded = dict(event)
         for key, value in snapshot.items():
             if value in (None, "", 0):
@@ -18393,6 +18423,37 @@ async def _close_live_session(session_id: str) -> None:
         pass
 
 
+async def _session_provision_lock(session_id: str) -> asyncio.Lock:
+    sid = session_id.strip() if isinstance(session_id, str) else ""
+    if not sid:
+        raise ValueError("session_id must not be empty")
+    sessions_lock = getattr(app.state, "sessions_lock", None)
+    if sessions_lock is None:
+        sessions_lock = asyncio.Lock()
+        app.state.sessions_lock = sessions_lock
+    async with sessions_lock:
+        session_provision_locks = getattr(app.state, "session_provision_locks", None)
+        if not isinstance(session_provision_locks, dict):
+            session_provision_locks = {}
+            app.state.session_provision_locks = session_provision_locks
+        provision_lock = session_provision_locks.get(sid)
+        if provision_lock is None:
+            provision_lock = asyncio.Lock()
+            session_provision_locks[sid] = provision_lock
+        return provision_lock
+
+
+async def _with_session_provision_lock(
+    session_id: str,
+    fn: Callable[[], Awaitable[tuple[LiveRuntimeSession, bool]]],
+) -> tuple[LiveRuntimeSession, bool]:
+    # Serialize external runtime provisioning per session_id so concurrent
+    # callers cannot create duplicate managed runtimes for the same session.
+    provision_lock = await _session_provision_lock(session_id)
+    async with provision_lock:
+        return await fn()
+
+
 async def _read_jsonl_line(
     reader: asyncio.StreamReader,
     buffer: bytearray,
@@ -18576,6 +18637,13 @@ async def _activate_live_session(live: LiveRuntimeSession) -> LiveRuntimeSession
 
 
 async def _ensure_live_docker_session(session_id: str, *, allow_create: bool) -> tuple[LiveRuntimeSession, bool]:
+    return await _with_session_provision_lock(
+        session_id,
+        lambda: _ensure_live_docker_session_unlocked(session_id, allow_create=allow_create),
+    )
+
+
+async def _ensure_live_docker_session_unlocked(session_id: str, *, allow_create: bool) -> tuple[LiveRuntimeSession, bool]:
     async with app.state.sessions_lock:
         existing = app.state.sessions.get(session_id)
     if existing is not None:
@@ -19160,6 +19228,13 @@ def _fugue_list_workspace_tree_sync(cfg: FugueProvisionConfig, session_id: str, 
 
 
 async def _ensure_live_fugue_session(session_id: str, *, allow_create: bool) -> tuple[LiveRuntimeSession, bool]:
+    return await _with_session_provision_lock(
+        session_id,
+        lambda: _ensure_live_fugue_session_unlocked(session_id, allow_create=allow_create),
+    )
+
+
+async def _ensure_live_fugue_session_unlocked(session_id: str, *, allow_create: bool) -> tuple[LiveRuntimeSession, bool]:
     async with app.state.sessions_lock:
         existing = app.state.sessions.get(session_id)
     if existing is not None:
@@ -19419,6 +19494,13 @@ async def _configure_native_live_session(
 
 
 async def _ensure_live_native_session(session_id: str, *, allow_create: bool) -> tuple[LiveRuntimeSession, bool]:
+    return await _with_session_provision_lock(
+        session_id,
+        lambda: _ensure_live_native_session_unlocked(session_id, allow_create=allow_create),
+    )
+
+
+async def _ensure_live_native_session_unlocked(session_id: str, *, allow_create: bool) -> tuple[LiveRuntimeSession, bool]:
     async with app.state.sessions_lock:
         existing = app.state.sessions.get(session_id)
     if existing is not None:
