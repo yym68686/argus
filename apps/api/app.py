@@ -18847,6 +18847,7 @@ def _fugue_request_json_sync(
     body: Optional[dict[str, Any]] = None,
     expected_statuses: tuple[int, ...] = (200,),
 ) -> Any:
+    method_upper = str(method or "GET").strip().upper() or "GET"
     url = cfg.base_url + path
     kwargs: dict[str, Any] = {
         "headers": _fugue_headers(cfg),
@@ -18855,14 +18856,27 @@ def _fugue_request_json_sync(
     }
     if body is not None:
         kwargs["json"] = body
-    response = requests.request(method, url, **kwargs)
-    payload: Any = None
-    try:
-        if response.content:
-            payload = response.json()
-    except Exception:
-        payload = None
-    if response.status_code not in expected_statuses:
+    max_attempts = 3 if method_upper == "GET" else 1
+    for attempt in range(1, max_attempts + 1):
+        try:
+            response = requests.request(method_upper, url, **kwargs)
+        except requests.RequestException as e:
+            if attempt < max_attempts:
+                time.sleep(0.25 * attempt)
+                continue
+            raise RuntimeError(f"Fugue API {method_upper} {path} request failed: {str(e)}") from e
+
+        payload: Any = None
+        try:
+            if response.content:
+                payload = response.json()
+        except Exception:
+            payload = None
+        if response.status_code in expected_statuses:
+            return payload
+        if 500 <= response.status_code < 600 and attempt < max_attempts:
+            time.sleep(0.25 * attempt)
+            continue
         detail = _fugue_response_detail(payload)
         if (
             response.status_code == 404
@@ -18874,8 +18888,8 @@ def _fugue_request_json_sync(
             )
             detail = f"{detail}; {extra}" if detail else extra
         suffix = f": {detail}" if detail else ""
-        raise RuntimeError(f"Fugue API {method} {path} failed with {response.status_code}{suffix}")
-    return payload
+        raise RuntimeError(f"Fugue API {method_upper} {path} failed with {response.status_code}{suffix}")
+    raise RuntimeError(f"Fugue API {method_upper} {path} failed after retries")
 
 
 def _fugue_app_name(cfg: FugueProvisionConfig, session_id: str) -> str:
@@ -19033,6 +19047,42 @@ def _fugue_get_app_sync(cfg: FugueProvisionConfig, app_id: str) -> dict[str, Any
     return app_data
 
 
+def _fugue_get_operation_sync(cfg: FugueProvisionConfig, operation_id: str) -> dict[str, Any]:
+    payload = _fugue_request_json_sync(cfg, "GET", f"/v1/operations/{operation_id}", expected_statuses=(200,))
+    operation_data = payload.get("operation") if isinstance(payload, dict) else None
+    if not isinstance(operation_data, dict):
+        raise RuntimeError(f"Invalid Fugue operation payload for {operation_id}")
+    return operation_data
+
+
+def _fugue_operation_status(operation_data: Any) -> str:
+    raw = operation_data.get("status") if isinstance(operation_data, dict) else None
+    if isinstance(raw, str):
+        return raw.strip().lower()
+    if isinstance(raw, dict):
+        for key in ("status", "state", "phase"):
+            value = raw.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip().lower()
+    return ""
+
+
+def _fugue_operation_detail(operation_data: Any) -> str:
+    if not isinstance(operation_data, dict):
+        return ""
+    for key in ("error_message", "errorMessage", "result_message", "resultMessage", "message", "detail"):
+        value = operation_data.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    error = operation_data.get("error")
+    if isinstance(error, dict):
+        for key in ("message", "detail", "error"):
+            value = error.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+    return ""
+
+
 def _fugue_runtime_image_from_app(app_data: dict[str, Any]) -> str:
     source = app_data.get("source") if isinstance(app_data.get("source"), dict) else {}
     spec = app_data.get("spec") if isinstance(app_data.get("spec"), dict) else {}
@@ -19118,6 +19168,9 @@ def _fugue_wait_for_app_ready_sync(cfg: FugueProvisionConfig, app_id: str) -> di
     deadline = time.time() + max(60.0, cfg.connect_timeout_s * 6.0)
     last_phase = ""
     last_message = ""
+    last_operation_id = ""
+    last_operation_status = ""
+    last_operation_detail = ""
     while True:
         app_data = _fugue_get_app_sync(cfg, app_id)
         status = app_data.get("status") if isinstance(app_data.get("status"), dict) else {}
@@ -19130,12 +19183,46 @@ def _fugue_wait_for_app_ready_sync(cfg: FugueProvisionConfig, app_id: str) -> di
             port = internal_service.get("port")
             if host and isinstance(port, int) and port > 0:
                 return app_data
+        operation_id = str(status.get("last_operation_id") or app_data.get("last_operation_id") or "").strip()
+        if operation_id:
+            last_operation_id = operation_id
+            try:
+                operation_data = _fugue_get_operation_sync(cfg, operation_id)
+            except Exception as e:
+                log.debug("Failed to inspect Fugue operation %s for app %s: %s", operation_id, app_id, str(e))
+            else:
+                operation_status = _fugue_operation_status(operation_data)
+                operation_detail = _fugue_operation_detail(operation_data)
+                last_operation_status = operation_status or last_operation_status
+                last_operation_detail = operation_detail or last_operation_detail
+                if operation_status in ("failed", "error", "canceled", "cancelled", "deleted"):
+                    detail = operation_detail or last_message
+                    suffix = f": {detail}" if detail else ""
+                    raise RuntimeError(
+                        f"Fugue app {app_id} last operation {operation_id} entered status {operation_status}{suffix}"
+                    )
         if phase in ("failed", "deleted"):
-            detail = f" ({last_message})" if last_message else ""
+            detail_parts: list[str] = []
+            if last_message:
+                detail_parts.append(last_message)
+            if last_operation_id and last_operation_status:
+                op_summary = f"operation {last_operation_id} {last_operation_status}"
+                if last_operation_detail:
+                    op_summary = f"{op_summary}: {last_operation_detail}"
+                detail_parts.append(op_summary)
+            detail = f" ({'; '.join(detail_parts)})" if detail_parts else ""
             raise RuntimeError(f"Fugue app {app_id} entered phase {phase}{detail}")
         if time.time() >= deadline:
-            detail = f" message={last_message}" if last_message else ""
-            raise TimeoutError(f"Timed out waiting for Fugue app {app_id} to become ready (phase={last_phase}){detail}")
+            detail_parts: list[str] = []
+            if last_message:
+                detail_parts.append(f"message={last_message}")
+            if last_operation_id and last_operation_status:
+                detail_parts.append(f"operation={last_operation_id}:{last_operation_status}")
+            if last_operation_detail:
+                detail_parts.append(f"operationDetail={last_operation_detail}")
+            detail = f" {' '.join(detail_parts)}" if detail_parts else ""
+            phase_label = last_phase or "unknown"
+            raise TimeoutError(f"Timed out waiting for Fugue app {app_id} to become ready (phase={phase_label}){detail}")
         time.sleep(1.0)
 
 

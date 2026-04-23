@@ -1,5 +1,6 @@
 import asyncio
 import importlib.util
+import json
 import pathlib
 import sys
 import tempfile
@@ -27,6 +28,70 @@ class DummyWriter:
 
     def close(self) -> None:
         self._closing = True
+
+
+def make_response(status_code: int, payload=None):
+    response = mock.Mock()
+    response.status_code = status_code
+    if payload is None:
+        response.content = b""
+    else:
+        response.content = json.dumps(payload).encode("utf-8")
+        response.json.return_value = payload
+    return response
+
+
+class FugueApiHelperTests(unittest.TestCase):
+    def test_fugue_request_json_sync_retries_transient_get_failures(self) -> None:
+        cfg = argus_app.FugueProvisionConfig(
+            base_url="https://fugue.invalid",
+            token="token",
+            project_id="project_123",
+            runtime_id="runtime_123",
+            gateway_internal_host="gateway.internal",
+            runtime_cmd="codex serve",
+            connect_timeout_s=1.0,
+        )
+        retryable = make_response(502, {"error": "bad gateway"})
+        success = make_response(200, {"ok": True})
+
+        with (
+            mock.patch.object(argus_app.requests, "request", side_effect=[retryable, success]) as request_mock,
+            mock.patch.object(argus_app.time, "sleep") as sleep_mock,
+        ):
+            payload = argus_app._fugue_request_json_sync(cfg, "GET", "/v1/apps", expected_statuses=(200,))
+
+        self.assertEqual(payload, {"ok": True})
+        self.assertEqual(request_mock.call_count, 2)
+        sleep_mock.assert_called_once_with(0.25)
+
+    def test_fugue_request_json_sync_does_not_retry_post_failures(self) -> None:
+        cfg = argus_app.FugueProvisionConfig(
+            base_url="https://fugue.invalid",
+            token="token",
+            project_id="project_123",
+            runtime_id="runtime_123",
+            gateway_internal_host="gateway.internal",
+            runtime_cmd="codex serve",
+            connect_timeout_s=1.0,
+        )
+        retryable = make_response(502, {"error": "bad gateway"})
+
+        with (
+            mock.patch.object(argus_app.requests, "request", return_value=retryable) as request_mock,
+            mock.patch.object(argus_app.time, "sleep") as sleep_mock,
+        ):
+            with self.assertRaisesRegex(RuntimeError, r"POST /v1/apps/import-image failed with 502"):
+                argus_app._fugue_request_json_sync(
+                    cfg,
+                    "POST",
+                    "/v1/apps/import-image",
+                    body={"project_id": cfg.project_id},
+                    expected_statuses=(202,),
+                )
+
+        request_mock.assert_called_once()
+        sleep_mock.assert_not_called()
 
 
 class RuntimeSessionProvisioningTests(unittest.IsolatedAsyncioTestCase):
@@ -164,6 +229,99 @@ class RuntimeSessionProvisioningTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(found["id"], "app_123")
         self.assertTrue(deleted)
         self.assertEqual(delete_calls, [("DELETE", "/v1/apps/app_123", {"force": "true"})])
+
+    async def test_fugue_wait_for_app_ready_surfaces_operation_failure(self) -> None:
+        cfg = argus_app.FugueProvisionConfig(
+            base_url="https://fugue.invalid",
+            token="token",
+            project_id="project_123",
+            runtime_id="runtime_123",
+            gateway_internal_host="gateway.internal",
+            runtime_cmd="codex serve",
+            connect_timeout_s=1.0,
+        )
+        app_data = {
+            "id": "app_123",
+            "status": {
+                "phase": "deploying",
+                "last_message": "deployment progressing (0/1 ready replicas)",
+                "last_operation_id": "op_123",
+            },
+        }
+        operation_data = {
+            "id": "op_123",
+            "status": "failed",
+            "error_message": "Unschedulable: 0/5 nodes are available",
+        }
+
+        with (
+            mock.patch.object(argus_app, "_fugue_get_app_sync", return_value=app_data),
+            mock.patch.object(argus_app, "_fugue_get_operation_sync", return_value=operation_data),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "Unschedulable: 0/5 nodes are available"):
+                argus_app._fugue_wait_for_app_ready_sync(cfg, "app_123")
+
+    async def test_fugue_wait_for_app_ready_prefers_current_ready_state(self) -> None:
+        cfg = argus_app.FugueProvisionConfig(
+            base_url="https://fugue.invalid",
+            token="token",
+            project_id="project_123",
+            runtime_id="runtime_123",
+            gateway_internal_host="gateway.internal",
+            runtime_cmd="codex serve",
+            connect_timeout_s=1.0,
+        )
+        app_data = {
+            "id": "app_123",
+            "status": {
+                "phase": "deployed",
+                "last_message": "deployment finished",
+                "last_operation_id": "op_old",
+            },
+            "internal_service": {"host": "runtime.internal", "port": 7777},
+        }
+
+        with mock.patch.object(argus_app, "_fugue_get_operation_sync") as get_operation:
+            with mock.patch.object(argus_app, "_fugue_get_app_sync", return_value=app_data):
+                ready = argus_app._fugue_wait_for_app_ready_sync(cfg, "app_123")
+
+        self.assertEqual(ready, app_data)
+        get_operation.assert_not_called()
+
+    async def test_fugue_wait_for_app_ready_timeout_includes_operation_context(self) -> None:
+        cfg = argus_app.FugueProvisionConfig(
+            base_url="https://fugue.invalid",
+            token="token",
+            project_id="project_123",
+            runtime_id="runtime_123",
+            gateway_internal_host="gateway.internal",
+            runtime_cmd="codex serve",
+            connect_timeout_s=10.0,
+        )
+        app_data = {
+            "id": "app_123",
+            "status": {
+                "phase": "deploying",
+                "last_message": "deployment progressing (0/1 ready replicas)",
+                "last_operation_id": "op_123",
+            },
+        }
+        operation_data = {
+            "id": "op_123",
+            "status": "running",
+            "message": "still reconciling",
+        }
+
+        with (
+            mock.patch.object(argus_app, "_fugue_get_app_sync", return_value=app_data),
+            mock.patch.object(argus_app, "_fugue_get_operation_sync", return_value=operation_data),
+            mock.patch.object(argus_app.time, "time", side_effect=[0.0, 61.0]),
+        ):
+            with self.assertRaisesRegex(
+                TimeoutError,
+                r"operation=op_123:running .*operationDetail=still reconciling",
+            ):
+                argus_app._fugue_wait_for_app_ready_sync(cfg, "app_123")
 
 
 if __name__ == "__main__":
