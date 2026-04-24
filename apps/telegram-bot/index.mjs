@@ -4,6 +4,7 @@ import http from "node:http";
 import { readFileSync } from "node:fs";
 import fs from "node:fs/promises";
 import path from "node:path";
+import { pathToFileURL } from "node:url";
 import WebSocket from "ws";
 
 const DEFAULT_BOT_VERSION = "0.0.0";
@@ -538,6 +539,99 @@ function redactUrlSecrets(rawUrl) {
     return u.toString();
   } catch {
     return raw.replace(/([?&](?:token|access_token|authorization|auth|bearer)=)[^&#]+/gi, "$1***");
+  }
+}
+
+function formatUnixTimestampSeconds(seconds) {
+  if (!Number.isFinite(seconds)) return null;
+  try {
+    return new Date(seconds * 1000).toISOString();
+  } catch {
+    return null;
+  }
+}
+
+function telegramWebhookInfoLogFields(info) {
+  if (!isObjectRecord(info)) return {};
+  const fields = {};
+  const allowedUpdates = Array.isArray(info.allowed_updates)
+    ? info.allowed_updates.filter((value) => isNonEmptyString(value)).slice(0, 20)
+    : undefined;
+  if (isNonEmptyString(info.url)) fields.webhook_url = redactUrlSecrets(info.url);
+  if (Number.isFinite(info.pending_update_count)) fields.webhook_pending_update_count = info.pending_update_count;
+  const lastErrorAt = formatUnixTimestampSeconds(info.last_error_date);
+  if (isNonEmptyString(lastErrorAt)) fields.webhook_last_error_at = lastErrorAt;
+  if (isNonEmptyString(info.last_error_message)) fields.webhook_last_error_message = info.last_error_message;
+  if (isNonEmptyString(info.ip_address)) fields.webhook_ip_address = info.ip_address;
+  if (info.has_custom_certificate === true) fields.webhook_has_custom_certificate = true;
+  if (allowedUpdates && allowedUpdates.length > 0) fields.webhook_allowed_updates = allowedUpdates;
+  return fields;
+}
+
+function isTelegramGetUpdatesWebhookConflict(error) {
+  const message = error instanceof Error ? error.message : String(error ?? "");
+  if (!isNonEmptyString(message)) return false;
+  const normalized = message.toLowerCase();
+  if (!normalized.includes("telegram getupdates failed")) return false;
+  return normalized.includes("webhook is active") || normalized.includes("terminated by setwebhook request");
+}
+
+async function getTelegramWebhookInfoSafe(tg, reason) {
+  try {
+    return await tg.getWebhookInfo();
+  } catch (e) {
+    log(`getWebhookInfo failed (${reason}):`, e instanceof Error ? e.message : String(e));
+    return null;
+  }
+}
+
+async function clearTelegramWebhookForPolling({ tg, reason, triggerError, logWhenNoWebhook = false } = {}) {
+  const triggerErrorText = triggerError instanceof Error ? triggerError.message : String(triggerError ?? "");
+  const before = await getTelegramWebhookInfoSafe(tg, `${reason}.before_delete`);
+  const hadWebhook = isObjectRecord(before) && isNonEmptyString(before.url);
+  if (hadWebhook || isNonEmptyString(triggerErrorText) || logWhenNoWebhook) {
+    logEvent("WARNING", "tg.polling.webhook_detected", {
+      reason,
+      trigger_error: isNonEmptyString(triggerErrorText) ? triggerErrorText : undefined,
+      ...telegramWebhookInfoLogFields(before)
+    });
+  }
+
+  let deleteError = null;
+  try {
+    await tg.deleteWebhook({ drop_pending_updates: false });
+  } catch (e) {
+    deleteError = e;
+  }
+
+  const after = deleteError ? before : await getTelegramWebhookInfoSafe(tg, `${reason}.after_delete`);
+  const cleared = !isObjectRecord(after) || !isNonEmptyString(after.url);
+  if (deleteError || hadWebhook || isNonEmptyString(triggerErrorText) || logWhenNoWebhook || !cleared) {
+    logEvent(deleteError || !cleared ? "WARNING" : "INFO", deleteError ? "tg.polling.webhook_clear_failed" : "tg.polling.webhook_cleared", {
+      reason,
+      trigger_error: isNonEmptyString(triggerErrorText) ? triggerErrorText : undefined,
+      delete_error: deleteError instanceof Error ? deleteError.message : deleteError ? String(deleteError) : undefined,
+      webhook_cleared: cleared,
+      ...telegramWebhookInfoLogFields(after)
+    });
+  }
+
+  return {
+    before,
+    after,
+    hadWebhook,
+    cleared,
+    deleteError
+  };
+}
+
+function isExecutedAsEntryPoint() {
+  const argv1 = process.argv?.[1];
+  if (!isNonEmptyString(argv1)) return false;
+  try {
+    return import.meta.url === pathToFileURL(path.resolve(argv1)).href;
+  } catch {
+    return false;
   }
 }
 
@@ -4915,10 +5009,9 @@ async function main() {
     }
     log("Serving Telegram webhook…", `port=${webhookListenPort}`, `path=${telegramDelivery.path}`);
   } else {
-    try {
-      await tg.deleteWebhook({ drop_pending_updates: false });
-    } catch (e) {
-      log("deleteWebhook failed (continuing):", e instanceof Error ? e.message : String(e));
+    const startupWebhookSync = await clearTelegramWebhookForPolling({ tg, reason: "startup" });
+    if (startupWebhookSync.deleteError) {
+      log("deleteWebhook failed (continuing):", startupWebhookSync.deleteError instanceof Error ? startupWebhookSync.deleteError.message : String(startupWebhookSync.deleteError));
     }
 
     if (Number.isFinite(state.state.lastUpdateId)) {
@@ -4947,6 +5040,8 @@ async function main() {
     log("Polling Telegram updates…");
   }
 
+  let nextPollingWebhookRecoveryAtMs = 0;
+
   // eslint-disable-next-line no-constant-condition
   while (true) {
     let updates = [];
@@ -4956,6 +5051,20 @@ async function main() {
       try {
         updates = await tg.getUpdates({ offset, timeout: 50, allowed_updates: ["message", "callback_query"] });
       } catch (e) {
+        if (isTelegramGetUpdatesWebhookConflict(e)) {
+          const now = nowMs();
+          if (now >= nextPollingWebhookRecoveryAtMs) {
+            nextPollingWebhookRecoveryAtMs = now + 15_000;
+            await clearTelegramWebhookForPolling({ tg, reason: "get_updates_conflict", triggerError: e });
+          } else {
+            logEvent("WARNING", "tg.polling.webhook_conflict_backoff", {
+              retry_after_ms: Math.max(0, nextPollingWebhookRecoveryAtMs - now),
+              trigger_error: e instanceof Error ? e.message : String(e)
+            });
+          }
+          await sleep(1000);
+          continue;
+        }
         log("getUpdates failed:", e instanceof Error ? e.message : String(e));
         await sleep(2000);
         continue;
@@ -5607,4 +5716,17 @@ async function main() {
   }
 }
 
-await main();
+export {
+  clearTelegramWebhookForPolling,
+  deriveTelegramWebhookSecret,
+  deriveTelegramWebhookUrl,
+  isTelegramGetUpdatesWebhookConflict,
+  normalizeTelegramDeliveryMode,
+  redactUrlSecrets,
+  resolveTelegramWebhookConfig,
+  telegramWebhookInfoLogFields
+};
+
+if (isExecutedAsEntryPoint()) {
+  await main();
+}
