@@ -759,6 +759,8 @@ class FugueProvisionConfig:
     jsonl_line_limit_bytes: int = 8 * 1024 * 1024
     workspace_storage_size: str = "1Gi"
     workspace_storage_class_name: Optional[str] = None
+    workspace_storage_mode: str = "dedicated_pvc"
+    workspace_shared_sub_path_prefix: str = "argus/sessions"
     service_port: int = 7777
     app_name_prefix: str = "argus-session"
 
@@ -18055,6 +18057,14 @@ def _fugue_cfg() -> FugueProvisionConfig:
     workspace_mount_path = (os.getenv("ARGUS_FUGUE_WORKSPACE_MOUNT_PATH") or "/workspace").strip() or "/workspace"
     workspace_storage_size = (os.getenv("ARGUS_FUGUE_WORKSPACE_STORAGE_SIZE") or "1Gi").strip() or "1Gi"
     workspace_storage_class_name = (os.getenv("ARGUS_FUGUE_WORKSPACE_STORAGE_CLASS") or "").strip() or None
+    workspace_storage_mode = (
+        os.getenv("ARGUS_FUGUE_WORKSPACE_STORAGE_MODE")
+        or os.getenv("ARGUS_FUGUE_PERSISTENT_STORAGE_MODE")
+        or "dedicated_pvc"
+    ).strip().lower() or "dedicated_pvc"
+    workspace_shared_sub_path_prefix = (
+        os.getenv("ARGUS_FUGUE_WORKSPACE_SHARED_SUBPATH_PREFIX") or "argus/sessions"
+    ).strip()
     app_name_prefix = (os.getenv("ARGUS_FUGUE_APP_NAME_PREFIX") or "argus-session").strip().lower() or "argus-session"
     connect_timeout_s = float(os.getenv("ARGUS_CONNECT_TIMEOUT_S", "30"))
     try:
@@ -18087,6 +18097,10 @@ def _fugue_cfg() -> FugueProvisionConfig:
         raise RuntimeError("ARGUS_FUGUE_SERVICE_PORT must be > 0")
     if not workspace_mount_path.startswith("/"):
         raise RuntimeError("ARGUS_FUGUE_WORKSPACE_MOUNT_PATH must be an absolute container path")
+    if workspace_storage_mode not in ("dedicated_pvc", "shared_project_rwx"):
+        raise RuntimeError("ARGUS_FUGUE_WORKSPACE_STORAGE_MODE must be dedicated_pvc or shared_project_rwx")
+    if _normalize_workspace_relative_path(workspace_shared_sub_path_prefix) is None:
+        raise RuntimeError("ARGUS_FUGUE_WORKSPACE_SHARED_SUBPATH_PREFIX must be a relative path")
 
     return FugueProvisionConfig(
         base_url=base_url,
@@ -18105,6 +18119,8 @@ def _fugue_cfg() -> FugueProvisionConfig:
         jsonl_line_limit_bytes=jsonl_line_limit_bytes,
         workspace_storage_size=workspace_storage_size,
         workspace_storage_class_name=workspace_storage_class_name,
+        workspace_storage_mode=workspace_storage_mode,
+        workspace_shared_sub_path_prefix=workspace_shared_sub_path_prefix,
         service_port=service_port,
         app_name_prefix=app_name_prefix,
     )
@@ -18116,6 +18132,14 @@ def _session_app_name(prefix: str, session_id: str) -> str:
         raise RuntimeError("Invalid session id")
     prefix_norm = re.sub(r"[^a-z0-9-]+", "-", (prefix or "").strip().lower()).strip("-") or "argus-session"
     return f"{prefix_norm}-{sid}"
+
+
+def _fugue_workspace_shared_sub_path(cfg: FugueProvisionConfig, session_id: str) -> str:
+    prefix = _normalize_workspace_relative_path(cfg.workspace_shared_sub_path_prefix) or "argus/sessions"
+    sid = _normalize_runtime_session_id(session_id)
+    if not sid:
+        raise RuntimeError("Invalid session id")
+    return f"{prefix.rstrip('/')}/{sid}"
 
 
 def _fugue_slugify(value: str) -> str:
@@ -19138,6 +19162,7 @@ def _fugue_create_session_app_sync(cfg: FugueProvisionConfig, session_id: str) -
         "service_port": cfg.service_port,
         "env": _fugue_build_runtime_env(cfg, session_id),
         "persistent_storage": {
+            "mode": cfg.workspace_storage_mode,
             "storage_size": cfg.workspace_storage_size,
             "mounts": [
                 {
@@ -19151,6 +19176,8 @@ def _fugue_create_session_app_sync(cfg: FugueProvisionConfig, session_id: str) -
         request_body["tenant_id"] = cfg.tenant_id
     if cfg.workspace_storage_class_name:
         request_body["persistent_storage"]["storage_class_name"] = cfg.workspace_storage_class_name
+    if cfg.workspace_storage_mode == "shared_project_rwx":
+        request_body["persistent_storage"]["shared_sub_path"] = _fugue_workspace_shared_sub_path(cfg, session_id)
     payload = _fugue_request_json_sync(
         cfg,
         "POST",
