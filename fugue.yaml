@@ -12,6 +12,7 @@ services:
     env:
       ARGUS_PROVISION_MODE: fugue
       ARGUS_DATABASE_URL: postgresql://argus:argus@postgres:5432/argus
+      ARGUS_FUGUE_BASE_URL: http://fugue-fugue.fugue-system.svc.cluster.local
       ARGUS_FUGUE_HOME_PATH: /data/argus
       ARGUS_FUGUE_WORKSPACE_STORAGE_SIZE: 1Gi
       ARGUS_PUBLIC_BASE_URL: https://argus.fugue.pro
