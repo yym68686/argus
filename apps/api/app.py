@@ -19554,10 +19554,14 @@ async def _ensure_live_fugue_session_unlocked(session_id: str, *, allow_create: 
         turn_owners_by_thread={},
     )
     live = await _activate_live_session(live)
-    try:
-        await _sync_remote_workspace_templates(live, session_id=session_id, workspace_path=cfg.workspace_mount_path)
-    except Exception as e:
-        log.warning("Failed to seed minimal Fugue workspace for session %s: %s", session_id, str(e))
+
+    async def _seed_workspace_templates_background() -> None:
+        try:
+            await _sync_remote_workspace_templates(live, session_id=session_id, workspace_path=cfg.workspace_mount_path)
+        except Exception as e:
+            log.warning("Failed to seed minimal Fugue workspace for session %s: %s", session_id, str(e))
+
+    asyncio.create_task(_seed_workspace_templates_background())
     return live, created
 
 
