@@ -2,15 +2,18 @@ FROM golang:1.26-trixie AS node-host-builder
 
 WORKDIR /src/apps/node-host
 COPY apps/node-host/ ./
+ARG ARGUS_BUILD_HOST_AGENT_DIST=0
 RUN set -eu; \
     mkdir -p /out/host-agent-dist; \
     CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -ldflags "-s -w" -o /out/argus ./cmd/argus; \
-    CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -ldflags "-s -w" -o /out/host-agent-dist/argus-linux-amd64 ./cmd/argus; \
-    CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -trimpath -ldflags "-s -w" -o /out/host-agent-dist/argus-linux-arm64 ./cmd/argus; \
-    CGO_ENABLED=0 GOOS=darwin GOARCH=amd64 go build -trimpath -ldflags "-s -w" -o /out/host-agent-dist/argus-darwin-amd64 ./cmd/argus; \
-    CGO_ENABLED=0 GOOS=darwin GOARCH=arm64 go build -trimpath -ldflags "-s -w" -o /out/host-agent-dist/argus-darwin-arm64 ./cmd/argus; \
-    CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build -trimpath -ldflags "-s -w" -o /out/host-agent-dist/argus-windows-amd64.exe ./cmd/argus; \
-    CGO_ENABLED=0 GOOS=windows GOARCH=arm64 go build -trimpath -ldflags "-s -w" -o /out/host-agent-dist/argus-windows-arm64.exe ./cmd/argus
+    cp /out/argus /out/host-agent-dist/argus-linux-amd64; \
+    if [ "${ARGUS_BUILD_HOST_AGENT_DIST}" = "1" ]; then \
+      CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -trimpath -ldflags "-s -w" -o /out/host-agent-dist/argus-linux-arm64 ./cmd/argus; \
+      CGO_ENABLED=0 GOOS=darwin GOARCH=amd64 go build -trimpath -ldflags "-s -w" -o /out/host-agent-dist/argus-darwin-amd64 ./cmd/argus; \
+      CGO_ENABLED=0 GOOS=darwin GOARCH=arm64 go build -trimpath -ldflags "-s -w" -o /out/host-agent-dist/argus-darwin-arm64 ./cmd/argus; \
+      CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build -trimpath -ldflags "-s -w" -o /out/host-agent-dist/argus-windows-amd64.exe ./cmd/argus; \
+      CGO_ENABLED=0 GOOS=windows GOARCH=arm64 go build -trimpath -ldflags "-s -w" -o /out/host-agent-dist/argus-windows-arm64.exe ./cmd/argus; \
+    fi
 
 FROM node:22-trixie-slim
 
