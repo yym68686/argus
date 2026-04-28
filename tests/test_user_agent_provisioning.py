@@ -143,6 +143,59 @@ class UserAgentProvisioningTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(ready_agent.provisioning_state, argus_app.AGENT_PROVISIONING_STATE_READY)
         self.assertEqual(attempts, 2)
 
+    async def test_missing_runtime_manifest_marks_session_unrecoverable_until_retry(self) -> None:
+        attempts = 0
+
+        async def fake_ensure_live_session(session_id: str, *, allow_create: bool):
+            nonlocal attempts
+            self.assertTrue(allow_create)
+            attempts += 1
+            if attempts == 1:
+                raise argus_app.FugueRuntimeImageMissingError(
+                    "configured runtime image digest is missing: registry.invalid/runtime@sha256:missing",
+                    image_ref="registry.invalid/runtime@sha256:missing",
+                    runtime_app_id="app_failed",
+                    operation_id="op_failed",
+                    last_message="MANIFEST_UNKNOWN: manifest unknown",
+                )
+            return types.SimpleNamespace(provider="fake"), True
+
+        with (
+            mock.patch.object(argus_app, "_require_user_agent_support", return_value=None),
+            mock.patch.object(argus_app, "_ensure_live_session", side_effect=fake_ensure_live_session),
+            mock.patch.object(argus_app, "_provisioner_manages_runtime_sessions", return_value=True),
+            mock.patch.object(argus_app, "_remove_managed_runtime", new=mock.AsyncMock(return_value=True)),
+            mock.patch.object(self.manager, "_force_close_live_session", new=mock.AsyncMock()),
+        ):
+            agent, created = await self.manager.create_user_agent(user_id=1, short_name="missing-image")
+            self.assertTrue(created)
+
+            failed_agent = await self.manager.wait_for_user_agent_provisioning(
+                agent_id=agent.agent_id,
+                timeout_ms=2000,
+            )
+            self.assertIsNotNone(failed_agent)
+            self.assertEqual(failed_agent.provisioning_state, argus_app.AGENT_PROVISIONING_STATE_FAILED)
+            self.assertTrue(self.manager.is_session_runtime_unrecoverable(agent.session_id))
+            runtime_status = self.manager.runtime_status_for_session(agent.session_id)
+            self.assertEqual(runtime_status["runtimeErrorClass"], "runtime_image_digest_missing")
+            self.assertEqual(runtime_status["runtimeAppId"], "app_failed")
+            self.assertEqual(runtime_status["imageRef"], "registry.invalid/runtime@sha256:missing")
+            self.assertEqual(runtime_status["operationId"], "op_failed")
+
+            retried = await self.manager.retry_user_agent_provisioning(user_id=1, agent_id=agent.agent_id)
+            self.assertEqual(retried.provisioning_state, argus_app.AGENT_PROVISIONING_STATE_PENDING)
+            self.assertFalse(self.manager.is_session_runtime_unrecoverable(agent.session_id))
+
+            ready_agent = await self.manager.wait_for_user_agent_provisioning(
+                agent_id=agent.agent_id,
+                timeout_ms=2000,
+            )
+
+        self.assertIsNotNone(ready_agent)
+        self.assertEqual(ready_agent.provisioning_state, argus_app.AGENT_PROVISIONING_STATE_READY)
+        self.assertEqual(attempts, 2)
+
     async def test_connection_payload_returns_409_while_agent_is_pending(self) -> None:
         gate = asyncio.Event()
 

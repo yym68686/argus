@@ -1,6 +1,7 @@
 import asyncio
 import importlib.util
 import json
+import os
 import pathlib
 import sys
 import tempfile
@@ -42,6 +43,17 @@ def make_response(status_code: int, payload=None):
 
 
 class FugueApiHelperTests(unittest.TestCase):
+    def _base_fugue_env(self, **overrides):
+        env = {
+            "ARGUS_FUGUE_BASE_URL": "https://fugue.invalid",
+            "ARGUS_FUGUE_TOKEN": "token",
+            "ARGUS_FUGUE_PROJECT_ID": "project_123",
+            "ARGUS_GATEWAY_INTERNAL_HOST": "gateway.internal",
+            "ARGUS_RUNTIME_CMD": "codex serve",
+        }
+        env.update(overrides)
+        return env
+
     def test_fugue_request_json_sync_retries_transient_get_failures(self) -> None:
         cfg = argus_app.FugueProvisionConfig(
             base_url="https://fugue.invalid",
@@ -92,6 +104,179 @@ class FugueApiHelperTests(unittest.TestCase):
 
         request_mock.assert_called_once()
         sleep_mock.assert_not_called()
+
+    def test_fugue_cfg_rejects_static_image_without_explicit_mode(self) -> None:
+        env = self._base_fugue_env(ARGUS_FUGUE_RUNTIME_IMAGE="registry.invalid/app@sha256:deadbeef")
+        with mock.patch.dict(os.environ, env, clear=True):
+            with self.assertRaisesRegex(RuntimeError, "ARGUS_FUGUE_RUNTIME_IMAGE_MODE=static"):
+                argus_app._fugue_cfg()
+
+    def test_fugue_cfg_rejects_image_with_compose_selector(self) -> None:
+        env = self._base_fugue_env(
+            ARGUS_FUGUE_RUNTIME_IMAGE="registry.invalid/app@sha256:deadbeef",
+            ARGUS_FUGUE_RUNTIME_IMAGE_MODE="static",
+            ARGUS_FUGUE_RUNTIME_COMPOSE_SERVICE="runtime",
+        )
+        with mock.patch.dict(os.environ, env, clear=True):
+            with self.assertRaisesRegex(RuntimeError, "cannot be set together"):
+                argus_app._fugue_cfg()
+
+    def test_fugue_cfg_accepts_compose_runtime_source(self) -> None:
+        env = self._base_fugue_env(ARGUS_FUGUE_RUNTIME_COMPOSE_SERVICE="runtime")
+        with mock.patch.dict(os.environ, env, clear=True):
+            cfg = argus_app._fugue_cfg()
+        self.assertEqual(cfg.runtime_compose_service, "runtime")
+        self.assertIsNone(cfg.image)
+
+    def test_fugue_runtime_image_from_app_prefers_current_spec_image(self) -> None:
+        app_data = {
+            "id": "app_template",
+            "name": "runtime",
+            "source": {"resolved_image_ref": "registry.invalid/runtime@sha256:old"},
+            "spec": {"image": "registry.invalid/runtime@sha256:new"},
+        }
+        self.assertEqual(
+            argus_app._fugue_runtime_image_from_app(app_data),
+            "registry.invalid/runtime@sha256:new",
+        )
+
+    def test_fugue_preflight_uses_template_inventory(self) -> None:
+        cfg = argus_app.FugueProvisionConfig(
+            base_url="https://fugue.invalid",
+            token="token",
+            project_id="project_123",
+            runtime_id="runtime_123",
+            gateway_internal_host="gateway.internal",
+            runtime_compose_service="runtime",
+            runtime_cmd="codex serve",
+            connect_timeout_s=1.0,
+        )
+        app_data = {
+            "id": "app_template",
+            "name": "runtime",
+            "project_id": "project_123",
+            "source": {"compose_service": "runtime", "resolved_image_ref": "registry.invalid/runtime@sha256:old"},
+            "spec": {"image": "registry.invalid/runtime@sha256:new"},
+            "status": {"phase": "deployed", "last_operation_id": "op_template"},
+        }
+        inventory = {
+            "app_id": "app_template",
+            "registry_configured": True,
+            "versions": [
+                {
+                    "image_ref": "registry.invalid/runtime@sha256:new",
+                    "runtime_image_ref": "registry.invalid/runtime@sha256:new",
+                    "status": "available",
+                    "current": True,
+                }
+            ],
+        }
+
+        with (
+            mock.patch.object(argus_app, "_fugue_list_apps_sync", return_value=[app_data]),
+            mock.patch.object(argus_app, "_fugue_get_app_sync", return_value=app_data),
+            mock.patch.object(argus_app, "_fugue_get_app_image_inventory_sync", return_value=inventory),
+            mock.patch.object(argus_app, "_registry_manifest_exists_sync") as registry_check,
+        ):
+            resolution = argus_app._fugue_preflight_runtime_image_sync(cfg)
+
+        self.assertEqual(resolution.image_ref, "registry.invalid/runtime@sha256:new")
+        self.assertEqual(resolution.source, "runtime_compose_service")
+        self.assertEqual(resolution.runtime_app_id, "app_template")
+        registry_check.assert_not_called()
+
+    def test_fugue_preflight_missing_inventory_image_is_clear(self) -> None:
+        cfg = argus_app.FugueProvisionConfig(
+            base_url="https://fugue.invalid",
+            token="token",
+            project_id="project_123",
+            runtime_id="runtime_123",
+            gateway_internal_host="gateway.internal",
+            runtime_compose_service="runtime",
+            runtime_cmd="codex serve",
+            connect_timeout_s=1.0,
+        )
+        app_data = {
+            "id": "app_template",
+            "name": "runtime",
+            "project_id": "project_123",
+            "source": {"compose_service": "runtime"},
+            "spec": {"image": "registry.invalid/runtime@sha256:missing"},
+        }
+        inventory = {
+            "app_id": "app_template",
+            "registry_configured": True,
+            "versions": [
+                {
+                    "image_ref": "registry.invalid/runtime@sha256:missing",
+                    "runtime_image_ref": "registry.invalid/runtime@sha256:missing",
+                    "status": "missing",
+                    "current": True,
+                }
+            ],
+        }
+
+        with (
+            mock.patch.object(argus_app, "_fugue_list_apps_sync", return_value=[app_data]),
+            mock.patch.object(argus_app, "_fugue_get_app_sync", return_value=app_data),
+            mock.patch.object(argus_app, "_fugue_get_app_image_inventory_sync", return_value=inventory),
+        ):
+            with self.assertRaisesRegex(argus_app.FugueRuntimeImageMissingError, "configured runtime image digest is missing"):
+                argus_app._fugue_preflight_runtime_image_sync(cfg)
+
+    def test_fugue_create_session_does_not_post_when_image_preflight_fails(self) -> None:
+        cfg = argus_app.FugueProvisionConfig(
+            base_url="https://fugue.invalid",
+            token="token",
+            project_id="project_123",
+            runtime_id="runtime_123",
+            gateway_internal_host="gateway.internal",
+            image="registry.invalid/runtime@sha256:missing",
+            runtime_image_mode="static",
+            runtime_cmd="codex serve",
+            connect_timeout_s=1.0,
+        )
+        resolution = argus_app.FugueRuntimeImageResolution(
+            image_ref="registry.invalid/runtime@sha256:missing",
+            source="static",
+        )
+        err = argus_app.FugueRuntimeImageMissingError(
+            "configured runtime image digest is missing: registry.invalid/runtime@sha256:missing",
+            image_ref=resolution.image_ref,
+        )
+
+        with (
+            mock.patch.object(argus_app, "_fugue_preflight_runtime_image_sync", side_effect=err),
+            mock.patch.object(argus_app, "_fugue_request_json_sync") as request_mock,
+        ):
+            with self.assertRaises(argus_app.FugueRuntimeImageMissingError):
+                argus_app._fugue_create_session_app_sync(cfg, "3416ab8781ab")
+
+        request_mock.assert_not_called()
+
+    def test_fugue_session_record_exposes_runtime_debug_fields(self) -> None:
+        record = argus_app._fugue_session_record_from_app(
+            "3416ab8781ab",
+            {
+                "id": "app_123",
+                "name": "argus-session-3416ab8781ab",
+                "source": {"resolved_image_ref": "registry.invalid/runtime@sha256:old"},
+                "spec": {"image": "registry.invalid/runtime@sha256:new"},
+                "status": {
+                    "phase": "failed",
+                    "last_message": "MANIFEST_UNKNOWN: manifest unknown",
+                    "last_operation_id": "op_123",
+                },
+            },
+        )
+        self.assertEqual(record["runtimeAppId"], "app_123")
+        self.assertEqual(record["imageRef"], "registry.invalid/runtime@sha256:new")
+        self.assertEqual(record["lastMessage"], "MANIFEST_UNKNOWN: manifest unknown")
+        self.assertEqual(record["operationId"], "op_123")
+
+    def test_runtime_provision_close_reason_classifies_missing_digest(self) -> None:
+        err = argus_app.FugueRuntimeImageMissingError("configured runtime image digest is missing")
+        self.assertEqual(argus_app._runtime_provision_ws_close_reason(err), "Runtime image digest missing")
 
 
 class RuntimeSessionProvisioningTests(unittest.IsolatedAsyncioTestCase):

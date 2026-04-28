@@ -749,6 +749,7 @@ class FugueProvisionConfig:
     gateway_internal_host: str
     tenant_id: Optional[str] = None
     image: Optional[str] = None
+    runtime_image_mode: Optional[str] = None
     runtime_app_id: Optional[str] = None
     runtime_app_name: Optional[str] = None
     runtime_compose_service: Optional[str] = None
@@ -763,6 +764,36 @@ class FugueProvisionConfig:
     workspace_shared_sub_path_prefix: str = "argus/sessions"
     service_port: int = 7777
     app_name_prefix: str = "argus-session"
+
+
+@dataclass(frozen=True)
+class FugueRuntimeImageResolution:
+    image_ref: str
+    source: str
+    runtime_app_id: Optional[str] = None
+    runtime_app_name: Optional[str] = None
+    runtime_operation_id: Optional[str] = None
+    runtime_last_message: Optional[str] = None
+    runtime_phase: Optional[str] = None
+
+
+class FugueRuntimeImageMissingError(RuntimeError):
+    category = "runtime_image_digest_missing"
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        image_ref: Optional[str] = None,
+        runtime_app_id: Optional[str] = None,
+        operation_id: Optional[str] = None,
+        last_message: Optional[str] = None,
+    ) -> None:
+        super().__init__(message)
+        self.image_ref = image_ref
+        self.runtime_app_id = runtime_app_id
+        self.operation_id = operation_id
+        self.last_message = last_message
 
 
 @dataclass
@@ -3309,6 +3340,13 @@ class PersistedSessionAutomation:
     last_active_by_thread: dict[str, PersistedLastActiveTarget] = field(default_factory=dict)
     pending_telegram_attachments_by_chat: dict[str, list[PersistedStagedAttachment]] = field(default_factory=dict)
     paused_node_ids: list[str] = field(default_factory=list)
+    runtime_unrecoverable: bool = False
+    runtime_error_class: Optional[str] = None
+    runtime_error_message: Optional[str] = None
+    runtime_app_id: Optional[str] = None
+    runtime_image_ref: Optional[str] = None
+    runtime_last_message: Optional[str] = None
+    runtime_operation_id: Optional[str] = None
 
     def to_json(self) -> dict[str, Any]:
         queues: dict[str, Any] = {}
@@ -3355,7 +3393,7 @@ class PersistedSessionAutomation:
                 out_runs.append(r.to_json())
             if out_runs:
                 cron_runs[jid.strip()] = out_runs
-        return {
+        out = {
             "ownerUserId": int(self.owner_user_id) if isinstance(self.owner_user_id, int) and self.owner_user_id > 0 else None,
             "mainThreadId": self.main_thread_id,
             "placement": self.placement.to_json() if isinstance(self.placement, SessionPlacement) else None,
@@ -3366,6 +3404,19 @@ class PersistedSessionAutomation:
             "pendingTelegramAttachmentsByChat": pending_attachments,
             "pausedNodeIds": paused_node_ids,
         }
+        if self.runtime_unrecoverable:
+            out["runtimeUnrecoverable"] = True
+        for key, value in (
+            ("runtimeErrorClass", self.runtime_error_class),
+            ("runtimeErrorMessage", self.runtime_error_message),
+            ("runtimeAppId", self.runtime_app_id),
+            ("runtimeImageRef", self.runtime_image_ref),
+            ("runtimeLastMessage", self.runtime_last_message),
+            ("runtimeOperationId", self.runtime_operation_id),
+        ):
+            if isinstance(value, str) and value.strip():
+                out[key] = value.strip()
+        return out
 
     @staticmethod
     def from_json(obj: Any) -> "PersistedSessionAutomation":
@@ -3457,6 +3508,11 @@ class PersistedSessionAutomation:
                     continue
                 seen_node_ids.add(node_id_norm)
                 paused_node_ids.append(node_id_norm)
+
+        def _opt_str(name: str) -> Optional[str]:
+            value = obj.get(name)
+            return (str(value).strip() or None) if value is not None else None
+
         return PersistedSessionAutomation(
             owner_user_id=owner_user_id,
             main_thread_id=main_thread_id.strip() if isinstance(main_thread_id, str) else None,
@@ -3467,6 +3523,13 @@ class PersistedSessionAutomation:
             last_active_by_thread=last_active_by_thread,
             pending_telegram_attachments_by_chat=pending_telegram_attachments_by_chat,
             paused_node_ids=paused_node_ids,
+            runtime_unrecoverable=bool(obj.get("runtimeUnrecoverable")),
+            runtime_error_class=_opt_str("runtimeErrorClass"),
+            runtime_error_message=_opt_str("runtimeErrorMessage"),
+            runtime_app_id=_opt_str("runtimeAppId"),
+            runtime_image_ref=_opt_str("runtimeImageRef") or _opt_str("imageRef"),
+            runtime_last_message=_opt_str("runtimeLastMessage") or _opt_str("lastMessage"),
+            runtime_operation_id=_opt_str("runtimeOperationId") or _opt_str("operationId"),
         )
 
 
@@ -7406,6 +7469,36 @@ class AutomationManager:
             return owner_user_id
         return None
 
+    def runtime_status_for_session(self, session_id: str) -> dict[str, Any]:
+        sid = session_id.strip() if isinstance(session_id, str) else ""
+        if not sid:
+            return {}
+        sess = self._store.state.sessions.get(sid)
+        if not isinstance(sess, PersistedSessionAutomation):
+            return {}
+        out: dict[str, Any] = {}
+        if bool(getattr(sess, "runtime_unrecoverable", False)):
+            out["runtimeUnrecoverable"] = True
+        for key, attr in (
+            ("runtimeErrorClass", "runtime_error_class"),
+            ("runtimeErrorMessage", "runtime_error_message"),
+            ("runtimeAppId", "runtime_app_id"),
+            ("imageRef", "runtime_image_ref"),
+            ("lastMessage", "runtime_last_message"),
+            ("operationId", "runtime_operation_id"),
+        ):
+            value = getattr(sess, attr, None)
+            if isinstance(value, str) and value.strip():
+                out[key] = value.strip()
+        return out
+
+    def is_session_runtime_unrecoverable(self, session_id: str) -> bool:
+        sid = session_id.strip() if isinstance(session_id, str) else ""
+        if not sid:
+            return False
+        sess = self._store.state.sessions.get(sid)
+        return isinstance(sess, PersistedSessionAutomation) and bool(getattr(sess, "runtime_unrecoverable", False))
+
     def list_session_ids_for_user(self, *, user_id: int) -> list[str]:
         if not isinstance(user_id, int) or user_id <= 0:
             return []
@@ -7888,6 +7981,138 @@ class AutomationManager:
         if updated is None:
             raise RuntimeError("Failed to update session owner")
         return updated
+
+    async def mark_session_runtime_unrecoverable(
+        self,
+        *,
+        session_id: str,
+        error_class: str,
+        error_message: str,
+        runtime_app_id: Optional[str] = None,
+        image_ref: Optional[str] = None,
+        last_message: Optional[str] = None,
+        operation_id: Optional[str] = None,
+    ) -> PersistedSessionAutomation:
+        sid = session_id.strip() if isinstance(session_id, str) else ""
+        if not sid:
+            raise ValueError("Invalid sessionId")
+        normalized_error = str(error_message or "").strip() or "Runtime provisioning failed"
+        if len(normalized_error) > 2000:
+            normalized_error = normalized_error[:2000]
+        updated: Optional[PersistedSessionAutomation] = None
+
+        def _clean(value: Optional[str]) -> Optional[str]:
+            return (str(value).strip() or None) if value is not None else None
+
+        def _write(st: PersistedGatewayAutomationState) -> None:
+            nonlocal updated
+            st.version = max(int(getattr(st, "version", 1) or 1), AUTOMATION_STATE_VERSION)
+            current = st.sessions.get(sid)
+            if not isinstance(current, PersistedSessionAutomation):
+                current = PersistedSessionAutomation()
+            updated = replace(
+                current,
+                runtime_unrecoverable=True,
+                runtime_error_class=_clean(error_class) or "runtime_provision_failed",
+                runtime_error_message=normalized_error,
+                runtime_app_id=_clean(runtime_app_id),
+                runtime_image_ref=_clean(image_ref),
+                runtime_last_message=_clean(last_message),
+                runtime_operation_id=_clean(operation_id),
+            )
+            st.sessions[sid] = updated
+
+        await self._store.update(_write)
+        self._clear_session_backoff(sid)
+        self._drop_session_lane_state(sid)
+        if updated is None:
+            raise RuntimeError("Failed to update session runtime state")
+        return updated
+
+    async def clear_session_runtime_status(self, *, session_id: str) -> Optional[PersistedSessionAutomation]:
+        sid = session_id.strip() if isinstance(session_id, str) else ""
+        if not sid:
+            return None
+        updated: Optional[PersistedSessionAutomation] = None
+
+        def _write(st: PersistedGatewayAutomationState) -> None:
+            nonlocal updated
+            current = st.sessions.get(sid)
+            if not isinstance(current, PersistedSessionAutomation):
+                return
+            if not (
+                current.runtime_unrecoverable
+                or current.runtime_error_class
+                or current.runtime_error_message
+                or current.runtime_app_id
+                or current.runtime_image_ref
+                or current.runtime_last_message
+                or current.runtime_operation_id
+            ):
+                updated = current
+                return
+            st.version = max(int(getattr(st, "version", 1) or 1), AUTOMATION_STATE_VERSION)
+            updated = replace(
+                current,
+                runtime_unrecoverable=False,
+                runtime_error_class=None,
+                runtime_error_message=None,
+                runtime_app_id=None,
+                runtime_image_ref=None,
+                runtime_last_message=None,
+                runtime_operation_id=None,
+            )
+            st.sessions[sid] = updated
+
+        await self._store.update(_write)
+        return updated
+
+    async def mark_session_runtime_rebuild_required(
+        self,
+        *,
+        session_id: str,
+        message: str,
+    ) -> Optional[PersistedAgentRuntime]:
+        sid = session_id.strip() if isinstance(session_id, str) else ""
+        if not sid:
+            raise ValueError("Invalid sessionId")
+        normalized_message = str(message or "").strip() or "Runtime rebuild required"
+        if len(normalized_message) > 2000:
+            normalized_message = normalized_message[:2000]
+        updated_agent: Optional[PersistedAgentRuntime] = None
+        now_ms = _now_ms()
+
+        def _write(st: PersistedGatewayAutomationState) -> None:
+            nonlocal updated_agent
+            st.version = max(int(getattr(st, "version", 1) or 1), AUTOMATION_STATE_VERSION)
+            current_session = st.sessions.get(sid)
+            if not isinstance(current_session, PersistedSessionAutomation):
+                current_session = PersistedSessionAutomation()
+            st.sessions[sid] = replace(
+                current_session,
+                runtime_unrecoverable=True,
+                runtime_error_class="runtime_rebuild_required",
+                runtime_error_message=normalized_message,
+            )
+            for aid, agent in list((st.agents or {}).items()):
+                if not isinstance(agent, PersistedAgentRuntime):
+                    continue
+                if str(agent.session_id or "").strip() != sid:
+                    continue
+                updated_agent = replace(
+                    agent,
+                    provisioning_state=AGENT_PROVISIONING_STATE_FAILED,
+                    provisioning_error=normalized_message,
+                    provisioning_updated_at_ms=now_ms,
+                )
+                st.agents[aid] = updated_agent
+                break
+
+        await self._store.update(_write)
+        self._clear_session_backoff(sid)
+        self._drop_session_lane_state(sid)
+        self._session_restart_locks.pop(sid, None)
+        return updated_agent
 
     async def delete_persisted_session_if_unreferenced(self, *, session_id: str) -> bool:
         sid = session_id.strip() if isinstance(session_id, str) else ""
@@ -8908,6 +9133,8 @@ class AutomationManager:
 
     async def _ensure_workspace_files_for_session(self, session_id: str, root: Path) -> None:
         sid = session_id.strip() if isinstance(session_id, str) else ""
+        if sid and self.is_session_runtime_unrecoverable(sid):
+            return
         if sid and _session_uses_remote_workspace(sid):
             live, _ = await _ensure_live_session(sid, allow_create=True)
             await _sync_remote_workspace_templates(live, session_id=sid, workspace_path=str(root))
@@ -8916,6 +9143,8 @@ class AutomationManager:
 
     async def _sync_workspace_agents_file_for_session(self, session_id: str, root: Path) -> None:
         sid = session_id.strip() if isinstance(session_id, str) else ""
+        if sid and self.is_session_runtime_unrecoverable(sid):
+            return
         if sid and _session_uses_remote_workspace(sid):
             live, _ = await _ensure_live_session(sid, allow_create=True)
             await _live_fs_write_text(
@@ -8929,6 +9158,8 @@ class AutomationManager:
     async def _write_agent_model_for_session(self, session_id: str, root: Path, model: str) -> None:
         sid = session_id.strip() if isinstance(session_id, str) else ""
         normalized = _normalize_agent_model(model) or ARGUS_AGENT_MODEL_DEFAULT
+        if sid and self.is_session_runtime_unrecoverable(sid):
+            return
         if sid and _session_uses_remote_workspace(sid):
             live, _ = await _ensure_live_session(sid, allow_create=True)
             await _live_fs_write_text(live, str(self._agent_model_file_for_workspace(root)), normalized + "\n")
@@ -8986,6 +9217,8 @@ class AutomationManager:
         sid = session_id.strip() if isinstance(session_id, str) else ""
         if not sid:
             return False
+        if self.is_session_runtime_unrecoverable(sid):
+            return False
         normalized = _normalize_agent_model(model) or ARGUS_AGENT_MODEL_DEFAULT
         if not _session_uses_remote_workspace(sid):
             return False
@@ -9037,6 +9270,20 @@ class AutomationManager:
             if not isinstance(agent, PersistedAgentRuntime):
                 return
             st.version = max(int(getattr(st, "version", 1) or 1), AUTOMATION_STATE_VERSION)
+            if clear_error:
+                sid = str(agent.session_id or "").strip()
+                sess = st.sessions.get(sid) if sid else None
+                if isinstance(sess, PersistedSessionAutomation):
+                    st.sessions[sid] = replace(
+                        sess,
+                        runtime_unrecoverable=False,
+                        runtime_error_class=None,
+                        runtime_error_message=None,
+                        runtime_app_id=None,
+                        runtime_image_ref=None,
+                        runtime_last_message=None,
+                        runtime_operation_id=None,
+                    )
             st.agents[aid] = replace(
                 agent,
                 provisioning_state=AGENT_PROVISIONING_STATE_PENDING,
@@ -9058,6 +9305,19 @@ class AutomationManager:
             if not isinstance(agent, PersistedAgentRuntime):
                 return
             st.version = max(int(getattr(st, "version", 1) or 1), AUTOMATION_STATE_VERSION)
+            sid = str(agent.session_id or "").strip()
+            sess = st.sessions.get(sid) if sid else None
+            if isinstance(sess, PersistedSessionAutomation):
+                st.sessions[sid] = replace(
+                    sess,
+                    runtime_unrecoverable=False,
+                    runtime_error_class=None,
+                    runtime_error_message=None,
+                    runtime_app_id=None,
+                    runtime_image_ref=None,
+                    runtime_last_message=None,
+                    runtime_operation_id=None,
+                )
             st.agents[aid] = replace(
                 agent,
                 provisioning_state=AGENT_PROVISIONING_STATE_READY,
@@ -9207,6 +9467,17 @@ class AutomationManager:
             except asyncio.CancelledError:
                 raise
             except Exception as e:
+                if _is_unrecoverable_runtime_manifest_failure(e):
+                    meta = _runtime_error_metadata(e)
+                    await self.mark_session_runtime_unrecoverable(
+                        session_id=current.session_id,
+                        error_class=meta["error_class"] or "runtime_image_digest_missing",
+                        error_message=meta["error_message"] or "Runtime image digest missing",
+                        runtime_app_id=meta.get("runtime_app_id"),
+                        image_ref=meta.get("image_ref"),
+                        last_message=meta.get("last_message"),
+                        operation_id=meta.get("operation_id"),
+                    )
                 await self._set_agent_provisioning_failed(aid, error_message=str(e))
                 log.warning(
                     "Failed to provision user agent %s (session=%s): %s",
@@ -13606,6 +13877,8 @@ class AutomationManager:
                 return
 
             now_ms = _now_ms()
+            if self.is_session_runtime_unrecoverable(session_id):
+                continue
             if self._is_session_backed_off(session_id, now_ms):
                 continue
 
@@ -14856,6 +15129,91 @@ def _require_runtime_automation_support(*, feature: str) -> None:
         raise RuntimeError(f"{feature} is not supported in provision mode '{_provisioner_mode_name()}'")
 
 
+def _is_manifest_missing_error_text(text: Any) -> bool:
+    value = str(text or "").strip().lower()
+    if not value:
+        return False
+    return any(
+        marker in value
+        for marker in (
+            "manifest_unknown",
+            "manifest unknown",
+            "name_unknown",
+            "configured runtime image digest is missing",
+            "image-manifest-missing",
+        )
+    )
+
+
+def _runtime_error_category(exc: BaseException) -> str:
+    category = getattr(exc, "category", None)
+    if isinstance(category, str) and category.strip():
+        return category.strip()
+    if _is_manifest_missing_error_text(str(exc)):
+        return "runtime_image_digest_missing"
+    return "runtime_provision_failed"
+
+
+def _is_unrecoverable_runtime_manifest_failure(exc: BaseException) -> bool:
+    return _runtime_error_category(exc) == "runtime_image_digest_missing"
+
+
+def _runtime_error_metadata(exc: BaseException) -> dict[str, Optional[str]]:
+    message = str(exc or "").strip() or "Runtime provisioning failed"
+    if len(message) > 2000:
+        message = message[:2000]
+    return {
+        "error_class": _runtime_error_category(exc),
+        "error_message": message,
+        "runtime_app_id": str(getattr(exc, "runtime_app_id", "") or "").strip() or None,
+        "image_ref": str(getattr(exc, "image_ref", "") or "").strip() or None,
+        "last_message": str(getattr(exc, "last_message", "") or "").strip() or None,
+        "operation_id": str(getattr(exc, "operation_id", "") or "").strip() or None,
+    }
+
+
+async def _mark_session_runtime_failure_if_unrecoverable(session_id: str, exc: BaseException) -> None:
+    sid = session_id.strip() if isinstance(session_id, str) else ""
+    if not sid or not _is_unrecoverable_runtime_manifest_failure(exc):
+        return
+    automation: Optional[AutomationManager] = getattr(app.state, "automation", None)
+    if automation is None:
+        return
+    meta = _runtime_error_metadata(exc)
+    try:
+        await automation.mark_session_runtime_unrecoverable(
+            session_id=sid,
+            error_class=meta["error_class"] or "runtime_image_digest_missing",
+            error_message=meta["error_message"] or "Runtime image digest missing",
+            runtime_app_id=meta.get("runtime_app_id"),
+            image_ref=meta.get("image_ref"),
+            last_message=meta.get("last_message"),
+            operation_id=meta.get("operation_id"),
+        )
+    except Exception:
+        log.exception("Failed to persist unrecoverable runtime failure for session %s", sid)
+
+
+def _session_runtime_unrecoverable(session_id: str) -> bool:
+    sid = session_id.strip() if isinstance(session_id, str) else ""
+    if not sid:
+        return False
+    automation: Optional[AutomationManager] = getattr(app.state, "automation", None)
+    if automation is None:
+        return False
+    try:
+        return automation.is_session_runtime_unrecoverable(sid)
+    except Exception:
+        return False
+
+
+def _runtime_provision_ws_close_reason(exc: BaseException) -> str:
+    category = _runtime_error_category(exc)
+    if category == "runtime_image_digest_missing":
+        return "Runtime image digest missing"
+    return "Runtime provisioning failed"
+
+
 async def _ensure_live_session(session_id: str, *, allow_create: bool) -> tuple[LiveRuntimeSession, bool]:
     return await _runtime_provisioner_for_session(session_id).ensure_live_session(session_id, allow_create=allow_create)
 
@@ -14897,6 +15255,13 @@ async def _list_managed_sessions() -> list[dict[str, Any]]:
                     owner_user_id = automation.get_owner_user_id_for_session(sid)
                     if isinstance(owner_user_id, int) and owner_user_id > 0:
                         enriched["ownerUserId"] = owner_user_id
+                runtime_status = automation.runtime_status_for_session(sid)
+                for key, value in runtime_status.items():
+                    if key in ("imageRef", "lastMessage", "runtimeAppId", "operationId"):
+                        if value and not enriched.get(key):
+                            enriched[key] = value
+                    else:
+                        enriched[key] = value
             out.append(enriched)
     out.sort(key=lambda item: ((item.get("provider") or ""), (item.get("sessionId") or "")))
     return out
@@ -14973,6 +15338,8 @@ def _fugue_relative_workspace_path(cfg: FugueProvisionConfig, workspace_path: st
 async def _sync_session_workspace_snapshot(session_id: str, root: Path) -> None:
     if not _fugue_workspace_enabled(session_id):
         return
+    if _session_runtime_unrecoverable(session_id):
+        return
     cfg = _fugue_cfg()
     try:
         await asyncio.to_thread(_fugue_push_workspace_snapshot_sync, cfg, session_id, root)
@@ -14982,6 +15349,8 @@ async def _sync_session_workspace_snapshot(session_id: str, root: Path) -> None:
 
 async def _sync_session_workspace_file(session_id: str, root: Path, path_obj: Path) -> None:
     if not _fugue_workspace_enabled(session_id):
+        return
+    if _session_runtime_unrecoverable(session_id):
         return
     rel = _relative_workspace_path(root, path_obj)
     if not rel or not path_obj.is_file():
@@ -15003,6 +15372,8 @@ async def _pull_session_workspace_file_to_local(
 ) -> bool:
     if not _fugue_workspace_enabled(session_id):
         return False
+    if _session_runtime_unrecoverable(session_id):
+        return False
     rel = _normalize_workspace_relative_path(relative_path)
     if not rel:
         return False
@@ -15021,6 +15392,8 @@ async def _pull_session_workspace_file_to_local(
 
 async def _sync_session_prompt_context_to_local(session_id: str, root: Path, *, include_heartbeat: bool) -> None:
     if not _fugue_workspace_enabled(session_id):
+        return
+    if _session_runtime_unrecoverable(session_id):
         return
     filenames = list(PROJECT_CONTEXT_FILENAMES)
     if include_heartbeat:
@@ -15347,9 +15720,42 @@ async def healthz():
     return {"ok": True}
 
 
+def _readyz_checks_sync() -> dict[str, Any]:
+    checks: dict[str, Any] = {}
+    if _provision_mode() == SESSION_PLACEMENT_KIND_FUGUE:
+        cfg = _fugue_cfg()
+        resolution = _fugue_preflight_runtime_image_sync(cfg)
+        checks["fugueRuntimeImage"] = {
+            "ok": True,
+            "source": resolution.source,
+            "imageRef": resolution.image_ref,
+            "runtimeAppId": resolution.runtime_app_id,
+            "operationId": resolution.runtime_operation_id,
+            "lastMessage": resolution.runtime_last_message,
+        }
+    return checks
+
+
 @app.get("/readyz")
 async def readyz():
-    return {"ok": True}
+    try:
+        checks = await asyncio.to_thread(_readyz_checks_sync)
+    except Exception as e:
+        log.warning("Ready check failed: %s", str(e))
+        return JSONResponse(
+            status_code=503,
+            content={
+                "ok": False,
+                "checks": {
+                    "fugueRuntimeImage": {
+                        "ok": False,
+                        "errorClass": _runtime_error_category(e),
+                        "error": str(e),
+                    }
+                },
+            },
+        )
+    return {"ok": True, "checks": checks}
 
 
 @app.get("/")
@@ -18083,6 +18489,7 @@ def _fugue_cfg() -> FugueProvisionConfig:
     project_id = (os.getenv("ARGUS_FUGUE_PROJECT_ID") or os.getenv("FUGUE_PROJECT_ID") or "").strip()
     tenant_id = (os.getenv("ARGUS_FUGUE_TENANT_ID") or os.getenv("FUGUE_TENANT_ID") or "").strip() or None
     image = (os.getenv("ARGUS_FUGUE_RUNTIME_IMAGE") or os.getenv("ARGUS_RUNTIME_IMAGE") or "").strip()
+    runtime_image_mode = (os.getenv("ARGUS_FUGUE_RUNTIME_IMAGE_MODE") or "").strip().lower() or None
     runtime_app_id = (os.getenv("ARGUS_FUGUE_RUNTIME_APP_ID") or "").strip() or None
     runtime_app_name = (os.getenv("ARGUS_FUGUE_RUNTIME_APP_NAME") or "").strip() or None
     runtime_compose_service = (os.getenv("ARGUS_FUGUE_RUNTIME_COMPOSE_SERVICE") or "").strip() or None
@@ -18125,6 +18532,28 @@ def _fugue_cfg() -> FugueProvisionConfig:
             "One of ARGUS_FUGUE_RUNTIME_IMAGE, ARGUS_RUNTIME_IMAGE, ARGUS_FUGUE_RUNTIME_APP_ID, "
             "ARGUS_FUGUE_RUNTIME_APP_NAME, or ARGUS_FUGUE_RUNTIME_COMPOSE_SERVICE is required in fugue provision mode"
         )
+    if image:
+        selectors = [
+            name
+            for name, value in (
+                ("ARGUS_FUGUE_RUNTIME_APP_ID", runtime_app_id),
+                ("ARGUS_FUGUE_RUNTIME_APP_NAME", runtime_app_name),
+                ("ARGUS_FUGUE_RUNTIME_COMPOSE_SERVICE", runtime_compose_service),
+            )
+            if value
+        ]
+        if selectors:
+            raise RuntimeError(
+                "ARGUS_FUGUE_RUNTIME_IMAGE/ARGUS_RUNTIME_IMAGE cannot be set together with "
+                f"{', '.join(selectors)}; production should use ARGUS_FUGUE_RUNTIME_COMPOSE_SERVICE=runtime"
+            )
+        if runtime_image_mode != "static":
+            raise RuntimeError(
+                "ARGUS_FUGUE_RUNTIME_IMAGE/ARGUS_RUNTIME_IMAGE requires ARGUS_FUGUE_RUNTIME_IMAGE_MODE=static; "
+                "production should use ARGUS_FUGUE_RUNTIME_COMPOSE_SERVICE=runtime instead of pinning a digest"
+            )
+    elif runtime_image_mode:
+        raise RuntimeError("ARGUS_FUGUE_RUNTIME_IMAGE_MODE is only valid when ARGUS_FUGUE_RUNTIME_IMAGE/ARGUS_RUNTIME_IMAGE is set")
     if not gateway_internal_host:
         if not gateway_compose_service:
             raise RuntimeError(
@@ -18146,6 +18575,7 @@ def _fugue_cfg() -> FugueProvisionConfig:
         project_id=project_id,
         tenant_id=tenant_id,
         image=image or None,
+        runtime_image_mode=runtime_image_mode,
         runtime_app_id=runtime_app_id,
         runtime_app_name=runtime_app_name,
         runtime_compose_service=runtime_compose_service,
@@ -19145,12 +19575,27 @@ def _fugue_operation_detail(operation_data: Any) -> str:
     return ""
 
 
+def _fugue_app_status(app_data: dict[str, Any]) -> dict[str, Any]:
+    status = app_data.get("status") if isinstance(app_data.get("status"), dict) else {}
+    return status if isinstance(status, dict) else {}
+
+
+def _fugue_app_operation_id(app_data: dict[str, Any]) -> str:
+    status = _fugue_app_status(app_data)
+    return str(status.get("last_operation_id") or app_data.get("last_operation_id") or "").strip()
+
+
+def _fugue_app_last_message(app_data: dict[str, Any]) -> str:
+    status = _fugue_app_status(app_data)
+    return str(status.get("last_message") or status.get("message") or "").strip()
+
+
 def _fugue_runtime_image_from_app(app_data: dict[str, Any]) -> str:
     source = app_data.get("source") if isinstance(app_data.get("source"), dict) else {}
     spec = app_data.get("spec") if isinstance(app_data.get("spec"), dict) else {}
     for candidate in (
-        source.get("resolved_image_ref"),
         spec.get("image"),
+        source.get("resolved_image_ref"),
         source.get("image_ref"),
     ):
         value = str(candidate or "").strip()
@@ -19160,38 +19605,277 @@ def _fugue_runtime_image_from_app(app_data: dict[str, Any]) -> str:
     raise RuntimeError(f"Fugue app {app_name} does not expose a usable runtime image reference yet")
 
 
-def _fugue_resolve_runtime_image_sync(cfg: FugueProvisionConfig) -> str:
+def _fugue_runtime_image_resolution_from_app(
+    cfg: FugueProvisionConfig,
+    app_data: dict[str, Any],
+    *,
+    source_label: str,
+) -> FugueRuntimeImageResolution:
+    if str(app_data.get("project_id") or "").strip() != cfg.project_id:
+        raise RuntimeError(
+            f"Configured Fugue runtime app {app_data.get('id') or app_data.get('name')!r} is not in project {cfg.project_id}"
+        )
+    status = _fugue_app_status(app_data)
+    return FugueRuntimeImageResolution(
+        image_ref=_fugue_runtime_image_from_app(app_data),
+        source=source_label,
+        runtime_app_id=str(app_data.get("id") or "").strip() or None,
+        runtime_app_name=str(app_data.get("name") or "").strip() or None,
+        runtime_operation_id=_fugue_app_operation_id(app_data) or None,
+        runtime_last_message=_fugue_app_last_message(app_data) or None,
+        runtime_phase=str(status.get("phase") or "").strip() or None,
+    )
+
+
+def _fugue_resolve_runtime_image_source_sync(cfg: FugueProvisionConfig) -> FugueRuntimeImageResolution:
     if cfg.image:
-        return cfg.image
+        return FugueRuntimeImageResolution(
+            image_ref=cfg.image,
+            source="static",
+        )
 
     app_data: Optional[dict[str, Any]] = None
+    source_label = ""
     if cfg.runtime_app_id:
         app_data = _fugue_get_app_sync(cfg, cfg.runtime_app_id)
+        source_label = "runtime_app_id"
     elif cfg.runtime_app_name:
         app_data = _fugue_find_app_by_name_sync(cfg, cfg.runtime_app_name)
         if app_data is None:
             raise RuntimeError(
                 f"Fugue runtime app named {cfg.runtime_app_name!r} was not found in project {cfg.project_id}"
             )
+        found_app_id = str(app_data.get("id") or "").strip()
+        if found_app_id:
+            app_data = _fugue_get_app_sync(cfg, found_app_id)
+        source_label = "runtime_app_name"
     elif cfg.runtime_compose_service:
         app_data = _fugue_find_app_by_compose_service_sync(cfg, cfg.runtime_compose_service)
+        found_app_id = str(app_data.get("id") or "").strip()
+        if found_app_id:
+            app_data = _fugue_get_app_sync(cfg, found_app_id)
+        source_label = "runtime_compose_service"
 
     if not isinstance(app_data, dict):
         raise RuntimeError("Fugue runtime image source is not configured")
 
-    if str(app_data.get("project_id") or "").strip() != cfg.project_id:
-        raise RuntimeError(
-            f"Configured Fugue runtime app {app_data.get('id') or app_data.get('name')!r} is not in project {cfg.project_id}"
+    return _fugue_runtime_image_resolution_from_app(cfg, app_data, source_label=source_label)
+
+
+def _fugue_resolve_runtime_image_sync(cfg: FugueProvisionConfig) -> str:
+    return _fugue_resolve_runtime_image_source_sync(cfg).image_ref
+
+
+def _fugue_get_app_image_inventory_sync(cfg: FugueProvisionConfig, app_id: str) -> dict[str, Any]:
+    payload = _fugue_request_json_sync(cfg, "GET", f"/v1/apps/{app_id}/images", expected_statuses=(200,))
+    if not isinstance(payload, dict):
+        raise RuntimeError(f"Invalid Fugue image inventory payload for {app_id}")
+    return payload
+
+
+def _image_ref_digest(image_ref: str) -> str:
+    value = str(image_ref or "").strip()
+    if "@sha256:" in value:
+        return value.rsplit("@", 1)[-1].strip()
+    return ""
+
+
+def _image_refs_match(left: Any, right: Any) -> bool:
+    left_s = str(left or "").strip()
+    right_s = str(right or "").strip()
+    if not left_s or not right_s:
+        return False
+    if left_s == right_s:
+        return True
+    left_digest = _image_ref_digest(left_s)
+    right_digest = _image_ref_digest(right_s)
+    if left_digest and right_digest and left_digest == right_digest:
+        return True
+    if left_digest and right_s == left_digest:
+        return True
+    if right_digest and left_s == right_digest:
+        return True
+    return False
+
+
+def _fugue_inventory_image_available(inventory: dict[str, Any], image_ref: str) -> Optional[bool]:
+    versions = inventory.get("versions") if isinstance(inventory, dict) else None
+    if not isinstance(versions, list):
+        return None
+    target_digest = _image_ref_digest(image_ref)
+    for version in versions:
+        if not isinstance(version, dict):
+            continue
+        candidates = (
+            version.get("image_ref"),
+            version.get("runtime_image_ref"),
+            version.get("digest"),
         )
-    return _fugue_runtime_image_from_app(app_data)
+        if not any(_image_refs_match(candidate, image_ref) for candidate in candidates):
+            continue
+        status = str(version.get("status") or "").strip().lower()
+        if status == "available":
+            return True
+        if status == "missing":
+            return False
+        if target_digest and str(version.get("digest") or "").strip() == target_digest:
+            return bool(version.get("current"))
+    return None
+
+
+def _split_registry_image_ref(image_ref: str) -> tuple[str, str, str]:
+    value = str(image_ref or "").strip()
+    if not value:
+        raise RuntimeError("image_ref is required")
+    if "://" in value:
+        raise RuntimeError("image_ref must not include a URL scheme")
+    name_part = value
+    reference = "latest"
+    if "@" in value:
+        name_part, reference = value.rsplit("@", 1)
+    else:
+        last_slash = value.rfind("/")
+        last_colon = value.rfind(":")
+        if last_colon > last_slash:
+            name_part = value[:last_colon]
+            reference = value[last_colon + 1 :]
+    parts = [part for part in name_part.split("/") if part]
+    if not parts:
+        raise RuntimeError(f"Invalid image_ref: {image_ref}")
+    first = parts[0]
+    if "." in first or ":" in first or first == "localhost":
+        registry = first
+        repo_parts = parts[1:]
+    else:
+        registry = "registry-1.docker.io"
+        repo_parts = parts
+        if len(repo_parts) == 1:
+            repo_parts = ["library", repo_parts[0]]
+    if registry == "docker.io":
+        registry = "registry-1.docker.io"
+    repository = "/".join(repo_parts).strip()
+    if not registry or not repository or not reference:
+        raise RuntimeError(f"Invalid image_ref: {image_ref}")
+    return registry, repository, reference
+
+
+def _registry_manifest_schemes(registry: str) -> tuple[str, ...]:
+    host = registry.split(":", 1)[0].strip().lower()
+    private = (
+        host == "localhost"
+        or host.startswith("127.")
+        or host.startswith("10.")
+        or host.startswith("192.168.")
+        or re.match(r"^172\.(1[6-9]|2[0-9]|3[0-1])\.", host) is not None
+        or registry.endswith(":5000")
+        or registry.endswith(":30500")
+        or host.endswith(".internal")
+    )
+    return ("http", "https") if private else ("https", "http")
+
+
+def _registry_manifest_exists_sync(image_ref: str, *, timeout_s: float) -> bool:
+    registry, repository, reference = _split_registry_image_ref(image_ref)
+    accept = ", ".join(
+        (
+            "application/vnd.oci.image.index.v1+json",
+            "application/vnd.oci.image.manifest.v1+json",
+            "application/vnd.docker.distribution.manifest.list.v2+json",
+            "application/vnd.docker.distribution.manifest.v2+json",
+        )
+    )
+    last_error = ""
+    for scheme in _registry_manifest_schemes(registry):
+        url = (
+            f"{scheme}://{registry}/v2/"
+            f"{urllib.parse.quote(repository, safe='/')}/manifests/{urllib.parse.quote(reference, safe=':')}"
+        )
+        try:
+            response = requests.get(url, headers={"Accept": accept}, timeout=max(5.0, min(timeout_s, 15.0)))
+        except requests.RequestException as e:
+            last_error = str(e)
+            continue
+        if response.status_code == 200:
+            return True
+        body = ""
+        try:
+            body = response.text[:1024]
+        except Exception:
+            body = ""
+        if response.status_code == 404 or _is_manifest_missing_error_text(body):
+            return False
+        if response.status_code in (401, 403):
+            raise RuntimeError(f"registry manifest check for {image_ref} was not authorized")
+        last_error = f"registry returned HTTP {response.status_code}"
+    if last_error:
+        raise RuntimeError(f"registry manifest check for {image_ref} failed: {last_error}")
+    raise RuntimeError(f"registry manifest check for {image_ref} failed")
+
+
+def _raise_runtime_image_missing(
+    message: str,
+    *,
+    resolution: FugueRuntimeImageResolution,
+) -> None:
+    raise FugueRuntimeImageMissingError(
+        message,
+        image_ref=resolution.image_ref,
+        runtime_app_id=resolution.runtime_app_id,
+        operation_id=resolution.runtime_operation_id,
+        last_message=resolution.runtime_last_message,
+    )
+
+
+def _fugue_preflight_runtime_image_sync(
+    cfg: FugueProvisionConfig,
+    resolution: Optional[FugueRuntimeImageResolution] = None,
+) -> FugueRuntimeImageResolution:
+    resolved = resolution or _fugue_resolve_runtime_image_source_sync(cfg)
+    image_ref = str(resolved.image_ref or "").strip()
+    if not image_ref:
+        raise RuntimeError("Fugue runtime image source resolved to an empty image_ref")
+
+    if resolved.runtime_app_id:
+        inventory = _fugue_get_app_image_inventory_sync(cfg, resolved.runtime_app_id)
+        available = _fugue_inventory_image_available(inventory, image_ref)
+        if available is True:
+            return resolved
+        if available is False:
+            _raise_runtime_image_missing(
+                f"configured runtime image digest is missing: {image_ref}",
+                resolution=resolved,
+            )
+
+    try:
+        if _registry_manifest_exists_sync(image_ref, timeout_s=cfg.connect_timeout_s):
+            return resolved
+    except Exception as e:
+        if _is_manifest_missing_error_text(str(e)):
+            _raise_runtime_image_missing(
+                f"configured runtime image digest is missing: {image_ref}",
+                resolution=resolved,
+            )
+        raise
+    _raise_runtime_image_missing(
+        f"configured runtime image digest is missing: {image_ref}",
+        resolution=resolved,
+    )
 
 
 def _fugue_create_session_app_sync(cfg: FugueProvisionConfig, session_id: str) -> dict[str, Any]:
     if not cfg.runtime_cmd:
         raise RuntimeError("ARGUS_RUNTIME_CMD is required in fugue provision mode")
+    image_resolution = _fugue_preflight_runtime_image_sync(cfg)
+    log.info(
+        "Creating Fugue session app session=%s runtime_image_source=%s resolved_image=%s template_app_id=%s",
+        session_id,
+        image_resolution.source,
+        image_resolution.image_ref,
+        image_resolution.runtime_app_id or "",
+    )
     request_body: dict[str, Any] = {
         "project_id": cfg.project_id,
-        "image_ref": _fugue_resolve_runtime_image_sync(cfg),
+        "image_ref": image_resolution.image_ref,
         "name": _fugue_app_name(cfg, session_id),
         "description": f"Argus managed runtime session {session_id}",
         "runtime_id": cfg.runtime_id,
@@ -19226,6 +19910,13 @@ def _fugue_create_session_app_sync(cfg: FugueProvisionConfig, session_id: str) -
     app_data = payload.get("app") if isinstance(payload, dict) else None
     if not isinstance(app_data, dict):
         raise RuntimeError("Invalid Fugue import-image response")
+    log.info(
+        "Created Fugue session app session=%s runtime_app_id=%s operation_id=%s image_ref=%s",
+        session_id,
+        str(app_data.get("id") or "").strip(),
+        _fugue_app_operation_id(app_data),
+        image_resolution.image_ref,
+    )
     return app_data
 
 
@@ -19263,9 +19954,15 @@ def _fugue_wait_for_app_ready_sync(cfg: FugueProvisionConfig, app_id: str) -> di
                 if operation_status in ("failed", "error", "canceled", "cancelled", "deleted"):
                     detail = operation_detail or last_message
                     suffix = f": {detail}" if detail else ""
-                    raise RuntimeError(
-                        f"Fugue app {app_id} last operation {operation_id} entered status {operation_status}{suffix}"
-                    )
+                    message = f"Fugue app {app_id} last operation {operation_id} entered status {operation_status}{suffix}"
+                    if _is_manifest_missing_error_text(message):
+                        raise FugueRuntimeImageMissingError(
+                            message,
+                            runtime_app_id=app_id,
+                            operation_id=operation_id,
+                            last_message=detail or last_message or None,
+                        )
+                    raise RuntimeError(message)
         if phase in ("failed", "deleted"):
             detail_parts: list[str] = []
             if last_message:
@@ -19276,7 +19973,15 @@ def _fugue_wait_for_app_ready_sync(cfg: FugueProvisionConfig, app_id: str) -> di
                     op_summary = f"{op_summary}: {last_operation_detail}"
                 detail_parts.append(op_summary)
             detail = f" ({'; '.join(detail_parts)})" if detail_parts else ""
-            raise RuntimeError(f"Fugue app {app_id} entered phase {phase}{detail}")
+            message = f"Fugue app {app_id} entered phase {phase}{detail}"
+            if _is_manifest_missing_error_text(message):
+                raise FugueRuntimeImageMissingError(
+                    message,
+                    runtime_app_id=app_id,
+                    operation_id=last_operation_id or None,
+                    last_message=last_operation_detail or last_message or None,
+                )
+            raise RuntimeError(message)
         if time.time() >= deadline:
             detail_parts: list[str] = []
             if last_message:
@@ -19318,15 +20023,23 @@ def _fugue_internal_service_target(app_data: dict[str, Any]) -> tuple[str, int]:
 
 def _fugue_session_record_from_app(session_id: str, app_data: dict[str, Any]) -> dict[str, Any]:
     status = app_data.get("status") if isinstance(app_data.get("status"), dict) else {}
+    try:
+        image_ref = _fugue_runtime_image_from_app(app_data)
+    except Exception:
+        image_ref = ""
     return {
         "sessionId": session_id,
         "provider": "fugue",
         "runtimeId": app_data.get("id"),
+        "runtimeAppId": app_data.get("id"),
         "runtimeName": app_data.get("name"),
         "containerId": app_data.get("id"),
         "name": app_data.get("name"),
         "status": status.get("phase"),
         "runtimeLayout": RUNTIME_LAYOUT,
+        "lastMessage": _fugue_app_last_message(app_data) or None,
+        "imageRef": image_ref or None,
+        "operationId": _fugue_app_operation_id(app_data) or None,
     }
 
 
@@ -19560,8 +20273,31 @@ async def _ensure_live_fugue_session_unlocked(session_id: str, *, allow_create: 
     except Exception as e:
         log.warning("Failed to create local workspace mirror for session %s at %s: %s", session_id, workspace_host_path, str(e))
 
-    app_data, created = await asyncio.to_thread(_fugue_ensure_session_app_ready_sync, cfg, session_id, allow_create)
+    try:
+        app_data, created = await asyncio.to_thread(_fugue_ensure_session_app_ready_sync, cfg, session_id, allow_create)
+    except Exception as e:
+        await _mark_session_runtime_failure_if_unrecoverable(session_id, e)
+        log.warning(
+            "Failed to ensure Fugue session app session=%s runtime_error_class=%s error=%s",
+            session_id,
+            _runtime_error_category(e),
+            str(e),
+        )
+        raise
     host, port = _fugue_internal_service_target(app_data)
+    image_ref = ""
+    try:
+        image_ref = _fugue_runtime_image_from_app(app_data)
+    except Exception:
+        image_ref = ""
+    log.info(
+        "Fugue session app ready session=%s runtime_app_id=%s operation_id=%s image_ref=%s created=%s",
+        session_id,
+        str(app_data.get("id") or "").strip(),
+        _fugue_app_operation_id(app_data),
+        image_ref,
+        created,
+    )
     reader, writer = await _wait_for_tcp(host, port, cfg.connect_timeout_s)
 
     live = LiveRuntimeSession(
@@ -19590,6 +20326,12 @@ async def _ensure_live_fugue_session_unlocked(session_id: str, *, allow_create: 
         outbox=deque(),
         pending_client_turn_starts={},
         turn_owners_by_thread={},
+        metadata={
+            "runtimeAppId": str(app_data.get("id") or "").strip(),
+            "operationId": _fugue_app_operation_id(app_data),
+            "imageRef": image_ref,
+            "lastMessage": _fugue_app_last_message(app_data),
+        },
     )
     live = await _activate_live_session(live)
 
@@ -21512,6 +22254,42 @@ async def admin_delete_session(session_id: str, request: Request):
     return {"ok": True, "sessionId": sid, **(cleanup_result or {})}
 
 
+@app.post("/admin/sessions/{session_id}/cleanup-failed-runtime")
+async def admin_cleanup_failed_runtime(session_id: str, request: Request):
+    _http_require_token(request)
+    sid = _normalize_runtime_session_id(session_id)
+    if not sid:
+        raise HTTPException(status_code=400, detail="Invalid sessionId")
+    automation = _get_automation_or_500()
+    if not _provisioner_manages_runtime_sessions(session_id):
+        raise HTTPException(
+            status_code=400,
+            detail=f"Managed sessions are not available for session '{session_id}'",
+        )
+    runtime_status = automation.runtime_status_for_session(sid)
+    try:
+        await automation._force_close_live_session(sid)
+    except Exception:
+        pass
+    try:
+        deleted_runtime = await _remove_managed_runtime(sid)
+    except Exception as e:
+        log.exception("Failed to cleanup failed runtime for session %s", sid)
+        raise HTTPException(status_code=500, detail=str(e)) from e
+    message = "Failed runtime was cleaned up; retry agent provisioning to rebuild the runtime"
+    updated_agent = await automation.mark_session_runtime_rebuild_required(session_id=sid, message=message)
+    return {
+        "ok": True,
+        "sessionId": sid,
+        "deletedRuntime": bool(deleted_runtime),
+        "agentId": updated_agent.agent_id if isinstance(updated_agent, PersistedAgentRuntime) else None,
+        "runtimeErrorClass": runtime_status.get("runtimeErrorClass"),
+        "runtimeAppId": runtime_status.get("runtimeAppId"),
+        "imageRef": runtime_status.get("imageRef"),
+        "message": message,
+    }
+
+
 @app.get("/admin/settings/gateway-api-access")
 async def admin_gateway_api_access_get(request: Request):
     _http_require_token(request)
@@ -23208,8 +23986,15 @@ async def ws_proxy(ws: WebSocket):
         except KeyError:
             await ws.close(code=1008, reason="Unknown session")
             return
-        except Exception:
-            await ws.close(code=1011, reason="Failed to provision upstream runtime")
+        except Exception as e:
+            await _mark_session_runtime_failure_if_unrecoverable(session_id, e)
+            log.warning(
+                "Failed to provision upstream runtime session=%s error_class=%s error=%s",
+                session_id,
+                _runtime_error_category(e),
+                str(e),
+            )
+            await ws.close(code=1011, reason=_runtime_provision_ws_close_reason(e))
             return
 
         await live.attach(ws)
