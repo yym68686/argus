@@ -6796,6 +6796,44 @@ class AutomationManager:
         items.sort(key=lambda item: (item.display_name or item.host_id or "").lower())
         return items
 
+    def _host_ids_visible_to_user(self, *, user_id: int) -> set[str]:
+        if not isinstance(user_id, int) or user_id <= 0:
+            return set()
+        user_scope_id = str(user_id)
+        st = self._store.state
+        host_ids: set[str] = set()
+        for binding in (st.host_bindings or {}).values():
+            if not isinstance(binding, PersistedHostBinding):
+                continue
+            normalized = binding.normalized()
+            if normalized is None:
+                continue
+            if normalized.scope_type == HOST_BINDING_SCOPE_USER and normalized.scope_id == user_scope_id:
+                host_ids.add(normalized.host_id)
+                continue
+            if normalized.scope_type == HOST_BINDING_SCOPE_AGENT:
+                agent = st.agents.get(normalized.scope_id) if isinstance(st.agents, dict) else None
+                if isinstance(agent, PersistedAgentRuntime) and self._can_user_access_agent(user_id=user_id, agent=agent):
+                    host_ids.add(normalized.host_id)
+        return host_ids
+
+    def can_user_access_host_enrollment(self, *, user_id: int, host_id: str) -> bool:
+        hid = _normalize_runtime_host_id(host_id)
+        if not hid:
+            return False
+        return hid in self._host_ids_visible_to_user(user_id=user_id)
+
+    def list_host_enrollments_for_user(self, *, user_id: int) -> list[PersistedHostEnrollment]:
+        visible_host_ids = self._host_ids_visible_to_user(user_id=user_id)
+        if not visible_host_ids:
+            return []
+        items = [
+            enrollment
+            for enrollment in self.list_host_enrollments()
+            if enrollment.host_id in visible_host_ids
+        ]
+        return items
+
     def get_host_binding(self, scope_type: str, scope_id: Any) -> Optional[PersistedHostBinding]:
         key = _host_binding_storage_key(scope_type, scope_id)
         if not key:
@@ -19910,7 +19948,7 @@ def _host_agent_summary_payload(
 
 @app.post("/host-agent/enroll-token")
 async def host_agent_enroll_token(request: Request):
-    _http_require_token(request)
+    principal = _http_require_auth(request)
     automation = _get_automation_or_500()
     try:
         body = await request.json()
@@ -19923,6 +19961,19 @@ async def host_agent_enroll_token(request: Request):
     scope_type = _normalize_host_binding_scope_type(body.get("scopeType")) or None
     scope_id = body.get("scopeId")
     workspace_base_path = _normalize_abs_host_path(body.get("workspaceBasePath"))
+    if not principal.is_admin:
+        user_id = principal.user_id
+        if not isinstance(user_id, int) or user_id <= 0:
+            raise HTTPException(status_code=403, detail="Forbidden")
+        requested_scope_id = _normalize_host_binding_scope_id(scope_type, scope_id) if scope_type else None
+        if scope_type and (scope_type != HOST_BINDING_SCOPE_USER or requested_scope_id != str(user_id)):
+            raise HTTPException(status_code=403, detail="Forbidden")
+        if host_id_hint:
+            existing = automation.get_host_enrollment(host_id_hint)
+            if existing is not None and not automation.can_user_access_host_enrollment(user_id=user_id, host_id=host_id_hint):
+                raise HTTPException(status_code=403, detail="Forbidden")
+        scope_type = HOST_BINDING_SCOPE_USER
+        scope_id = user_id
     try:
         ttl_s = int(body.get("ttlSec")) if body.get("ttlSec") is not None else DEFAULT_HOST_AGENT_ENROLL_TTL_S
     except Exception as e:
@@ -20052,7 +20103,7 @@ async def host_agent_claim(request: Request):
 
 @app.get("/host-agents")
 async def list_host_agents(request: Request):
-    _http_require_token(request)
+    principal = _http_require_auth(request)
     automation = _get_automation_or_500()
     runtime_hosts = await app.state.runtime_host_registry.list_connected()
     nodes = await app.state.node_registry.list_connected(scope_session_id=None)
@@ -20062,9 +20113,15 @@ async def list_host_agents(request: Request):
         for item in nodes
         if not item.get("sessionId") and str(item.get("nodeId") or "").strip()
     }
+    if principal.is_admin:
+        enrollments = automation.list_host_enrollments()
+    elif isinstance(principal.user_id, int) and principal.user_id > 0:
+        enrollments = automation.list_host_enrollments_for_user(user_id=principal.user_id)
+    else:
+        raise HTTPException(status_code=403, detail="Forbidden")
     hosts = [
         _host_agent_summary_payload(automation, enrollment, runtime_hosts_by_id=runtime_by_id, nodes_by_id=nodes_by_id)
-        for enrollment in automation.list_host_enrollments()
+        for enrollment in enrollments
     ]
     return {"hosts": hosts}
 
@@ -23240,6 +23297,12 @@ async def ws_proxy(ws: WebSocket):
                                 for item in nodes
                                 if not item.get("sessionId") and str(item.get("nodeId") or "").strip()
                             }
+                            if principal.is_admin:
+                                enrollments = automation.list_host_enrollments()
+                            elif isinstance(principal.user_id, int) and principal.user_id > 0:
+                                enrollments = automation.list_host_enrollments_for_user(user_id=principal.user_id)
+                            else:
+                                enrollments = []
                             hosts = [
                                 _host_agent_summary_payload(
                                     automation,
@@ -23247,7 +23310,7 @@ async def ws_proxy(ws: WebSocket):
                                     runtime_hosts_by_id=runtime_by_id,
                                     nodes_by_id=nodes_by_id,
                                 )
-                                for enrollment in automation.list_host_enrollments()
+                                for enrollment in enrollments
                             ]
                             if has_id:
                                 await ws.send_text(json.dumps({"id": req_id, "result": {"hosts": hosts}}))
