@@ -4,9 +4,11 @@ import * as React from "react";
 import { Check, Copy, Link2, Pencil, Plus, RefreshCw, Trash2 } from "lucide-react";
 import { toast } from "sonner";
 
+import { useConfirmDialog } from "@/components/confirm-dialog";
 import { useAuth } from "@/components/admin-gate";
 import { Badge, EmptyState, Fact, InlineError, PanelCard } from "@/components/console-primitives";
 import { ConsoleShell } from "@/components/console-shell";
+import { PanelReveal, TextSwap } from "@/components/transitions";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { formatWhen } from "@/lib/format";
@@ -66,6 +68,7 @@ function agentProvisioningToast(state: SelfAgentsResponse, fallback = "Agent upd
 
 export default function AgentsPage() {
   const { user } = useAuth();
+  const { confirm, confirmDialog } = useConfirmDialog();
   const [wsUrl] = useGatewayWsUrlState();
   const [agentsState, setAgentsState] = React.useState<SelfAgentsResponse | null>(null);
   const [connection, setConnection] = React.useState<SelfAgentConnectionResponse | null>(null);
@@ -263,7 +266,14 @@ export default function AgentsPage() {
 
   const removeAgent = React.useCallback(async () => {
     if (!selectedAgent || !wsUrl.trim()) return;
-    if (!window.confirm(`Delete ${selectedAgent.shortName || selectedAgent.agentId}?`)) return;
+    const label = selectedAgent.shortName || selectedAgent.agentId;
+    const confirmed = await confirm({
+      title: "Delete agent?",
+      body: `Delete ${label}? Its dedicated session binding and connection details will be removed.`,
+      confirmLabel: "Delete agent",
+      tone: "destructive",
+    });
+    if (!confirmed) return;
     setSaving(true);
     setError(null);
     try {
@@ -278,7 +288,7 @@ export default function AgentsPage() {
     } finally {
       setSaving(false);
     }
-  }, [applyAgents, selectedAgent, wsUrl]);
+  }, [applyAgents, confirm, selectedAgent, wsUrl]);
 
   const loadConnection = React.useCallback(async () => {
     if (!selectedAgent || !wsUrl.trim()) return;
@@ -312,6 +322,7 @@ export default function AgentsPage() {
         </Button>
       }
     >
+      {confirmDialog}
       {error ? <InlineError message={error} /> : null}
 
       <div className="grid gap-4">
@@ -382,6 +393,7 @@ export default function AgentsPage() {
           </section>
 
           <section className="space-y-4">
+            <PanelReveal key={selectedAgent?.agentId ?? "agent-none"} open className="space-y-4" travel="12px">
             <PanelCard
               title={selectedAgent?.shortName || selectedAgent?.agentId || "Agent"}
               action={
@@ -406,7 +418,7 @@ export default function AgentsPage() {
                     ) : null}
                     <Button type="button" size="sm" variant="secondary" disabled={loading || saving} onClick={() => void loadConnection()}>
                       <Link2 className="h-4 w-4" />
-                      {agentProvisioningState(selectedAgent) === "pending" ? "Wait for ready" : "Connection"}
+                      <TextSwap value={agentProvisioningState(selectedAgent) === "pending" ? "Wait for ready" : "Connection"} />
                     </Button>
                     {!selectedAgent.isDefault ? (
                       <Button type="button" size="sm" variant="destructive" disabled={loading || saving} onClick={() => void removeAgent()}>
@@ -421,7 +433,9 @@ export default function AgentsPage() {
               {selectedAgent ? (
                 <div className="grid gap-4">
                   <div className="flex flex-wrap gap-2">
-                    <Badge tone={agentProvisioningTone(selectedAgent)}>{agentProvisioningLabel(selectedAgent)}</Badge>
+                    <Badge tone={agentProvisioningTone(selectedAgent)}>
+                      <TextSwap value={agentProvisioningLabel(selectedAgent)} />
+                    </Badge>
                     {selectedAgent.isDefault ? <Badge tone="success">main</Badge> : null}
                     {selectedAgent.agentId === agentsState?.currentAgentId ? <Badge tone="primary">current</Badge> : null}
                   </div>
@@ -519,11 +533,12 @@ export default function AgentsPage() {
                   </div>
                   <Button type="button" variant="secondary" disabled={!selectedAgent || loading || saving} onClick={() => void loadConnection()}>
                     <Link2 className="h-4 w-4" />
-                    {selectedAgent && agentProvisioningState(selectedAgent) === "pending" ? "Wait and generate" : "Generate"}
+                    <TextSwap value={selectedAgent && agentProvisioningState(selectedAgent) === "pending" ? "Wait and generate" : "Generate"} />
                   </Button>
                 </div>
               )}
             </PanelCard>
+            </PanelReveal>
           </section>
         </div>
       </div>

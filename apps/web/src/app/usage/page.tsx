@@ -6,6 +6,7 @@ import { toast } from "sonner";
 import { useAuth } from "@/components/admin-gate";
 import { Badge, EmptyState, Fact, InlineError, PanelCard, Skeleton, StatCard } from "@/components/console-primitives";
 import { ConsoleShell } from "@/components/console-shell";
+import { PanelReveal } from "@/components/transitions";
 import { Input } from "@/components/ui/input";
 import {
   type AdminOverviewResponse,
@@ -176,6 +177,7 @@ function AdminUsagePage() {
         )}
 
         {!usageUnavailable ? (
+          <PanelReveal key={selectedUserId || "global"} open travel="12px">
           <div className="grid gap-4 xl:grid-cols-[320px_minmax(0,1fr)]">
             <section className="space-y-4">
               <PanelCard title="Top users">
@@ -312,6 +314,7 @@ function AdminUsagePage() {
               </PanelCard>
             </section>
           </div>
+          </PanelReveal>
         ) : null}
       </div>
     </ConsoleShell>

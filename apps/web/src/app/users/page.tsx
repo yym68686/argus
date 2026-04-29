@@ -4,8 +4,10 @@ import React from "react";
 import { Plus, KeyRound, Trash2, UserRoundCheck, Pencil, Bot, RadioTower, RefreshCw } from "lucide-react";
 import { toast } from "sonner";
 
+import { useConfirmDialog } from "@/components/confirm-dialog";
 import { Badge, EmptyState, Fact, InfoPill, InlineError, PanelCard, Skeleton } from "@/components/console-primitives";
 import { ConsoleShell } from "@/components/console-shell";
+import { PanelReveal, TextSwap } from "@/components/transitions";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import {
@@ -73,6 +75,7 @@ function userIdentitySubtitle(user: Pick<AdminUserSummary, "email" | "telegramPr
 }
 
 export default function UsersPage() {
+  const { confirm, confirmDialog } = useConfirmDialog();
   const [wsUrl] = useGatewayWsUrlState();
   const [users, setUsers] = React.useState<AdminUserSummary[]>([]);
   const [usersBusy, setUsersBusy] = React.useState(false);
@@ -271,9 +274,13 @@ export default function UsersPage() {
     const label = currentUser?.email || currentUser?.telegramProfile?.username
       ? `${currentUser?.email || ""}${currentUser?.email && currentUser?.telegramProfile?.username ? " / " : ""}${currentUser?.telegramProfile?.username ? `@${currentUser.telegramProfile.username}` : ""}`
       : `User ${selectedUserId}`;
-    if (!window.confirm(`Delete ${label}? This will remove the user's agents, channel settings, Telegram profile, and console sessions.`)) {
-      return;
-    }
+    const confirmed = await confirm({
+      title: "Delete user?",
+      body: `Delete ${label}? This will remove the user's agents, channel settings, Telegram profile, and console sessions.`,
+      confirmLabel: "Delete user",
+      tone: "destructive",
+    });
+    if (!confirmed) return;
 
     const actionKey = `user-delete:${selectedUserId}`;
     setPendingAction(actionKey, true);
@@ -366,7 +373,13 @@ export default function UsersPage() {
 
   async function deleteAgent(agent: AdminAgentEntry): Promise<void> {
     if (!selectedUserId) return;
-    if (!window.confirm(`Delete agent ${agent.shortName || agent.agentId}?`)) return;
+    const confirmed = await confirm({
+      title: "Delete agent?",
+      body: `Delete agent ${agent.shortName || agent.agentId}?`,
+      confirmLabel: "Delete agent",
+      tone: "destructive",
+    });
+    if (!confirmed) return;
     try {
       await gatewayFetchJson(wsUrl, `/admin/users/${selectedUserId}/agents/${encodeURIComponent(agent.agentId)}`, {
         method: "DELETE",
@@ -525,7 +538,13 @@ export default function UsersPage() {
 
   async function deleteChannel(channel: AdminChannelEntry): Promise<void> {
     if (!selectedUserId) return;
-    if (!window.confirm(`Delete channel ${channel.name || channel.channelId}?`)) return;
+    const confirmed = await confirm({
+      title: "Delete channel?",
+      body: `Delete channel ${channel.name || channel.channelId}?`,
+      confirmLabel: "Delete channel",
+      tone: "destructive",
+    });
+    if (!confirmed) return;
     try {
       await gatewayFetchJson(
         wsUrl,
@@ -567,7 +586,13 @@ export default function UsersPage() {
 
   async function clearChannelKey(channel: AdminChannelEntry): Promise<void> {
     if (!selectedUserId) return;
-    if (!window.confirm(`Clear API key for ${channel.name || channel.channelId}?`)) return;
+    const confirmed = await confirm({
+      title: "Clear API key?",
+      body: `Clear API key for ${channel.name || channel.channelId}?`,
+      confirmLabel: "Clear key",
+      tone: "destructive",
+    });
+    if (!confirmed) return;
     try {
       await gatewayFetchJson(
         wsUrl,
@@ -632,6 +657,7 @@ export default function UsersPage() {
 
   return (
     <ConsoleShell title="Users">
+      {confirmDialog}
       <div className="space-y-6">
         <PanelCard
           eyebrow="Fleet roster"
@@ -755,6 +781,7 @@ export default function UsersPage() {
         </PanelCard>
 
         <section className="space-y-6">
+          <PanelReveal key={selectedUserId ?? "user-none"} open className="space-y-6" travel="12px">
           {usersError && !selectedUserId ? (
             <PanelCard title="User">
               <InlineError message={usersError} />
@@ -780,7 +807,11 @@ export default function UsersPage() {
                   <div className="flex flex-wrap gap-2">
                     {detail.user.email ? <Badge tone="default">web</Badge> : null}
                     {detail.user.telegramProfile ? <Badge tone="default">tg</Badge> : null}
-                    {detail.user.initialized ? <Badge tone="success">initialized</Badge> : <Badge tone="warning">pending</Badge>}
+                    {detail.user.initialized ? (
+                      <Badge tone="success"><TextSwap value="initialized" /></Badge>
+                    ) : (
+                      <Badge tone="warning"><TextSwap value="pending" /></Badge>
+                    )}
                     <Badge tone="default">{detail.user.agentCount} agents</Badge>
                     <Badge tone="default">{detail.user.channelCount} channels</Badge>
                     <Button type="button" size="sm" variant="destructive" disabled={deletingSelectedUser} onClick={() => void deleteUser()}>
@@ -845,7 +876,9 @@ export default function UsersPage() {
                               <div className="font-medium text-foreground">{agent.shortName || agent.agentId}</div>
                               {agent.isDefault ? <Badge tone="primary">main</Badge> : null}
                               {detail.user.currentAgentId === agent.agentId ? <Badge tone="success">current</Badge> : null}
-                              <Badge tone={agentProvisioningTone(agent)}>{agentProvisioningLabel(agent)}</Badge>
+                              <Badge tone={agentProvisioningTone(agent)}>
+                                <TextSwap value={agentProvisioningLabel(agent)} />
+                              </Badge>
                             </div>
                             <div className="mt-2 text-xs leading-5 text-muted-foreground">
                               session <code className="font-mono">{agent.sessionId || "—"}</code> · created {formatWhen(agent.createdAtMs)} · updated {formatWhen(agent.provisioningUpdatedAtMs || agent.lastReadyAtMs)}
@@ -866,7 +899,7 @@ export default function UsersPage() {
                               onClick={() => void activateAgent(agent)}
                             >
                               <UserRoundCheck className="h-4 w-4" />
-                              {pendingActions[`agent-use:${agent.agentId}`] ? "Switching…" : "Use"}
+                              <TextSwap value={pendingActions[`agent-use:${agent.agentId}`] ? "Switching…" : "Use"} />
                             </Button>
                             {agentProvisioningState(agent) === "failed" ? (
                               <Button type="button" size="sm" variant="secondary" onClick={() => void retryAgent(agent)}>
@@ -989,7 +1022,7 @@ export default function UsersPage() {
                               onClick={() => void selectChannel(channel)}
                             >
                               <RadioTower className="h-4 w-4" />
-                              {pendingActions[`channel-select:${channel.channelId}`] ? "Switching…" : "Select"}
+                              <TextSwap value={pendingActions[`channel-select:${channel.channelId}`] ? "Switching…" : "Select"} />
                             </Button>
                             {channel.canAdminToggleAccess
                               ? gatewayAccessActions(channel).map((action) => (
@@ -1086,6 +1119,7 @@ export default function UsersPage() {
               </PanelCard>
             </>
           ) : null}
+          </PanelReveal>
         </section>
       </div>
     </ConsoleShell>

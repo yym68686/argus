@@ -1,5 +1,6 @@
 import type { ReactNode } from "react";
 
+import { AnimatedNumber } from "@/components/transitions";
 import { cn } from "@/lib/utils";
 
 export function PanelCard({
@@ -62,7 +63,7 @@ export function StatCard({
     >
       <div className="argus-surface-label">{label}</div>
       <div className="mt-2 text-[clamp(1.5rem,2.1vw,2.3rem)] font-semibold tracking-[-0.05em] text-foreground">
-        {value}
+        <AnimatedNumber value={value} />
       </div>
     </div>
   );

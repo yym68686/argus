@@ -4,6 +4,7 @@ import * as React from "react";
 import { RefreshCw, Trash2 } from "lucide-react";
 import { toast } from "sonner";
 
+import { useConfirmDialog } from "@/components/confirm-dialog";
 import { useAuth } from "@/components/admin-gate";
 import { Badge, EmptyState, InlineError, PanelCard, Skeleton, StatCard } from "@/components/console-primitives";
 import { ConsoleShell } from "@/components/console-shell";
@@ -36,6 +37,7 @@ function sessionValue(value?: string | number | null): string {
 
 export default function SessionFleetPage() {
   const { user } = useAuth();
+  const { confirm, confirmDialog } = useConfirmDialog();
   const [wsUrl] = useGatewayWsUrlState();
   const [sessions, setSessions] = React.useState<AdminSessionRow[]>([]);
   const [loading, setLoading] = React.useState(false);
@@ -81,9 +83,13 @@ export default function SessionFleetPage() {
       const sessionId = String(session.sessionId || "").trim();
       if (!sessionId || !wsUrl.trim()) return;
       const label = sessionDisplayName(session);
-      if (typeof window !== "undefined" && !window.confirm(`Delete ${label}?`)) {
-        return;
-      }
+      const confirmed = await confirm({
+        title: "Delete session?",
+        body: `Delete ${label}? This removes the runtime session from the gateway.`,
+        confirmLabel: "Delete session",
+        tone: "destructive",
+      });
+      if (!confirmed) return;
       setDeletingId(sessionId);
       setError(null);
       try {
@@ -98,7 +104,7 @@ export default function SessionFleetPage() {
         setDeletingId(null);
       }
     },
-    [refresh, wsUrl],
+    [confirm, refresh, wsUrl],
   );
 
   const runningCount = React.useMemo(
@@ -132,6 +138,7 @@ export default function SessionFleetPage() {
         </Button>
       }
     >
+      {confirmDialog}
       <div className="grid gap-4">
         {error ? <InlineError message={error} /> : null}
 

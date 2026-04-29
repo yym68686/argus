@@ -4,9 +4,11 @@ import * as React from "react";
 import { Check, Copy, KeyRound, Pencil, Plus, Trash2 } from "lucide-react";
 import { toast } from "sonner";
 
+import { useConfirmDialog } from "@/components/confirm-dialog";
 import { useAuth } from "@/components/admin-gate";
 import { Badge, EmptyState, Fact, InlineError, PanelCard } from "@/components/console-primitives";
 import { ConsoleShell } from "@/components/console-shell";
+import { PanelReveal, TextSwap } from "@/components/transitions";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import type { AdminChannelEntry } from "@/lib/admin";
@@ -43,6 +45,7 @@ function channelKind(channel: AdminChannelEntry): string {
 
 export default function ApiKeysPage() {
   const { user } = useAuth();
+  const { confirm, confirmDialog } = useConfirmDialog();
   const [wsUrl] = useGatewayWsUrlState();
   const [channelsState, setChannelsState] = React.useState<SelfChannelsResponse | null>(null);
   const [developerKeysState, setDeveloperKeysState] = React.useState<SelfDeveloperKeysResponse | null>(null);
@@ -182,7 +185,13 @@ export default function ApiKeysPage() {
 
   const revokeDeveloperKey = React.useCallback(async (keyId: string) => {
     if (!wsUrl.trim()) return;
-    if (!window.confirm("Revoke this developer key?")) return;
+    const confirmed = await confirm({
+      title: "Revoke developer key?",
+      body: "Applications using this key will no longer be able to access the gateway.",
+      confirmLabel: "Revoke key",
+      tone: "destructive",
+    });
+    if (!confirmed) return;
     setSaving(true);
     setError(null);
     try {
@@ -196,7 +205,7 @@ export default function ApiKeysPage() {
     } finally {
       setSaving(false);
     }
-  }, [wsUrl]);
+  }, [confirm, wsUrl]);
 
   const createChannel = React.useCallback(async () => {
     if (!wsUrl.trim()) return;
@@ -307,7 +316,13 @@ export default function ApiKeysPage() {
 
   const removeChannel = React.useCallback(async () => {
     if (!selectedChannel || !selectedChannel.canDelete || !wsUrl.trim()) return;
-    if (!window.confirm(`Delete ${selectedChannel.name}?`)) return;
+    const confirmed = await confirm({
+      title: "Delete channel?",
+      body: `Delete ${selectedChannel.name}? Stored upstream key settings for this channel will be removed.`,
+      confirmLabel: "Delete channel",
+      tone: "destructive",
+    });
+    if (!confirmed) return;
     setSaving(true);
     setError(null);
     try {
@@ -321,12 +336,13 @@ export default function ApiKeysPage() {
     } finally {
       setSaving(false);
     }
-  }, [applyChannels, selectedChannel, wsUrl]);
+  }, [applyChannels, confirm, selectedChannel, wsUrl]);
 
   if (!user) return null;
 
   return (
     <ConsoleShell title="API Keys">
+      {confirmDialog}
       {error ? <InlineError message={error} /> : null}
 
       <div className="grid gap-4">
@@ -432,7 +448,9 @@ export default function ApiKeysPage() {
                         </div>
                         <div className="mt-3 flex flex-wrap gap-2">
                           {channel.selected ? <Badge tone="primary">current</Badge> : null}
-                          <Badge tone={channel.ready ? "success" : "default"}>{channel.ready ? "ready" : "pending"}</Badge>
+                          <Badge tone={channel.ready ? "success" : "default"}>
+                            <TextSwap value={channel.ready ? "ready" : "pending"} />
+                          </Badge>
                           <Badge tone={channel.hasApiKey ? "success" : "default"}>
                             {channel.hasApiKey ? "key" : "no key"}
                           </Badge>
@@ -467,6 +485,7 @@ export default function ApiKeysPage() {
           </section>
 
           <section className="space-y-4">
+            <PanelReveal key={selectedChannel?.channelId ?? "channel-none"} open className="space-y-4" travel="12px">
             <PanelCard
               title={selectedChannel?.name || "Channel"}
               action={
@@ -579,6 +598,7 @@ export default function ApiKeysPage() {
                 <EmptyState title="No custom keys" />
               </PanelCard>
             )}
+            </PanelReveal>
           </section>
         </div>
       </div>

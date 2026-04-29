@@ -22,11 +22,13 @@ import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { toast } from "sonner";
 
+import { useConfirmDialog } from "@/components/confirm-dialog";
 import { useAuth } from "@/components/admin-gate";
 import { ConsoleFrame } from "@/components/console-shell";
 import { cn } from "@/lib/utils";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
+import { AnimatedDropdown, AnimatedNumber, PageSideBySide, PanelReveal, TextSwap } from "@/components/transitions";
 import { buildGatewayHeaders, useGatewayWsUrlState, withGatewayAdminToken } from "@/lib/gateway";
 
 const ARGUS_WEB_VERSION = process.env.NEXT_PUBLIC_ARGUS_VERSION || "0.0.0";
@@ -687,6 +689,7 @@ function turnsToChatMessages(turns: unknown): ChatMessage[] {
 export default function Page() {
   type ActivePane = "chat" | "connection";
   const { user, loading: authLoading } = useAuth();
+  const { confirm, confirmDialog } = useConfirmDialog();
 
   const [wsUrl, setWsUrl] = useGatewayWsUrlState();
   const [cwd, setCwd] = React.useState<string>("/workspace");
@@ -2192,6 +2195,14 @@ export default function Page() {
   }
 
   async function deleteSession(id: string): Promise<void> {
+    const confirmed = await confirm({
+      title: "Delete session?",
+      body: `Delete session ${id}? This removes it from the gateway session list.`,
+      confirmLabel: "Delete session",
+      tone: "destructive",
+    });
+    if (!confirmed) return;
+
     setSessionsBusy(true);
     try {
       closeSessionSocket(id, "deleting session");
@@ -2605,11 +2616,12 @@ export default function Page() {
                       >
                         <MoreHorizontal className="h-4 w-4" />
                       </Button>
-                      {sid && isMenuOpen ? (
-                        <div
-                          className="absolute right-0 top-full z-50 mt-2 w-48 overflow-hidden rounded-[16px] border border-border/70 bg-background/96 shadow-[0_18px_42px_oklch(0%_0_0/0.22)]"
-                          onClick={(e) => e.stopPropagation()}
-                        >
+                      <AnimatedDropdown
+                        open={Boolean(sid && isMenuOpen)}
+                        origin="top-right"
+                        className="absolute right-0 top-full z-50 mt-2 w-48 overflow-hidden rounded-[16px] border border-border/70 bg-background/96 shadow-[0_18px_42px_oklch(0%_0_0/0.22)]"
+                      >
+                        <div onClick={(e) => e.stopPropagation()}>
                           <button
                             type="button"
                             className="flex w-full items-center gap-2 px-3 py-2 text-left text-sm text-foreground transition-colors hover:bg-background/40"
@@ -2650,12 +2662,13 @@ export default function Page() {
                             Delete session
                           </button>
                         </div>
-                      ) : null}
+                      </AnimatedDropdown>
                     </div>
                   </div>
 
-                  {sid && isExpanded ? (
-                    <div className="mt-1 space-y-2 pl-4">
+                  {sid ? (
+                    <PanelReveal open={isExpanded} className="mt-1 pl-4" travel="10px">
+                      <div className="space-y-2">
                       {threadsBusy && threads == null ? (
                         <div className="flex items-center gap-2 rounded-[14px] px-2 py-1.5 text-sm text-muted-foreground">
                           <RefreshCw className="h-4 w-4 animate-spin" />
@@ -2725,11 +2738,12 @@ export default function Page() {
                                     <MoreHorizontal className="h-4 w-4" />
                                   </Button>
 
-                                  {isThreadMenuOpen ? (
-                                    <div
-                                      className="absolute right-0 top-full z-50 mt-2 w-48 overflow-hidden rounded-[16px] border border-border/70 bg-background/96 shadow-[0_18px_42px_oklch(0%_0_0/0.22)]"
-                                      onClick={(e) => e.stopPropagation()}
-                                    >
+                                  <AnimatedDropdown
+                                    open={isThreadMenuOpen}
+                                    origin="top-right"
+                                    className="absolute right-0 top-full z-50 mt-2 w-48 overflow-hidden rounded-[16px] border border-border/70 bg-background/96 shadow-[0_18px_42px_oklch(0%_0_0/0.22)]"
+                                  >
+                                    <div onClick={(e) => e.stopPropagation()}>
                                       <button
                                         type="button"
                                         className="flex w-full items-center gap-2 px-3 py-2 text-left text-sm text-foreground transition-colors hover:bg-background/40"
@@ -2755,14 +2769,15 @@ export default function Page() {
                                         Archive thread
                                       </button>
                                     </div>
-                                  ) : null}
+                                  </AnimatedDropdown>
                                 </div>
                               </div>
                             );
                           })}
                         </div>
                       )}
-                    </div>
+                      </div>
+                    </PanelReveal>
                   ) : null}
                 </React.Fragment>
               );
@@ -2824,10 +2839,14 @@ export default function Page() {
     <ConsoleFrame
       contextRail={workbenchRail}
       header={activePane === "connection" ? connectionHeader : chatHeader}
-      bodyClassName={activePane === "connection" ? "overflow-auto p-4 scrollbar-hide md:p-6" : "relative overflow-hidden"}
+      bodyClassName="relative overflow-hidden"
     >
-      {activePane === "connection" ? (
-        <div className="grid gap-4 xl:grid-cols-[minmax(0,1.05fr)_minmax(0,0.95fr)]">
+      <PageSideBySide
+        page={activePane === "connection" ? "2" : "1"}
+        className="h-full min-h-0"
+        pageTwo={
+          <div className="h-full overflow-auto p-4 scrollbar-hide md:p-6">
+            <div className="grid gap-4 xl:grid-cols-[minmax(0,1.05fr)_minmax(0,0.95fr)]">
           <div className="argus-shell-panel-soft rounded-[22px] p-4 md:p-5">
             <div className="border-b border-border/60 pb-3">
               <div className="text-sm font-semibold tracking-[-0.02em] text-foreground">Connection</div>
@@ -2874,7 +2893,7 @@ export default function Page() {
                   }
                   disabled={!wsUrl.trim() || sessionsBusy}
                 >
-                  {activeConnStatus?.ok ? "Disconnect" : "Connect"}
+                  <TextSwap value={activeConnStatus?.ok ? "Disconnect" : "Connect"} />
                 </Button>
               </div>
             </div>
@@ -2891,9 +2910,11 @@ export default function Page() {
               <ConnectionFact label="State" value={activeConnStatus?.text ?? "disconnected"} />
             </div>
           </div>
-        </div>
-      ) : (
-        <>
+            </div>
+          </div>
+        }
+        pageOne={
+          <>
           <div
             ref={chatScrollRef}
             className="h-full overflow-auto px-4 pb-32 pt-4 scrollbar-hide md:px-6 md:pb-36 md:pt-5"
@@ -3022,8 +3043,10 @@ export default function Page() {
               </div>
             </div>
           </div>
-        </>
-      )}
+          </>
+        }
+      />
+      {confirmDialog}
     </ConsoleFrame>
   );
 }
@@ -3068,7 +3091,7 @@ function FieldLabel({ label, icon }: { label: string; icon?: React.ReactNode }) 
   return (
     <div className="mb-1.5 inline-flex items-center gap-2 text-[11px] uppercase tracking-[0.12em] text-muted-foreground">
       {icon ? <span className="text-primary">{icon}</span> : null}
-      <span>{label}</span>
+      <TextSwap value={label} />
     </div>
   );
 }
@@ -3092,7 +3115,9 @@ function IdPill({
       )}
     >
       <span className="text-[10px] uppercase tracking-[0.12em] text-muted-foreground">{label}</span>
-      <code className="font-mono text-xs text-foreground">{value ?? "-"}</code>
+      <code className="font-mono text-xs text-foreground">
+        <TextSwap value={value ?? "-"} />
+      </code>
     </div>
   );
 }
@@ -3115,7 +3140,7 @@ function RailStat({
         <span className="argus-status-dot" data-state={status} />
       </div>
       <div className={cn("mt-2 text-sm font-medium text-foreground", mono ? "font-mono text-[12.5px]" : null)}>
-        {value}
+        {mono ? <TextSwap value={value} /> : <AnimatedNumber value={value} />}
       </div>
     </div>
   );
@@ -3125,7 +3150,9 @@ function ConnectionFact({ label, value, mono = false }: { label: string; value: 
   return (
     <div className="rounded-[16px] border border-border/70 bg-background/24 px-3.5 py-3 shadow-[inset_0_1px_0_0_oklch(var(--foreground)/0.04)]">
       <div className="argus-surface-label">{label}</div>
-      <div className={cn("mt-2 text-sm font-medium text-foreground", mono ? "font-mono text-[12.5px]" : null)}>{value}</div>
+      <div className={cn("mt-2 text-sm font-medium text-foreground", mono ? "font-mono text-[12.5px]" : null)}>
+        {mono ? <TextSwap value={value} /> : <AnimatedNumber value={value} />}
+      </div>
     </div>
   );
 }
