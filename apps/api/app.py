@@ -770,6 +770,7 @@ class FugueProvisionConfig:
 class FugueRuntimeImageResolution:
     image_ref: str
     source: str
+    registry_check_ref: Optional[str] = None
     runtime_app_id: Optional[str] = None
     runtime_app_name: Optional[str] = None
     runtime_operation_id: Optional[str] = None
@@ -19616,9 +19617,12 @@ def _fugue_runtime_image_resolution_from_app(
             f"Configured Fugue runtime app {app_data.get('id') or app_data.get('name')!r} is not in project {cfg.project_id}"
         )
     status = _fugue_app_status(app_data)
+    source = app_data.get("source") if isinstance(app_data.get("source"), dict) else {}
+    registry_check_ref = str(source.get("resolved_image_ref") or source.get("image_ref") or "").strip() or None
     return FugueRuntimeImageResolution(
         image_ref=_fugue_runtime_image_from_app(app_data),
         source=source_label,
+        registry_check_ref=registry_check_ref,
         runtime_app_id=str(app_data.get("id") or "").strip() or None,
         runtime_app_name=str(app_data.get("name") or "").strip() or None,
         runtime_operation_id=_fugue_app_operation_id(app_data) or None,
@@ -19857,16 +19861,38 @@ def _fugue_preflight_runtime_image_sync(
                     resolution=resolved,
                 )
 
-    try:
-        if _registry_manifest_exists_sync(image_ref, timeout_s=cfg.connect_timeout_s):
-            return resolved
-    except Exception as e:
-        if _is_manifest_missing_error_text(str(e)):
+    registry_refs = [image_ref]
+    fallback_ref = str(resolved.registry_check_ref or "").strip()
+    if fallback_ref and not _image_refs_match(fallback_ref, image_ref):
+        registry_refs.append(fallback_ref)
+    last_error: Optional[Exception] = None
+    missing_seen = False
+    for check_ref in registry_refs:
+        try:
+            if _registry_manifest_exists_sync(check_ref, timeout_s=cfg.connect_timeout_s):
+                return resolved
+        except Exception as e:
+            if _is_manifest_missing_error_text(str(e)):
+                _raise_runtime_image_missing(
+                    f"configured runtime image digest is missing: {image_ref}",
+                    resolution=resolved,
+                )
+            last_error = e
+            log.info("Registry manifest check for %s failed; trying fallback if available: %s", check_ref, str(e))
+            continue
+        missing_seen = True
+        if check_ref == image_ref:
             _raise_runtime_image_missing(
                 f"configured runtime image digest is missing: {image_ref}",
                 resolution=resolved,
             )
-        raise
+    if missing_seen:
+        _raise_runtime_image_missing(
+            f"configured runtime image digest is missing: {image_ref}",
+            resolution=resolved,
+        )
+    if last_error is not None:
+        raise last_error
     _raise_runtime_image_missing(
         f"configured runtime image digest is missing: {image_ref}",
         resolution=resolved,

@@ -239,9 +239,17 @@ class FugueApiHelperTests(unittest.TestCase):
             "id": "app_template",
             "name": "runtime",
             "project_id": "project_123",
-            "source": {"compose_service": "runtime"},
-            "spec": {"image": "registry.invalid/runtime@sha256:available"},
+            "source": {
+                "compose_service": "runtime",
+                "resolved_image_ref": "fugue-registry.svc.cluster.local:5000/runtime:git-abc123",
+            },
+            "spec": {"image": "registry.fugue.internal:5000/runtime@sha256:available"},
         }
+
+        def fake_registry_check(image_ref: str, *, timeout_s: float) -> bool:
+            if image_ref.startswith("registry.fugue.internal:"):
+                raise RuntimeError("registry manifest check failed: name or service not known")
+            return image_ref == "fugue-registry.svc.cluster.local:5000/runtime:git-abc123"
 
         with (
             mock.patch.object(argus_app, "_fugue_list_apps_sync", return_value=[app_data]),
@@ -251,12 +259,13 @@ class FugueApiHelperTests(unittest.TestCase):
                 "_fugue_get_app_image_inventory_sync",
                 side_effect=RuntimeError("Fugue API GET /v1/apps/app_template/images failed with 403"),
             ),
-            mock.patch.object(argus_app, "_registry_manifest_exists_sync", return_value=True) as registry_check,
+            mock.patch.object(argus_app, "_registry_manifest_exists_sync", side_effect=fake_registry_check) as registry_check,
         ):
             resolution = argus_app._fugue_preflight_runtime_image_sync(cfg)
 
-        self.assertEqual(resolution.image_ref, "registry.invalid/runtime@sha256:available")
-        registry_check.assert_called_once_with("registry.invalid/runtime@sha256:available", timeout_s=1.0)
+        self.assertEqual(resolution.image_ref, "registry.fugue.internal:5000/runtime@sha256:available")
+        self.assertEqual(resolution.registry_check_ref, "fugue-registry.svc.cluster.local:5000/runtime:git-abc123")
+        self.assertEqual(registry_check.call_count, 2)
 
     def test_fugue_create_session_does_not_post_when_image_preflight_fails(self) -> None:
         cfg = argus_app.FugueProvisionConfig(
