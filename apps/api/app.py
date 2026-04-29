@@ -19836,15 +19836,26 @@ def _fugue_preflight_runtime_image_sync(
         raise RuntimeError("Fugue runtime image source resolved to an empty image_ref")
 
     if resolved.runtime_app_id:
-        inventory = _fugue_get_app_image_inventory_sync(cfg, resolved.runtime_app_id)
-        available = _fugue_inventory_image_available(inventory, image_ref)
-        if available is True:
-            return resolved
-        if available is False:
-            _raise_runtime_image_missing(
-                f"configured runtime image digest is missing: {image_ref}",
-                resolution=resolved,
+        try:
+            inventory = _fugue_get_app_image_inventory_sync(cfg, resolved.runtime_app_id)
+        except RuntimeError as e:
+            detail = str(e)
+            if " failed with 403" not in detail and " failed with 404" not in detail:
+                raise
+            log.info(
+                "Fugue image inventory unavailable for runtime app %s; falling back to registry manifest check: %s",
+                resolved.runtime_app_id,
+                detail,
             )
+        else:
+            available = _fugue_inventory_image_available(inventory, image_ref)
+            if available is True:
+                return resolved
+            if available is False:
+                _raise_runtime_image_missing(
+                    f"configured runtime image digest is missing: {image_ref}",
+                    resolution=resolved,
+                )
 
     try:
         if _registry_manifest_exists_sync(image_ref, timeout_s=cfg.connect_timeout_s):
