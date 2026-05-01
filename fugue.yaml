@@ -18,8 +18,8 @@ services:
       ARGUS_PUBLIC_BASE_URL: https://argus.fugue.pro
       ARGUS_FUGUE_GATEWAY_COMPOSE_SERVICE: gateway
       ARGUS_FUGUE_RUNTIME_COMPOSE_SERVICE: runtime
-      ARGUS_FUGUE_WORKSPACE_STORAGE_MODE: shared_project_rwx
-      ARGUS_FUGUE_WORKSPACE_STORAGE_CLASS: fugue-rwx
+      ARGUS_FUGUE_WORKSPACE_STORAGE_MODE: movable_rwo
+      ARGUS_FUGUE_WORKSPACE_STORAGE_CLASS: fugue-local-rwo
       ARGUS_FUGUE_WORKSPACE_SHARED_SUBPATH_PREFIX: argus/sessions
       ARGUS_RUNTIME_CMD: codex app-server
     depends_on:

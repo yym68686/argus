@@ -128,6 +128,59 @@ class FugueApiHelperTests(unittest.TestCase):
         self.assertEqual(cfg.runtime_compose_service, "runtime")
         self.assertIsNone(cfg.image)
 
+    def test_fugue_cfg_accepts_movable_rwo_workspace_storage_mode(self) -> None:
+        env = self._base_fugue_env(
+            ARGUS_FUGUE_RUNTIME_COMPOSE_SERVICE="runtime",
+            ARGUS_FUGUE_WORKSPACE_STORAGE_MODE="movable_rwo",
+            ARGUS_FUGUE_WORKSPACE_STORAGE_CLASS="fugue-local-rwo",
+        )
+        with mock.patch.dict(os.environ, env, clear=True):
+            cfg = argus_app._fugue_cfg()
+        self.assertEqual(cfg.workspace_storage_mode, "movable_rwo")
+        self.assertEqual(cfg.workspace_storage_class_name, "fugue-local-rwo")
+
+    def test_fugue_create_session_posts_movable_rwo_persistent_storage(self) -> None:
+        cfg = argus_app.FugueProvisionConfig(
+            base_url="https://fugue.invalid",
+            token="token",
+            project_id="project_123",
+            runtime_id="runtime_123",
+            gateway_internal_host="gateway.internal",
+            runtime_compose_service="runtime",
+            runtime_cmd="codex serve",
+            workspace_storage_mode="movable_rwo",
+            workspace_storage_class_name="fugue-local-rwo",
+            connect_timeout_s=1.0,
+        )
+        captured_body: dict[str, object] = {}
+
+        def fake_request_json_sync(patched_cfg, method, path, **kwargs):
+            self.assertIs(patched_cfg, cfg)
+            self.assertEqual(method, "POST")
+            self.assertEqual(path, "/v1/apps/import-image")
+            captured_body.update(kwargs["body"])
+            return {"app": {"id": "app_session"}}
+
+        with (
+            mock.patch.object(
+                argus_app,
+                "_fugue_preflight_runtime_image_sync",
+                return_value=argus_app.FugueRuntimeImageResolution(
+                    image_ref="registry.invalid/runtime@sha256:available",
+                    source="runtime_compose_service",
+                ),
+            ),
+            mock.patch.object(argus_app, "_fugue_request_json_sync", side_effect=fake_request_json_sync),
+        ):
+            app_data = argus_app._fugue_create_session_app_sync(cfg, "3416ab8781ab")
+
+        self.assertEqual(app_data["id"], "app_session")
+        persistent_storage = captured_body["persistent_storage"]
+        self.assertIsInstance(persistent_storage, dict)
+        self.assertEqual(persistent_storage["mode"], "movable_rwo")
+        self.assertEqual(persistent_storage["storage_class_name"], "fugue-local-rwo")
+        self.assertNotIn("shared_sub_path", persistent_storage)
+
     def test_fugue_runtime_image_from_app_prefers_current_spec_image(self) -> None:
         app_data = {
             "id": "app_template",

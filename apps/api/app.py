@@ -18565,8 +18565,8 @@ def _fugue_cfg() -> FugueProvisionConfig:
         raise RuntimeError("ARGUS_FUGUE_SERVICE_PORT must be > 0")
     if not workspace_mount_path.startswith("/"):
         raise RuntimeError("ARGUS_FUGUE_WORKSPACE_MOUNT_PATH must be an absolute container path")
-    if workspace_storage_mode not in ("dedicated_pvc", "shared_project_rwx"):
-        raise RuntimeError("ARGUS_FUGUE_WORKSPACE_STORAGE_MODE must be dedicated_pvc or shared_project_rwx")
+    if workspace_storage_mode not in ("dedicated_pvc", "movable_rwo", "shared_project_rwx"):
+        raise RuntimeError("ARGUS_FUGUE_WORKSPACE_STORAGE_MODE must be dedicated_pvc, movable_rwo, or shared_project_rwx")
     if _normalize_workspace_relative_path(workspace_shared_sub_path_prefix) is None:
         raise RuntimeError("ARGUS_FUGUE_WORKSPACE_SHARED_SUBPATH_PREFIX must be a relative path")
 

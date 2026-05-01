@@ -155,8 +155,8 @@ How changes take effect:
 | `ARGUS_FUGUE_GATEWAY_COMPOSE_SERVICE` | Optional | unset | Compute the gateway callback hostname from the Fugue project id plus a `compose_service` alias instead of hard-coding the final app name. Use `gateway` for the bundled `fugue.yaml`. |
 | `ARGUS_FUGUE_WORKSPACE_MOUNT_PATH` | Optional | `/workspace` | Container path where Fugue mounts each session app's persistent storage. |
 | `ARGUS_FUGUE_WORKSPACE_STORAGE_SIZE` | Optional | `1Gi` | Requested persistent storage size for each Fugue-managed session app, or for the project-level shared workspace PVC when `shared_project_rwx` is enabled. |
-| `ARGUS_FUGUE_WORKSPACE_STORAGE_CLASS` | Optional | unset | Storage class name for Fugue-managed workspaces, when you need a specific PVC class. The bundled Fugue deployment uses `fugue-rwx` for shared project workspaces. |
-| `ARGUS_FUGUE_WORKSPACE_STORAGE_MODE` | Optional | `dedicated_pvc` | Fugue persistent storage mode for session workspaces. Use `shared_project_rwx` to mount one per-project RWX PVC with one subdirectory per Argus session. |
+| `ARGUS_FUGUE_WORKSPACE_STORAGE_CLASS` | Optional | unset | Storage class name for Fugue-managed workspaces, when you need a specific PVC class. The bundled Fugue deployment uses `fugue-local-rwo` for movable RWO session workspaces and `fugue-rwx` for shared project workspaces. |
+| `ARGUS_FUGUE_WORKSPACE_STORAGE_MODE` | Optional | `dedicated_pvc` | Fugue persistent storage mode for session workspaces. Use `movable_rwo` for Fugue-movable per-session RWO PVCs, or `shared_project_rwx` to mount one per-project RWX PVC with one subdirectory per Argus session. |
 | `ARGUS_FUGUE_WORKSPACE_SHARED_SUBPATH_PREFIX` | Optional | `argus/sessions` | Relative prefix inside the project-level RWX PVC; each session uses `<prefix>/<sessionId>`. |
 | `ARGUS_FUGUE_SERVICE_PORT` | Optional | `7777` | Internal TCP port that the app-server bridge listens on inside each Fugue session app. |
 | `ARGUS_FUGUE_APP_NAME_PREFIX` | Optional | `argus-session` | Prefix for Fugue app names. Resulting names look like `argus-session-<sessionId>`. |
