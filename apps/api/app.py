@@ -753,6 +753,9 @@ class FugueProvisionConfig:
     runtime_app_id: Optional[str] = None
     runtime_app_name: Optional[str] = None
     runtime_compose_service: Optional[str] = None
+    gateway_compose_service: Optional[str] = None
+    runtime_network_policy: str = "auto"
+    runtime_allow_public_egress: bool = True
     workspace_mount_path: str = "/workspace"
     home_container_path: str = "/root/.argus"
     runtime_cmd: Optional[str] = None
@@ -5017,11 +5020,43 @@ def _normalized_database_url(raw: Optional[str]) -> Optional[str]:
     return value or None
 
 
+def _database_url_from_db_env() -> Optional[str]:
+    db_type = (os.getenv("DB_TYPE") or "").strip().lower()
+    db_host = (os.getenv("DB_HOST") or "").strip()
+    db_port = (os.getenv("DB_PORT") or "").strip() or "5432"
+    db_user = (os.getenv("DB_USER") or "").strip()
+    db_password = os.getenv("DB_PASSWORD") or ""
+    db_name = (os.getenv("DB_NAME") or "").strip()
+
+    db_fields = {
+        "DB_HOST": db_host,
+        "DB_USER": db_user,
+        "DB_PASSWORD": db_password,
+        "DB_NAME": db_name,
+    }
+    if not db_type and not any(db_fields.values()):
+        return None
+    if db_type and db_type not in {"postgres", "postgresql"}:
+        return None
+
+    missing = [name for name, value in db_fields.items() if value == ""]
+    if missing:
+        raise RuntimeError(
+            "DB_HOST, DB_USER, DB_PASSWORD, and DB_NAME are required when using DB_* database binding env; "
+            f"missing {', '.join(missing)}"
+        )
+
+    quoted_user = urllib.parse.quote(db_user, safe="")
+    quoted_password = urllib.parse.quote(db_password, safe="")
+    quoted_name = urllib.parse.quote(db_name, safe="")
+    return f"postgresql://{quoted_user}:{quoted_password}@{db_host}:{db_port}/{quoted_name}"
+
+
 def _configured_database_url() -> Optional[str]:
     return _normalized_database_url(
         os.getenv("ARGUS_DATABASE_URL")
         or os.getenv("DATABASE_URL")
-    )
+    ) or _database_url_from_db_env()
 
 
 def _is_postgres_database_url(database_url: Optional[str]) -> bool:
@@ -18439,7 +18474,7 @@ async def _mcp_get_session(request: Request, *, allow_missing: bool = False) -> 
 
 def _docker_cfg() -> DockerProvisionConfig:
     image = os.getenv("ARGUS_RUNTIME_IMAGE", "argus-runtime")
-    network = os.getenv("ARGUS_DOCKER_NETWORK", "argus-net")
+    network = os.getenv("ARGUS_DOCKER_NETWORK", "argus-runtime-net")
 
     home_host_path = _configured_home_host_path()
     workspace_host_path = _configured_workspace_host_path()
@@ -18499,6 +18534,11 @@ def _fugue_cfg() -> FugueProvisionConfig:
         os.getenv("ARGUS_GATEWAY_INTERNAL_HOST") or os.getenv("ARGUS_FUGUE_GATEWAY_INTERNAL_HOST") or ""
     ).strip()
     gateway_compose_service = (os.getenv("ARGUS_FUGUE_GATEWAY_COMPOSE_SERVICE") or "").strip() or None
+    runtime_network_policy = (os.getenv("ARGUS_FUGUE_RUNTIME_NETWORK_POLICY") or "auto").strip().lower() or "auto"
+    runtime_allow_public_egress = (
+        (os.getenv("ARGUS_FUGUE_RUNTIME_ALLOW_PUBLIC_EGRESS") or "true").strip().lower()
+        not in ("0", "false", "no", "off")
+    )
     runtime_cmd = (os.getenv("ARGUS_RUNTIME_CMD") or "").strip() or None
     workspace_mount_path = (os.getenv("ARGUS_FUGUE_WORKSPACE_MOUNT_PATH") or "/workspace").strip() or "/workspace"
     workspace_storage_size = (os.getenv("ARGUS_FUGUE_WORKSPACE_STORAGE_SIZE") or "1Gi").strip() or "1Gi"
@@ -18563,6 +18603,8 @@ def _fugue_cfg() -> FugueProvisionConfig:
         gateway_internal_host = _fugue_compose_service_alias(project_id, gateway_compose_service)
     if service_port <= 0:
         raise RuntimeError("ARGUS_FUGUE_SERVICE_PORT must be > 0")
+    if runtime_network_policy not in ("off", "auto", "required"):
+        raise RuntimeError("ARGUS_FUGUE_RUNTIME_NETWORK_POLICY must be off, auto, or required")
     if not workspace_mount_path.startswith("/"):
         raise RuntimeError("ARGUS_FUGUE_WORKSPACE_MOUNT_PATH must be an absolute container path")
     if workspace_storage_mode not in ("dedicated_pvc", "movable_rwo", "shared_project_rwx"):
@@ -18580,6 +18622,9 @@ def _fugue_cfg() -> FugueProvisionConfig:
         runtime_app_id=runtime_app_id,
         runtime_app_name=runtime_app_name,
         runtime_compose_service=runtime_compose_service,
+        gateway_compose_service=gateway_compose_service,
+        runtime_network_policy=runtime_network_policy,
+        runtime_allow_public_egress=runtime_allow_public_egress,
         runtime_id=runtime_id,
         gateway_internal_host=gateway_internal_host,
         workspace_mount_path=workspace_mount_path,
@@ -19670,6 +19715,52 @@ def _fugue_resolve_runtime_image_sync(cfg: FugueProvisionConfig) -> str:
     return _fugue_resolve_runtime_image_source_sync(cfg).image_ref
 
 
+def _fugue_runtime_network_policy_sync(cfg: FugueProvisionConfig) -> Optional[dict[str, Any]]:
+    mode = (cfg.runtime_network_policy or "auto").strip().lower()
+    if mode == "off":
+        return None
+    if not cfg.gateway_compose_service:
+        if mode == "required":
+            raise RuntimeError(
+                "ARGUS_FUGUE_RUNTIME_NETWORK_POLICY=required needs ARGUS_FUGUE_GATEWAY_COMPOSE_SERVICE"
+            )
+        log.warning("Skipping Fugue runtime network_policy because ARGUS_FUGUE_GATEWAY_COMPOSE_SERVICE is unset")
+        return None
+
+    gateway_app = _fugue_find_app_by_compose_service_sync(cfg, cfg.gateway_compose_service)
+    gateway_app_id = str(gateway_app.get("id") or "").strip()
+    if not gateway_app_id:
+        if mode == "required":
+            raise RuntimeError("Fugue gateway app id is unavailable; cannot build required runtime network_policy")
+        log.warning("Skipping Fugue runtime network_policy because the gateway app id is unavailable")
+        return None
+
+    egress: dict[str, Any] = {
+        "mode": "restricted",
+        "allow_dns": True,
+        "allow_apps": [
+            {
+                "app_id": gateway_app_id,
+                "ports": [8080],
+            }
+        ],
+    }
+    if cfg.runtime_allow_public_egress:
+        egress["allow_public_internet"] = True
+    return {
+        "egress": egress,
+        "ingress": {
+            "mode": "restricted",
+            "allow_apps": [
+                {
+                    "app_id": gateway_app_id,
+                    "ports": [cfg.service_port],
+                }
+            ],
+        },
+    }
+
+
 def _fugue_get_app_image_inventory_sync(cfg: FugueProvisionConfig, app_id: str) -> dict[str, Any]:
     payload = _fugue_request_json_sync(cfg, "GET", f"/v1/apps/{app_id}/images", expected_statuses=(200,))
     if not isinstance(payload, dict):
@@ -19931,6 +20022,9 @@ def _fugue_create_session_app_sync(cfg: FugueProvisionConfig, session_id: str) -
             ],
         },
     }
+    network_policy = _fugue_runtime_network_policy_sync(cfg)
+    if network_policy is not None:
+        request_body["network_policy"] = network_policy
     if cfg.tenant_id:
         request_body["tenant_id"] = cfg.tenant_id
     if cfg.workspace_storage_class_name:

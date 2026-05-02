@@ -19,7 +19,7 @@ services:
     volumes:
       - argus-postgres-data:/var/lib/postgresql/data
     networks:
-      - argus-net
+      - argus-db-net
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U ${ARGUS_POSTGRES_USER:-argus} -d ${ARGUS_POSTGRES_DB:-argus}"]
       interval: 5s
@@ -40,7 +40,7 @@ services:
     environment:
       ARGUS_PROVISION_MODE: ${ARGUS_PROVISION_MODE:-auto}
       ARGUS_RUNTIME_IMAGE: argus-runtime
-      ARGUS_DOCKER_NETWORK: argus-net
+      ARGUS_DOCKER_NETWORK: argus-runtime-net
       ARGUS_HOME_HOST_PATH: ${ARGUS_HOME_HOST_PATH:-${HOME}/.argus}
       ARGUS_DATABASE_URL: ${ARGUS_DATABASE_URL:-postgresql://argus:argus@postgres:5432/argus}
       # Optional (advanced): base directory for auto-created `/ws` session workspaces; when unset, uses `${ARGUS_HOME_HOST_PATH}/workspaces`.
@@ -79,7 +79,8 @@ services:
     ports:
       - "8080:8080"
     networks:
-      - argus-net
+      - argus-db-net
+      - argus-runtime-net
     restart: unless-stopped
 
   web:
@@ -111,12 +112,14 @@ services:
     volumes:
       - telegram-bot-data:/data
     networks:
-      - argus-net
+      - argus-runtime-net
     restart: unless-stopped
 
 networks:
-  argus-net:
-    name: argus-net
+  argus-db-net:
+    name: argus-db-net
+  argus-runtime-net:
+    name: argus-runtime-net
 
 volumes:
   telegram-bot-data:

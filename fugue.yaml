@@ -12,17 +12,23 @@ services:
       dockerfile: apps/api/Dockerfile
     env:
       ARGUS_PROVISION_MODE: fugue
-      ARGUS_DATABASE_URL: postgresql://argus:argus@postgres:5432/argus
       ARGUS_FUGUE_BASE_URL: http://fugue-fugue.fugue-system.svc.cluster.local
       ARGUS_FUGUE_HOME_PATH: /data/argus
       ARGUS_FUGUE_WORKSPACE_STORAGE_SIZE: 1Gi
       ARGUS_PUBLIC_BASE_URL: https://argus.fugue.pro
       ARGUS_FUGUE_GATEWAY_COMPOSE_SERVICE: gateway
       ARGUS_FUGUE_RUNTIME_COMPOSE_SERVICE: runtime
+      ARGUS_FUGUE_RUNTIME_NETWORK_POLICY: required
+      ARGUS_FUGUE_RUNTIME_ALLOW_PUBLIC_EGRESS: "true"
       ARGUS_FUGUE_WORKSPACE_STORAGE_MODE: movable_rwo
       ARGUS_FUGUE_WORKSPACE_STORAGE_CLASS: fugue-local-rwo
       ARGUS_FUGUE_WORKSPACE_SHARED_SUBPATH_PREFIX: argus/sessions
       ARGUS_RUNTIME_CMD: codex app-server
+    generated_env:
+      ARGUS_TOKEN:
+        generate: random
+        encoding: base64url
+        length: 32
     depends_on:
       - postgres
     persistent_storage:
@@ -36,8 +42,7 @@ services:
     image: postgres:17.6-alpine
     service_name: postgres
     database: argus
-    user: argus
-    password: argus
+    user: argus_gateway
 
   runtime:
     network_mode: internal

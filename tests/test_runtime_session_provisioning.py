@@ -42,6 +42,44 @@ def make_response(status_code: int, payload=None):
     return response
 
 
+class DatabaseConfigTests(unittest.TestCase):
+    def test_configured_database_url_prefers_explicit_dsn(self) -> None:
+        env = {
+            "ARGUS_DATABASE_URL": "postgresql://explicit:secret@db:5432/argus",
+            "DB_TYPE": "postgres",
+            "DB_HOST": "bound-postgres-rw",
+            "DB_PORT": "5432",
+            "DB_USER": "bound",
+            "DB_PASSWORD": "bound-secret",
+            "DB_NAME": "bound-db",
+        }
+        with mock.patch.dict(os.environ, env, clear=True):
+            self.assertEqual(
+                argus_app._configured_database_url(),
+                "postgresql://explicit:secret@db:5432/argus",
+            )
+
+    def test_configured_database_url_uses_fugue_db_binding_env(self) -> None:
+        env = {
+            "DB_TYPE": "postgres",
+            "DB_HOST": "argus-postgres-rw",
+            "DB_PORT": "5432",
+            "DB_USER": "argus gateway",
+            "DB_PASSWORD": "secret:/@",
+            "DB_NAME": "argus/main",
+        }
+        with mock.patch.dict(os.environ, env, clear=True):
+            self.assertEqual(
+                argus_app._configured_database_url(),
+                "postgresql://argus%20gateway:secret%3A%2F%40@argus-postgres-rw:5432/argus%2Fmain",
+            )
+
+    def test_configured_database_url_rejects_partial_db_binding_env(self) -> None:
+        with mock.patch.dict(os.environ, {"DB_TYPE": "postgres", "DB_HOST": "db"}, clear=True):
+            with self.assertRaisesRegex(RuntimeError, "missing DB_USER, DB_PASSWORD, DB_NAME"):
+                argus_app._configured_database_url()
+
+
 class FugueApiHelperTests(unittest.TestCase):
     def _base_fugue_env(self, **overrides):
         env = {
@@ -180,6 +218,54 @@ class FugueApiHelperTests(unittest.TestCase):
         self.assertEqual(persistent_storage["mode"], "movable_rwo")
         self.assertEqual(persistent_storage["storage_class_name"], "fugue-local-rwo")
         self.assertNotIn("shared_sub_path", persistent_storage)
+
+    def test_fugue_create_session_posts_runtime_network_policy(self) -> None:
+        cfg = argus_app.FugueProvisionConfig(
+            base_url="https://fugue.invalid",
+            token="token",
+            project_id="project_123",
+            runtime_id="runtime_123",
+            gateway_internal_host="gateway.internal",
+            gateway_compose_service="gateway",
+            runtime_compose_service="runtime",
+            runtime_network_policy="required",
+            runtime_cmd="codex serve",
+            connect_timeout_s=1.0,
+        )
+        captured_body: dict[str, object] = {}
+
+        def fake_request_json_sync(patched_cfg, method, path, **kwargs):
+            self.assertIs(patched_cfg, cfg)
+            captured_body.update(kwargs["body"])
+            return {"app": {"id": "app_session"}}
+
+        with (
+            mock.patch.object(
+                argus_app,
+                "_fugue_preflight_runtime_image_sync",
+                return_value=argus_app.FugueRuntimeImageResolution(
+                    image_ref="registry.invalid/runtime@sha256:available",
+                    source="runtime_compose_service",
+                ),
+            ),
+            mock.patch.object(
+                argus_app,
+                "_fugue_find_app_by_compose_service_sync",
+                return_value={"id": "app_gateway"},
+            ) as find_gateway,
+            mock.patch.object(argus_app, "_fugue_request_json_sync", side_effect=fake_request_json_sync),
+        ):
+            app_data = argus_app._fugue_create_session_app_sync(cfg, "3416ab8781ab")
+
+        self.assertEqual(app_data["id"], "app_session")
+        find_gateway.assert_called_once_with(cfg, "gateway")
+        network_policy = captured_body["network_policy"]
+        self.assertIsInstance(network_policy, dict)
+        self.assertEqual(network_policy["egress"]["mode"], "restricted")
+        self.assertTrue(network_policy["egress"]["allow_dns"])
+        self.assertTrue(network_policy["egress"]["allow_public_internet"])
+        self.assertEqual(network_policy["egress"]["allow_apps"], [{"app_id": "app_gateway", "ports": [8080]}])
+        self.assertEqual(network_policy["ingress"]["allow_apps"], [{"app_id": "app_gateway", "ports": [7777]}])
 
     def test_fugue_runtime_image_from_app_prefers_current_spec_image(self) -> None:
         app_data = {

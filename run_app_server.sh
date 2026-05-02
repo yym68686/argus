@@ -14,24 +14,35 @@ mkdir -p "$APP_HOME_DIR" "$APP_WORKSPACE_DIR"
 
 TEMPLATE_DIR="/app/docs/templates"
 
-write_workspace_file_from_template() {
+render_workspace_file_from_template() {
   src="$1"
   dst="$2"
-  tmp="${dst}.tmp.$$"
 
   if [ -f "$src" ]; then
     # Strip YAML front matter if present (--- ... --- at top).
-    awk 'NR==1{if($0=="---"){fm=1; next}} fm==1{if($0=="---"){fm=0; next} next} {print}' "$src" > "$tmp"
+    awk 'NR==1{if($0=="---"){fm=1; next}} fm==1{if($0=="---"){fm=0; next} next} {print}' "$src"
   else
-    printf '# %s\n' "$(basename "$dst")" > "$tmp"
+    printf '# %s\n' "$(basename "$dst")"
   fi
+}
 
-  if [ -f "$dst" ] && cmp -s "$tmp" "$dst"; then
-    rm -f "$tmp"
+write_workspace_file_from_template() {
+  src="$1"
+  dst="$2"
+
+  if [ -f "$dst" ] && render_workspace_file_from_template "$src" "$dst" | cmp -s - "$dst"; then
     return 0
   fi
 
-  mv -f "$tmp" "$dst"
+  tmp="$(mktemp "${dst}.tmp.XXXXXX")"
+  if render_workspace_file_from_template "$src" "$dst" > "$tmp"; then
+    mv -f "$tmp" "$dst"
+    return 0
+  fi
+
+  status=$?
+  rm -f "$tmp"
+  return "$status"
 }
 
 bootstrap_workspace_file() {
