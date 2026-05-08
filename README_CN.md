@@ -276,7 +276,7 @@ runtime 会管理这些 workspace 文件：
 - **重复 `/start`**：不会重复创建；只会复用并确保绑定到自己的 `main`。
 - 使用 `/menu` 打开控制面板：
   - **Switch Agent**：切换当前私聊使用的 agent（workspace/session）。
-  - **Switch Model**：在 `gpt-5.2` 和 `gpt-5.4` 之间切换当前 agent 的模型。
+  - **Switch Model**：在 `gpt-5.2`、`gpt-5.4` 和 `gpt-5.5` 之间切换当前 agent 的模型。
   - **API Channels**：管理用户级渠道列表（`gateway`、`0-0.pro`、以及你自己添加的自定义渠道），并为你所有 agent / 容器切换当前渠道。
   - **Create Agent**：创建新的 agent 并切换过去（同名会报“已存在”）。
   - **Rename Agent**：重命名当前 agent（仅 owner；不包含 `main`）。
@@ -397,7 +397,7 @@ Argus 会让 runtime 容器始终使用固定的 gateway 代理地址（`/openai
 - 代理要求每个 session 的派生 Bearer token（master：`ARGUS_OPENAI_TOKEN`；未设置则回退到 `ARGUS_TOKEN`）。
 - runtime 会写入一个生成的 `CODEX_HOME/config.toml`（不包含 provider secrets），用于把 Codex 指向 gateway 的 MCP 和代理。
   - 默认 `CODEX_HOME`：`/workspace/.codex`（按 workspace 隔离）
-  - 默认模型：`gpt-5.4`（Telegram agent 可在 `/menu` 中切换 `gpt-5.2` / `gpt-5.4`，并按 agent 持久化）
+  - 默认模型：`gpt-5.5`（Telegram agent 可在 `/menu` 中切换 `gpt-5.2` / `gpt-5.4` / `gpt-5.5`，并按 agent 持久化）
   - 生成的 provider block 会标记成 `OpenAI`，这样 Codex 可以继续使用官方压缩能力，但实际流量仍然走 Argus 的 gateway 代理地址。
 - 如果你希望所有用户开箱即用，就在 gateway 上配置 `OPENAI_API_KEY`；否则用户需要先选中一个“已就绪”的个人渠道。
 

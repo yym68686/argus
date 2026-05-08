@@ -68,7 +68,7 @@ class GatewayProxyRouteTests(unittest.IsolatedAsyncioTestCase):
             mock.patch.object(argus_app, "_get_automation_or_500", return_value=automation),
             mock.patch.object(argus_app.requests, "post", return_value=upstream) as post_mock,
         ):
-            response = argus_app.openai_responses_compact_proxy(request, {"model": "gpt-5.4"})
+            response = argus_app.openai_responses_compact_proxy(request, {"model": "gpt-5.5"})
 
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.body, b'{"ok":true}')
@@ -76,6 +76,15 @@ class GatewayProxyRouteTests(unittest.IsolatedAsyncioTestCase):
             post_mock.call_args.args[0],
             "https://upstream.invalid/v1/responses/compact",
         )
+
+    async def test_gateway_default_model_is_available(self) -> None:
+        self.assertEqual(argus_app.ARGUS_AGENT_MODEL_DEFAULT, "gpt-5.5")
+        self.assertIn("gpt-5.5", argus_app.ARGUS_GATEWAY_AGENT_MODELS)
+        catalog = argus_app._static_model_catalog(
+            models=argus_app.ARGUS_GATEWAY_AGENT_MODELS,
+            source="static",
+        )
+        self.assertIn("gpt-5.5", catalog["availableModels"])
 
     async def test_mcp_get_returns_streaming_response_instead_of_405(self) -> None:
         request = self.make_request("/mcp", method="GET")

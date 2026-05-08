@@ -1512,7 +1512,7 @@ function detectLocaleFromLanguageCode(languageCode) {
   return "en";
 }
 
-const DEFAULT_AGENT_MODEL = "gpt-5.4";
+const DEFAULT_AGENT_MODEL = "gpt-5.5";
 const AGENT_MODEL_RE = /^[A-Za-z0-9][A-Za-z0-9._:/+-]{0,127}$/;
 
 function normalizeAgentModel(model) {

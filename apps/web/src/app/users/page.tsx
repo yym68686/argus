@@ -941,7 +941,7 @@ export default function UsersPage() {
                                 </option>
                               ))
                             ) : (
-                              <option value={agent.model || ""}>{agent.model || "gpt-5.4"}</option>
+                              <option value={agent.model || ""}>{agent.model || "gpt-5.5"}</option>
                             )}
                           </select>
                           <Button type="button" size="sm" onClick={() => void saveAgentModel(agent)}>
