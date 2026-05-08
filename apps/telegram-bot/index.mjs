@@ -527,6 +527,16 @@ function buildUrlWithParams(url, params) {
   return u.toString();
 }
 
+function shellDoubleQuote(value) {
+  return `"${String(value ?? "").replace(/(["\\$`])/g, "\\$1")}"`;
+}
+
+function buildNodeConnectionCommand(wsUrl) {
+  const raw = stripOuterQuotes(wsUrl);
+  if (!isNonEmptyString(raw)) return null;
+  return `./argus --url ${shellDoubleQuote(raw)}`;
+}
+
 function redactUrlSecrets(rawUrl) {
   const raw = stripOuterQuotes(rawUrl);
   if (!isNonEmptyString(raw)) return rawUrl;
@@ -1559,6 +1569,7 @@ function normalizeAvailableModels(models, currentModel) {
     btn_pause_node: "Pause",
     btn_resume_node: "Resume",
     btn_show_node_token: "Show Token",
+    btn_copy_node_command: "Copy Command",
     btn_status: "Status",
     btn_help: "Help",
     btn_close: "Close",
@@ -1635,6 +1646,7 @@ function normalizeAvailableModels(models, currentModel) {
     node_connected_label: "Connected nodes",
     node_none_connected: "No nodes are currently connected for this session.",
     node_token_label: "Connection token",
+    node_command_label: "Run command",
     node_status_active: "active",
     node_status_paused: "paused",
     node_status_default: "default",
@@ -1727,6 +1739,7 @@ function normalizeAvailableModels(models, currentModel) {
     btn_pause_node: "暂停",
     btn_resume_node: "恢复",
     btn_show_node_token: "显示 Token",
+    btn_copy_node_command: "复制命令",
     btn_status: "状态",
     btn_help: "帮助",
     btn_close: "关闭",
@@ -1803,6 +1816,7 @@ function normalizeAvailableModels(models, currentModel) {
     node_connected_label: "已连接节点",
     node_none_connected: "当前 session 下还没有已连接节点。",
     node_token_label: "连接 Token",
+    node_command_label: "执行命令",
     node_status_active: "活跃",
     node_status_paused: "已暂停",
     node_status_default: "默认",
@@ -2528,6 +2542,12 @@ async function main() {
 
   function urlButton(text, url) {
     return { text, url };
+  }
+
+  function copyTextButton(text, copyText) {
+    const value = isNonEmptyString(copyText) ? copyText.trim() : "";
+    if (!isNonEmptyString(text) || !value || value.length > 256) return null;
+    return { text, copy_text: { text: value } };
   }
 
   function kb(rows) {
@@ -3448,6 +3468,7 @@ async function main() {
     const S = uiStrings(locale);
     const lines = [];
     const rows = [];
+    let nodeCommand = null;
     lines.push(`<b>${escapeHtml(S.title_node_token)}</b>`);
     if (isNonEmptyString(notice)) lines.push(`<i>${escapeHtml(notice)}</i>`);
 
@@ -3506,6 +3527,12 @@ async function main() {
           if (wsUrl) {
             lines.push(`wsUrl:
 <pre><code>${escapeHtml(wsUrl)}</code></pre>`);
+            const command = buildNodeConnectionCommand(wsUrl);
+            if (command) {
+              nodeCommand = command;
+              lines.push(`${escapeHtml(S.node_command_label)}:
+<pre><code>${escapeHtml(command)}</code></pre>`);
+            }
           }
         } catch (e) {
           lines.push(escapeHtml(formatGatewayErrorForUser(e, { locale })));
@@ -3523,6 +3550,10 @@ async function main() {
       lines.push(`<b>${escapeHtml(S.label_error)}:</b> ${escapeHtml(error)}`);
     }
 
+    if (reveal && isNonEmptyString(nodeCommand)) {
+      const copyCommandButton = copyTextButton(S.btn_copy_node_command, nodeCommand);
+      if (copyCommandButton) rows.push([copyCommandButton]);
+    }
     rows.push([cbButton(S.btn_refresh, { action: reveal ? "p:node_reveal" : "p:node", chatKey })]);
     if (!reveal) rows.push([cbButton(S.btn_show_node_token, { action: "p:node_reveal", chatKey })]);
     rows.push([cbButton(S.btn_back, { action: "p:main", chatKey })]);
@@ -5717,6 +5748,7 @@ async function main() {
 }
 
 export {
+  buildNodeConnectionCommand,
   clearTelegramWebhookForPolling,
   deriveTelegramWebhookSecret,
   deriveTelegramWebhookUrl,

@@ -2,6 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 
 import {
+  buildNodeConnectionCommand,
   deriveTelegramWebhookSecret,
   isTelegramGetUpdatesWebhookConflict,
   resolveTelegramWebhookConfig,
@@ -77,4 +78,12 @@ test("telegramWebhookInfoLogFields redacts webhook URLs and preserves diagnostic
     webhook_ip_address: "188.114.96.0",
     webhook_allowed_updates: ["message", "callback_query"]
   });
+});
+
+test("buildNodeConnectionCommand renders a shell-safe copyable command", () => {
+  assert.equal(
+    buildNodeConnectionCommand("ws://example.com:8080/nodes/ws?token=abc123"),
+    './argus --url "ws://example.com:8080/nodes/ws?token=abc123"'
+  );
+  assert.equal(buildNodeConnectionCommand(""), null);
 });
