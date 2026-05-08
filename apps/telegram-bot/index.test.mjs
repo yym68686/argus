@@ -84,15 +84,15 @@ test("telegramWebhookInfoLogFields redacts webhook URLs and preserves diagnostic
 test("buildNodeConnectionCommand renders a shell-safe copyable command", () => {
   assert.equal(
     buildNodeConnectionCommand("ws://example.com:8080/nodes/ws?token=abc123"),
-    "./argus --host example.com:8080 --token abc123"
+    "argus --host example.com:8080 --token abc123"
   );
   assert.equal(
     buildNodeConnectionCommand("wss://example.com/nodes/ws?token=abc123"),
-    "./argus --gateway https://example.com --token abc123"
+    "argus --gateway https://example.com --token abc123"
   );
   assert.equal(
     buildNodeConnectionCommand("ws://example.com:8080/custom/ws?token=abc123"),
-    './argus --url "ws://example.com:8080/custom/ws?token=abc123"'
+    'argus --url "ws://example.com:8080/custom/ws?token=abc123"'
   );
   assert.equal(buildNodeConnectionCommand(""), null);
 });

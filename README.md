@@ -55,6 +55,12 @@ Stop:
 docker compose down
 ```
 
+After installing the system `argus` CLI, update a self-hosted checkout and rebuild the containers with:
+
+```bash
+argus gateway upgrade --dir /root/argus
+```
+
 ## Developer Self-Serve
 
 Argus now supports a basic developer-user flow in the built-in web console:
@@ -190,7 +196,7 @@ Channel behavior:
 | `NEXT_PUBLIC_ARGUS_WS_URL` | Optional | unset | **Build-time** preset WebSocket URL for the optional web UI. Rebuild `web` after changing it. Common example: `ws://127.0.0.1:8080/ws?token=...`. When the UI is served behind HTTPS and the preset still uses `ws://`, the client will automatically reuse the current page origin with `wss://` while preserving the original path/query. In the bundled compose setup you can usually leave this unset. |
 | `TELEGRAM_BOT_TOKEN` | Required for `docker compose --profile tg ...` | unset | Telegram bot token from `@BotFather`. The Telegram bot service exits immediately if this is missing. |
 | `TELEGRAM_DRAFT_STREAMING` | Optional | `auto` | Controls gateway-side private-chat draft streaming. Accepted forms: `auto` / `on` / `true`, `force` / `always`, and `off`. |
-| `ARGUS_PUBLIC_BASE_URL` | Optional but recommended | unset | Public gateway base URL used by Telegram node copy commands. When set, the bot shows a command like `./argus --host <public-host>:8080 --token ...` instead of a Docker-internal hostname. |
+| `ARGUS_PUBLIC_BASE_URL` | Optional but recommended | unset | Public gateway base URL used by Telegram node copy commands. When set, the bot shows a command like `argus --host <public-host>:8080 --token ...` instead of a Docker-internal hostname. |
 | `ARGUS_PUBLIC_NODE_WS_URL` | Optional | unset | Full public `/nodes/ws` override when the exposed public path differs from the default. |
 | `ARGUS_GATEWAY_WS_URL` | Optional | `ws://gateway:8080/ws` in the bundled compose file | Internal WebSocket URL for `apps/telegram-bot` when it is not running in the default Compose topology. |
 | `ARGUS_GATEWAY_HTTP_URL` | Optional | `http://gateway:8080` in the bundled compose file | Internal HTTP base URL for `apps/telegram-bot`. Useful when WS and HTTP are routed differently or when URL derivation is wrong for your deployment. |
@@ -206,7 +212,10 @@ For a user machine that should act as a first-class native Codex host, use the u
 ```bash
 cd apps/node-host
 go build -o argus ./cmd/argus
-./argus connect --gateway "https://argus.example.com" --enroll-token "<one-time-token>" --default
+mkdir -p "$HOME/.argus/bin"
+install -m 0755 argus "$HOME/.argus/bin/argus"
+sudo ln -sf "$HOME/.argus/bin/argus" /usr/local/bin/argus
+argus connect --gateway "https://argus.example.com" --enroll-token "<one-time-token>" --default
 ```
 
 This claims a one-time enrollment token, saves a local device credential, and starts a unified host-agent over `/host-agent/ws`.
@@ -214,7 +223,13 @@ This claims a one-time enrollment token, saves a local device credential, and st
 After the first install, you can refresh the local CLI without re-running the original curl/bootstrap command:
 
 ```bash
-./argus upgrade
+argus upgrade
+```
+
+For a self-hosted gateway checkout, update the repo and containers with:
+
+```bash
+argus gateway upgrade --dir /root/argus
 ```
 
 Legacy `/nodes/ws` and `/runtime-host/ws` binaries still exist for compatibility, but the primary path is now `argus connect`.
@@ -222,9 +237,9 @@ Legacy `/nodes/ws` and `/runtime-host/ws` binaries still exist for compatibility
 You normally do **not** need the legacy node-only flags below unless you are explicitly running the old `/nodes/ws` control plane by itself.
 
 ```bash
-./argus --host 127.0.0.1:8080 --token "argus-node-v1.<sessionId>.<sig>"
+argus --host 127.0.0.1:8080 --token "argus-node-v1.<sessionId>.<sig>"
 # or, when you want to include the scheme explicitly:
-./argus --gateway "http://127.0.0.1:8080" --token "argus-node-v1.<sessionId>.<sig>"
+argus --gateway "http://127.0.0.1:8080" --token "argus-node-v1.<sessionId>.<sig>"
 ```
 
 | Variable | Required? | Default | What it does / notes |
@@ -352,10 +367,9 @@ Nodes let the assistant execute commands on your devices (e.g. your Mac).
 Start a node-host on your Mac:
 
 ```bash
-cd apps/node-host
-go build -o argus ./cmd/argus
-./argus \
-  --url "ws://127.0.0.1:8080/nodes/ws?token=argus-node-v1.<sessionId>.<sig>" \
+argus \
+  --host 127.0.0.1:8080 \
+  --token "argus-node-v1.<sessionId>.<sig>" \
   --node-id "mac" \
   --display-name "My Mac"
 ```
@@ -368,7 +382,7 @@ Notes:
   - When auth is configured, you must use a derived token: `argus-node-v1.<sessionId>.<sig>` (master secret: `ARGUS_NODE_TOKEN`, fallback: `ARGUS_TOKEN`; `sig = base64url(hmac_sha256(master, sessionId))[:32]`).
   - In dev mode with no auth configured, the node token can be omitted.
 - node-host prints connection/reconnect status and an audit log of received remote commands to stderr.
-  - Disable audit logs: `ARGUS_NODE_AUDIT=0` (or `./argus --audit false ...`)
+  - Disable audit logs: `ARGUS_NODE_AUDIT=0` (or `argus --audit false ...`)
   - Tune output: `ARGUS_NODE_AUDIT_MAX_BYTES`, `ARGUS_NODE_AUDIT_STDIN_PREVIEW_BYTES`
 - Interactive CLI flow: start with `system.run` using `params={"argv":[...],"pty":true,"yieldMs":0}`, then continue with `process.write`, `process.send_keys`, `process.submit`, or `process.paste` using the returned `jobId`.
 

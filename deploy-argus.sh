@@ -47,6 +47,30 @@ build_responses_upstream_url() {
     fi
 }
 
+install_argus_cli_from_runtime_image() {
+    local bin_dir="${DATA_DIR}/bin"
+    local bin_path="${bin_dir}/argus"
+    local link_path="/usr/local/bin/argus"
+    local tmp
+
+    mkdir -p "$bin_dir"
+    tmp="$(mktemp)"
+    docker run --rm --entrypoint cat argus-runtime /app/node-host/argus > "$tmp"
+    chmod +x "$tmp"
+    mv "$tmp" "$bin_path"
+
+    if [ -w "$(dirname "$link_path")" ]; then
+        ln -sf "$bin_path" "$link_path"
+    elif command -v sudo &>/dev/null; then
+        sudo ln -sf "$bin_path" "$link_path"
+    else
+        warn "无法创建 ${link_path}，请把 ${bin_dir} 加入 PATH 后使用 argus"
+        return 0
+    fi
+
+    info "Argus CLI 已安装: ${link_path} -> ${bin_path}"
+}
+
 # ---------- 欢迎 ----------
 clear
 echo ""
@@ -298,6 +322,8 @@ fi
 
 docker compose "${COMPOSE_ARGS[@]}" up --build -d
 
+install_argus_cli_from_runtime_image
+
 # 等待启动
 info "等待服务启动..."
 sleep 8
@@ -348,7 +374,8 @@ echo -e "  ${B}常用命令:${N}"
 echo -e "    查看日志:  cd ${DEPLOY_DIR} && ${COMPOSE_CMD} logs -f"
 echo -e "    重启服务:  cd ${DEPLOY_DIR} && ${COMPOSE_CMD} restart"
 echo -e "    停止服务:  cd ${DEPLOY_DIR} && ${COMPOSE_CMD} down"
-echo -e "    更新升级:  cd ${DEPLOY_DIR} && git pull && ${COMPOSE_CMD} up --build -d"
+echo -e "    更新升级:  argus gateway upgrade --dir ${DEPLOY_DIR}"
+echo -e "    CLI 自更新: argus upgrade --gateway http://${SERVER_IP}:8080"
 echo ""
 echo -e "    启用 Web UI:  cd ${DEPLOY_DIR} && ${WEB_COMPOSE_CMD} up --build -d"
 echo -e "    Web 地址:     http://${SERVER_IP}:3000"

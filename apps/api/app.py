@@ -439,27 +439,53 @@ set -euo pipefail
 ARGUS_GATEWAY_BASE={_shell_quote(gateway_base)}
 ARGUS_ENROLL_TOKEN={_shell_quote(enroll_token)}
 
+OS="$(uname -s 2>/dev/null || echo unknown)"
 ARCH="$(uname -m 2>/dev/null || echo unknown)"
-case "$ARCH" in
-  arm64|aarch64)
+case "$(printf '%s' "$OS" | tr '[:upper:]' '[:lower:]'):$ARCH" in
+  darwin:arm64|darwin:aarch64)
     TARGET="darwin-arm64"
     ;;
-  x86_64|amd64)
+  darwin:x86_64|darwin:amd64)
     TARGET="darwin-amd64"
     ;;
+  linux:arm64|linux:aarch64)
+    TARGET="linux-arm64"
+    ;;
+  linux:x86_64|linux:amd64)
+    TARGET="linux-amd64"
+    ;;
   *)
-    echo "Unsupported macOS architecture: $ARCH" >&2
+    echo "Unsupported platform: $OS/$ARCH" >&2
     exit 1
     ;;
 esac
 
-BIN_DIR="${{HOME}}/.argus/bin"
+BIN_DIR="${{ARGUS_BIN_DIR:-${{HOME}}/.argus/bin}}"
 BIN_PATH="${{BIN_DIR}}/argus"
+ARGUS_LINK_PATH="${{ARGUS_LINK_PATH:-/usr/local/bin/argus}}"
 DESKTOP_DIR="${{HOME}}/Desktop"
 
 mkdir -p "$BIN_DIR" "$DESKTOP_DIR"
 curl -fsSL "${{ARGUS_GATEWAY_BASE}}/host-agent/download/${{TARGET}}" -o "$BIN_PATH"
 chmod +x "$BIN_PATH"
+
+if [ "${{ARGUS_INSTALL_SYSTEM_LINK:-1}}" != "0" ]; then
+  LINK_DIR="$(dirname "$ARGUS_LINK_PATH")"
+  if [ ! -d "$LINK_DIR" ]; then
+    if command -v sudo >/dev/null 2>&1; then
+      sudo mkdir -p "$LINK_DIR"
+    else
+      mkdir -p "$LINK_DIR"
+    fi
+  fi
+  if [ -w "$LINK_DIR" ]; then
+    ln -sf "$BIN_PATH" "$ARGUS_LINK_PATH"
+  elif command -v sudo >/dev/null 2>&1; then
+    sudo ln -sf "$BIN_PATH" "$ARGUS_LINK_PATH"
+  else
+    echo "Unable to create $ARGUS_LINK_PATH; add $BIN_DIR to PATH to run argus anywhere." >&2
+  fi
+fi
 
 if ! command -v codex >/dev/null 2>&1; then
   if command -v npm >/dev/null 2>&1; then
@@ -470,7 +496,14 @@ if ! command -v codex >/dev/null 2>&1; then
   fi
 fi
 
-exec "$BIN_PATH" connect --gateway "$ARGUS_GATEWAY_BASE" --enroll-token "$ARGUS_ENROLL_TOKEN" --workspace-base "$DESKTOP_DIR"
+if command -v argus >/dev/null 2>&1; then
+  ARGUS_CMD="$(command -v argus)"
+else
+  ARGUS_CMD="$BIN_PATH"
+fi
+
+echo "Installed argus CLI: $ARGUS_CMD"
+exec "$ARGUS_CMD" connect --gateway "$ARGUS_GATEWAY_BASE" --enroll-token "$ARGUS_ENROLL_TOKEN" --workspace-base "$DESKTOP_DIR"
 """
 
 
@@ -505,6 +538,19 @@ if (-not (Test-Path $DesktopDir)) {{
 }}
 
 Invoke-WebRequest -UseBasicParsing -Uri "$GatewayBaseUrl/host-agent/download/$Target" -OutFile $BinPath
+
+$UserPath = [Environment]::GetEnvironmentVariable("Path", "User")
+if ([string]::IsNullOrWhiteSpace($UserPath)) {{
+  $UserPath = ""
+}}
+$PathParts = $UserPath -split ';' | Where-Object {{ -not [string]::IsNullOrWhiteSpace($_) }}
+if (-not ($PathParts | Where-Object {{ $_.TrimEnd('\\') -ieq $BinDir.TrimEnd('\\') }})) {{
+  $NewUserPath = if ([string]::IsNullOrWhiteSpace($UserPath)) {{ $BinDir }} else {{ "$BinDir;$UserPath" }}
+  [Environment]::SetEnvironmentVariable("Path", $NewUserPath, "User")
+}}
+if (-not (($env:Path -split ';') | Where-Object {{ $_.TrimEnd('\\') -ieq $BinDir.TrimEnd('\\') }})) {{
+  $env:Path = "$BinDir;$env:Path"
+}}
 
 $Codex = Get-Command codex -ErrorAction SilentlyContinue
 if (-not $Codex) {{

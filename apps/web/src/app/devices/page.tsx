@@ -1,7 +1,7 @@
 "use client";
 
 import * as React from "react";
-import { Apple, Copy, KeyRound, Laptop, Monitor, RefreshCw } from "lucide-react";
+import { Copy, KeyRound, Laptop, Monitor, RefreshCw } from "lucide-react";
 import { toast } from "sonner";
 
 import { Badge, EmptyState, Fact, InlineError, PanelCard, Skeleton } from "@/components/console-primitives";
@@ -18,19 +18,19 @@ import {
 import { httpBaseFromWsUrl, useGatewayWsUrlState } from "@/lib/gateway";
 import { cn } from "@/lib/utils";
 
-type ClientPlatform = "mac" | "windows";
+type ClientPlatform = "unix" | "windows";
 
 const DEFAULT_ENROLL_TTL_SEC = 6 * 60 * 60;
 
 function detectClientPlatform(): ClientPlatform {
-  if (typeof navigator === "undefined") return "mac";
+  if (typeof navigator === "undefined") return "unix";
   const nav = navigator as Navigator & { userAgentData?: { platform?: string } };
   const signature = [nav.userAgentData?.platform, navigator.platform, navigator.userAgent]
     .filter(Boolean)
     .join(" ")
     .toLowerCase();
   if (signature.includes("win")) return "windows";
-  return "mac";
+  return "unix";
 }
 
 function buildInstallCommand(httpBase: string, token: string, platform: ClientPlatform): string {
@@ -147,10 +147,10 @@ export default function DevicesPage() {
             action={
               <div className="flex flex-wrap items-center gap-2">
                 <PlatformButton
-                  active={platform === "mac"}
-                  icon={<Apple className="h-4 w-4" />}
-                  label="macOS"
-                  onClick={() => setPlatform("mac")}
+                  active={platform === "unix"}
+                  icon={<Laptop className="h-4 w-4" />}
+                  label="macOS/Linux"
+                  onClick={() => setPlatform("unix")}
                 />
                 <PlatformButton
                   active={platform === "windows"}
@@ -170,7 +170,7 @@ export default function DevicesPage() {
             ) : (
               <div className="space-y-4">
                 <div className="flex flex-wrap items-center gap-2">
-                  <Badge tone="primary">{platform === "windows" ? "Detected Windows" : "Detected macOS"}</Badge>
+                  <Badge tone="primary">{platform === "windows" ? "Detected Windows" : "Detected macOS/Linux"}</Badge>
                   <Badge tone="success">One command</Badge>
                   <Badge tone="default">Desktop workspace</Badge>
                 </div>
@@ -200,8 +200,8 @@ export default function DevicesPage() {
                 </div>
 
                 <p className="text-sm leading-6 text-muted-foreground">
-                  The installer downloads the right Argus CLI for the machine, sets the default workspace under the
-                  Desktop, and connects the local Codex host to this gateway with no extra steps.
+                  The installer downloads the right Argus CLI, installs the system argus command, sets the default
+                  workspace under the Desktop, and connects the local Codex host to this gateway.
                 </p>
               </div>
             )}

@@ -10,6 +10,9 @@ Build for your current platform:
 ```bash
 go build -o argus ./cmd/argus
 go build -o runtime-host ./cmd/runtime-host
+mkdir -p "$HOME/.argus/bin"
+install -m 0755 argus "$HOME/.argus/bin/argus"
+sudo ln -sf "$HOME/.argus/bin/argus" /usr/local/bin/argus
 ```
 
 Cross-compile:
@@ -28,7 +31,7 @@ GOOS=windows GOARCH=amd64 go build -o dist/argus-windows-amd64.exe ./cmd/argus
 One-command host takeover:
 
 ```bash
-./argus connect \
+argus connect \
   --gateway "https://argus.example.com" \
   --enroll-token "argus-host-enroll-v1.<tokenId>.<secret>" \
   --default
@@ -43,28 +46,34 @@ This claims the one-time enrollment token, saves a local device credential, and 
 Run from saved config later:
 
 ```bash
-./argus daemon
+argus daemon
 ```
 
 Refresh the local CLI from the enrolled gateway:
 
 ```bash
-./argus upgrade
+argus upgrade
+```
+
+Update a local self-hosted gateway checkout and rebuild its containers:
+
+```bash
+argus gateway upgrade --dir /root/argus
 ```
 
 Inspect or revoke the local enrollment:
 
 ```bash
-./argus status
-./argus disconnect
+argus status
+argus disconnect
 ```
 
 Legacy node control plane:
 
 ```bash
-./argus --host 127.0.0.1:8080 --token "argus-node-v1.<sessionId>.<sig>" --node-id "mac"
+argus --host 127.0.0.1:8080 --token "argus-node-v1.<sessionId>.<sig>" --node-id "mac"
 # or, when you want to include the scheme explicitly:
-./argus --gateway "http://127.0.0.1:8080" --token "argus-node-v1.<sessionId>.<sig>" --node-id "mac"
+argus --gateway "http://127.0.0.1:8080" --token "argus-node-v1.<sessionId>.<sig>" --node-id "mac"
 ```
 
 Interactive jobs on the legacy node plane:

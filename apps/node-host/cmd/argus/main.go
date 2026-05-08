@@ -53,6 +53,8 @@ func dispatch(args []string) error {
 		return runDaemon(args[1:])
 	case "upgrade":
 		return runUpgrade(args[1:])
+	case "gateway":
+		return runGateway(args[1:])
 	case "status":
 		return runStatus(args[1:])
 	case "disconnect":
@@ -80,6 +82,7 @@ Usage:
   argus connect --gateway <url> --enroll-token <token> [--default]
   argus daemon [--config <path>]
   argus upgrade [--gateway <url>] [--config <path>]
+  argus gateway upgrade [--dir <repo>] [--profile tg]
   argus status [--config <path>]
   argus disconnect [--config <path>]
 

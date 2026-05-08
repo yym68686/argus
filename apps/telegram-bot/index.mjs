@@ -562,9 +562,9 @@ function buildNodeConnectionCommand(wsUrl) {
   if (!isNonEmptyString(raw)) return null;
   const args = nodeCommandArgsFromWsUrl(raw);
   if (args) {
-    return `./argus ${args.map(shellWord).join(" ")}`;
+    return `argus ${args.map(shellWord).join(" ")}`;
   }
-  return `./argus --url ${shellDoubleQuote(raw)}`;
+  return `argus --url ${shellDoubleQuote(raw)}`;
 }
 
 function deriveWsUrlFromBase(baseUrl, pathName, token) {
