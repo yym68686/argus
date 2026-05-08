@@ -181,19 +181,23 @@ echo -e "  为每个 AI 会话容器设置资源限制，防止占满服务器�
 echo -e "  小内存服务器建议设置。"
 echo ""
 
-ask "CPU 限制 [默认: 0.8 核]:"
+ask "CPU 限制 [默认: 1.5 核]:"
 read -r RT_CPUS
-RT_CPUS="${RT_CPUS:-0.8}"
+RT_CPUS="${RT_CPUS:-1.5}"
 
-ask "内存限制 [默认: 768m]:"
+ask "内存限制 [默认: 2g]:"
 read -r RT_MEM
-RT_MEM="${RT_MEM:-768m}"
+RT_MEM="${RT_MEM:-2g}"
 
-ask "进程数限制 [默认: 512]:"
+ask "内存+swap 限制 [默认: 3g，需 >= 内存限制]:"
+read -r RT_MEMSWAP
+RT_MEMSWAP="${RT_MEMSWAP:-3g}"
+
+ask "进程数限制 [默认: 1024]:"
 read -r RT_PIDS
-RT_PIDS="${RT_PIDS:-512}"
+RT_PIDS="${RT_PIDS:-1024}"
 
-info "CPU: ${RT_CPUS}  内存: ${RT_MEM}  进程: ${RT_PIDS}"
+info "CPU: ${RT_CPUS}  内存: ${RT_MEM}  内存+swap: ${RT_MEMSWAP}  进程: ${RT_PIDS}"
 echo ""
 
 # ---------- 确认 ----------
@@ -208,7 +212,7 @@ echo -e "  API Key:       ${B}${API_KEY:0:10}***${N}"
 echo -e "  Telegram Bot:  ${B}$([ "$SKIP_TG" = true ] && echo '稍后配置' || echo "${TG_TOKEN:0:10}***")${N}"
 echo -e "  流式输出:      ${B}${TG_STREAMING}${N}"
 echo -e "  管理员 ID:     ${B}${TG_ADMIN_IDS:-未设置（当前版本暂未使用）}${N}"
-echo -e "  资源限制:      ${B}${RT_CPUS} CPU / ${RT_MEM} 内存 / ${RT_PIDS} 进程${N}"
+echo -e "  资源限制:      ${B}${RT_CPUS} CPU / ${RT_MEM} 内存 / ${RT_MEMSWAP} 内存+swap / ${RT_PIDS} 进程${N}"
 echo ""
 
 ask "确认开始部署? (y/n)"
@@ -268,7 +272,7 @@ ARGUS_RUNTIME_CMD="codex app-server"
 # --- 资源限制 ---
 ARGUS_RUNTIME_CPUS=${RT_CPUS}
 ARGUS_RUNTIME_MEM_LIMIT=${RT_MEM}
-ARGUS_RUNTIME_MEMSWAP_LIMIT=${RT_MEM}
+ARGUS_RUNTIME_MEMSWAP_LIMIT=${RT_MEMSWAP}
 ARGUS_RUNTIME_PIDS_LIMIT=${RT_PIDS}
 
 # --- 第三方 API 配置 ---

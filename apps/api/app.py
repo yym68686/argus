@@ -11946,6 +11946,7 @@ class AutomationManager:
                             thread_id,
                             final_text,
                             turn_id=turn_id,
+                            turn_kind=turn_kind,
                             source_channel=source_channel,
                             source_chat_key=source_chat_key,
                         )
@@ -12184,13 +12185,34 @@ class AutomationManager:
         text: str,
         *,
         turn_id: Optional[str] = None,
+        turn_kind: Optional[str] = None,
         source_channel: Optional[str] = None,
         source_chat_key: Optional[str] = None,
     ) -> None:
         # Gateway-owned delivery: send final text on turn/completed, splitting when needed.
         if not isinstance(text, str) or not text.strip():
             return
+        normalized_turn_kind = self._normalize_turn_kind(turn_kind)
+        if normalized_turn_kind is not None and normalized_turn_kind != TURN_KIND_USER:
+            _event_log(
+                "info",
+                "gw.tg.final_delivery.skip",
+                session_id=session_id,
+                thread_id=thread_id,
+                turn_id=turn_id,
+                turn_kind=normalized_turn_kind,
+                source_channel=source_channel,
+                chat_key_hash=_chat_key_hash(source_chat_key),
+                reason="non_user_turn",
+                text_len=len(text.strip()),
+                text_hash=_text_hash(text),
+            )
+            return
         delivery_started_at_ms = _now_ms()
+        source_is_telegram = (
+            isinstance(source_channel, str)
+            and source_channel.strip().lower() in ("telegram", "tg")
+        )
         resolved = self._resolve_telegram_target_for_source(
             source_channel=source_channel,
             source_chat_key=source_chat_key,
@@ -12199,11 +12221,12 @@ class AutomationManager:
             resolved = self._resolve_telegram_target_for_turn(session_id, thread_id, turn_id)
         if resolved is None:
             _event_log(
-                "warning",
+                "warning" if source_is_telegram else "info",
                 "gw.tg.final_delivery.skip",
                 session_id=session_id,
                 thread_id=thread_id,
                 turn_id=turn_id,
+                turn_kind=normalized_turn_kind,
                 source_channel=source_channel,
                 chat_key_hash=_chat_key_hash(source_chat_key),
                 reason="missing_target",
@@ -16370,6 +16393,8 @@ def _build_openai_proxy_usage_context(
     session_id: Optional[str],
     target: dict[str, Any],
     body: Any,
+    upstream_url: Optional[str] = None,
+    proxy_path: str = "/responses",
 ) -> dict[str, Any]:
     scoped_session_id = str(session_id or "").strip() or None
     requested_model = ""
@@ -16384,7 +16409,8 @@ def _build_openai_proxy_usage_context(
         "channelName": str(target.get("name") or target.get("channelId") or "").strip() or None,
         "requestedModel": requested_model or None,
         "provider": "openai.responses",
-        "upstreamUrl": str(target.get("upstreamUrl") or "").strip() or None,
+        "upstreamUrl": str(upstream_url or target.get("upstreamUrl") or "").strip() or None,
+        "proxyPath": proxy_path,
         "requestStream": bool(isinstance(body, dict) and body.get("stream")),
     }
 
@@ -16432,8 +16458,24 @@ def _record_openai_proxy_usage(event: dict[str, Any], payload: Any = None) -> No
         log.exception("Failed to record OpenAI proxy usage")
 
 
-@app.post("/openai/v1/responses")
-def openai_responses_proxy(request: Request, body: Any = Body(...)):
+def _openai_responses_child_url(upstream_url: str, child_path: str) -> str:
+    base = str(upstream_url or "").strip()
+    child = str(child_path or "").strip().strip("/")
+    if not child:
+        return base
+    try:
+        parsed = urllib.parse.urlparse(base)
+    except Exception:
+        return ""
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc or parsed.query or parsed.fragment:
+        return ""
+    path = parsed.path.rstrip("/")
+    if not path:
+        return ""
+    return urllib.parse.urlunparse((parsed.scheme, parsed.netloc, f"{path}/{child}", "", "", ""))
+
+
+def _forward_openai_responses_request(request: Request, body: Any, *, child_path: str = "") -> Response:
     _openai_proxy_require_token(request)
 
     if request.url.query:
@@ -16453,6 +16495,10 @@ def openai_responses_proxy(request: Request, body: Any = Body(...)):
     openai_api_key = _normalize_channel_api_key(target.get("apiKey"))
     if not upstream_url or not openai_api_key:
         raise HTTPException(status_code=503, detail="OpenAI proxy target is not configured")
+    forwarded_upstream_url = _openai_responses_child_url(upstream_url, child_path)
+    if not forwarded_upstream_url:
+        raise HTTPException(status_code=503, detail="OpenAI proxy target URL is invalid")
+    proxy_path = "/responses" + (f"/{child_path.strip('/')}" if child_path.strip("/") else "")
 
     hop_by_hop = {
         "connection",
@@ -16482,11 +16528,13 @@ def openai_responses_proxy(request: Request, body: Any = Body(...)):
         session_id=str(scoped_session_id or ""),
         target=target,
         body=body,
+        upstream_url=forwarded_upstream_url,
+        proxy_path=proxy_path,
     )
 
     try:
         upstream = requests.post(
-            upstream_url,
+            forwarded_upstream_url,
             json=body,
             headers=forward_headers,
             stream=True,
@@ -16541,10 +16589,34 @@ def openai_responses_proxy(request: Request, body: Any = Body(...)):
     return Response(content=content, status_code=upstream.status_code, media_type=content_type)
 
 
+@app.post("/openai/v1/responses")
+def openai_responses_proxy(request: Request, body: Any = Body(...)):
+    return _forward_openai_responses_request(request, body)
+
+
+@app.post("/openai/v1/responses/compact")
+def openai_responses_compact_proxy(request: Request, body: Any = Body(...)):
+    return _forward_openai_responses_request(request, body, child_path="compact")
+
+
 @app.get("/mcp")
 async def mcp_get(request: Request):
     _mcp_require_token(request)
-    raise HTTPException(status_code=405, detail="Streamable HTTP GET is not supported on this MCP endpoint")
+    sess = await _mcp_get_session(request)
+
+    async def event_stream():
+        yield ": argus mcp stream opened\n\n"
+        while True:
+            if await request.is_disconnected():
+                break
+            await asyncio.sleep(15)
+            yield ": keepalive\n\n"
+
+    headers = {
+        "Cache-Control": "no-cache",
+        "MCP-Protocol-Version": sess.protocol_version,
+    }
+    return StreamingResponse(event_stream(), media_type="text/event-stream", headers=headers)
 
 
 @app.delete("/mcp")

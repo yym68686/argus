@@ -130,8 +130,8 @@ How changes take effect:
 | `ARGUS_RUNTIME_CMD` | Optional in Compose, conceptually required in `docker` mode | `codex app-server` | Command executed inside each spawned runtime container. This is what `run_app_server.sh` launches through the TCP bridge. |
 | `ARGUS_CONNECT_TIMEOUT_S` | Optional | `30` | Timeout for runtime bootstrap and TCP connect checks. Also reused as a coarse upper bound for Docker API calls. |
 | `ARGUS_CONTAINER_PREFIX` | Optional | `argus-session` | Prefix for auto-created docker container names. Resulting names look like `argus-session-<sessionId>`. |
-| `ARGUS_RUNTIME_CPUS` | Optional | unset | CPU limit for newly created runtime containers. Use decimal CPU counts such as `0.8` or `2`. |
-| `ARGUS_RUNTIME_MEM_LIMIT` | Optional | unset | Memory limit for newly created runtime containers. Supports values like `512m`, `1g`, `2gb`. |
+| `ARGUS_RUNTIME_CPUS` | Optional | unset | CPU limit for newly created runtime containers. Use decimal CPU counts such as `1.5` or `2`. |
+| `ARGUS_RUNTIME_MEM_LIMIT` | Optional | unset | Memory limit for newly created runtime containers. Supports values like `2g`, `3gb`. |
 | `ARGUS_RUNTIME_MEMSWAP_LIMIT` | Optional | unset | Memory+swap limit for newly created runtime containers. Requires `ARGUS_RUNTIME_MEM_LIMIT`, and must be `>=` that value. Set it equal to mem limit to effectively disable swap. |
 | `ARGUS_RUNTIME_PIDS_LIMIT` | Optional | unset | Process count limit for newly created runtime containers. Must be a positive integer. |
 | `ARGUS_JSONL_LINE_LIMIT_BYTES` | Optional | `134217728` (128 MiB) | Max JSONL line size accepted from upstream runtimes. Increase this if you hit `Separator is not found, and chunk exceed the limit` on large tool outputs. |
@@ -444,10 +444,10 @@ Advanced:
 The gateway spawns runtime session containers dynamically. Set these on the gateway to limit newly created sessions:
 
 ```bash
-export ARGUS_RUNTIME_CPUS="0.8"
-export ARGUS_RUNTIME_MEM_LIMIT="768m"
-export ARGUS_RUNTIME_MEMSWAP_LIMIT="768m" # optional; requires MEM_LIMIT
-export ARGUS_RUNTIME_PIDS_LIMIT="512"     # optional
+export ARGUS_RUNTIME_CPUS="1.5"
+export ARGUS_RUNTIME_MEM_LIMIT="2g"
+export ARGUS_RUNTIME_MEMSWAP_LIMIT="3g" # optional; requires MEM_LIMIT
+export ARGUS_RUNTIME_PIDS_LIMIT="1024"   # optional
 ```
 
 They apply to **new** sessions. Existing containers need `docker update` or recreation.
