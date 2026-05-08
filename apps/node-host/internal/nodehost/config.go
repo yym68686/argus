@@ -3,6 +3,7 @@ package nodehost
 import (
 	"flag"
 	"fmt"
+	"net/url"
 	"os"
 	"strconv"
 	"strings"
@@ -86,6 +87,9 @@ func ParseConfig(argv []string) (*Config, error) {
 
 	var (
 		flagURL         = fs.String("url", "", "nodes/ws URL (or ARGUS_NODE_WS_URL)")
+		flagGateway     = fs.String("gateway", "", "gateway base URL; builds /nodes/ws with --token (or ARGUS_NODE_GATEWAY_URL)")
+		flagHost        = fs.String("host", "", "gateway host[:port]; builds /nodes/ws with --token (or ARGUS_NODE_HOST)")
+		flagToken       = fs.String("token", "", "node session token used with --gateway/--host (or ARGUS_NODE_WS_TOKEN)")
 		flagNodeID      = fs.String("node-id", "", "node id (or ARGUS_NODE_ID)")
 		flagDisplayName = fs.String("display-name", "", "display name (or ARGUS_NODE_DISPLAY_NAME)")
 
@@ -115,13 +119,44 @@ func ParseConfig(argv []string) (*Config, error) {
 	if err := fs.Parse(argv); err != nil {
 		return nil, err
 	}
+	seenFlags := map[string]bool{}
+	fs.Visit(func(f *flag.Flag) {
+		seenFlags[f.Name] = true
+	})
 
 	urlStr := strings.TrimSpace(*flagURL)
-	if urlStr == "" {
+	explicitEndpoint := seenFlags["gateway"] || seenFlags["host"] || seenFlags["token"]
+	if urlStr == "" && !seenFlags["url"] && !explicitEndpoint {
 		urlStr = strings.TrimSpace(os.Getenv("ARGUS_NODE_WS_URL"))
 	}
 	if urlStr == "" {
-		return nil, fmt.Errorf("missing --url (or ARGUS_NODE_WS_URL). Example: ws://127.0.0.1:8080/nodes/ws?token=...")
+		gateway := strings.TrimSpace(*flagGateway)
+		if gateway == "" {
+			gateway = strings.TrimSpace(os.Getenv("ARGUS_NODE_GATEWAY_URL"))
+		}
+		host := strings.TrimSpace(*flagHost)
+		if host == "" {
+			host = strings.TrimSpace(os.Getenv("ARGUS_NODE_HOST"))
+		}
+		token := strings.TrimSpace(*flagToken)
+		if token == "" {
+			token = strings.TrimSpace(os.Getenv("ARGUS_NODE_WS_TOKEN"))
+		}
+
+		endpoint := gateway
+		if endpoint == "" {
+			endpoint = host
+		}
+		if endpoint != "" || token != "" {
+			var err error
+			urlStr, err = buildNodeWSURL(endpoint, token)
+			if err != nil {
+				return nil, err
+			}
+		}
+	}
+	if urlStr == "" {
+		return nil, fmt.Errorf("missing --gateway/--host with --token, or --url (or ARGUS_NODE_WS_URL). Example: --host 127.0.0.1:8080 --token argus-node-v1...")
 	}
 
 	nodeID := strings.TrimSpace(*flagNodeID)
@@ -213,6 +248,43 @@ func ParseConfig(argv []string) (*Config, error) {
 
 		WriteTimeout: 10 * time.Second,
 	}, nil
+}
+
+func buildNodeWSURL(endpoint string, token string) (string, error) {
+	endpoint = strings.TrimSpace(endpoint)
+	token = strings.TrimSpace(token)
+	if endpoint == "" {
+		return "", fmt.Errorf("missing --gateway or --host")
+	}
+	if token == "" {
+		return "", fmt.Errorf("missing --token")
+	}
+
+	raw := endpoint
+	if !strings.Contains(raw, "://") {
+		raw = "ws://" + raw
+	}
+	u, err := url.Parse(raw)
+	if err != nil || u.Host == "" {
+		return "", fmt.Errorf("invalid --gateway/--host: %s", endpoint)
+	}
+	switch u.Scheme {
+	case "http":
+		u.Scheme = "ws"
+	case "https":
+		u.Scheme = "wss"
+	case "ws", "wss":
+	default:
+		return "", fmt.Errorf("unsupported --gateway/--host scheme: %s", u.Scheme)
+	}
+	u.Path = "/nodes/ws"
+	u.RawQuery = ""
+	u.ForceQuery = false
+	u.Fragment = ""
+	q := u.Query()
+	q.Set("token", token)
+	u.RawQuery = q.Encode()
+	return u.String(), nil
 }
 
 func intFromMaybeIntOrEnv(flagVal *maybeInt, envName string, def int) int {

@@ -531,9 +531,39 @@ function shellDoubleQuote(value) {
   return `"${String(value ?? "").replace(/(["\\$`])/g, "\\$1")}"`;
 }
 
+function shellWord(value) {
+  const raw = String(value ?? "");
+  if (/^[A-Za-z0-9_./:@%+=,-]+$/.test(raw)) return raw;
+  return shellDoubleQuote(raw);
+}
+
+function nodeCommandArgsFromWsUrl(wsUrl) {
+  const raw = stripOuterQuotes(wsUrl);
+  if (!isNonEmptyString(raw)) return null;
+  try {
+    const u = new URL(raw);
+    const token = u.searchParams.get("token");
+    if (!isNonEmptyString(token)) return null;
+    if (u.pathname !== "/nodes/ws") return null;
+    if (u.protocol === "ws:") {
+      return ["--host", u.host, "--token", token];
+    }
+    if (u.protocol === "wss:") {
+      return ["--gateway", `https://${u.host}`, "--token", token];
+    }
+    return null;
+  } catch {
+    return null;
+  }
+}
+
 function buildNodeConnectionCommand(wsUrl) {
   const raw = stripOuterQuotes(wsUrl);
   if (!isNonEmptyString(raw)) return null;
+  const args = nodeCommandArgsFromWsUrl(raw);
+  if (args) {
+    return `./argus ${args.map(shellWord).join(" ")}`;
+  }
   return `./argus --url ${shellDoubleQuote(raw)}`;
 }
 

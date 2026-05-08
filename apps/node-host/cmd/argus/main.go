@@ -84,6 +84,8 @@ Usage:
   argus disconnect [--config <path>]
 
 Legacy compatibility:
+  argus --gateway <base-url> --token <node-token> --node-id <id>
+  argus --host <host:port> --token <node-token> --node-id <id>
   argus --url <nodes-ws-url> --node-id <id>
   argus legacy-runtime-host --url <runtime-host-ws-url> --host-id <id>
 `, version.Current())

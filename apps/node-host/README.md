@@ -62,7 +62,9 @@ Inspect or revoke the local enrollment:
 Legacy node control plane:
 
 ```bash
-./argus --url "ws://127.0.0.1:8080/nodes/ws?token=argus-node-v1.<sessionId>.<sig>" --node-id "mac"
+./argus --host 127.0.0.1:8080 --token "argus-node-v1.<sessionId>.<sig>" --node-id "mac"
+# or, when you want to include the scheme explicitly:
+./argus --gateway "http://127.0.0.1:8080" --token "argus-node-v1.<sessionId>.<sig>" --node-id "mac"
 ```
 
 Interactive jobs on the legacy node plane:

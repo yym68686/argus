@@ -183,7 +183,7 @@ cp .env.example .env
 | `NEXT_PUBLIC_ARGUS_WS_URL` | 可选 | 未设置 | 可选 Web UI 的**构建期** WebSocket 预设地址。修改后需要重新 build `web`。常见示例：`ws://127.0.0.1:8080/ws?token=...`。如果页面本身跑在 HTTPS 下，但预设仍然是 `ws://`，前端会自动改用当前页面同源的 `wss://`，同时保留原来的路径和 query。当前 compose 方案里通常可以留空。 |
 | `TELEGRAM_BOT_TOKEN` | `docker compose --profile tg ...` 时必需 | 未设置 | 从 `@BotFather` 获取的 bot token；缺失时 Telegram bot 服务会直接退出。 |
 | `TELEGRAM_DRAFT_STREAMING` | 可选 | `auto` | 控制 gateway 在私聊里是否发送实时草稿。接受形式：`auto` / `on` / `true`、`force` / `always`、`off`。 |
-| `ARGUS_PUBLIC_BASE_URL` | 可选但推荐 | 未设置 | Telegram 节点复制命令使用的公共 gateway 基础 URL。设置后，bot 会显示 `ws://<公网 IP 或域名>:8080/nodes/ws?...`，而不是 Docker 内部的 `gateway` 主机名。 |
+| `ARGUS_PUBLIC_BASE_URL` | 可选但推荐 | 未设置 | Telegram 节点复制命令使用的公共 gateway 基础 URL。设置后，bot 会显示类似 `./argus --host <公网 IP 或域名>:8080 --token ...` 的命令，而不是 Docker 内部的 `gateway` 主机名。 |
 | `ARGUS_PUBLIC_NODE_WS_URL` | 可选 | 未设置 | 如果对外暴露的 `/nodes/ws` 路径不是默认值，可直接覆盖完整地址。 |
 | `ARGUS_GATEWAY_WS_URL` | 可选 | bundled compose 下默认 `ws://gateway:8080/ws` | `apps/telegram-bot` 的内部 WebSocket 地址；当它不在默认 Compose 拓扑里运行时再显式指定。 |
 | `ARGUS_GATEWAY_HTTP_URL` | 可选 | bundled compose 下默认 `http://gateway:8080` | `apps/telegram-bot` 的内部 HTTP base URL。WS / HTTP 分流或自动推导不正确时再显式指定。 |
@@ -196,9 +196,18 @@ cp .env.example .env
 
 如果你只使用 runtime 容器里内置的 node-host，通常**不需要**自己设置下面这些变量；gateway 会自动把连接参数注入进去。以下变量主要用于你在别的机器（例如自己的 Mac）上手动运行 `apps/node-host`。
 
+```bash
+./argus --host 127.0.0.1:8080 --token "argus-node-v1.<sessionId>.<sig>"
+# 或者显式带上 scheme：
+./argus --gateway "http://127.0.0.1:8080" --token "argus-node-v1.<sessionId>.<sig>"
+```
+
 | 变量 | 是否必需 | 默认值 | 作用 / 注意事项 |
 | --- | --- | --- | --- |
-| `ARGUS_NODE_WS_URL` | 必需（除非你改用 `--url`） | 未设置 | `/nodes/ws` 的 WebSocket 地址，例如 `ws://127.0.0.1:8080/nodes/ws?token=...`。 |
+| `ARGUS_NODE_WS_URL` | 可选 | 未设置 | `/nodes/ws` 的完整 WebSocket 地址。手动使用时优先用 `--host/--gateway` 加 `--token`。例如 `ws://127.0.0.1:8080/nodes/ws?token=...`。 |
+| `ARGUS_NODE_GATEWAY_URL` | 可选 | 未设置 | 配合 `ARGUS_NODE_WS_TOKEN` 生成 `/nodes/ws` 地址，等同于传 `--gateway`。 |
+| `ARGUS_NODE_HOST` | 可选 | 未设置 | 配合 `ARGUS_NODE_WS_TOKEN` 生成 `/nodes/ws` 地址，等同于传 `--host`。 |
+| `ARGUS_NODE_WS_TOKEN` | 可选 | 未设置 | 配合 `ARGUS_NODE_GATEWAY_URL` / `ARGUS_NODE_HOST` 使用的节点 session token。它不是服务端的 `ARGUS_NODE_TOKEN` master secret。 |
 | `ARGUS_NODE_ID` | 可选 | 当前机器 hostname | 显示给 gateway 的逻辑 node id。 |
 | `ARGUS_NODE_DISPLAY_NAME` | 可选 | 当前机器 hostname | 给人看的节点名称，会出现在节点列表和 system event 中。 |
 | `ARGUS_NODE_STATE_DIR` | 可选 | 若有 `APP_HOME` 则为 `$APP_HOME/node-host/<nodeId>`，否则为 `$HOME/.argus/node-host/<nodeId>` | 本地 node-host 状态目录。 |
