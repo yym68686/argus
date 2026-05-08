@@ -2,6 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 
 import {
+  buildArgusCliInstallCommand,
   buildNodeConnectionCommand,
   derivePublicNodeWsUrl,
   deriveTelegramWebhookSecret,
@@ -95,6 +96,13 @@ test("buildNodeConnectionCommand renders a shell-safe copyable command", () => {
     'argus --url "ws://example.com:8080/custom/ws?token=abc123"'
   );
   assert.equal(buildNodeConnectionCommand(""), null);
+});
+
+test("buildArgusCliInstallCommand renders the GitHub installer command", () => {
+  assert.equal(
+    buildArgusCliInstallCommand(),
+    'curl -fsSL "https://raw.githubusercontent.com/yym68686/argus/main/scripts/install-argus.sh" | bash'
+  );
 });
 
 test("derivePublicNodeWsUrl prefers the public base url for copy commands", () => {

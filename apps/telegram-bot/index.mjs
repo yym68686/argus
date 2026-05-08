@@ -10,6 +10,7 @@ import WebSocket from "ws";
 const DEFAULT_BOT_VERSION = "0.0.0";
 const TELEGRAM_WEBHOOK_PATH = "/telegram/webhook";
 const TELEGRAM_WEBHOOK_BODY_LIMIT_BYTES = 1024 * 1024;
+const ARGUS_CLI_INSTALL_SCRIPT_URL = "https://raw.githubusercontent.com/yym68686/argus/main/scripts/install-argus.sh";
 
 function loadBotVersion() {
   const override = typeof process.env.ARGUS_VERSION === "string" ? process.env.ARGUS_VERSION.trim() : "";
@@ -529,6 +530,10 @@ function buildUrlWithParams(url, params) {
 
 function shellDoubleQuote(value) {
   return `"${String(value ?? "").replace(/(["\\$`])/g, "\\$1")}"`;
+}
+
+function buildArgusCliInstallCommand() {
+  return `curl -fsSL ${shellDoubleQuote(ARGUS_CLI_INSTALL_SCRIPT_URL)} | bash`;
 }
 
 function shellWord(value) {
@@ -1650,6 +1655,7 @@ function normalizeAvailableModels(models, currentModel) {
     btn_resume_node: "Resume",
     btn_show_node_token: "Show Token",
     btn_copy_node_command: "Copy Command",
+    btn_copy_argus_install: "Copy Install",
     btn_status: "Status",
     btn_help: "Help",
     btn_close: "Close",
@@ -1727,6 +1733,8 @@ function normalizeAvailableModels(models, currentModel) {
     node_none_connected: "No nodes are currently connected for this session.",
     node_token_label: "Connection token",
     node_command_label: "Run command",
+    node_install_label: "Install argus CLI",
+    node_install_hint: "Run this once first if argus is not available. After install, run argus from any directory; no ./ prefix is needed.",
     node_status_active: "active",
     node_status_paused: "paused",
     node_status_default: "default",
@@ -1820,6 +1828,7 @@ function normalizeAvailableModels(models, currentModel) {
     btn_resume_node: "恢复",
     btn_show_node_token: "显示 Token",
     btn_copy_node_command: "复制命令",
+    btn_copy_argus_install: "复制安装命令",
     btn_status: "状态",
     btn_help: "帮助",
     btn_close: "关闭",
@@ -1897,6 +1906,8 @@ function normalizeAvailableModels(models, currentModel) {
     node_none_connected: "当前 session 下还没有已连接节点。",
     node_token_label: "连接 Token",
     node_command_label: "执行命令",
+    node_install_label: "安装 argus 命令行",
+    node_install_hint: "如果本机还没有 argus，先执行一次安装命令；安装后任意目录可直接运行 argus，不需要加 ./。",
     node_status_active: "活跃",
     node_status_paused: "已暂停",
     node_status_default: "默认",
@@ -3537,6 +3548,7 @@ async function main() {
     const lines = [];
     const rows = [];
     let nodeCommand = null;
+    let nodeInstallCommand = null;
     lines.push(`<b>${escapeHtml(S.title_node_token)}</b>`);
     if (isNonEmptyString(notice)) lines.push(`<i>${escapeHtml(notice)}</i>`);
 
@@ -3606,6 +3618,10 @@ async function main() {
               nodeCommand = command;
               lines.push(`${escapeHtml(S.node_command_label)}:
 <pre><code>${escapeHtml(command)}</code></pre>`);
+              nodeInstallCommand = buildArgusCliInstallCommand();
+              lines.push(`${escapeHtml(S.node_install_label)}:
+<pre><code>${escapeHtml(nodeInstallCommand)}</code></pre>`);
+              lines.push(escapeHtml(S.node_install_hint));
             }
           }
         } catch (e) {
@@ -3625,6 +3641,8 @@ async function main() {
     }
 
     if (reveal && isNonEmptyString(nodeCommand)) {
+      const copyInstallButton = copyTextButton(S.btn_copy_argus_install, nodeInstallCommand);
+      if (copyInstallButton) rows.push([copyInstallButton]);
       const copyCommandButton = copyTextButton(S.btn_copy_node_command, nodeCommand);
       if (copyCommandButton) rows.push([copyCommandButton]);
     }
@@ -5822,6 +5840,7 @@ async function main() {
 }
 
 export {
+  buildArgusCliInstallCommand,
   buildNodeConnectionCommand,
   clearTelegramWebhookForPolling,
   deriveTelegramWebhookSecret,
