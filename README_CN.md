@@ -61,6 +61,18 @@ docker compose down
 argus gateway upgrade --dir /root/argus
 ```
 
+第一次从已运行的 gateway 安装 `argus` CLI：
+
+```bash
+curl -fsSL "http://127.0.0.1:8080/argus/install.sh" | bash
+```
+
+Windows：
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -Command "irm 'http://127.0.0.1:8080/argus/install.ps1' | iex"
+```
+
 ## 开发者自助模式
 
 Argus 现在已经具备一套基础的开发者自助流程：

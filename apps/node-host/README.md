@@ -15,6 +15,12 @@ install -m 0755 argus "$HOME/.argus/bin/argus"
 sudo ln -sf "$HOME/.argus/bin/argus" /usr/local/bin/argus
 ```
 
+Install from a running gateway:
+
+```bash
+curl -fsSL "https://argus.example.com/argus/install.sh" | bash
+```
+
 Cross-compile:
 
 ```bash

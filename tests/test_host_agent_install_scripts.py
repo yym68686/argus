@@ -17,6 +17,16 @@ SPEC.loader.exec_module(argus_app)
 
 
 class HostAgentInstallScriptTests(unittest.TestCase):
+    def test_shell_cli_installer_installs_argus_without_enrollment(self) -> None:
+        with mock.patch.dict(os.environ, {"ARGUS_PUBLIC_BASE_URL": "https://argus.example.com"}, clear=True):
+            script = argus_app._render_argus_cli_install_sh()
+
+        self.assertIn('ARGUS_GATEWAY_BASE=https://argus.example.com', script)
+        self.assertIn('linux:x86_64|linux:amd64)', script)
+        self.assertIn('ARGUS_LINK_PATH="${ARGUS_LINK_PATH:-/usr/local/bin/argus}"', script)
+        self.assertIn('curl -fsSL "${ARGUS_GATEWAY_BASE}/host-agent/download/${TARGET}"', script)
+        self.assertNotIn("ARGUS_ENROLL_TOKEN", script)
+
     def test_shell_installer_installs_system_argus_command(self) -> None:
         with mock.patch.dict(os.environ, {"ARGUS_PUBLIC_BASE_URL": "https://argus.example.com"}, clear=True):
             script = argus_app._render_host_agent_install_sh("argus-host-enroll-v1.tid.secret")
@@ -33,6 +43,15 @@ class HostAgentInstallScriptTests(unittest.TestCase):
         self.assertIn('[Environment]::SetEnvironmentVariable("Path", $NewUserPath, "User")', script)
         self.assertIn('$env:Path = "$BinDir;$env:Path"', script)
         self.assertIn("& $BinPath connect --gateway $GatewayBaseUrl", script)
+
+    def test_powershell_cli_installer_installs_argus_without_enrollment(self) -> None:
+        with mock.patch.dict(os.environ, {"ARGUS_PUBLIC_BASE_URL": "https://argus.example.com"}, clear=True):
+            script = argus_app._render_argus_cli_install_ps1()
+
+        self.assertIn("$GatewayBaseUrl = 'https://argus.example.com'", script)
+        self.assertIn('[Environment]::SetEnvironmentVariable("Path", $NewUserPath, "User")', script)
+        self.assertIn('Invoke-WebRequest -UseBasicParsing -Uri "$GatewayBaseUrl/host-agent/download/$Target"', script)
+        self.assertNotIn("$EnrollToken", script)
 
 
 if __name__ == "__main__":

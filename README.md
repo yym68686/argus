@@ -61,6 +61,18 @@ After installing the system `argus` CLI, update a self-hosted checkout and rebui
 argus gateway upgrade --dir /root/argus
 ```
 
+Install the `argus` CLI for the first time from a running gateway:
+
+```bash
+curl -fsSL "http://127.0.0.1:8080/argus/install.sh" | bash
+```
+
+On Windows:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -Command "irm 'http://127.0.0.1:8080/argus/install.ps1' | iex"
+```
+
 ## Developer Self-Serve
 
 Argus now supports a basic developer-user flow in the built-in web console:
@@ -210,11 +222,7 @@ Channel behavior:
 For a user machine that should act as a first-class native Codex host, use the unified CLI:
 
 ```bash
-cd apps/node-host
-go build -o argus ./cmd/argus
-mkdir -p "$HOME/.argus/bin"
-install -m 0755 argus "$HOME/.argus/bin/argus"
-sudo ln -sf "$HOME/.argus/bin/argus" /usr/local/bin/argus
+curl -fsSL "https://argus.example.com/argus/install.sh" | bash
 argus connect --gateway "https://argus.example.com" --enroll-token "<one-time-token>" --default
 ```
 

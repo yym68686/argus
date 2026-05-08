@@ -507,6 +507,71 @@ exec "$ARGUS_CMD" connect --gateway "$ARGUS_GATEWAY_BASE" --enroll-token "$ARGUS
 """
 
 
+def _render_argus_cli_install_sh(request: Optional[Request] = None) -> str:
+    gateway_base = _public_gateway_base_url(request)
+    return f"""#!/usr/bin/env bash
+set -euo pipefail
+
+ARGUS_GATEWAY_BASE={_shell_quote(gateway_base)}
+
+OS="$(uname -s 2>/dev/null || echo unknown)"
+ARCH="$(uname -m 2>/dev/null || echo unknown)"
+case "$(printf '%s' "$OS" | tr '[:upper:]' '[:lower:]'):$ARCH" in
+  darwin:arm64|darwin:aarch64)
+    TARGET="darwin-arm64"
+    ;;
+  darwin:x86_64|darwin:amd64)
+    TARGET="darwin-amd64"
+    ;;
+  linux:arm64|linux:aarch64)
+    TARGET="linux-arm64"
+    ;;
+  linux:x86_64|linux:amd64)
+    TARGET="linux-amd64"
+    ;;
+  *)
+    echo "Unsupported platform: $OS/$ARCH" >&2
+    exit 1
+    ;;
+esac
+
+BIN_DIR="${{ARGUS_BIN_DIR:-${{HOME}}/.argus/bin}}"
+BIN_PATH="${{BIN_DIR}}/argus"
+ARGUS_LINK_PATH="${{ARGUS_LINK_PATH:-/usr/local/bin/argus}}"
+
+mkdir -p "$BIN_DIR"
+curl -fsSL "${{ARGUS_GATEWAY_BASE}}/host-agent/download/${{TARGET}}" -o "$BIN_PATH"
+chmod +x "$BIN_PATH"
+
+if [ "${{ARGUS_INSTALL_SYSTEM_LINK:-1}}" != "0" ]; then
+  LINK_DIR="$(dirname "$ARGUS_LINK_PATH")"
+  if [ ! -d "$LINK_DIR" ]; then
+    if command -v sudo >/dev/null 2>&1; then
+      sudo mkdir -p "$LINK_DIR"
+    else
+      mkdir -p "$LINK_DIR"
+    fi
+  fi
+  if [ -w "$LINK_DIR" ]; then
+    ln -sf "$BIN_PATH" "$ARGUS_LINK_PATH"
+  elif command -v sudo >/dev/null 2>&1; then
+    sudo ln -sf "$BIN_PATH" "$ARGUS_LINK_PATH"
+  else
+    echo "Unable to create $ARGUS_LINK_PATH; add $BIN_DIR to PATH to run argus anywhere." >&2
+  fi
+fi
+
+if command -v argus >/dev/null 2>&1; then
+  ARGUS_CMD="$(command -v argus)"
+else
+  ARGUS_CMD="$BIN_PATH"
+fi
+
+echo "Installed argus CLI: $ARGUS_CMD"
+"$ARGUS_CMD" --help >/dev/null
+"""
+
+
 def _render_host_agent_install_ps1(enroll_token: str, request: Optional[Request] = None) -> str:
     gateway_base = _public_gateway_base_url(request)
     return f"""$ErrorActionPreference = "Stop"
@@ -562,6 +627,48 @@ if (-not $Codex) {{
 }}
 
 & $BinPath connect --gateway $GatewayBaseUrl --enroll-token $EnrollToken --workspace-base $DesktopDir
+exit $LASTEXITCODE
+"""
+
+
+def _render_argus_cli_install_ps1(request: Optional[Request] = None) -> str:
+    gateway_base = _public_gateway_base_url(request)
+    return f"""$ErrorActionPreference = "Stop"
+
+$GatewayBaseUrl = {_powershell_quote(gateway_base)}
+
+$Arch = $env:PROCESSOR_ARCHITECTURE
+if ([string]::IsNullOrWhiteSpace($Arch)) {{
+  $Arch = [System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture.ToString()
+}}
+
+switch -Regex ($Arch.ToUpperInvariant()) {{
+  "ARM64|AARCH64" {{ $Target = "windows-arm64" }}
+  "AMD64|X64|X86_64" {{ $Target = "windows-amd64" }}
+  default {{ throw "Unsupported Windows architecture: $Arch" }}
+}}
+
+$BinDir = Join-Path $HOME ".argus\\bin"
+$BinPath = Join-Path $BinDir "argus.exe"
+
+New-Item -ItemType Directory -Force -Path $BinDir | Out-Null
+Invoke-WebRequest -UseBasicParsing -Uri "$GatewayBaseUrl/host-agent/download/$Target" -OutFile $BinPath
+
+$UserPath = [Environment]::GetEnvironmentVariable("Path", "User")
+if ([string]::IsNullOrWhiteSpace($UserPath)) {{
+  $UserPath = ""
+}}
+$PathParts = $UserPath -split ';' | Where-Object {{ -not [string]::IsNullOrWhiteSpace($_) }}
+if (-not ($PathParts | Where-Object {{ $_.TrimEnd('\\') -ieq $BinDir.TrimEnd('\\') }})) {{
+  $NewUserPath = if ([string]::IsNullOrWhiteSpace($UserPath)) {{ $BinDir }} else {{ "$BinDir;$UserPath" }}
+  [Environment]::SetEnvironmentVariable("Path", $NewUserPath, "User")
+}}
+if (-not (($env:Path -split ';') | Where-Object {{ $_.TrimEnd('\\') -ieq $BinDir.TrimEnd('\\') }})) {{
+  $env:Path = "$BinDir;$env:Path"
+}}
+
+Write-Host "Installed argus CLI: $BinPath"
+& $BinPath --help | Out-Null
 exit $LASTEXITCODE
 """
 
@@ -21015,6 +21122,24 @@ async def host_agent_download_binary(target: str):
     if path is None:
         raise HTTPException(status_code=503, detail="Host-agent binary is not available on this gateway")
     return FileResponse(path, media_type="application/octet-stream", filename=spec["download_name"])
+
+
+@app.get("/argus/install.sh")
+async def argus_cli_install_sh(request: Request):
+    return PlainTextResponse(
+        _render_argus_cli_install_sh(request),
+        media_type="text/x-shellscript",
+        headers={"Cache-Control": "no-store, max-age=0"},
+    )
+
+
+@app.get("/argus/install.ps1")
+async def argus_cli_install_ps1(request: Request):
+    return PlainTextResponse(
+        _render_argus_cli_install_ps1(request),
+        media_type="text/plain",
+        headers={"Cache-Control": "no-store, max-age=0"},
+    )
 
 
 @app.get("/host-agent/install.sh")
