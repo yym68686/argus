@@ -85,7 +85,7 @@ cp .env.example .env
 
 环境变量改动的生效范围可以这样理解：
 
-- **构建期生效**：`ARGUS_RUNTIME_INSTALL_CMD`、`NEXT_PUBLIC_ARGUS_WS_URL` 会被写进镜像或构建产物，修改后需要重新 build。
+- **构建期生效**：`ARGUS_RUNTIME_INSTALL_CMD` 会被写进镜像或构建产物；`NEXT_PUBLIC_ARGUS_WS_URL` 只是 web 的构建期预设，当前 compose 方案里通常可以留空。修改后需要重新 build。
 - **重启服务生效**：大多数 gateway / Telegram bot 环境变量，在重启对应容器后生效。
 - **仅对新建 runtime session 生效**：注入到 runtime 容器内的变量（如 `ARGUS_RUNTIME_CMD`、资源限制、gateway 内部回连地址、按 session 派生的代理配置）只会影响新创建的 session 容器。
 
@@ -94,6 +94,7 @@ cp .env.example .env
 | 变量 | 是否必需 | 默认值 | 作用 / 注意事项 |
 | --- | --- | --- | --- |
 | `ARGUS_TOKEN` | 推荐设置；如果要暴露到 localhost 之外，几乎等同必需 | 未设置 | `/ws` 与 HTTP 管理接口共用的 Bearer token。同时也是 `ARGUS_NODE_TOKEN`、`ARGUS_MCP_TOKEN`、`ARGUS_OPENAI_TOKEN` 的回退 master secret。它**不是** OpenAI API Key。 |
+| `ARGUS_PUBLIC_BASE_URL` | 使用 native host-agent / 本地 Codex host 时必需 | 未设置 | native host session 回连 `/mcp`、`/openai/v1`、host-agent 注册流程，以及 Telegram 节点复制命令使用的公共 gateway 基础 URL。示例：`https://argus.example.com`。 |
 | `ARGUS_NODE_TOKEN` | 可选 | 回退到 `ARGUS_TOKEN` | 用于派生 `/nodes/ws` 的 session 级 token。如果你希望 node 访问和主网关 token 分离，就单独设置它。 |
 | `ARGUS_MCP_TOKEN` | 可选 | 回退到 `ARGUS_TOKEN` | gateway MCP 端点使用的独立 master secret。runtime 容器里拿到的是按 session 派生后的 token，而不是原始 secret。 |
 | `ARGUS_DATABASE_URL` | 可选，但推荐在正式部署中设置 | 未设置 | gateway 自动化状态和 usage 账本使用的 PostgreSQL DSN，例如 `postgresql://argus:argus@postgres:5432/argus`。设置后 Argus 会把网关状态持久化到 PostgreSQL，并在首次启动且目标表为空时，自动导入旧的 `state.json`、`state.db`、`usage.db`。 |
@@ -179,12 +180,14 @@ cp .env.example .env
 
 | 变量 | 是否必需 | 默认值 | 作用 / 注意事项 |
 | --- | --- | --- | --- |
-| `NEXT_PUBLIC_ARGUS_WS_URL` | 可选 | 未设置 | 可选 Web UI 的**构建期** WebSocket 预设地址。修改后需要重新 build `web`。常见示例：`ws://127.0.0.1:8080/ws?token=...`。如果页面本身跑在 HTTPS 下，但预设仍然是 `ws://`，前端会自动改用当前页面同源的 `wss://`，同时保留原来的路径和 query。 |
+| `NEXT_PUBLIC_ARGUS_WS_URL` | 可选 | 未设置 | 可选 Web UI 的**构建期** WebSocket 预设地址。修改后需要重新 build `web`。常见示例：`ws://127.0.0.1:8080/ws?token=...`。如果页面本身跑在 HTTPS 下，但预设仍然是 `ws://`，前端会自动改用当前页面同源的 `wss://`，同时保留原来的路径和 query。当前 compose 方案里通常可以留空。 |
 | `TELEGRAM_BOT_TOKEN` | `docker compose --profile tg ...` 时必需 | 未设置 | 从 `@BotFather` 获取的 bot token；缺失时 Telegram bot 服务会直接退出。 |
 | `TELEGRAM_DRAFT_STREAMING` | 可选 | `auto` | 控制 gateway 在私聊里是否发送实时草稿。接受形式：`auto` / `on` / `true`、`force` / `always`、`off`。 |
-| `HOST` | 可选辅助变量 | `127.0.0.1` | 主要给文档示例、Web 预设和 Telegram bot 自动推导 gateway 地址使用。它**不是**安全配置项，gateway 自身也不依赖它做鉴权。Docker 场景下会在需要时自动改用 `gateway`。 |
-| `ARGUS_GATEWAY_WS_URL` | 可选 | 从 `HOST` 或 `NEXT_PUBLIC_ARGUS_WS_URL` 推导 | 当 `apps/telegram-bot` 不在默认 Compose 拓扑里运行时，用它显式指定 WebSocket 地址。 |
-| `ARGUS_GATEWAY_HTTP_URL` | 可选 | 从 `ARGUS_GATEWAY_WS_URL` 或 `HOST` 推导 | 给 `apps/telegram-bot` 显式指定 HTTP base URL。适合 WS / HTTP 分流，或者自动推导不正确的部署。 |
+| `ARGUS_PUBLIC_BASE_URL` | 可选但推荐 | 未设置 | Telegram 节点复制命令使用的公共 gateway 基础 URL。设置后，bot 会显示 `ws://<公网 IP 或域名>:8080/nodes/ws?...`，而不是 Docker 内部的 `gateway` 主机名。 |
+| `ARGUS_PUBLIC_NODE_WS_URL` | 可选 | 未设置 | 如果对外暴露的 `/nodes/ws` 路径不是默认值，可直接覆盖完整地址。 |
+| `ARGUS_GATEWAY_WS_URL` | 可选 | bundled compose 下默认 `ws://gateway:8080/ws` | `apps/telegram-bot` 的内部 WebSocket 地址；当它不在默认 Compose 拓扑里运行时再显式指定。 |
+| `ARGUS_GATEWAY_HTTP_URL` | 可选 | bundled compose 下默认 `http://gateway:8080` | `apps/telegram-bot` 的内部 HTTP base URL。WS / HTTP 分流或自动推导不正确时再显式指定。 |
+| `HOST` | 可选辅助变量 | `127.0.0.1` | 仅用于文档 / 旧部署兼容；在 compose 里显式设置内部 URL 时通常不再需要。 |
 | `ARGUS_CWD` | 可选 | `/workspace` | `apps/telegram-bot` 创建 / 恢复线程时默认使用的工作目录。 |
 | `STATE_PATH` | 可选 | 容器内默认 `/data/state.json`；容器外默认 `./state.json` | `apps/telegram-bot` 的本地状态文件路径。只有你直接运行 bot（而不是用当前 compose volume）时才需要关心。 |
 | `TELEGRAM_ADMIN_CHAT_IDS` | 预留 / 当前版本未使用 | 未设置 | `docker-compose.yml` 里保留了这个变量，但当前代码并没有读取它；现在可以安全忽略。 |
@@ -358,7 +361,7 @@ open http://127.0.0.1:3000
 - `runtime`：非公网的模板 app，gateway 会复用它的当前镜像来创建每个 session app
 - `telegram-bot`：可选配套服务；只有在你提供 `TELEGRAM_BOT_TOKEN` 时才建议保留
 
-这份 manifest 现在已经包含 `gateway`、`postgres`、`runtime`、`web` 和 `telegram-bot`。对 `web` 来说，你可以不设置 `NEXT_PUBLIC_ARGUS_WS_URL`，让浏览器自动按当前页面同源推导 WebSocket 地址；也可以在需要指向特定网关时提供一个构建期预设。
+这份 manifest 现在已经包含 `gateway`、`postgres`、`runtime`、`web` 和 `telegram-bot`。对 `web` 来说，通常可以不设置 `NEXT_PUBLIC_ARGUS_WS_URL`，让浏览器按当前页面和端口映射自动推导 WebSocket 地址；只有在你需要把前端指向别的 gateway 时才提供这个构建期预设。
 
 由于 gateway 需要 `ARGUS_FUGUE_PROJECT_ID`，Fugue 部署不是单步导入，而是先准备 project，再部署进去：
 

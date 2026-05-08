@@ -41,6 +41,7 @@ services:
       ARGUS_PROVISION_MODE: ${ARGUS_PROVISION_MODE:-auto}
       ARGUS_RUNTIME_IMAGE: argus-runtime
       ARGUS_DOCKER_NETWORK: argus-runtime-net
+      ARGUS_PUBLIC_BASE_URL: ${ARGUS_PUBLIC_BASE_URL:-}
       ARGUS_HOME_HOST_PATH: ${ARGUS_HOME_HOST_PATH:-${HOME}/.argus}
       ARGUS_DATABASE_URL: ${ARGUS_DATABASE_URL:-postgresql://argus:argus@postgres:5432/argus}
       # Optional (advanced): base directory for auto-created `/ws` session workspaces; when unset, uses `${ARGUS_HOME_HOST_PATH}/workspaces`.
@@ -104,11 +105,11 @@ services:
     environment:
       TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:-}
       ARGUS_TOKEN: ${ARGUS_TOKEN:-}
-      # Optional: restrict /newmain usage to a comma-separated allowlist of private chat ids.
-      # Example: TELEGRAM_ADMIN_CHAT_IDS=123456789,987654321
-      TELEGRAM_ADMIN_CHAT_IDS: ${TELEGRAM_ADMIN_CHAT_IDS:-}
+      ARGUS_GATEWAY_HTTP_URL: ${ARGUS_GATEWAY_HTTP_URL:-http://gateway:8080}
+      ARGUS_GATEWAY_WS_URL: ${ARGUS_GATEWAY_WS_URL:-ws://gateway:8080/ws}
+      ARGUS_PUBLIC_BASE_URL: ${ARGUS_PUBLIC_BASE_URL:-}
+      ARGUS_PUBLIC_NODE_WS_URL: ${ARGUS_PUBLIC_NODE_WS_URL:-}
       TELEGRAM_DRAFT_STREAMING: ${TELEGRAM_DRAFT_STREAMING:-auto}
-      HOST: ${HOST:-gateway}
     volumes:
       - telegram-bot-data:/data
     networks:

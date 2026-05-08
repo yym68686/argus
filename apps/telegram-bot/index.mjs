@@ -537,6 +537,56 @@ function buildNodeConnectionCommand(wsUrl) {
   return `./argus --url ${shellDoubleQuote(raw)}`;
 }
 
+function deriveWsUrlFromBase(baseUrl, pathName, token) {
+  const raw = stripOuterQuotes(baseUrl);
+  if (!isNonEmptyString(raw)) return null;
+  try {
+    const u = new URL(raw);
+    if (u.protocol === "http:") {
+      u.protocol = "ws:";
+    } else if (u.protocol === "https:") {
+      u.protocol = "wss:";
+    } else if (u.protocol !== "ws:" && u.protocol !== "wss:") {
+      return null;
+    }
+    u.pathname = String(pathName || "/nodes/ws");
+    u.search = "";
+    u.hash = "";
+    if (isNonEmptyString(token)) u.searchParams.set("token", token);
+    return u.toString();
+  } catch {
+    return null;
+  }
+}
+
+function deriveWsUrlWithToken(wsUrl, token) {
+  const raw = stripOuterQuotes(wsUrl);
+  if (!isNonEmptyString(raw)) return null;
+  try {
+    const u = new URL(raw);
+    if (u.protocol === "http:" || u.protocol === "https:") {
+      return deriveWsUrlFromBase(raw, u.pathname || "/nodes/ws", token);
+    }
+    if (u.protocol !== "ws:" && u.protocol !== "wss:") {
+      return null;
+    }
+    u.searchParams.delete("session");
+    if (isNonEmptyString(token)) u.searchParams.set("token", token);
+    return u.toString();
+  } catch {
+    return null;
+  }
+}
+
+function derivePublicNodeWsUrl({ publicNodeWsUrl, publicBaseUrl, fallbackBaseUrl, pathName, token }) {
+  const direct = stripOuterQuotes(publicNodeWsUrl);
+  if (isNonEmptyString(direct)) {
+    return deriveWsUrlWithToken(direct, token) || direct;
+  }
+  const base = stripOuterQuotes(publicBaseUrl) || fallbackBaseUrl;
+  return deriveWsUrlFromBase(base, pathName, token);
+}
+
 function redactUrlSecrets(rawUrl) {
   const raw = stripOuterQuotes(rawUrl);
   if (!isNonEmptyString(raw)) return rawUrl;
@@ -2171,9 +2221,10 @@ async function main() {
   }
 
   const gatewayWsUrlRaw =
-    stripSessionFromWsUrl(process.env.ARGUS_GATEWAY_WS_URL) ||
-    stripSessionFromWsUrl(process.env.NEXT_PUBLIC_ARGUS_WS_URL);
+    stripSessionFromWsUrl(process.env.ARGUS_GATEWAY_WS_URL);
   const gatewayHttpUrlRaw = stripOuterQuotes(process.env.ARGUS_GATEWAY_HTTP_URL);
+  const publicBaseUrlRaw = stripOuterQuotes(process.env.ARGUS_PUBLIC_BASE_URL);
+  const publicNodeWsUrlRaw = stripOuterQuotes(process.env.ARGUS_PUBLIC_NODE_WS_URL);
 
   const runningInDocker = await pathExists("/.dockerenv");
   const fromHost = deriveGatewayFromHostEnv(process.env.HOST, { runningInDocker });
@@ -2574,19 +2625,6 @@ async function main() {
       return status === "creator" || status === "administrator";
     } catch {
       return false;
-    }
-  }
-
-  function deriveNodeWsUrl({ httpBase, pathName, token }) {
-    try {
-      const u = new URL(httpBase);
-      u.protocol = u.protocol === "https:" ? "wss:" : "ws:";
-      u.pathname = String(pathName || "/nodes/ws");
-      u.search = "";
-      if (isNonEmptyString(token)) u.searchParams.set("token", token);
-      return u.toString();
-    } catch {
-      return null;
     }
   }
 
@@ -3520,7 +3558,13 @@ async function main() {
           const tokenRes = await argusHttp.automationNodeToken(chatKey);
           const token = isNonEmptyString(tokenRes?.token) ? tokenRes.token : null;
           const pathName = isNonEmptyString(tokenRes?.path) ? tokenRes.path : "/nodes/ws";
-          const wsUrl = deriveNodeWsUrl({ httpBase: gatewayHttpUrl, pathName, token });
+          const wsUrl = derivePublicNodeWsUrl({
+            publicNodeWsUrl: publicNodeWsUrlRaw,
+            publicBaseUrl: publicBaseUrlRaw,
+            fallbackBaseUrl: gatewayHttpUrl,
+            pathName,
+            token
+          });
           lines.push(`path: ${htmlCode(pathName)}`);
           lines.push(`token:
 <pre><code>${escapeHtml(token || "(none)")}</code></pre>`);
@@ -5752,6 +5796,7 @@ export {
   clearTelegramWebhookForPolling,
   deriveTelegramWebhookSecret,
   deriveTelegramWebhookUrl,
+  derivePublicNodeWsUrl,
   isTelegramGetUpdatesWebhookConflict,
   normalizeTelegramDeliveryMode,
   redactUrlSecrets,

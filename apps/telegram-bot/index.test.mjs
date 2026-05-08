@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 
 import {
   buildNodeConnectionCommand,
+  derivePublicNodeWsUrl,
   deriveTelegramWebhookSecret,
   isTelegramGetUpdatesWebhookConflict,
   resolveTelegramWebhookConfig,
@@ -86,4 +87,28 @@ test("buildNodeConnectionCommand renders a shell-safe copyable command", () => {
     './argus --url "ws://example.com:8080/nodes/ws?token=abc123"'
   );
   assert.equal(buildNodeConnectionCommand(""), null);
+});
+
+test("derivePublicNodeWsUrl prefers the public base url for copy commands", () => {
+  assert.equal(
+    derivePublicNodeWsUrl({
+      publicNodeWsUrl: null,
+      publicBaseUrl: "http://91.103.121.64:8080",
+      fallbackBaseUrl: "http://gateway:8080",
+      pathName: "/nodes/ws",
+      token: "argus-node-v1.session.sig"
+    }),
+    "ws://91.103.121.64:8080/nodes/ws?token=argus-node-v1.session.sig"
+  );
+
+  assert.equal(
+    derivePublicNodeWsUrl({
+      publicNodeWsUrl: "wss://example.com/custom/ws",
+      publicBaseUrl: null,
+      fallbackBaseUrl: "http://gateway:8080",
+      pathName: "/nodes/ws",
+      token: "abc123"
+    }),
+    "wss://example.com/custom/ws?token=abc123"
+  );
 });

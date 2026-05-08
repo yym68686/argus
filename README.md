@@ -85,7 +85,7 @@ cp .env.example .env
 
 How changes take effect:
 
-- **Build-time**: `ARGUS_RUNTIME_INSTALL_CMD` and `NEXT_PUBLIC_ARGUS_WS_URL` are baked into images/build output; rebuild after changing them.
+- **Build-time**: `ARGUS_RUNTIME_INSTALL_CMD` is baked into images/build output; `NEXT_PUBLIC_ARGUS_WS_URL` is a web-only build preset and usually can stay unset in the bundled compose setup. Rebuild after changing either.
 - **Gateway restart**: most gateway / Telegram bot variables take effect after restarting the relevant container.
 - **New runtime sessions only**: variables injected into spawned runtime containers (`ARGUS_RUNTIME_CMD`, resource limits, gateway-internal host, per-session proxy wiring) apply only to newly created sessions.
 
@@ -94,7 +94,7 @@ How changes take effect:
 | Variable | Required? | Default | What it does / notes |
 | --- | --- | --- | --- |
 | `ARGUS_TOKEN` | Recommended; effectively required if you expose the gateway beyond localhost | unset | Shared bearer token for `/ws` and the HTTP management endpoints. Also acts as the fallback master secret for `ARGUS_NODE_TOKEN`, `ARGUS_MCP_TOKEN`, and `ARGUS_OPENAI_TOKEN`. This is **not** an OpenAI API key. |
-| `ARGUS_PUBLIC_BASE_URL` | Required if you use native host-agents / local Codex hosts | unset | Public gateway base URL that native host sessions use when wiring back to `/mcp`, `/openai/v1`, and the host-agent enrollment flow. Example: `https://argus.example.com`. |
+| `ARGUS_PUBLIC_BASE_URL` | Required if you use native host-agents / local Codex hosts | unset | Public gateway base URL used by native host sessions, gateway-generated external links, and Telegram node copy commands. Example: `https://argus.example.com`. |
 | `ARGUS_NODE_TOKEN` | Optional | falls back to `ARGUS_TOKEN` | Separate master secret for derived `/nodes/ws` session tokens. Set this if you want node access scoped separately from the main gateway token. |
 | `ARGUS_MCP_TOKEN` | Optional | falls back to `ARGUS_TOKEN` | Separate master secret for the gateway MCP endpoint. Runtime containers receive per-session derived tokens instead of the raw secret. |
 | `ARGUS_DATABASE_URL` | Optional, but recommended for non-trivial deployments | unset | PostgreSQL DSN used for gateway automation state and usage ledger. When unset, Argus also accepts Fugue managed Postgres binding env (`DB_TYPE=postgres`, `DB_HOST`, `DB_PORT`, `DB_USER`, `DB_PASSWORD`, `DB_NAME`) and builds the DSN from those values. When PostgreSQL is configured, Argus stores gateway state in PostgreSQL and auto-imports legacy `state.json`, `state.db`, and `usage.db` on first boot when the target tables are still empty. |
@@ -187,12 +187,14 @@ Channel behavior:
 
 | Variable | Required? | Default | What it does / notes |
 | --- | --- | --- | --- |
-| `NEXT_PUBLIC_ARGUS_WS_URL` | Optional | unset | **Build-time** preset WebSocket URL for the optional web UI. Rebuild `web` after changing it. Common example: `ws://127.0.0.1:8080/ws?token=...`. When the UI is served behind HTTPS and the preset still uses `ws://`, the client will automatically reuse the current page origin with `wss://` while preserving the original path/query. |
+| `NEXT_PUBLIC_ARGUS_WS_URL` | Optional | unset | **Build-time** preset WebSocket URL for the optional web UI. Rebuild `web` after changing it. Common example: `ws://127.0.0.1:8080/ws?token=...`. When the UI is served behind HTTPS and the preset still uses `ws://`, the client will automatically reuse the current page origin with `wss://` while preserving the original path/query. In the bundled compose setup you can usually leave this unset. |
 | `TELEGRAM_BOT_TOKEN` | Required for `docker compose --profile tg ...` | unset | Telegram bot token from `@BotFather`. The Telegram bot service exits immediately if this is missing. |
 | `TELEGRAM_DRAFT_STREAMING` | Optional | `auto` | Controls gateway-side private-chat draft streaming. Accepted forms: `auto` / `on` / `true`, `force` / `always`, and `off`. |
-| `HOST` | Optional helper variable | `127.0.0.1` | Convenience host used by docs, examples, and Telegram bot URL derivation. It is **not** a security boundary and is not required by the gateway itself. In Docker, `gateway` is used automatically when appropriate. |
-| `ARGUS_GATEWAY_WS_URL` | Optional | derived from `HOST` or `NEXT_PUBLIC_ARGUS_WS_URL` | Explicit WebSocket URL for `apps/telegram-bot` when it is not running in the default Compose topology. |
-| `ARGUS_GATEWAY_HTTP_URL` | Optional | derived from `ARGUS_GATEWAY_WS_URL` or `HOST` | Explicit HTTP base URL for `apps/telegram-bot`. Useful when WS and HTTP are routed differently or when URL derivation is wrong for your deployment. |
+| `ARGUS_PUBLIC_BASE_URL` | Optional but recommended | unset | Public gateway base URL used by Telegram node copy commands. When set, the bot shows `ws://<public-host>:8080/nodes/ws?...` instead of a Docker-internal hostname. |
+| `ARGUS_PUBLIC_NODE_WS_URL` | Optional | unset | Full public `/nodes/ws` override when the exposed public path differs from the default. |
+| `ARGUS_GATEWAY_WS_URL` | Optional | `ws://gateway:8080/ws` in the bundled compose file | Internal WebSocket URL for `apps/telegram-bot` when it is not running in the default Compose topology. |
+| `ARGUS_GATEWAY_HTTP_URL` | Optional | `http://gateway:8080` in the bundled compose file | Internal HTTP base URL for `apps/telegram-bot`. Useful when WS and HTTP are routed differently or when URL derivation is wrong for your deployment. |
+| `HOST` | Optional helper variable | `127.0.0.1` | Legacy/docs helper only; not required when compose sets the internal URLs explicitly. |
 | `ARGUS_CWD` | Optional | `/workspace` | Default working directory passed by `apps/telegram-bot` when creating/resuming threads. |
 | `STATE_PATH` | Optional | In container: `/data/state.json`; outside container: `./state.json` | Persistent state path for `apps/telegram-bot`. Only relevant if you run the bot directly rather than through the provided volume setup. |
 | `TELEGRAM_ADMIN_CHAT_IDS` | Reserved / currently unused in this repo | unset | Present in `docker-compose.yml`, but the current codebase does not read it yet. Safe to leave unset for now. |
@@ -388,7 +390,7 @@ This repo now ships with [fugue.yaml](/Users/yanyuming/Downloads/GitHub/argus/fu
 - `runtime`: non-public template app whose current image is reused for per-session Fugue apps
 - `telegram-bot`: optional companion service; keep it only when `TELEGRAM_BOT_TOKEN` is set
 
-The bundled manifest includes `gateway`, `postgres`, `runtime`, `web`, and `telegram-bot`. For `web`, you can either leave `NEXT_PUBLIC_ARGUS_WS_URL` unset and let the browser derive a same-origin WebSocket URL, or provide a build-time preset when you want the UI to point at a specific gateway.
+The bundled manifest includes `gateway`, `postgres`, `runtime`, `web`, and `telegram-bot`. For `web`, you can usually leave `NEXT_PUBLIC_ARGUS_WS_URL` unset and let the browser derive the gateway WebSocket URL from the current origin / port mapping. Use a build-time preset only when you need to point the UI at a different gateway.
 
 Because the gateway needs `ARGUS_FUGUE_PROJECT_ID`, Fugue deployment is a two-step flow: create/select the project first, then deploy into it.
 

@@ -256,8 +256,8 @@ cat > "$DEPLOY_DIR/.env" << EOF
 # ===== Argus 环境配置 (由部署脚本自动生成) =====
 # 生成时间: $(date '+%Y-%m-%d %H:%M:%S')
 
-# 供 Docker 内的 Telegram Bot 推导 gateway 地址使用。
-HOST=gateway
+# 公网 gateway 基础地址，供 Telegram Bot 生成可复制的节点命令使用。
+ARGUS_PUBLIC_BASE_URL=http://${SERVER_IP}:8080
 
 # --- Gateway 认证 ---
 ARGUS_TOKEN=${ARGUS_TOKEN}
@@ -283,9 +283,6 @@ ARGUS_OPENAI_RESPONSES_UPSTREAM_URL=${RESPONSES_UPSTREAM_URL}
 TELEGRAM_BOT_TOKEN=${TG_TOKEN}
 TELEGRAM_DRAFT_STREAMING=${TG_STREAMING}
 TELEGRAM_ADMIN_CHAT_IDS=${TG_ADMIN_IDS}
-
-# --- Web UI (取消注释以启用) ---
-# NEXT_PUBLIC_ARGUS_WS_URL="ws://${SERVER_IP}:8080/ws?token=${ARGUS_TOKEN}"
 EOF
 
 info ".env 配置文件已写入"
