@@ -1,4 +1,4 @@
-FROM golang:1.26-trixie AS node-host-builder
+FROM golang:1.26-alpine AS node-host-builder
 
 WORKDIR /src/apps/node-host
 COPY apps/node-host/ ./
