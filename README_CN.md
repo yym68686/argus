@@ -67,10 +67,17 @@ argus gateway upgrade --dir /root/argus
 curl -fsSL "http://127.0.0.1:8080/argus/install.sh" | bash
 ```
 
+或者直接从 GitHub 安装：
+
+```bash
+curl -fsSL "https://raw.githubusercontent.com/yym68686/argus/main/scripts/install-argus.sh" | bash
+```
+
 Windows：
 
 ```powershell
 powershell -NoProfile -ExecutionPolicy Bypass -Command "irm 'http://127.0.0.1:8080/argus/install.ps1' | iex"
+powershell -NoProfile -ExecutionPolicy Bypass -Command "irm 'https://raw.githubusercontent.com/yym68686/argus/main/scripts/install-argus.ps1' | iex"
 ```
 
 ## 开发者自助模式

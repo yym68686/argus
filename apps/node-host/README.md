@@ -21,6 +21,12 @@ Install from a running gateway:
 curl -fsSL "https://argus.example.com/argus/install.sh" | bash
 ```
 
+Install from GitHub:
+
+```bash
+curl -fsSL "https://raw.githubusercontent.com/yym68686/argus/main/scripts/install-argus.sh" | bash
+```
+
 Cross-compile:
 
 ```bash

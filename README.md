@@ -67,10 +67,17 @@ Install the `argus` CLI for the first time from a running gateway:
 curl -fsSL "http://127.0.0.1:8080/argus/install.sh" | bash
 ```
 
+Or install directly from GitHub:
+
+```bash
+curl -fsSL "https://raw.githubusercontent.com/yym68686/argus/main/scripts/install-argus.sh" | bash
+```
+
 On Windows:
 
 ```powershell
 powershell -NoProfile -ExecutionPolicy Bypass -Command "irm 'http://127.0.0.1:8080/argus/install.ps1' | iex"
+powershell -NoProfile -ExecutionPolicy Bypass -Command "irm 'https://raw.githubusercontent.com/yym68686/argus/main/scripts/install-argus.ps1' | iex"
 ```
 
 ## Developer Self-Serve
@@ -222,7 +229,7 @@ Channel behavior:
 For a user machine that should act as a first-class native Codex host, use the unified CLI:
 
 ```bash
-curl -fsSL "https://argus.example.com/argus/install.sh" | bash
+curl -fsSL "https://raw.githubusercontent.com/yym68686/argus/main/scripts/install-argus.sh" | bash
 argus connect --gateway "https://argus.example.com" --enroll-token "<one-time-token>" --default
 ```
 

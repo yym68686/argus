@@ -53,9 +53,12 @@ jobs:
           cd apps/node-host
           export CGO_ENABLED=0
 
+          GOOS=linux  GOARCH=arm64 go build -trimpath -ldflags "-s -w" -o "../../$out_dir/argus-linux-arm64"  ./cmd/argus
           GOOS=darwin GOARCH=arm64 go build -trimpath -ldflags "-s -w" -o "../../$out_dir/argus-darwin-arm64" ./cmd/argus
+          GOOS=darwin GOARCH=amd64 go build -trimpath -ldflags "-s -w" -o "../../$out_dir/argus-darwin-amd64" ./cmd/argus
           GOOS=linux  GOARCH=amd64 go build -trimpath -ldflags "-s -w" -o "../../$out_dir/argus-linux-amd64"  ./cmd/argus
           GOOS=windows GOARCH=amd64 go build -trimpath -ldflags "-s -w" -o "../../$out_dir/argus-windows-amd64.exe" ./cmd/argus
+          GOOS=windows GOARCH=arm64 go build -trimpath -ldflags "-s -w" -o "../../$out_dir/argus-windows-arm64.exe" ./cmd/argus
 
           cd "../../$out_dir"
           sha256sum argus-* > SHA256SUMS.txt
