@@ -1469,6 +1469,16 @@ def _is_image_media_ref(ref: str) -> bool:
     return ext in TELEGRAM_IMAGE_EXTS
 
 
+def _path_from_optional(raw: Optional[str]) -> Optional[Path]:
+    value = str(raw or "").strip()
+    if not value:
+        return None
+    try:
+        return Path(value)
+    except Exception:
+        return None
+
+
 def _split_media_from_output(raw: str) -> tuple[str, list[str]]:
     """
     Extract MEDIA directives from assistant output.
@@ -10435,16 +10445,25 @@ class AutomationManager:
     def _workspace_root_for_session(self, session_id: str) -> Optional[Path]:
         sid = session_id.strip() if isinstance(session_id, str) else ""
         if sid:
+            try:
+                resolved = _resolve_workspace_host_path_for_session(sid)
+            except Exception:
+                resolved = None
+            resolved_path = _path_from_optional(resolved)
+            if resolved_path is not None:
+                return resolved_path
             p = self.get_workspace_host_path_for_session(sid)
-            if isinstance(p, str) and p.strip():
-                return Path(p)
+            p_path = _path_from_optional(p)
+            if p_path is not None:
+                return p_path
             derived = _derive_default_workspace_host_path_for_session(
                 sid,
                 home_host_path=self._home_host_path,
                 workspace_base_host_path=self._workspace_host_path,
             )
-            if derived:
-                return Path(derived)
+            derived_path = _path_from_optional(derived)
+            if derived_path is not None:
+                return derived_path
         return self._workspace_root()
 
     def _staged_attachment_to_dict(self, attachment: PersistedStagedAttachment) -> dict[str, Any]:
@@ -12488,7 +12507,17 @@ class AutomationManager:
                 )
 
         if media_refs:
-            workspace_root = self._workspace_root_for_session(session_id)
+            workspace_root_source = "none"
+            try:
+                workspace_root = _path_from_optional(_resolve_workspace_host_path_for_session(session_id))
+            except Exception:
+                workspace_root = None
+            if workspace_root is not None:
+                workspace_root_source = "resolved_session"
+            else:
+                workspace_root = self._workspace_root_for_session(session_id)
+                if workspace_root is not None:
+                    workspace_root_source = "manager_fallback"
             root_resolved = None
             if workspace_root is not None:
                 try:
@@ -12514,7 +12543,7 @@ class AutomationManager:
                     if not ref.startswith("./"):
                         continue
                     if root_resolved is None:
-                        raise RuntimeError("workspace root is not configured (ARGUS_HOME_HOST_PATH/ARGUS_WORKSPACE_HOST_PATH)")
+                        raise RuntimeError("workspace root is not configured or could not be resolved for session")
 
                     rel = ref[2:]
                     cand = (root_resolved / rel).resolve()
@@ -12528,9 +12557,9 @@ class AutomationManager:
                             max_bytes=TELEGRAM_MAX_UPLOAD_BYTES,
                         )
                         if not pulled:
-                            raise RuntimeError("media file not found")
+                            raise RuntimeError(f"media file not found under workspace root: {root_resolved}")
                     if not cand.is_file():
-                        raise RuntimeError("media file not found")
+                        raise RuntimeError(f"media file not found under workspace root: {root_resolved}")
                     size = cand.stat().st_size
                     if size > TELEGRAM_MAX_UPLOAD_BYTES:
                         raise RuntimeError(f"media file too large ({size} bytes)")
@@ -12552,6 +12581,20 @@ class AutomationManager:
                         thread_id,
                         ref,
                         str(e),
+                    )
+                    _event_log(
+                        "warning",
+                        "gw.tg.final_delivery.attachment_result",
+                        session_id=session_id,
+                        thread_id=thread_id,
+                        turn_id=turn_id,
+                        chat_key_hash=_chat_key_hash(resolved_chat_key),
+                        result="error",
+                        ref_hash=_text_hash(ref),
+                        workspace_root_source=workspace_root_source,
+                        workspace_root_configured=root_resolved is not None,
+                        err_kind=type(e).__name__,
+                        err_msg=str(e),
                     )
 
         overall_result = "ok"
