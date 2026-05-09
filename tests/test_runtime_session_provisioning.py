@@ -80,6 +80,76 @@ class DatabaseConfigTests(unittest.TestCase):
                 argus_app._configured_database_url()
 
 
+class WorkspacePathTests(unittest.TestCase):
+    def test_default_native_workspace_path_uses_argus_home_native_workspaces(self) -> None:
+        with mock.patch.dict(os.environ, {"ARGUS_HOME_HOST_PATH": "/root/.argus"}, clear=True):
+            self.assertEqual(
+                argus_app._default_native_workspace_path("abc123abc123"),
+                "/root/.argus/native-workspaces/sess-abc123abc123",
+            )
+
+    def test_default_native_workspace_path_prefers_native_base_override(self) -> None:
+        with mock.patch.dict(
+            os.environ,
+            {
+                "ARGUS_HOME_HOST_PATH": "/root/.argus",
+                "ARGUS_NATIVE_WORKSPACE_BASE_PATH": "/srv/native",
+            },
+            clear=True,
+        ):
+            self.assertEqual(
+                argus_app._default_native_workspace_path("abc123abc123"),
+                "/srv/native/sess-abc123abc123",
+            )
+
+    def test_docker_user_agent_workspace_uses_argus_home_not_native_fallback(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            manager = argus_app.AutomationManager(
+                state_store=mock.Mock(),
+                home_host_path=tmpdir,
+                workspace_host_path=None,
+            )
+            placement = argus_app.SessionPlacement(kind=argus_app.SESSION_PLACEMENT_KIND_DOCKER).normalized(
+                session_id="abc123abc123"
+            )
+            with mock.patch.dict(os.environ, {"ARGUS_NATIVE_WORKSPACE_BASE_PATH": "/tmp/argus-native"}, clear=True):
+                self.assertEqual(
+                    manager._user_agent_workspace_host_path(
+                        session_id="abc123abc123",
+                        user_id=42,
+                        short_name="main",
+                        placement=placement,
+                    ),
+                    str((pathlib.Path(tmpdir) / "workspace-42-main").resolve()),
+                )
+
+    def test_docker_workspace_visibility_rejects_outside_configured_roots(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            home = pathlib.Path(tmpdir) / "home"
+            outside = pathlib.Path(tmpdir) / "argus-native" / "sess-abc123abc123"
+            with self.assertRaisesRegex(RuntimeError, "outside configured gateway-visible roots"):
+                argus_app._validate_docker_workspace_host_path_visible(
+                    str(outside),
+                    home_host_path=str(home),
+                    workspace_base_host_path=None,
+                    session_id="abc123abc123",
+                    gateway_containerized=True,
+                )
+
+    def test_docker_workspace_visibility_accepts_custom_workspace_base(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            home = pathlib.Path(tmpdir) / "home"
+            workspace_base = pathlib.Path(tmpdir) / "custom-workspaces"
+            workspace = workspace_base / "sess-abc123abc123"
+            argus_app._validate_docker_workspace_host_path_visible(
+                str(workspace),
+                home_host_path=str(home),
+                workspace_base_host_path=str(workspace_base),
+                session_id="abc123abc123",
+                gateway_containerized=True,
+            )
+
+
 class FugueApiHelperTests(unittest.TestCase):
     def _base_fugue_env(self, **overrides):
         env = {

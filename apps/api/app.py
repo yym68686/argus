@@ -288,6 +288,15 @@ def _normalize_abs_host_path(raw: Any) -> Optional[str]:
     return str(Path(text).resolve())
 
 
+def _path_is_under_or_equal(path: str, root: str) -> bool:
+    try:
+        child = Path(path).resolve()
+        parent = Path(root).resolve()
+    except Exception:
+        return False
+    return child == parent or child.is_relative_to(parent)
+
+
 def _host_binding_storage_key(scope_type: str, scope_id: Optional[str]) -> str:
     scope = _normalize_host_binding_scope_type(scope_type)
     if not scope:
@@ -349,6 +358,20 @@ def _configured_native_workspace_base_path() -> Optional[str]:
     if not raw:
         return None
     return raw if os.path.isabs(raw) else None
+
+
+def _default_native_workspace_base_path() -> Optional[str]:
+    configured = _configured_native_workspace_base_path()
+    if configured:
+        return configured
+    home_host_path = _configured_home_host_path()
+    if home_host_path and os.path.isabs(home_host_path):
+        return str((Path(home_host_path) / "native-workspaces").resolve())
+    try:
+        user_home = Path.home()
+    except Exception:
+        return None
+    return str((user_home / ".argus" / "native-workspaces").resolve())
 
 
 def _configured_native_runtime_host_id() -> Optional[str]:
@@ -677,9 +700,9 @@ def _default_native_workspace_path(session_id: str) -> Optional[str]:
     sid = _normalize_runtime_session_id(session_id)
     if not sid:
         return None
-    base = _configured_native_workspace_base_path()
+    base = _default_native_workspace_base_path()
     if not base:
-        base = "/tmp/argus-native"
+        return None
     return str((Path(base) / f"sess-{sid}").resolve())
 
 
@@ -9449,9 +9472,15 @@ class AutomationManager:
         return lock
 
     def _user_agent_workspace_host_path(self, *, session_id: str, user_id: int, short_name: str, placement: SessionPlacement) -> str:
-        return placement.workspace_path or _default_native_workspace_path(session_id) or (
-            str((Path(self._home_host_path) / f"workspace-{user_id}-{short_name}").resolve()) if self._home_host_path else ""
-        )
+        if placement.workspace_path:
+            return placement.workspace_path
+        if placement.kind == SESSION_PLACEMENT_KIND_NATIVE:
+            native_path = _default_native_workspace_path(session_id)
+            if native_path:
+                return native_path
+        if self._home_host_path:
+            return str((Path(self._home_host_path) / f"workspace-{user_id}-{short_name}").resolve())
+        return ""
 
     async def _set_agent_provisioning_pending(
         self,
@@ -19008,6 +19037,62 @@ def _docker_api_timeout_s() -> float:
         bound = 30.0
     return max(3.0, min(10.0, bound))
 
+
+def _gateway_running_in_container() -> bool:
+    if os.path.exists("/.dockerenv"):
+        return True
+    try:
+        cgroup = Path("/proc/1/cgroup").read_text(errors="ignore")
+    except Exception:
+        return False
+    lowered = cgroup.lower()
+    return any(marker in lowered for marker in ("docker", "kubepods", "containerd"))
+
+
+def _docker_workspace_visible_roots(
+    *,
+    home_host_path: Optional[str],
+    workspace_base_host_path: Optional[str],
+) -> list[str]:
+    roots: list[str] = []
+    home = _normalize_abs_host_path(home_host_path)
+    if home:
+        roots.append(home)
+    workspace_base = _normalize_abs_host_path(workspace_base_host_path)
+    if workspace_base and workspace_base not in roots:
+        roots.append(workspace_base)
+    return roots
+
+
+def _validate_docker_workspace_host_path_visible(
+    workspace_host_path: str,
+    *,
+    home_host_path: Optional[str],
+    workspace_base_host_path: Optional[str],
+    session_id: str,
+    gateway_containerized: Optional[bool] = None,
+) -> None:
+    if gateway_containerized is None:
+        gateway_containerized = _gateway_running_in_container()
+    if not gateway_containerized:
+        return
+    workspace = _normalize_abs_host_path(workspace_host_path)
+    if not workspace:
+        raise RuntimeError(f"Invalid workspaceHostPath for session {session_id}: not an absolute path")
+    roots = _docker_workspace_visible_roots(
+        home_host_path=home_host_path,
+        workspace_base_host_path=workspace_base_host_path,
+    )
+    if any(_path_is_under_or_equal(workspace, root) for root in roots):
+        return
+    roots_text = ", ".join(roots) if roots else "(none)"
+    raise RuntimeError(
+        f"Docker workspaceHostPath for session {session_id} is outside configured gateway-visible roots: "
+        f"{workspace}. Configure ARGUS_HOME_HOST_PATH/ARGUS_WORKSPACE_HOST_PATH and bind-mount the same absolute "
+        f"path into the gateway container. Configured roots: {roots_text}"
+    )
+
+
 _MEM_LIMIT_RE = re.compile(r"^\s*(\d+(?:\.\d+)?)\s*([kmgt]i?b?|b)?\s*$", re.IGNORECASE)
 
 
@@ -19576,6 +19661,12 @@ async def _ensure_live_docker_session_unlocked(session_id: str, *, allow_create:
         raise RuntimeError("workspace root is not configured (ARGUS_HOME_HOST_PATH/ARGUS_WORKSPACE_HOST_PATH)")
     if not os.path.isabs(workspace_host_path):
         raise RuntimeError(f"Invalid workspaceHostPath for session {session_id}: not an absolute path")
+    _validate_docker_workspace_host_path_visible(
+        workspace_host_path,
+        home_host_path=cfg.home_host_path,
+        workspace_base_host_path=cfg.workspace_host_path,
+        session_id=session_id,
+    )
     try:
         Path(workspace_host_path).mkdir(parents=True, exist_ok=True)
     except Exception as e:

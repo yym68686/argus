@@ -77,6 +77,8 @@ services:
       - ${DOCKER_SOCK:-/var/run/docker.sock}:/var/run/docker.sock
       # Persist local workspace mirrors (and sqlite fallback files when ARGUS_DATABASE_URL is unset).
       - ${ARGUS_HOME_HOST_PATH:-${HOME}/.argus}:${ARGUS_HOME_HOST_PATH:-${HOME}/.argus}
+      # Keep an explicit custom workspace base visible to the gateway at the same absolute path it passes to Docker.
+      - ${ARGUS_WORKSPACE_HOST_PATH:-${ARGUS_HOME_HOST_PATH:-${HOME}/.argus}/workspaces}:${ARGUS_WORKSPACE_HOST_PATH:-${ARGUS_HOME_HOST_PATH:-${HOME}/.argus}/workspaces}
     ports:
       - "8080:8080"
     networks:
