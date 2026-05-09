@@ -227,6 +227,16 @@ argus --host 127.0.0.1:8080 --token "argus-node-v1.<sessionId>.<sig>"
 argus --gateway "http://127.0.0.1:8080" --token "argus-node-v1.<sessionId>.<sig>"
 ```
 
+旧版节点命令现在会在后台启动并立即返回。用下面这些本机命令管理这个后台节点：
+
+```bash
+argus logs
+argus reconnect
+argus disconnect
+```
+
+`argus logs` 是阻塞式日志命令，会持续跟随连接 / 重连 / 审计输出。需要旧的前台运行方式时，使用 `argus legacy-node --host ... --token ...`。
+
 | 变量 | 是否必需 | 默认值 | 作用 / 注意事项 |
 | --- | --- | --- | --- |
 | `ARGUS_NODE_WS_URL` | 可选 | 未设置 | `/nodes/ws` 的完整 WebSocket 地址。手动使用时优先用 `--host/--gateway` 加 `--token`。例如 `ws://127.0.0.1:8080/nodes/ws?token=...`。 |

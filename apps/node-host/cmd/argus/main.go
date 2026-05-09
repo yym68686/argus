@@ -44,7 +44,7 @@ func main() {
 
 func dispatch(args []string) error {
 	if len(args) == 0 {
-		return runLegacyNode(nil)
+		return runLegacyNodeBackground(nil)
 	}
 	switch args[0] {
 	case "connect":
@@ -59,8 +59,16 @@ func dispatch(args []string) error {
 		return runStatus(args[1:])
 	case "disconnect":
 		return runDisconnect(args[1:])
+	case "reconnect":
+		return runLegacyNodeReconnect(args[1:])
+	case "logs", "log":
+		return runLegacyNodeLogs(args[1:])
+	case "node":
+		return runLegacyNodeSubcommand(args[1:])
 	case "legacy-node":
 		return runLegacyNode(args[1:])
+	case "legacy-node-run":
+		return runLegacyNodeWorker(args[1:])
 	case "legacy-runtime-host":
 		return runLegacyRuntimeHost(args[1:])
 	case "help", "--help", "-h":
@@ -68,7 +76,7 @@ func dispatch(args []string) error {
 		return nil
 	default:
 		if strings.HasPrefix(args[0], "-") {
-			return runLegacyNode(args)
+			return runLegacyNodeBackground(args)
 		}
 		printUsage()
 		return fmt.Errorf("unknown subcommand: %s", args[0])
@@ -85,11 +93,15 @@ Usage:
   argus gateway upgrade [--dir <repo>] [--profile tg]
   argus status [--config <path>]
   argus disconnect [--config <path>]
+  argus reconnect [--config <path>]
+  argus logs [--config <path>] [--tail 120]
 
 Legacy compatibility:
-  argus --gateway <base-url> --token <node-token> --node-id <id>
-  argus --host <host:port> --token <node-token> --node-id <id>
-  argus --url <nodes-ws-url> --node-id <id>
+  argus --gateway <base-url> --token <node-token> --node-id <id>   (starts in background)
+  argus --host <host:port> --token <node-token> --node-id <id>     (starts in background)
+  argus --url <nodes-ws-url> --node-id <id>                        (starts in background)
+  argus legacy-node --host <host:port> --token <node-token>        (foreground)
+  argus node disconnect|reconnect|logs
   argus legacy-runtime-host --url <runtime-host-ws-url> --host-id <id>
 `, version.Current())
 }
@@ -103,7 +115,10 @@ func runLegacyNode(args []string) error {
 	if err != nil {
 		return err
 	}
+	return runLegacyNodeConfig(cfg)
+}
 
+func runLegacyNodeConfig(cfg *nodehost.Config) error {
 	invoker := &nodehost.CommandInvoker{}
 	host := nodehost.New(cfg, invoker)
 
@@ -294,6 +309,20 @@ func runStatus(args []string) error {
 }
 
 func runDisconnect(args []string) error {
+	if legacyNodeProcessRunningForArgs(args) {
+		return runLegacyNodeDisconnect(args)
+	}
+	err := runHostAgentDisconnect(args)
+	if err == nil {
+		return nil
+	}
+	if legacyNodeConfigExists() {
+		return runLegacyNodeDisconnect(args)
+	}
+	return err
+}
+
+func runHostAgentDisconnect(args []string) error {
 	fs := flag.NewFlagSet("disconnect", flag.ContinueOnError)
 	configPath := fs.String("config", defaultConfigPath(), "host-agent config path")
 	keepConfig := fs.Bool("keep-config", false, "do not remove the local config after revoking")

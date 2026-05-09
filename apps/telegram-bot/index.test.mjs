@@ -3,7 +3,10 @@ import assert from "node:assert/strict";
 
 import {
   buildArgusCliInstallCommand,
+  buildNodeDisconnectCommand,
   buildNodeConnectionCommand,
+  buildNodeLogsCommand,
+  buildNodeReconnectCommand,
   derivePublicNodeWsUrl,
   deriveTelegramWebhookSecret,
   isTelegramGetUpdatesWebhookConflict,
@@ -103,6 +106,12 @@ test("buildArgusCliInstallCommand renders the GitHub installer command", () => {
     buildArgusCliInstallCommand(),
     'curl -fsSL "https://raw.githubusercontent.com/yym68686/argus/main/scripts/install-argus.sh" | bash'
   );
+});
+
+test("node lifecycle commands are short copyable commands", () => {
+  assert.equal(buildNodeLogsCommand(), "argus logs");
+  assert.equal(buildNodeReconnectCommand(), "argus reconnect");
+  assert.equal(buildNodeDisconnectCommand(), "argus disconnect");
 });
 
 test("derivePublicNodeWsUrl prefers the public base url for copy commands", () => {

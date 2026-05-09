@@ -88,6 +88,20 @@ argus --host 127.0.0.1:8080 --token "argus-node-v1.<sessionId>.<sig>" --node-id 
 argus --gateway "http://127.0.0.1:8080" --token "argus-node-v1.<sessionId>.<sig>" --node-id "mac"
 ```
 
+The legacy node command starts in the background and returns immediately. Manage that local background node with:
+
+```bash
+argus logs
+argus reconnect
+argus disconnect
+```
+
+Use `argus logs` when you want a blocking terminal that follows connection/reconnect/audit output. For the old foreground behavior, run:
+
+```bash
+argus legacy-node --host 127.0.0.1:8080 --token "argus-node-v1.<sessionId>.<sig>" --node-id "mac"
+```
+
 Interactive jobs on the legacy node plane:
 
 - Use `system.run` with `pty: true` to allocate a pseudo-terminal.

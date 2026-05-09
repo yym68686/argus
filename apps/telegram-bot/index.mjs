@@ -572,6 +572,18 @@ function buildNodeConnectionCommand(wsUrl) {
   return `argus --url ${shellDoubleQuote(raw)}`;
 }
 
+function buildNodeLogsCommand() {
+  return "argus logs";
+}
+
+function buildNodeReconnectCommand() {
+  return "argus reconnect";
+}
+
+function buildNodeDisconnectCommand() {
+  return "argus disconnect";
+}
+
 function deriveWsUrlFromBase(baseUrl, pathName, token) {
   const raw = stripOuterQuotes(baseUrl);
   if (!isNonEmptyString(raw)) return null;
@@ -1655,6 +1667,9 @@ function normalizeAvailableModels(models, currentModel) {
     btn_resume_node: "Resume",
     btn_show_node_token: "Show Token",
     btn_copy_node_command: "Copy Command",
+    btn_copy_node_logs: "Copy Logs",
+    btn_copy_node_reconnect: "Copy Reconnect",
+    btn_copy_node_disconnect: "Copy Disconnect",
     btn_copy_argus_install: "Copy Install",
     btn_status: "Status",
     btn_help: "Help",
@@ -1732,7 +1747,11 @@ function normalizeAvailableModels(models, currentModel) {
     node_connected_label: "Connected nodes",
     node_none_connected: "No nodes are currently connected for this session.",
     node_token_label: "Connection token",
-    node_command_label: "Run command",
+    node_command_label: "Start command (background)",
+    node_logs_label: "Logs command (blocks)",
+    node_reconnect_label: "Reconnect command",
+    node_disconnect_label: "Disconnect command",
+    node_command_hint: "The start command returns immediately. Use the logs command when you want to keep a terminal open and watch connection output.",
     node_install_label: "Install argus CLI",
     node_install_hint: "Run this once first if argus is not available. After install, run argus from any directory; no ./ prefix is needed.",
     node_status_active: "active",
@@ -1828,6 +1847,9 @@ function normalizeAvailableModels(models, currentModel) {
     btn_resume_node: "恢复",
     btn_show_node_token: "显示 Token",
     btn_copy_node_command: "复制命令",
+    btn_copy_node_logs: "复制日志命令",
+    btn_copy_node_reconnect: "复制重连命令",
+    btn_copy_node_disconnect: "复制断开命令",
     btn_copy_argus_install: "复制安装命令",
     btn_status: "状态",
     btn_help: "帮助",
@@ -1905,7 +1927,11 @@ function normalizeAvailableModels(models, currentModel) {
     node_connected_label: "已连接节点",
     node_none_connected: "当前 session 下还没有已连接节点。",
     node_token_label: "连接 Token",
-    node_command_label: "执行命令",
+    node_command_label: "启动命令（后台）",
+    node_logs_label: "日志命令（阻塞）",
+    node_reconnect_label: "重连命令",
+    node_disconnect_label: "断开命令",
+    node_command_hint: "启动命令会立即返回；需要在终端里持续查看连接输出时，用日志命令。",
     node_install_label: "安装 argus 命令行",
     node_install_hint: "如果本机还没有 argus，先执行一次安装命令；安装后任意目录可直接运行 argus，不需要加 ./。",
     node_status_active: "活跃",
@@ -3549,6 +3575,9 @@ async function main() {
     const rows = [];
     let nodeCommand = null;
     let nodeInstallCommand = null;
+    let nodeLogsCommand = null;
+    let nodeReconnectCommand = null;
+    let nodeDisconnectCommand = null;
     lines.push(`<b>${escapeHtml(S.title_node_token)}</b>`);
     if (isNonEmptyString(notice)) lines.push(`<i>${escapeHtml(notice)}</i>`);
 
@@ -3616,8 +3645,18 @@ async function main() {
             const command = buildNodeConnectionCommand(wsUrl);
             if (command) {
               nodeCommand = command;
+              nodeLogsCommand = buildNodeLogsCommand();
+              nodeReconnectCommand = buildNodeReconnectCommand();
+              nodeDisconnectCommand = buildNodeDisconnectCommand();
               lines.push(`${escapeHtml(S.node_command_label)}:
 <pre><code>${escapeHtml(command)}</code></pre>`);
+              lines.push(escapeHtml(S.node_command_hint));
+              lines.push(`${escapeHtml(S.node_logs_label)}:
+<pre><code>${escapeHtml(nodeLogsCommand)}</code></pre>`);
+              lines.push(`${escapeHtml(S.node_reconnect_label)}:
+<pre><code>${escapeHtml(nodeReconnectCommand)}</code></pre>`);
+              lines.push(`${escapeHtml(S.node_disconnect_label)}:
+<pre><code>${escapeHtml(nodeDisconnectCommand)}</code></pre>`);
               nodeInstallCommand = buildArgusCliInstallCommand();
               lines.push(`${escapeHtml(S.node_install_label)}:
 <pre><code>${escapeHtml(nodeInstallCommand)}</code></pre>`);
@@ -3645,6 +3684,11 @@ async function main() {
       if (copyInstallButton) rows.push([copyInstallButton]);
       const copyCommandButton = copyTextButton(S.btn_copy_node_command, nodeCommand);
       if (copyCommandButton) rows.push([copyCommandButton]);
+      const copyLogsButton = copyTextButton(S.btn_copy_node_logs, nodeLogsCommand);
+      const copyReconnectButton = copyTextButton(S.btn_copy_node_reconnect, nodeReconnectCommand);
+      const copyDisconnectButton = copyTextButton(S.btn_copy_node_disconnect, nodeDisconnectCommand);
+      if (copyLogsButton || copyReconnectButton) rows.push([copyLogsButton, copyReconnectButton].filter(Boolean));
+      if (copyDisconnectButton) rows.push([copyDisconnectButton]);
     }
     rows.push([cbButton(S.btn_refresh, { action: reveal ? "p:node_reveal" : "p:node", chatKey })]);
     if (!reveal) rows.push([cbButton(S.btn_show_node_token, { action: "p:node_reveal", chatKey })]);
@@ -5841,7 +5885,10 @@ async function main() {
 
 export {
   buildArgusCliInstallCommand,
+  buildNodeDisconnectCommand,
   buildNodeConnectionCommand,
+  buildNodeLogsCommand,
+  buildNodeReconnectCommand,
   clearTelegramWebhookForPolling,
   deriveTelegramWebhookSecret,
   deriveTelegramWebhookUrl,

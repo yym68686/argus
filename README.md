@@ -257,6 +257,16 @@ argus --host 127.0.0.1:8080 --token "argus-node-v1.<sessionId>.<sig>"
 argus --gateway "http://127.0.0.1:8080" --token "argus-node-v1.<sessionId>.<sig>"
 ```
 
+The legacy node command starts in the background and returns immediately. Use these local lifecycle commands for that background node:
+
+```bash
+argus logs
+argus reconnect
+argus disconnect
+```
+
+`argus logs` blocks and follows connection/reconnect/audit output. For the old foreground behavior, run `argus legacy-node --host ... --token ...`.
+
 | Variable | Required? | Default | What it does / notes |
 | --- | --- | --- | --- |
 | `ARGUS_NODE_WS_URL` | Optional | unset | Full WebSocket URL for `/nodes/ws`. Prefer `--host/--gateway` with `--token` for manual use. Example: `ws://127.0.0.1:8080/nodes/ws?token=...`. |
