@@ -52,7 +52,7 @@ Notes:
 Stop:
 
 ```bash
-docker compose down
+docker compose --profile tg down
 ```
 
 After installing the system `argus` CLI, update a self-hosted checkout and rebuild the containers with:

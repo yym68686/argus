@@ -41,7 +41,7 @@ func TestGatewayUpgradeShellScriptIncludesManagedRuntimeCleanup(t *testing.T) {
 	script := gatewayUpgradeShellScript()
 	for _, want := range []string{
 		"git pull --ff-only",
-		"docker compose down",
+		`docker compose "${compose_args[@]}" down`,
 		`docker ps -aq --filter "label=io.argus.gateway=apps/api"`,
 		`docker compose "${compose_args[@]}" up --build -d`,
 		"/app/node-host/argus",

@@ -52,7 +52,7 @@ docker compose --profile tg up --build
 停止：
 
 ```bash
-docker compose down
+docker compose --profile tg down
 ```
 
 安装系统级 `argus` CLI 后，可以用一条命令更新自托管仓库并重建容器：

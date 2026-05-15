@@ -34,9 +34,9 @@ func printGatewayUsage() {
 
 Updates a local Argus gateway checkout and rebuilt Docker services:
   git pull --ff-only
-  docker compose down
+  docker compose [--profile <name> ...] down
   docker rm -f <managed runtime containers>
-  docker compose --profile tg up --build -d
+  docker compose [--profile <name> ...] up --build -d
 `)
 }
 
@@ -164,15 +164,6 @@ cd "$ARGUS_GATEWAY_UPGRADE_DIR"
 echo "Updating Argus gateway in $(pwd)"
 git pull --ff-only
 
-docker compose down
-
-if [ "${ARGUS_GATEWAY_UPGRADE_REMOVE_RUNTIME:-1}" = "1" ]; then
-  ids="$(docker ps -aq --filter "label=io.argus.gateway=apps/api" || true)"
-  if [ -n "$ids" ]; then
-    docker rm -f $ids
-  fi
-fi
-
 compose_args=()
 profiles="${ARGUS_GATEWAY_UPGRADE_PROFILES:-}"
 profiles="${profiles//,/ }"
@@ -181,6 +172,15 @@ for profile in $profiles; do
     compose_args+=(--profile "$profile")
   fi
 done
+
+docker compose "${compose_args[@]}" down
+
+if [ "${ARGUS_GATEWAY_UPGRADE_REMOVE_RUNTIME:-1}" = "1" ]; then
+  ids="$(docker ps -aq --filter "label=io.argus.gateway=apps/api" || true)"
+  if [ -n "$ids" ]; then
+    docker rm -f $ids
+  fi
+fi
 
 docker compose "${compose_args[@]}" up --build -d
 
