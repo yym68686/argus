@@ -68,16 +68,6 @@ function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-function waitForServerClose(server) {
-  return new Promise((resolve) => {
-    if (!server) {
-      resolve();
-      return;
-    }
-    server.close(() => resolve());
-  });
-}
-
 function parseJson(text) {
   try {
     return JSON.parse(text);
@@ -673,6 +663,22 @@ function telegramWebhookInfoLogFields(info) {
   if (info.has_custom_certificate === true) fields.webhook_has_custom_certificate = true;
   if (allowedUpdates && allowedUpdates.length > 0) fields.webhook_allowed_updates = allowedUpdates;
   return fields;
+}
+
+function formatErrorMessage(error) {
+  return error instanceof Error ? error.message : String(error);
+}
+
+async function refreshTelegramBotIdentity(tg) {
+  try {
+    const me = await tg.getMe();
+    const username = isNonEmptyString(me?.username) ? me.username : null;
+    log("Telegram bot:", username ? `@${username}` : "(unknown)");
+    return username;
+  } catch (e) {
+    log("Telegram getMe failed (continuing):", formatErrorMessage(e));
+    return null;
+  }
 }
 
 function isTelegramGetUpdatesWebhookConflict(error) {
@@ -2313,9 +2319,7 @@ async function main() {
   log("Argus Telegram bot starting:", `version=${BOT_VERSION}`);
   const tg = new TelegramApi(telegramToken);
   const typing = new TypingController(tg);
-  const me = await tg.getMe();
-  const botUsername = isNonEmptyString(me?.username) ? me.username : null;
-  log("Telegram bot:", botUsername ? `@${botUsername}` : "(unknown)");
+  let botUsername = await refreshTelegramBotIdentity(tg);
 
   const defaultCommands = [
     { command: "menu", description: "Open menu" },
@@ -2362,6 +2366,16 @@ async function main() {
     );
   } catch (e) {
     log("setMyCommands failed (continuing):", e instanceof Error ? e.message : String(e));
+  }
+  if (!botUsername) {
+    const identityRetryTimer = setInterval(async () => {
+      const username = await refreshTelegramBotIdentity(tg);
+      if (username) {
+        botUsername = username;
+        clearInterval(identityRetryTimer);
+      }
+    }, 30_000);
+    identityRetryTimer.unref?.();
   }
 
   const state = new StateStore(statePath);
@@ -5154,25 +5168,37 @@ async function main() {
       secretToken: telegramDelivery.secretToken,
       onUpdate: enqueueWebhookUpdate
     });
-    try {
-      await tg.setWebhook({
-        url: telegramDelivery.url,
-        secret_token: telegramDelivery.secretToken,
-        allowed_updates: ["message", "callback_query"],
-        drop_pending_updates: false
-      });
-      log("Telegram webhook enabled:", redactUrlSecrets(telegramDelivery.url));
-      const info = await tg.getWebhookInfo().catch(() => null);
-      if (isObjectRecord(info)) {
-        logEvent("INFO", "tg.webhook.enabled", {
-          url: redactUrlSecrets(info.url || telegramDelivery.url),
-          pending_update_count: Number.isFinite(info.pending_update_count) ? info.pending_update_count : undefined,
-          has_custom_certificate: info.has_custom_certificate === true
+    const configureTelegramWebhook = async (reason) => {
+      try {
+        await tg.setWebhook({
+          url: telegramDelivery.url,
+          secret_token: telegramDelivery.secretToken,
+          allowed_updates: ["message", "callback_query"],
+          drop_pending_updates: false
         });
+        log("Telegram webhook enabled:", redactUrlSecrets(telegramDelivery.url));
+        const info = await tg.getWebhookInfo().catch(() => null);
+        if (isObjectRecord(info)) {
+          logEvent("INFO", "tg.webhook.enabled", {
+            url: redactUrlSecrets(info.url || telegramDelivery.url),
+            pending_update_count: Number.isFinite(info.pending_update_count) ? info.pending_update_count : undefined,
+            has_custom_certificate: info.has_custom_certificate === true
+          });
+        }
+        return true;
+      } catch (e) {
+        log(`setWebhook failed (${reason}; continuing):`, formatErrorMessage(e));
+        return false;
       }
-    } catch (e) {
-      await waitForServerClose(webhookServer);
-      throw e;
+    };
+    const webhookConfigured = await configureTelegramWebhook("startup");
+    if (!webhookConfigured) {
+      const webhookRetryTimer = setInterval(async () => {
+        if (await configureTelegramWebhook("retry")) {
+          clearInterval(webhookRetryTimer);
+        }
+      }, 30_000);
+      webhookRetryTimer.unref?.();
     }
     log("Serving Telegram webhook…", `port=${webhookListenPort}`, `path=${telegramDelivery.path}`);
   } else {
