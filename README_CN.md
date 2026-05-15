@@ -214,7 +214,7 @@ cp .env.example .env
 | `ARGUS_GATEWAY_HTTP_URL` | 可选 | bundled compose 下默认 `http://gateway:8080` | `apps/telegram-bot` 的内部 HTTP base URL。WS / HTTP 分流或自动推导不正确时再显式指定。 |
 | `HOST` | 可选辅助变量 | `127.0.0.1` | 仅用于文档 / 旧部署兼容；在 compose 里显式设置内部 URL 时通常不再需要。 |
 | `ARGUS_CWD` | 可选 | `/workspace` | `apps/telegram-bot` 创建 / 恢复线程时默认使用的工作目录。 |
-| `STATE_PATH` | 可选 | 容器内默认 `/data/state.json`；容器外默认 `./state.json` | `apps/telegram-bot` 的本地状态文件路径。只有你直接运行 bot（而不是用当前 compose volume）时才需要关心。 |
+| `STATE_PATH` | 可选 | bundled compose volume 下默认 `/data/state.json`；其它场景默认 `./state.json` | `apps/telegram-bot` 的本地状态文件路径。Fugue 会把 bot 当成无状态 webhook service 部署；除非你明确需要有状态恢复，否则不要再给 Fugue 版 bot 加应用级持久化存储。 |
 | `TELEGRAM_ADMIN_CHAT_IDS` | 预留 / 当前版本未使用 | 未设置 | `docker-compose.yml` 里保留了这个变量，但当前代码并没有读取它；现在可以安全忽略。 |
 
 ### 独立 node-host（`apps/node-host`）
@@ -402,7 +402,7 @@ open http://127.0.0.1:3000
 - `gateway`：公网入口，运行在 `ARGUS_PROVISION_MODE=fugue`
 - `postgres`：内部 PostgreSQL backing service，负责保存 gateway 状态和 usage
 - `runtime`：非公网的模板 app，gateway 会复用它的当前镜像来创建每个 session app
-- `telegram-bot`：可选配套服务；只有在你提供 `TELEGRAM_BOT_TOKEN` 时才建议保留
+- `telegram-bot`：可选配套服务；只有在你提供 `TELEGRAM_BOT_TOKEN` 时才建议保留。`fugue.yaml` 中它刻意保持无状态并使用 webhook 投递，以便继续可迁移。
 
 这份 manifest 现在已经包含 `gateway`、`postgres`、`runtime`、`web` 和 `telegram-bot`。对 `web` 来说，通常可以不设置 `NEXT_PUBLIC_ARGUS_WS_URL`，让浏览器按当前页面和端口映射自动推导 WebSocket 地址；只有在你需要把前端指向别的 gateway 时才提供这个构建期预设。
 

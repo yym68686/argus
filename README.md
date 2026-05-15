@@ -221,7 +221,7 @@ Channel behavior:
 | `ARGUS_GATEWAY_HTTP_URL` | Optional | `http://gateway:8080` in the bundled compose file | Internal HTTP base URL for `apps/telegram-bot`. Useful when WS and HTTP are routed differently or when URL derivation is wrong for your deployment. |
 | `HOST` | Optional helper variable | `127.0.0.1` | Legacy/docs helper only; not required when compose sets the internal URLs explicitly. |
 | `ARGUS_CWD` | Optional | `/workspace` | Default working directory passed by `apps/telegram-bot` when creating/resuming threads. |
-| `STATE_PATH` | Optional | In container: `/data/state.json`; outside container: `./state.json` | Persistent state path for `apps/telegram-bot`. Only relevant if you run the bot directly rather than through the provided volume setup. |
+| `STATE_PATH` | Optional | Compose with the bundled volume: `/data/state.json`; otherwise: `./state.json` | Local state path for `apps/telegram-bot`. Fugue deploys the bot as a stateless webhook service, so do not add app-local persistent storage there unless you intentionally need stateful bot recovery. |
 | `TELEGRAM_ADMIN_CHAT_IDS` | Reserved / currently unused in this repo | unset | Present in `docker-compose.yml`, but the current codebase does not read it yet. Safe to leave unset for now. |
 
 ### Standalone host-agent (`apps/node-host`)
@@ -436,7 +436,7 @@ This repo now ships with [fugue.yaml](/Users/yanyuming/Downloads/GitHub/argus/fu
 - `gateway`: public service, runs in `ARGUS_PROVISION_MODE=fugue`
 - `postgres`: internal PostgreSQL backing service for gateway state + usage
 - `runtime`: non-public template app whose current image is reused for per-session Fugue apps
-- `telegram-bot`: optional companion service; keep it only when `TELEGRAM_BOT_TOKEN` is set
+- `telegram-bot`: optional companion service; keep it only when `TELEGRAM_BOT_TOKEN` is set. In `fugue.yaml` it is intentionally stateless and uses webhook delivery so it can stay movable.
 
 The bundled manifest includes `gateway`, `postgres`, `runtime`, `web`, and `telegram-bot`. For `web`, you can usually leave `NEXT_PUBLIC_ARGUS_WS_URL` unset and let the browser derive the gateway WebSocket URL from the current origin / port mapping. Use a build-time preset only when you need to point the UI at a different gateway.
 
