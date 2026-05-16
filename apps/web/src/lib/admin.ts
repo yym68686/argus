@@ -204,7 +204,9 @@ export interface HostAgentSummary {
   tokenPreview?: string | null;
   claimed?: boolean;
   connected?: boolean;
+  online?: boolean;
   runtimeConnected?: boolean;
+  controlConnected?: boolean;
   nodeConnected?: boolean;
   workspaceBasePath?: string | null;
   codexProfileMode?: string | null;

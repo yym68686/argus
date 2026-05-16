@@ -9,7 +9,7 @@ import { useAuth } from "@/components/admin-gate";
 import { Badge, EmptyState, InlineError, PanelCard, Skeleton, StatCard } from "@/components/console-primitives";
 import { ConsoleShell } from "@/components/console-shell";
 import { Button } from "@/components/ui/button";
-import { type AdminSessionRow, deleteAdminSession, fetchAdminSessions } from "@/lib/admin";
+import { type AdminSessionRow, type AdminUserSummary, deleteAdminSession, fetchAdminSessions, fetchAdminUsers } from "@/lib/admin";
 import { formatInt } from "@/lib/format";
 import { useGatewayWsUrlState } from "@/lib/gateway";
 
@@ -35,11 +35,21 @@ function sessionValue(value?: string | number | null): string {
   return "—";
 }
 
+function ownerDisplayValue(session: AdminSessionRow, usersById: Map<number, AdminUserSummary>): string {
+  const ownerUserId = session.ownerUserId;
+  if (typeof ownerUserId !== "number" || !Number.isFinite(ownerUserId) || ownerUserId <= 0) {
+    return "—";
+  }
+  const email = usersById.get(ownerUserId)?.email?.trim();
+  return email || String(ownerUserId);
+}
+
 export default function SessionFleetPage() {
   const { user } = useAuth();
   const { confirm, confirmDialog } = useConfirmDialog();
   const [wsUrl] = useGatewayWsUrlState();
   const [sessions, setSessions] = React.useState<AdminSessionRow[]>([]);
+  const [users, setUsers] = React.useState<AdminUserSummary[]>([]);
   const [loading, setLoading] = React.useState(false);
   const [deletingId, setDeletingId] = React.useState<string | null>(null);
   const [error, setError] = React.useState<string | null>(null);
@@ -50,8 +60,19 @@ export default function SessionFleetPage() {
       setLoading(true);
       setError(null);
       try {
-        const result = await fetchAdminSessions(wsUrl);
-        setSessions(Array.isArray(result.sessions) ? result.sessions : []);
+        const [sessionsResult, usersResult] = await Promise.allSettled([
+          fetchAdminSessions(wsUrl),
+          fetchAdminUsers(wsUrl),
+        ]);
+        if (sessionsResult.status === "rejected") {
+          throw sessionsResult.reason;
+        }
+        setSessions(Array.isArray(sessionsResult.value.sessions) ? sessionsResult.value.sessions : []);
+        if (usersResult.status === "fulfilled") {
+          setUsers(Array.isArray(usersResult.value.users) ? usersResult.value.users : []);
+        } else {
+          setUsers([]);
+        }
         if (opts?.notify) {
           toast.success("Refreshed");
         }
@@ -124,6 +145,15 @@ export default function SessionFleetPage() {
       ).size,
     [sessions],
   );
+  const usersById = React.useMemo(() => {
+    const next = new Map<number, AdminUserSummary>();
+    for (const item of users) {
+      if (typeof item.userId === "number" && Number.isFinite(item.userId) && item.userId > 0) {
+        next.set(item.userId, item);
+      }
+    }
+    return next;
+  }, [users]);
   const showSkeleton = loading && !sessions.length && !error;
 
   if (!user || !user.isAdmin) return null;
@@ -203,7 +233,7 @@ export default function SessionFleetPage() {
                             ) : null}
                           </div>
                         </td>
-                        <td className="px-4 py-3 font-mono text-[12.5px]">{sessionValue(session.ownerUserId)}</td>
+                        <td className="px-4 py-3 break-all text-[12.5px]">{ownerDisplayValue(session, usersById)}</td>
                         <td className="px-4 py-3 font-mono text-[12.5px]">{sessionValue(session.agentId)}</td>
                         <td className="px-4 py-3 font-mono text-[12.5px]">{sessionValue(session.containerId)}</td>
                         <td className="px-4 py-3">
