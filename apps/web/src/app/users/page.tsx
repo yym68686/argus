@@ -64,12 +64,32 @@ function formatTelegramIdentity(profile: AdminUserSummary["telegramProfile"] | n
   return parts.length ? parts.join(" · ") : null;
 }
 
-function userIdentitySubtitle(user: Pick<AdminUserSummary, "email" | "telegramProfile" | "privateChatKey" | "currentChannel" | "currentChannelId">): string {
-  const parts: string[] = [];
-  if (user.email) parts.push(user.email);
+function userPrimaryLabel(user: Pick<AdminUserSummary, "userId" | "email" | "telegramProfile" | "privateChatKey">): string {
+  const email = user.email?.trim();
+  if (email) return email;
   const telegramIdentity = formatTelegramIdentity(user.telegramProfile);
-  if (telegramIdentity) parts.push(telegramIdentity);
-  parts.push(`Private chat ${user.privateChatKey}`);
+  if (telegramIdentity) return telegramIdentity;
+  const privateChatKey = String(user.privateChatKey || "").trim();
+  if (privateChatKey) return `Private chat ${privateChatKey}`;
+  return `ID ${user.userId}`;
+}
+
+function userSecondaryLabels(user: Pick<AdminUserSummary, "email" | "telegramProfile" | "privateChatKey">): string[] {
+  const labels: string[] = [];
+  const telegramIdentity = formatTelegramIdentity(user.telegramProfile);
+  if (user.email && telegramIdentity) labels.push(telegramIdentity);
+  if (!user.email && telegramIdentity && user.privateChatKey) labels.push(`Private chat ${user.privateChatKey}`);
+  return labels;
+}
+
+function userIdentitySubtitle(user: Pick<AdminUserSummary, "userId" | "email" | "telegramProfile" | "privateChatKey" | "currentChannel" | "currentChannelId">): string {
+  const primaryLabel = userPrimaryLabel(user);
+  const parts: string[] = [];
+  if (user.email && user.email !== primaryLabel) parts.push(user.email);
+  const telegramIdentity = formatTelegramIdentity(user.telegramProfile);
+  if (telegramIdentity && telegramIdentity !== primaryLabel) parts.push(telegramIdentity);
+  const privateChatLabel = `Private chat ${user.privateChatKey}`;
+  if (privateChatLabel !== primaryLabel) parts.push(privateChatLabel);
   parts.push(`current channel ${user.currentChannel?.name || user.currentChannelId || "gateway"}`);
   return parts.join(" · ");
 }
@@ -228,7 +248,7 @@ export default function UsersPage() {
       await gatewayFetchJson(wsUrl, `/admin/users/${encodeURIComponent(String(userId))}/bootstrap`, {
         method: "POST",
       });
-      toast.success(`User ${userId} initialized`);
+      toast.success(`Telegram user ${userId} initialized`);
       setBootstrapUserId("");
       selectUser(userId);
       await refreshUsers({ preserveSelection: true });
@@ -271,9 +291,7 @@ export default function UsersPage() {
     const currentUser = detail?.user.userId === selectedUserId
       ? detail.user
       : users.find((user) => user.userId === selectedUserId) ?? null;
-    const label = currentUser?.email || currentUser?.telegramProfile?.username
-      ? `${currentUser?.email || ""}${currentUser?.email && currentUser?.telegramProfile?.username ? " / " : ""}${currentUser?.telegramProfile?.username ? `@${currentUser.telegramProfile.username}` : ""}`
-      : `User ${selectedUserId}`;
+    const label = currentUser ? userPrimaryLabel(currentUser) : `ID ${selectedUserId}`;
     const confirmed = await confirm({
       title: "Delete user?",
       body: `Delete ${label}? This will remove the user's agents, channel settings, Telegram profile, and console sessions.`,
@@ -298,7 +316,7 @@ export default function UsersPage() {
       setDetailError(null);
       await refreshUsers();
       toast.success(
-        `Deleted user ${response.deletedUserId} (${response.deletedAgentIds?.length ?? 0} agents, ${response.deletedCustomChannelIds?.length ?? 0} custom channels)`,
+        `Deleted ${label} (${response.deletedAgentIds?.length ?? 0} agents, ${response.deletedCustomChannelIds?.length ?? 0} custom channels)`,
       );
     } catch (error) {
       toast.error((error as Error)?.message || String(error));
@@ -654,6 +672,12 @@ export default function UsersPage() {
   const showDetailSkeleton = Boolean(selectedUserId && detailBusy && !detail);
   const rosterTitle = users.length ? `Users (${users.length})` : "Users";
   const deletingSelectedUser = Boolean(selectedUserId && pendingActions[`user-delete:${selectedUserId}`]);
+  const selectedUser = selectedUserId
+    ? detail?.user.userId === selectedUserId
+      ? detail.user
+      : users.find((user) => user.userId === selectedUserId) ?? null
+    : null;
+  const selectedUserLabel = selectedUser ? userPrimaryLabel(selectedUser) : null;
 
   return (
     <ConsoleShell title="Users">
@@ -709,6 +733,8 @@ export default function UsersPage() {
                 <tbody>
                   {users.map((user) => {
                     const active = user.userId === selectedUserId;
+                    const userLabel = userPrimaryLabel(user);
+                    const secondaryLabels = userSecondaryLabels(user);
                     return (
                       <tr
                         key={user.userId}
@@ -728,18 +754,16 @@ export default function UsersPage() {
                       >
                         <td className="px-4 py-3">
                           <div className="flex flex-wrap items-center gap-2">
-                            <span className="font-medium text-foreground">User {user.userId}</span>
+                            <span className="break-all font-medium text-foreground">{userLabel}</span>
                             {user.email ? <Badge tone="default">web</Badge> : null}
                             {user.telegramProfile ? <Badge tone="default">tg</Badge> : null}
                             {active ? <Badge tone="primary">selected</Badge> : null}
                           </div>
-                          {user.email ? <div className="mt-1 text-[12.5px] text-muted-foreground">{user.email}</div> : null}
-                          {user.telegramProfile ? (
-                            <div className="mt-1 text-[12.5px] text-muted-foreground">
-                              {formatTelegramIdentity(user.telegramProfile)}
+                          {secondaryLabels.map((label) => (
+                            <div key={label} className="mt-1 text-[12.5px] text-muted-foreground">
+                              {label}
                             </div>
-                          ) : null}
-                          <div className="mt-1 font-mono text-[12.5px] text-muted-foreground">{user.privateChatKey}</div>
+                          ))}
                         </td>
                         <td className="px-4 py-3">
                           <Badge tone={user.initialized ? "success" : "warning"}>
@@ -774,7 +798,7 @@ export default function UsersPage() {
 
           {selectedUserId ? (
             <div className="mt-3 flex flex-wrap items-center gap-2 text-xs text-muted-foreground">
-              <Badge tone="default">selected user {selectedUserId}</Badge>
+              <Badge tone="default">selected {selectedUserLabel || `ID ${selectedUserId}`}</Badge>
               <InfoPill label="users" value={String(users.length)} />
             </div>
           ) : null}
@@ -791,16 +815,16 @@ export default function UsersPage() {
               <EmptyState title="No selection" />
             </PanelCard>
           ) : showDetailSkeleton ? (
-            <UserDetailSkeleton userId={selectedUserId} />
+            <UserDetailSkeleton label={selectedUserLabel || "Loading user"} />
           ) : detailError ? (
-            <PanelCard title={`User ${selectedUserId}`}>
+            <PanelCard title={selectedUserLabel || `ID ${selectedUserId}`}>
               <InlineError message={detailError} />
             </PanelCard>
           ) : detail ? (
             <>
               <PanelCard
                 eyebrow="Selected user"
-                title={`User ${detail.user.userId}`}
+                title={userPrimaryLabel(detail.user)}
                 subtitle={userIdentitySubtitle(detail.user)}
                 className="argus-data-grid"
                 action={
@@ -1218,12 +1242,12 @@ function UsersRosterSkeleton() {
   );
 }
 
-function UserDetailSkeleton({ userId }: { userId: number }) {
+function UserDetailSkeleton({ label }: { label: string }) {
   return (
     <>
       <PanelCard
         eyebrow="Selected user"
-        title={`User ${userId}`}
+        title={label}
         className="argus-data-grid"
       >
         <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-4">
