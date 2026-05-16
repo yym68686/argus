@@ -284,7 +284,7 @@ export default function DevicesPage() {
             {showSkeleton ? (
               <div className="grid gap-3">
                 {Array.from({ length: 3 }).map((_, index) => (
-                  <div key={index} className="rounded-[18px] border border-border/70 bg-background/24 p-3">
+                  <div key={index} className="border-l border-border/58 px-3 py-2.5">
                     <Skeleton className="h-4 w-32 rounded-full" />
                     <Skeleton className="mt-3 h-3 w-52 rounded-full" />
                   </div>
@@ -293,7 +293,7 @@ export default function DevicesPage() {
             ) : hosts.length ? (
               <div className="grid gap-3">
                 {hosts.map((host) => (
-                  <div key={host.hostId} className="rounded-[18px] border border-border/70 bg-background/24 p-3">
+                  <div key={host.hostId} className="border-l border-border/58 px-3 py-2.5">
                     <div className="flex flex-wrap items-center justify-between gap-2">
                       <div>
                         <div className="font-medium text-foreground">{hostLabel(host)}</div>

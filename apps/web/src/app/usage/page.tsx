@@ -184,7 +184,7 @@ function AdminUsagePage() {
                 {showUsersSkeleton ? (
                   <div className="space-y-3">
                     {Array.from({ length: 6 }).map((_, index) => (
-                      <div key={index} className="argus-row-shell rounded-[16px] px-4 py-3">
+                      <div key={index} className="border-l border-border/58 px-3 py-2.5">
                         <Skeleton className="h-4 w-24 rounded-full" />
                         <Skeleton className="mt-3 h-3 w-40" />
                         <Skeleton className="mt-3 h-3 w-full" />
@@ -208,10 +208,10 @@ function AdminUsagePage() {
                           setLoading(true);
                         }}
                         className={cn(
-                          "argus-row-shell w-full rounded-[16px] px-4 py-3 text-left",
+                          "w-full border-l border-border/58 px-3 py-2.5 text-left transition-colors",
                           String(currentUser.userId) === selectedUserId
-                            ? "border-primary/28 bg-primary/10"
-                            : "hover:border-border hover:bg-background/36"
+                            ? "border-primary/70 bg-primary/10"
+                            : "hover:border-border hover:bg-background/24"
                         )}
                       >
                         <div className="flex items-start justify-between gap-3">
@@ -251,7 +251,7 @@ function AdminUsagePage() {
                 {showUsageSkeleton ? (
                   <div className="space-y-3">
                     {Array.from({ length: 7 }).map((_, index) => (
-                      <div key={index} className="grid gap-3 rounded-[16px] border border-border/70 bg-background/24 px-4 py-3 md:grid-cols-[1.15fr_0.7fr_0.95fr_0.95fr_0.95fr_0.7fr_0.7fr]">
+                      <div key={index} className="grid gap-3 border-t border-border/54 px-4 py-3 first:border-t-0 md:grid-cols-[1.15fr_0.7fr_0.95fr_0.95fr_0.95fr_0.7fr_0.7fr]">
                         {Array.from({ length: 7 }).map((__, cellIndex) => (
                           <Skeleton key={cellIndex} className="h-4 w-full" />
                         ))}
@@ -259,7 +259,7 @@ function AdminUsagePage() {
                     ))}
                   </div>
                 ) : (
-                  <div className="argus-table-shell rounded-[20px]">
+                  <div className="argus-table-shell">
                     <table className="w-full border-collapse text-sm">
                       <thead className="argus-table-head text-left text-[10px] uppercase tracking-[0.12em] text-muted-foreground">
                         <tr>

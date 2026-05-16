@@ -5,7 +5,7 @@ import { Plus, KeyRound, Trash2, UserRoundCheck, Pencil, Bot, RadioTower, Refres
 import { toast } from "sonner";
 
 import { useConfirmDialog } from "@/components/confirm-dialog";
-import { Badge, EmptyState, Fact, InfoPill, InlineError, PanelCard, Skeleton } from "@/components/console-primitives";
+import { Badge, EmptyState, Fact, InlineError, PanelCard, Skeleton } from "@/components/console-primitives";
 import { ConsoleShell } from "@/components/console-shell";
 import { PanelReveal, TextSwap } from "@/components/transitions";
 import { Button } from "@/components/ui/button";
@@ -686,6 +686,8 @@ export default function UsersPage() {
         <PanelCard
           eyebrow="Fleet roster"
           title={rosterTitle}
+          className="overflow-hidden"
+          contentClassName="-mx-4 -mb-4 -mt-4 min-w-0 md:-mx-5 md:-mb-5"
           action={
             <div className="grid gap-2 lg:grid-cols-[auto_minmax(0,1fr)_auto]">
               <Button
@@ -710,24 +712,28 @@ export default function UsersPage() {
             </div>
           }
         >
-          {usersError ? <InlineError message={usersError} /> : null}
+          {usersError ? (
+            <div className="px-4 pb-4 pt-4 md:px-5">
+              <InlineError message={usersError} />
+            </div>
+          ) : null}
           {showUsersSkeleton ? (
             <UsersRosterSkeleton />
           ) : users.length ? (
-            <div className="argus-table-shell rounded-[20px]">
-              <table className="min-w-[980px] w-full border-collapse text-sm">
+            <div className="argus-table-shell">
+              <table className="w-full min-w-[960px] border-collapse text-sm">
                 <thead className="argus-table-head text-left text-[10px] uppercase tracking-[0.12em] text-muted-foreground">
                   <tr>
-                    <th className="px-4 py-3">User</th>
-                    <th className="px-4 py-3">Status</th>
-                    <th className="px-4 py-3">Current agent</th>
-                    <th className="px-4 py-3">Channel</th>
-                    <th className="px-4 py-3">Model</th>
-                    <th className="px-4 py-3 text-right">Agents</th>
-                    <th className="px-4 py-3 text-right">Channels</th>
-                    <th className="px-4 py-3 text-right">Sessions</th>
-                    <th className="px-4 py-3 text-right">24h tokens</th>
-                    <th className="px-4 py-3">Last active</th>
+                    <th className="w-[25%] px-5 py-3.5">User</th>
+                    <th className="w-[10%] px-4 py-3.5">Status</th>
+                    <th className="w-[18%] px-4 py-3.5">Current agent</th>
+                    <th className="w-[12%] px-4 py-3.5">Channel</th>
+                    <th className="w-[8%] px-4 py-3.5">Model</th>
+                    <th className="w-[5%] px-4 py-3.5 text-right">Agents</th>
+                    <th className="w-[5%] px-4 py-3.5 text-right">Channels</th>
+                    <th className="hidden 2xl:table-cell w-[5%] px-4 py-3.5 text-right">Sessions</th>
+                    <th className="hidden 2xl:table-cell w-[7%] px-4 py-3.5 text-right">24h tokens</th>
+                    <th className="hidden 2xl:table-cell w-[7rem] px-5 py-3.5 text-right">Last active</th>
                   </tr>
                 </thead>
                 <tbody>
@@ -748,19 +754,19 @@ export default function UsersPage() {
                           }
                         }}
                         className={cn(
-                          "cursor-pointer border-t border-border/60 align-top transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary/30",
-                          active ? "bg-primary/10" : "hover:bg-background/36",
+                          "cursor-pointer border-t border-border/52 align-top transition-colors",
+                          "hover:bg-background/34 focus-visible:bg-primary/10 focus-visible:outline-none focus-visible:shadow-[inset_2px_0_0_0_oklch(var(--primary)/0.6)]",
+                          active ? "bg-primary/10 shadow-[inset_2px_0_0_0_oklch(var(--primary)/0.6)]" : null,
                         )}
                       >
-                        <td className="px-4 py-3">
+                        <td className="px-5 py-3.5">
                           <div className="flex flex-wrap items-center gap-2">
-                            <span className="break-all font-medium text-foreground">{userLabel}</span>
+                            <span className="min-w-0 max-w-[22rem] truncate font-medium text-foreground">{userLabel}</span>
                             {user.email ? <Badge tone="default">web</Badge> : null}
                             {user.telegramProfile ? <Badge tone="default">tg</Badge> : null}
-                            {active ? <Badge tone="primary">selected</Badge> : null}
                           </div>
                           {secondaryLabels.map((label) => (
-                            <div key={label} className="mt-1 text-[12.5px] text-muted-foreground">
+                            <div key={label} className="mt-1 truncate text-[12.5px] text-muted-foreground">
                               {label}
                             </div>
                           ))}
@@ -770,21 +776,26 @@ export default function UsersPage() {
                             {user.initialized ? "initialized" : "pending"}
                           </Badge>
                         </td>
-                        <td className="px-4 py-3 font-mono text-[12.5px]">{user.currentAgentId || user.defaultAgentId || "—"}</td>
+                        <td className="px-4 py-3 font-mono text-[12.5px]">
+                          <div className="max-w-[17rem] truncate">{user.currentAgentId || user.defaultAgentId || "—"}</div>
+                        </td>
                         <td className="px-4 py-3">
-                          <div>{user.currentChannel?.name || user.currentChannelId || "gateway"}</div>
+                          <div className="truncate">{user.currentChannel?.name || user.currentChannelId || "gateway"}</div>
                           <div className="mt-1 text-[12px] text-muted-foreground">
                             {user.readyChannelCount}/{user.channelCount} ready
                           </div>
                         </td>
-                        <td className="px-4 py-3 font-mono text-[12.5px]">{user.currentModel || "—"}</td>
-                        <td className="px-4 py-3 text-right font-medium">{formatInt(user.agentCount)}</td>
-                        <td className="px-4 py-3 text-right font-medium">{formatInt(user.channelCount)}</td>
-                        <td className="px-4 py-3 text-right font-medium">{formatInt(user.sessionCount)}</td>
-                        <td className="px-4 py-3 text-right font-medium">{formatCompact(user.usage24h.totalTokens)}</td>
-                        <td className="px-4 py-3">
-                          <div>{formatRelative(user.lastActiveMs)}</div>
-                          <div className="mt-1 text-[12px] text-muted-foreground">{formatWhen(user.lastActiveMs)}</div>
+                        <td className="px-4 py-3 font-mono text-[12.5px]">
+                          <div className="max-w-[8rem] truncate">{user.currentModel || "—"}</div>
+                        </td>
+                        <td className="px-4 py-3 text-right font-medium tabular-nums">{formatInt(user.agentCount)}</td>
+                        <td className="px-4 py-3 text-right font-medium tabular-nums">{formatInt(user.channelCount)}</td>
+                        <td className="hidden px-4 py-3 text-right font-medium tabular-nums 2xl:table-cell">{formatInt(user.sessionCount)}</td>
+                        <td className="hidden px-4 py-3 text-right font-medium tabular-nums 2xl:table-cell">{formatCompact(user.usage24h.totalTokens)}</td>
+                        <td className="hidden px-5 py-3 text-right 2xl:table-cell">
+                          <div className="whitespace-nowrap" title={formatWhen(user.lastActiveMs)}>
+                            {formatRelative(user.lastActiveMs)}
+                          </div>
                         </td>
                       </tr>
                     );
@@ -793,35 +804,30 @@ export default function UsersPage() {
               </table>
             </div>
           ) : (
-            <EmptyState title="No users" />
-          )}
-
-          {selectedUserId ? (
-            <div className="mt-3 flex flex-wrap items-center gap-2 text-xs text-muted-foreground">
-              <Badge tone="default">selected {selectedUserLabel || `ID ${selectedUserId}`}</Badge>
-              <InfoPill label="users" value={String(users.length)} />
+            <div className="px-4 pb-4 md:px-5">
+              <EmptyState title="No users" />
             </div>
-          ) : null}
+          )}
         </PanelCard>
 
         <section className="space-y-6">
           <PanelReveal key={selectedUserId ?? "user-none"} open className="space-y-6" travel="12px">
-          {usersError && !selectedUserId ? (
-            <PanelCard title="User">
-              <InlineError message={usersError} />
-            </PanelCard>
-          ) : !selectedUserId ? (
-            <PanelCard title="User">
-              <EmptyState title="No selection" />
-            </PanelCard>
-          ) : showDetailSkeleton ? (
-            <UserDetailSkeleton label={selectedUserLabel || "Loading user"} />
-          ) : detailError ? (
-            <PanelCard title={selectedUserLabel || `ID ${selectedUserId}`}>
-              <InlineError message={detailError} />
-            </PanelCard>
-          ) : detail ? (
-            <>
+            {usersError && !selectedUserId ? (
+              <PanelCard title="User">
+                <InlineError message={usersError} />
+              </PanelCard>
+            ) : !selectedUserId ? (
+              <PanelCard title="User">
+                <EmptyState title="No selection" />
+              </PanelCard>
+            ) : showDetailSkeleton ? (
+              <UserDetailSkeleton label={selectedUserLabel || "Loading user"} />
+            ) : detailError ? (
+              <PanelCard title={selectedUserLabel || `ID ${selectedUserId}`}>
+                <InlineError message={detailError} />
+              </PanelCard>
+            ) : detail ? (
+              <>
               <PanelCard
                 eyebrow="Selected user"
                 title={userPrimaryLabel(detail.user)}
@@ -893,7 +899,7 @@ export default function UsersPage() {
                 >
                   <div className="grid gap-3">
                     {detail.agents.map((agent) => (
-                      <div key={agent.agentId} className="argus-row-shell rounded-[16px] px-4 py-3.5">
+                      <div key={agent.agentId} className="min-w-0 border-l border-border/58 px-3 py-2.5">
                         <div className="flex flex-col gap-3 xl:flex-row xl:items-start xl:justify-between">
                           <div className="min-w-0">
                             <div className="flex flex-wrap items-center gap-2">
@@ -1010,7 +1016,7 @@ export default function UsersPage() {
                 >
                   <div className="grid gap-3">
                     {detail.channels.channels.map((channel) => (
-                      <div key={channel.channelId} className="argus-row-shell rounded-[16px] px-4 py-3.5">
+                      <div key={channel.channelId} className="min-w-0 border-l border-border/58 px-3 py-2.5">
                         <div className="flex flex-col gap-3 xl:flex-row xl:items-start xl:justify-between">
                           <div className="min-w-0">
                             <div className="flex flex-wrap items-center gap-2">
@@ -1093,8 +1099,13 @@ export default function UsersPage() {
                 </PanelCard>
               </div>
 
-              <PanelCard eyebrow="Ledger" title="Usage">
-                <div className="argus-table-shell rounded-[20px]">
+              <PanelCard
+                eyebrow="Ledger"
+                title="Usage"
+                className="overflow-hidden"
+                contentClassName="-mx-4 -mb-4 -mt-4 min-w-0 md:-mx-5 md:-mb-5"
+              >
+                <div className="argus-table-shell">
                   <table className="w-full border-collapse text-sm">
                     <thead className="argus-table-head text-left text-[10px] uppercase tracking-[0.12em] text-muted-foreground">
                       <tr>
@@ -1141,8 +1152,8 @@ export default function UsersPage() {
                   ) : null}
                 </div>
               </PanelCard>
-            </>
-          ) : null}
+              </>
+            ) : null}
           </PanelReveal>
         </section>
       </div>
@@ -1187,12 +1198,18 @@ function gatewayAccessActions(
 
 function UsersRosterSkeleton() {
   return (
-    <div className="argus-table-shell rounded-[20px]">
-      <table className="min-w-[980px] w-full border-collapse text-sm">
+    <div className="argus-table-shell">
+      <table className="w-full min-w-[960px] border-collapse text-sm">
         <thead className="argus-table-head text-left text-[10px] uppercase tracking-[0.12em] text-muted-foreground">
           <tr>
-            {["User", "Status", "Current agent", "Channel", "Model", "Agents", "Channels", "Sessions", "24h tokens", "Last active"].map((label) => (
-              <th key={label} className="px-4 py-3">
+            {["User", "Status", "Current agent", "Channel", "Model", "Agents", "Channels", "Sessions", "24h tokens", "Last active"].map((label, index) => (
+              <th
+                key={label}
+                className={cn(
+                  "px-4 py-3.5",
+                  index >= 7 ? "hidden 2xl:table-cell" : null
+                )}
+              >
                 {label}
               </th>
             ))}
@@ -1224,13 +1241,13 @@ function UsersRosterSkeleton() {
               <td className="px-4 py-3">
                 <Skeleton className="ml-auto h-4 w-8" />
               </td>
-              <td className="px-4 py-3">
+              <td className="hidden px-4 py-3 2xl:table-cell">
                 <Skeleton className="ml-auto h-4 w-8" />
               </td>
-              <td className="px-4 py-3">
+              <td className="hidden px-4 py-3 2xl:table-cell">
                 <Skeleton className="ml-auto h-4 w-16" />
               </td>
-              <td className="px-4 py-3">
+              <td className="hidden px-4 py-3 2xl:table-cell">
                 <Skeleton className="h-4 w-20" />
                 <Skeleton className="mt-2 h-3 w-28" />
               </td>
@@ -1254,7 +1271,7 @@ function UserDetailSkeleton({ label }: { label: string }) {
           {Array.from({ length: 8 }).map((_, index) => (
             <div
               key={index}
-              className="rounded-[16px] border border-border/70 bg-background/24 px-3.5 py-3"
+              className="min-w-0 border-l border-border/58 py-1.5 pl-3"
             >
               <Skeleton className="h-3 w-24 rounded-full" />
               <Skeleton className="mt-3 h-5 w-40" />
@@ -1269,7 +1286,7 @@ function UserDetailSkeleton({ label }: { label: string }) {
             {Array.from({ length: 2 }).map((_, index) => (
               <div
                 key={index}
-                className="rounded-[16px] border border-border/70 bg-background/24 px-4 py-3.5"
+                className="min-w-0 border-l border-border/58 px-3 py-2.5"
               >
                 <Skeleton className="h-5 w-40" />
                 <Skeleton className="mt-3 h-3 w-56" />
@@ -1287,7 +1304,7 @@ function UserDetailSkeleton({ label }: { label: string }) {
             {Array.from({ length: 3 }).map((_, index) => (
               <div
                 key={index}
-                className="rounded-[16px] border border-border/70 bg-background/24 px-4 py-3.5"
+                className="min-w-0 border-l border-border/58 px-3 py-2.5"
               >
                 <Skeleton className="h-5 w-32" />
                 <Skeleton className="mt-3 h-3 w-64" />
@@ -1301,10 +1318,15 @@ function UserDetailSkeleton({ label }: { label: string }) {
         </PanelCard>
       </div>
 
-      <PanelCard eyebrow="Ledger" title="Usage">
+      <PanelCard
+        eyebrow="Ledger"
+        title="Usage"
+        className="overflow-hidden"
+        contentClassName="-mx-4 -mb-4 -mt-4 min-w-0 md:-mx-5 md:-mb-5"
+      >
         <div className="space-y-3">
           {Array.from({ length: 6 }).map((_, index) => (
-            <div key={index} className="grid gap-3 rounded-[16px] border border-border/70 bg-background/24 px-4 py-3 md:grid-cols-[1.1fr_0.9fr_0.9fr_1fr_0.6fr]">
+            <div key={index} className="grid gap-3 border-t border-border/54 px-4 py-3 first:border-t-0 md:grid-cols-[1.1fr_0.9fr_0.9fr_1fr_0.6fr]">
               <Skeleton className="h-4 w-full" />
               <Skeleton className="h-4 w-full" />
               <Skeleton className="h-4 w-full" />

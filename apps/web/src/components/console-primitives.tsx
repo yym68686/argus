@@ -79,7 +79,7 @@ export function Fact({
   mono?: boolean;
 }) {
   return (
-    <div className="rounded-[16px] border border-border/70 bg-background/24 px-3.5 py-3 shadow-[inset_0_1px_0_0_oklch(var(--foreground)/0.04)]">
+    <div className="min-w-0 border-l border-border/58 py-1.5 pl-3">
       <div className="argus-surface-label">{label}</div>
       <div
         className={cn(
@@ -97,8 +97,8 @@ export function EmptyState({ title, body }: { title: string; body?: string }) {
   void body;
 
   return (
-    <div className="rounded-[20px] border border-dashed border-border/72 bg-background/20 px-4 py-8 text-center">
-      <div className="mx-auto h-9 w-9 rounded-lg border border-border/70 bg-background/35" />
+    <div className="border-y border-dashed border-border/62 px-4 py-8 text-center">
+      <div className="mx-auto h-9 w-9 rounded-lg border border-border/58 bg-background/20" />
       <div className="mt-4 text-base font-medium text-foreground">{title}</div>
     </div>
   );

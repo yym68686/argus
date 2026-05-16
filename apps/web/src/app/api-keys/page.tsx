@@ -395,7 +395,7 @@ export default function ApiKeysPage() {
           {developerKeys.length ? (
             <div className="space-y-2">
               {developerKeys.map((key) => (
-                <div key={key.keyId} className="argus-row-shell flex flex-col gap-3 rounded-[16px] px-4 py-3 md:flex-row md:items-center md:justify-between">
+                <div key={key.keyId} className="flex flex-col gap-3 border-l border-border/58 px-3 py-2.5 md:flex-row md:items-center md:justify-between">
                   <div className="min-w-0">
                     <div className="truncate font-medium text-foreground">{key.name}</div>
                     <div className="mt-1 truncate text-xs text-muted-foreground">{key.keyId}</div>

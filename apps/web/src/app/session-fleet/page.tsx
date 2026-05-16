@@ -160,7 +160,7 @@ export default function SessionFleetPage() {
               {Array.from({ length: 6 }).map((_, index) => (
                 <div
                   key={index}
-                  className="grid gap-3 rounded-[16px] border border-border/70 bg-background/24 px-4 py-3 md:grid-cols-[1.5fr_0.7fr_1fr_1fr_0.8fr_0.7fr]"
+                  className="grid gap-3 border-t border-border/54 px-4 py-3 first:border-t-0 md:grid-cols-[1.5fr_0.7fr_1fr_1fr_0.8fr_0.7fr]"
                 >
                   {Array.from({ length: 6 }).map((__, cellIndex) => (
                     <Skeleton key={cellIndex} className="h-4 w-full" />
@@ -169,7 +169,7 @@ export default function SessionFleetPage() {
               ))}
             </div>
           ) : sessions.length ? (
-            <div className="argus-table-shell rounded-[20px]">
+            <div className="argus-table-shell">
               <table className="w-full border-collapse text-sm">
                 <thead className="argus-table-head text-left text-[10px] uppercase tracking-[0.12em] text-muted-foreground">
                   <tr>

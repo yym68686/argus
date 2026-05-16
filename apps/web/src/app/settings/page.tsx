@@ -154,7 +154,7 @@ export default function SettingsPage() {
                   {Array.from({ length: 2 }).map((_, index) => (
                     <div
                       key={index}
-                      className="rounded-[16px] border border-border/70 bg-background/24 px-3.5 py-3"
+                      className="min-w-0 border-l border-border/58 py-1.5 pl-3"
                     >
                       <Skeleton className="h-3 w-20 rounded-full" />
                       <Skeleton className="mt-3 h-5 w-24" />
@@ -191,7 +191,7 @@ export default function SettingsPage() {
                   {Array.from({ length: 6 }).map((_, index) => (
                     <div
                       key={index}
-                      className="rounded-[16px] border border-border/70 bg-background/24 px-3.5 py-3"
+                      className="min-w-0 border-l border-border/58 py-1.5 pl-3"
                     >
                       <Skeleton className="h-3 w-24 rounded-full" />
                       <Skeleton className="mt-3 h-5 w-full" />
@@ -230,7 +230,7 @@ export default function SettingsPage() {
                   {Array.from({ length: 4 }).map((_, index) => (
                     <div
                       key={index}
-                      className="rounded-[16px] border border-border/70 bg-background/24 px-3.5 py-3"
+                      className="min-w-0 border-l border-border/58 py-1.5 pl-3"
                     >
                       <Skeleton className="h-3 w-24 rounded-full" />
                       <Skeleton className="mt-3 h-5 w-32" />
@@ -257,7 +257,7 @@ export default function SettingsPage() {
 
 function ContractRow({ label, ok, detail }: { label: string; ok: boolean; detail: string }) {
   return (
-    <div className="argus-row-shell flex items-center justify-between gap-3 rounded-[16px] px-4 py-3">
+    <div className="flex items-center justify-between gap-3 border-l border-border/58 py-2.5 pl-3 pr-1">
       <div className="flex min-w-0 items-center gap-3">
         <div
           className={cn(

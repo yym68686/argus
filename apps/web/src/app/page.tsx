@@ -2562,8 +2562,8 @@ export default function Page() {
                 <React.Fragment key={sid || s.containerId || Math.random().toString(16)}>
                   <div
                     className={cn(
-                      "argus-row-shell group flex items-center gap-2 rounded-[16px] border",
-                      isCurrent ? "border-primary/28 bg-primary/10" : "border-border/70 hover:border-border hover:bg-background/36"
+                      "group flex items-center gap-2 border-l border-border/58 bg-background/10 transition-colors",
+                      isCurrent ? "border-primary/70 bg-primary/10" : "hover:border-border/70 hover:bg-background/24"
                     )}
                   >
                     <button
@@ -2694,17 +2694,17 @@ export default function Page() {
                               <div
                                 key={t.id}
                                 className={cn(
-                                  "argus-row-shell group flex items-center gap-2 rounded-[14px] border",
-                                  isCurrentThread ? "border-primary/28 bg-primary/10" : "border-border/70 hover:border-primary/28 hover:bg-primary/10"
-                                )}
-                              >
-                                <button
-                                  type="button"
-                                  title={label}
-                                  className="min-w-0 flex-1 px-3 py-2 text-left focus-visible:outline-none"
-                                  onClick={() => {
-                                    setThreadMenuOpenFor(null);
-                                    void openThreadInSession(sid, t.id);
+                              "group flex items-center gap-2 border-l border-border/58 bg-background/10 transition-colors",
+                              isCurrentThread ? "border-primary/70 bg-primary/10" : "hover:border-primary/70 hover:bg-primary/10"
+                            )}
+                          >
+                            <button
+                              type="button"
+                              title={label}
+                              className="min-w-0 flex-1 px-3 py-2 text-left focus-visible:outline-none"
+                              onClick={() => {
+                                setThreadMenuOpenFor(null);
+                                void openThreadInSession(sid, t.id);
                                   }}
                                 >
                                   <span className="flex min-w-0 items-center gap-2">
@@ -3148,7 +3148,7 @@ function RailStat({
 
 function ConnectionFact({ label, value, mono = false }: { label: string; value: string; mono?: boolean }) {
   return (
-    <div className="rounded-[16px] border border-border/70 bg-background/24 px-3.5 py-3 shadow-[inset_0_1px_0_0_oklch(var(--foreground)/0.04)]">
+    <div className="min-w-0 border-l border-border/58 py-1.5 pl-3">
       <div className="argus-surface-label">{label}</div>
       <div className={cn("mt-2 text-sm font-medium text-foreground", mono ? "font-mono text-[12.5px]" : null)}>
         {mono ? <TextSwap value={value} /> : <AnimatedNumber value={value} />}

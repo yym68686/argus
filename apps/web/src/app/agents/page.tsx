@@ -354,8 +354,8 @@ export default function AgentsPage() {
                           setModelDraft(agent.model ?? "");
                         }}
                         className={cn(
-                          "argus-row-shell w-full rounded-[16px] px-4 py-3 text-left",
-                          active ? "border-primary/28 bg-primary/10" : "hover:border-border hover:bg-background/36"
+                          "w-full border-l border-border/58 px-3 py-2.5 text-left transition-colors",
+                          active ? "border-primary/70 bg-primary/10" : "hover:border-border hover:bg-background/24"
                         )}
                       >
                         <div className="flex items-start justify-between gap-3">
