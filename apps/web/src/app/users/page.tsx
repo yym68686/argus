@@ -1,7 +1,7 @@
 "use client";
 
 import React from "react";
-import { Plus, KeyRound, Trash2, UserRoundCheck, Pencil, Bot, RadioTower, RefreshCw } from "lucide-react";
+import { Bot, ChevronDown, KeyRound, Pencil, Plus, RadioTower, RefreshCw, Trash2, UserRoundCheck } from "lucide-react";
 import { toast } from "sonner";
 
 import { useConfirmDialog } from "@/components/confirm-dialog";
@@ -105,11 +105,16 @@ export default function UsersPage() {
   const [detailBusy, setDetailBusy] = React.useState(false);
   const [detailError, setDetailError] = React.useState<string | null>(null);
   const [bootstrapUserId, setBootstrapUserId] = React.useState("");
+  const [agentComposerOpen, setAgentComposerOpen] = React.useState(false);
+  const [channelComposerOpen, setChannelComposerOpen] = React.useState(false);
   const [newAgentName, setNewAgentName] = React.useState("");
   const [newChannelName, setNewChannelName] = React.useState("");
   const [newChannelBaseUrl, setNewChannelBaseUrl] = React.useState("");
   const [newChannelApiKey, setNewChannelApiKey] = React.useState("");
   const [modelDraftByAgent, setModelDraftByAgent] = React.useState<Record<string, string>>({});
+  const [agentNameDraftById, setAgentNameDraftById] = React.useState<Record<string, string>>({});
+  const [channelNameDraftById, setChannelNameDraftById] = React.useState<Record<string, string>>({});
+  const [channelKeyDraftById, setChannelKeyDraftById] = React.useState<Record<string, string>>({});
   const [pendingActions, setPendingActions] = React.useState<Record<string, boolean>>({});
 
   const refreshUsers = React.useCallback(
@@ -181,11 +186,18 @@ export default function UsersPage() {
         setDetail(response);
         const availableModels = response.availableModels ?? response.models?.map((item) => item.id || "").filter(Boolean) ?? [];
         const nextDrafts: Record<string, string> = {};
+        const nextAgentNames: Record<string, string> = {};
         for (const agent of response.agents ?? []) {
           const current = String(agent.model || "").trim();
           nextDrafts[agent.agentId] = current || availableModels[0] || "";
+          nextAgentNames[agent.agentId] = agent.shortName || agent.agentId || "";
         }
         setModelDraftByAgent(nextDrafts);
+        setAgentNameDraftById(nextAgentNames);
+        setChannelNameDraftById(
+          Object.fromEntries((response.channels.channels ?? []).map((channel) => [channel.channelId, channel.name || channel.channelId])),
+        );
+        setChannelKeyDraftById({});
       } catch (error) {
         const message = (error as Error)?.message || String(error);
         setDetailError(message);
@@ -277,6 +289,7 @@ export default function UsersPage() {
       );
       toast.success(agentMutationToast(response.agent, response.created, "Agent created"));
       setNewAgentName("");
+      setAgentComposerOpen(false);
       await Promise.all([
         refreshUsers({ preserveSelection: true }),
         refreshDetail(selectedUserId, { keepVisible: true }),
@@ -327,12 +340,15 @@ export default function UsersPage() {
 
   async function renameAgent(agent: AdminAgentEntry): Promise<void> {
     if (!selectedUserId) return;
-    const nextName = window.prompt("Rename agent", agent.shortName || agent.agentId || "");
-    if (!nextName) return;
+    const nextName = String(agentNameDraftById[agent.agentId] ?? agent.shortName ?? agent.agentId ?? "").trim();
+    if (!nextName) {
+      toast.error("Enter an agent name");
+      return;
+    }
     try {
       await gatewayFetchJson(wsUrl, `/admin/users/${selectedUserId}/agents/${encodeURIComponent(agent.agentId)}`, {
         method: "PATCH",
-        body: JSON.stringify({ newName: nextName.trim() }),
+        body: JSON.stringify({ newName: nextName }),
       });
       toast.success("Agent renamed");
       await Promise.all([
@@ -474,6 +490,7 @@ export default function UsersPage() {
       setNewChannelName("");
       setNewChannelBaseUrl("");
       setNewChannelApiKey("");
+      setChannelComposerOpen(false);
       await Promise.all([
         refreshUsers({ preserveSelection: true }),
         refreshDetail(selectedUserId, { keepVisible: true }),
@@ -533,15 +550,18 @@ export default function UsersPage() {
 
   async function renameChannel(channel: AdminChannelEntry): Promise<void> {
     if (!selectedUserId) return;
-    const nextName = window.prompt("Rename channel", channel.name || channel.channelId || "");
-    if (!nextName) return;
+    const nextName = String(channelNameDraftById[channel.channelId] ?? channel.name ?? channel.channelId ?? "").trim();
+    if (!nextName) {
+      toast.error("Enter a channel name");
+      return;
+    }
     try {
       await gatewayFetchJson(
         wsUrl,
         `/admin/users/${selectedUserId}/channels/${encodeURIComponent(channel.channelId)}`,
         {
           method: "PATCH",
-          body: JSON.stringify({ newName: nextName.trim() }),
+          body: JSON.stringify({ newName: nextName }),
         },
       );
       toast.success("Channel renamed");
@@ -581,8 +601,11 @@ export default function UsersPage() {
 
   async function setChannelKey(channel: AdminChannelEntry): Promise<void> {
     if (!selectedUserId) return;
-    const nextKey = window.prompt(`Set API key for ${channel.name || channel.channelId}`, "");
-    if (!nextKey) return;
+    const nextKey = String(channelKeyDraftById[channel.channelId] ?? "").trim();
+    if (!nextKey) {
+      toast.error("Enter an API key");
+      return;
+    }
     try {
       await gatewayFetchJson(
         wsUrl,
@@ -593,6 +616,7 @@ export default function UsersPage() {
         },
       );
       toast.success("Key updated");
+      setChannelKeyDraftById((prev) => ({ ...prev, [channel.channelId]: "" }));
       await Promise.all([
         refreshUsers({ preserveSelection: true }),
         refreshDetail(selectedUserId, { keepVisible: true }),
@@ -844,10 +868,6 @@ export default function UsersPage() {
                     )}
                     <Badge tone="default">{detail.user.agentCount} agents</Badge>
                     <Badge tone="default">{detail.user.channelCount} channels</Badge>
-                    <Button type="button" size="sm" variant="destructive" disabled={deletingSelectedUser} onClick={() => void deleteUser()}>
-                      <Trash2 className="h-4 w-4" />
-                      {deletingSelectedUser ? "Deleting…" : "Delete user"}
-                    </Button>
                   </div>
                 }
               >
@@ -876,6 +896,18 @@ export default function UsersPage() {
                   <Fact label="Ready channels" value={`${detail.user.readyChannelCount}/${detail.user.channelCount}`} />
                   <Fact label="Last active" value={formatRelative(detail.user.lastActiveMs)} />
                 </div>
+
+                <ManageDetails label="Manage user">
+                  <div className="flex flex-wrap items-center justify-between gap-3">
+                    <div className="max-w-[48rem] text-sm leading-6 text-muted-foreground">
+                      Remove this user and their agents, channel settings, Telegram profile, and console sessions.
+                    </div>
+                    <Button type="button" variant="destructive" disabled={deletingSelectedUser} onClick={() => void deleteUser()}>
+                      <Trash2 className="h-4 w-4" />
+                      {deletingSelectedUser ? "Deleting…" : "Delete user"}
+                    </Button>
+                  </div>
+                </ManageDetails>
               </PanelCard>
 
               <div className="grid gap-4 xl:grid-cols-2">
@@ -884,103 +916,163 @@ export default function UsersPage() {
                   title="Agents"
                   subtitle="Create dedicated agents, switch the active binding, and pin per-agent model defaults."
                   action={
-                    <div className="grid gap-2 md:grid-cols-[minmax(0,1fr)_auto]">
-                      <Input
-                        value={newAgentName}
-                        onChange={(event) => setNewAgentName(event.target.value)}
-                        placeholder="new-agent"
-                      />
-                      <Button type="button" onClick={() => void createAgent()}>
-                        <Plus className="h-4 w-4" />
-                        Create agent
-                      </Button>
-                    </div>
+                    <Button
+                      type="button"
+                      variant={agentComposerOpen ? "default" : "secondary"}
+                      aria-expanded={agentComposerOpen}
+                      onClick={() => setAgentComposerOpen((open) => !open)}
+                    >
+                      <Plus className="h-4 w-4" />
+                      {agentComposerOpen ? "Close" : "New agent"}
+                    </Button>
                   }
                 >
-                  <div className="grid gap-3">
-                    {detail.agents.map((agent) => (
-                      <div key={agent.agentId} className="min-w-0 border-l border-border/58 px-3 py-2.5">
-                        <div className="flex flex-col gap-3 xl:flex-row xl:items-start xl:justify-between">
-                          <div className="min-w-0">
-                            <div className="flex flex-wrap items-center gap-2">
-                              <div className="font-medium text-foreground">{agent.shortName || agent.agentId}</div>
-                              {agent.isDefault ? <Badge tone="primary">main</Badge> : null}
-                              {detail.user.currentAgentId === agent.agentId ? <Badge tone="success">current</Badge> : null}
-                              <Badge tone={agentProvisioningTone(agent)}>
-                                <TextSwap value={agentProvisioningLabel(agent)} />
-                              </Badge>
-                            </div>
-                            <div className="mt-2 text-xs leading-5 text-muted-foreground">
-                              session <code className="font-mono">{agent.sessionId || "—"}</code> · created {formatWhen(agent.createdAtMs)} · updated {formatWhen(agent.provisioningUpdatedAtMs || agent.lastReadyAtMs)}
-                            </div>
-                            {agent.provisioningError ? (
-                              <div className="mt-2 text-xs leading-5 text-destructive">
-                                {agent.provisioningError}
+                  <div className="grid gap-4">
+                    {agentComposerOpen ? (
+                      <form
+                        className="rounded-xl border border-border/70 bg-background/24 p-4"
+                        onSubmit={(event) => {
+                          event.preventDefault();
+                          void createAgent();
+                        }}
+                      >
+                        <label className="grid gap-2">
+                          <span className="text-sm font-medium text-foreground">Agent name</span>
+                          <div className="grid gap-2 md:grid-cols-[minmax(0,1fr)_auto]">
+                            <Input
+                              value={newAgentName}
+                              onChange={(event) => setNewAgentName(event.target.value)}
+                              placeholder="new-agent"
+                            />
+                            <Button type="submit" disabled={!newAgentName.trim()}>
+                              <Plus className="h-4 w-4" />
+                              Create agent
+                            </Button>
+                          </div>
+                        </label>
+                      </form>
+                    ) : null}
+
+                    {detail.agents.length ? detail.agents.map((agent) => {
+                      const isCurrent = detail.user.currentAgentId === agent.agentId;
+                      const state = agentProvisioningState(agent);
+                      return (
+                        <article key={agent.agentId} className="rounded-xl border border-border/70 bg-background/18 p-4">
+                          <div className="grid gap-4 lg:grid-cols-[minmax(0,1fr)_auto] lg:items-start">
+                            <div className="min-w-0">
+                              <div className="flex flex-wrap items-center gap-2">
+                                <div className="min-w-0 truncate font-medium text-foreground">{agent.shortName || agent.agentId}</div>
+                                {isCurrent ? <Badge tone="primary">current</Badge> : agent.isDefault ? <Badge tone="default">main</Badge> : null}
+                                <Badge tone={agentProvisioningTone(agent)}>
+                                  <TextSwap value={agentProvisioningLabel(agent)} />
+                                </Badge>
                               </div>
-                            ) : null}
+                              <div className="mt-2 flex flex-wrap gap-x-4 gap-y-1 text-xs leading-5 text-muted-foreground">
+                                <span>
+                                  session <code className="font-mono">{agent.sessionId || "—"}</code>
+                                </span>
+                                <span>created {formatWhen(agent.createdAtMs)}</span>
+                              </div>
+                              {agent.provisioningError ? (
+                                <div className="mt-2 text-xs leading-5 text-destructive">{agent.provisioningError}</div>
+                              ) : null}
+                            </div>
+
+                            <div className="flex flex-wrap gap-2 lg:justify-end">
+                              {!isCurrent ? (
+                                <Button
+                                  type="button"
+                                  variant="secondary"
+                                  disabled={Boolean(pendingActions[`agent-use:${agent.agentId}`]) || state !== "ready"}
+                                  onClick={() => void activateAgent(agent)}
+                                >
+                                  <UserRoundCheck className="h-4 w-4" />
+                                  <TextSwap value={pendingActions[`agent-use:${agent.agentId}`] ? "Switching…" : "Use"} />
+                                </Button>
+                              ) : null}
+                              {state === "failed" ? (
+                                <Button type="button" variant="secondary" onClick={() => void retryAgent(agent)}>
+                                  <RefreshCw className="h-4 w-4" />
+                                  Retry
+                                </Button>
+                              ) : null}
+                            </div>
                           </div>
 
-                          <div className="flex flex-wrap gap-2">
-                            <Button
-                              type="button"
-                              size="sm"
-                              variant="secondary"
-                              disabled={Boolean(pendingActions[`agent-use:${agent.agentId}`]) || agentProvisioningState(agent) !== "ready"}
-                              onClick={() => void activateAgent(agent)}
-                            >
-                              <UserRoundCheck className="h-4 w-4" />
-                              <TextSwap value={pendingActions[`agent-use:${agent.agentId}`] ? "Switching…" : "Use"} />
-                            </Button>
-                            {agentProvisioningState(agent) === "failed" ? (
-                              <Button type="button" size="sm" variant="secondary" onClick={() => void retryAgent(agent)}>
-                                <RefreshCw className="h-4 w-4" />
-                                Retry
-                              </Button>
-                            ) : null}
-                            <Button
-                              type="button"
-                              size="sm"
-                              variant="secondary"
-                              disabled={agentProvisioningState(agent) === "pending"}
-                              onClick={() => void renameAgent(agent)}
-                            >
-                              <Pencil className="h-4 w-4" />
-                              Rename
-                            </Button>
-                            {!agent.isDefault ? (
-                              <Button type="button" size="sm" variant="destructive" onClick={() => void deleteAgent(agent)}>
-                                <Trash2 className="h-4 w-4" />
-                                Delete
-                              </Button>
-                            ) : null}
-                          </div>
-                        </div>
+                          <ManageDetails label="Manage agent">
+                            <div className="grid gap-4">
+                              {!agent.isDefault ? (
+                                <label className="grid gap-2">
+                                  <span className="text-sm font-medium text-foreground">Display name</span>
+                                  <div className="grid gap-2 md:grid-cols-[minmax(0,1fr)_auto]">
+                                    <Input
+                                      value={agentNameDraftById[agent.agentId] ?? agent.shortName ?? agent.agentId}
+                                      onChange={(event) =>
+                                        setAgentNameDraftById((prev) => ({ ...prev, [agent.agentId]: event.target.value }))
+                                      }
+                                      disabled={state === "pending"}
+                                    />
+                                    <Button
+                                      type="button"
+                                      variant="secondary"
+                                      disabled={state === "pending" || !(agentNameDraftById[agent.agentId] ?? "").trim()}
+                                      onClick={() => void renameAgent(agent)}
+                                    >
+                                      <Pencil className="h-4 w-4" />
+                                      Rename
+                                    </Button>
+                                  </div>
+                                </label>
+                              ) : null}
 
-                        <div className="mt-4 grid gap-2 md:grid-cols-[minmax(0,1fr)_auto]">
-                          <select
-                            value={modelDraftByAgent[agent.agentId] ?? agent.model ?? ""}
-                            onChange={(event) =>
-                              setModelDraftByAgent((prev) => ({ ...prev, [agent.agentId]: event.target.value }))
-                            }
-                            className="argus-select"
-                          >
-                            {availableModels.length ? (
-                              availableModels.map((model) => (
-                                <option key={model} value={model}>
-                                  {model}
-                                </option>
-                              ))
-                            ) : (
-                              <option value={agent.model || ""}>{agent.model || "gpt-5.5"}</option>
-                            )}
-                          </select>
-                          <Button type="button" size="sm" onClick={() => void saveAgentModel(agent)}>
-                            <Bot className="h-4 w-4" />
-                            Save model
-                          </Button>
-                        </div>
-                      </div>
-                    ))}
+                              <label className="grid gap-2">
+                                <span className="text-sm font-medium text-foreground">Default model</span>
+                                <div className="grid gap-2 md:grid-cols-[minmax(0,1fr)_auto]">
+                                  <select
+                                    value={modelDraftByAgent[agent.agentId] ?? agent.model ?? ""}
+                                    onChange={(event) =>
+                                      setModelDraftByAgent((prev) => ({ ...prev, [agent.agentId]: event.target.value }))
+                                    }
+                                    className="argus-select"
+                                  >
+                                    {availableModels.length ? (
+                                      availableModels.map((model) => (
+                                        <option key={model} value={model}>
+                                          {model}
+                                        </option>
+                                      ))
+                                    ) : (
+                                      <option value={agent.model || ""}>{agent.model || "gpt-5.5"}</option>
+                                    )}
+                                  </select>
+                                  <Button type="button" variant="secondary" onClick={() => void saveAgentModel(agent)}>
+                                    <Bot className="h-4 w-4" />
+                                    Save model
+                                  </Button>
+                                </div>
+                              </label>
+
+                              <div className="flex flex-wrap items-center justify-between gap-3 border-t border-border/60 pt-4">
+                                <div className="text-xs leading-5 text-muted-foreground">
+                                  <div className="break-all">
+                                    agent id <code className="font-mono">{agent.agentId}</code>
+                                  </div>
+                                  <div>updated {formatWhen(agent.provisioningUpdatedAtMs || agent.lastReadyAtMs)}</div>
+                                </div>
+                                {!agent.isDefault ? (
+                                  <Button type="button" variant="destructive" onClick={() => void deleteAgent(agent)}>
+                                    <Trash2 className="h-4 w-4" />
+                                    Delete agent
+                                  </Button>
+                                ) : null}
+                              </div>
+                            </div>
+                          </ManageDetails>
+                        </article>
+                      );
+                    }) : (
+                      <EmptyState title="No agents" />
+                    )}
                   </div>
                 </PanelCard>
 
@@ -989,112 +1081,193 @@ export default function UsersPage() {
                   title="Channels"
                   subtitle="Switch upstreams and set gateway access."
                   action={
-                    <div className="grid gap-2 md:grid-cols-2">
-                      <Input
-                        value={newChannelName}
-                        onChange={(event) => setNewChannelName(event.target.value)}
-                        placeholder="channel name"
-                      />
-                      <Input
-                        value={newChannelBaseUrl}
-                        onChange={(event) => setNewChannelBaseUrl(event.target.value)}
-                        placeholder="https://provider/v1"
-                      />
-                      <Input
-                        value={newChannelApiKey}
-                        onChange={(event) => setNewChannelApiKey(event.target.value)}
-                        placeholder="api key"
-                        type="password"
-                        className="md:col-span-2"
-                      />
-                      <Button type="button" onClick={() => void createChannel()} className="md:col-span-2">
-                        <Plus className="h-4 w-4" />
-                        Create channel
-                      </Button>
-                    </div>
+                    <Button
+                      type="button"
+                      variant={channelComposerOpen ? "default" : "secondary"}
+                      aria-expanded={channelComposerOpen}
+                      onClick={() => setChannelComposerOpen((open) => !open)}
+                    >
+                      <Plus className="h-4 w-4" />
+                      {channelComposerOpen ? "Close" : "New channel"}
+                    </Button>
                   }
                 >
-                  <div className="grid gap-3">
-                    {detail.channels.channels.map((channel) => (
-                      <div key={channel.channelId} className="min-w-0 border-l border-border/58 px-3 py-2.5">
-                        <div className="flex flex-col gap-3 xl:flex-row xl:items-start xl:justify-between">
-                          <div className="min-w-0">
-                            <div className="flex flex-wrap items-center gap-2">
-                              <div className="font-medium text-foreground">{channel.name}</div>
-                              {channel.selected ? <Badge tone="primary">selected</Badge> : null}
-                              {channel.channelId === "gateway" ? (
-                                <Badge tone={gatewayAccessBadge(channel).tone}>{gatewayAccessBadge(channel).label}</Badge>
+                  <div className="grid gap-4">
+                    {channelComposerOpen ? (
+                      <form
+                        className="rounded-xl border border-border/70 bg-background/24 p-4"
+                        onSubmit={(event) => {
+                          event.preventDefault();
+                          void createChannel();
+                        }}
+                      >
+                        <div className="grid gap-4 md:grid-cols-2">
+                          <label className="grid gap-2">
+                            <span className="text-sm font-medium text-foreground">Channel name</span>
+                            <Input
+                              value={newChannelName}
+                              onChange={(event) => setNewChannelName(event.target.value)}
+                              placeholder="provider"
+                            />
+                          </label>
+                          <label className="grid gap-2">
+                            <span className="text-sm font-medium text-foreground">Base URL</span>
+                            <Input
+                              value={newChannelBaseUrl}
+                              onChange={(event) => setNewChannelBaseUrl(event.target.value)}
+                              placeholder="https://provider/v1"
+                              type="url"
+                            />
+                          </label>
+                          <label className="grid gap-2 md:col-span-2">
+                            <span className="text-sm font-medium text-foreground">API key</span>
+                            <Input
+                              value={newChannelApiKey}
+                              onChange={(event) => setNewChannelApiKey(event.target.value)}
+                              placeholder="api key"
+                              type="password"
+                            />
+                          </label>
+                        </div>
+                        <div className="mt-4 flex justify-end">
+                          <Button
+                            type="submit"
+                            disabled={!newChannelName.trim() || !newChannelBaseUrl.trim() || !newChannelApiKey.trim()}
+                          >
+                            <Plus className="h-4 w-4" />
+                            Create channel
+                          </Button>
+                        </div>
+                      </form>
+                    ) : null}
+
+                    {detail.channels.channels.length ? detail.channels.channels.map((channel) => (
+                        <article key={channel.channelId} className="rounded-xl border border-border/70 bg-background/18 p-4">
+                          <div className="grid gap-4 lg:grid-cols-[minmax(0,1fr)_auto] lg:items-start">
+                            <div className="min-w-0">
+                              <div className="flex flex-wrap items-center gap-2">
+                                <div className="min-w-0 truncate font-medium text-foreground">{channel.name}</div>
+                                {channel.selected ? <Badge tone="primary">selected</Badge> : null}
+                                {channel.disabledByAdmin ? (
+                                  <Badge tone="warning">blocked</Badge>
+                                ) : channel.ready ? (
+                                  <Badge tone="success">ready</Badge>
+                                ) : (
+                                  <Badge tone="warning">needs setup</Badge>
+                                )}
+                              </div>
+                              <div className="mt-2 text-xs leading-5 text-muted-foreground">
+                                {channel.baseUrl || "Gateway-managed channel"}
+                                {channel.apiKeyMasked ? ` · key ${channel.apiKeyMasked}` : ""}
+                              </div>
+                              <div className="mt-1 flex flex-wrap gap-x-4 gap-y-1 text-xs leading-5 text-muted-foreground">
+                                {channel.channelId === "gateway" ? (
+                                  <span>gateway access {gatewayAccessBadge(channel).label}</span>
+                                ) : null}
+                                {channel.isBuiltin ? <span>{channel.builtinKind || "builtin"}</span> : null}
+                              </div>
+                              {!channel.ready && channel.reason ? (
+                                <div className="mt-2 text-xs leading-5 text-amber-300">{channel.reason}</div>
                               ) : null}
-                              {channel.disabledByAdmin ? (
-                                <Badge tone="warning">blocked</Badge>
-                              ) : channel.ready ? (
-                                <Badge tone="success">ready</Badge>
-                              ) : (
-                                <Badge tone="warning">needs setup</Badge>
-                              )}
-                              {channel.isBuiltin ? <Badge tone="default">{channel.builtinKind || "builtin"}</Badge> : null}
                             </div>
-                            <div className="mt-2 text-xs leading-5 text-muted-foreground">
-                              {channel.baseUrl || "Gateway-managed channel"}
-                              {channel.apiKeyMasked ? ` · key ${channel.apiKeyMasked}` : ""}
+
+                            <div className="flex flex-wrap gap-2 lg:justify-end">
+                              {!channel.selected && channel.ready ? (
+                                <Button
+                                  type="button"
+                                  variant="secondary"
+                                  disabled={Boolean(pendingActions[`channel-select:${channel.channelId}`])}
+                                  onClick={() => void selectChannel(channel)}
+                                >
+                                  <RadioTower className="h-4 w-4" />
+                                  <TextSwap value={pendingActions[`channel-select:${channel.channelId}`] ? "Switching…" : "Select"} />
+                                </Button>
+                              ) : null}
                             </div>
-                            {!channel.ready && channel.reason ? (
-                              <div className="mt-2 text-xs leading-5 text-amber-300">{channel.reason}</div>
-                            ) : null}
                           </div>
 
-                          <div className="flex flex-wrap gap-2">
-                            <Button
-                              type="button"
-                              size="sm"
-                              variant="secondary"
-                              disabled={channel.selected || !channel.ready || Boolean(pendingActions[`channel-select:${channel.channelId}`])}
-                              onClick={() => void selectChannel(channel)}
-                            >
-                              <RadioTower className="h-4 w-4" />
-                              <TextSwap value={pendingActions[`channel-select:${channel.channelId}`] ? "Switching…" : "Select"} />
-                            </Button>
-                            {channel.canAdminToggleAccess
-                              ? gatewayAccessActions(channel).map((action) => (
-                                  <Button
-                                    key={`${channel.channelId}:${action.mode}`}
-                                    type="button"
-                                    size="sm"
-                                    variant={action.variant}
-                                    disabled={Boolean(pendingActions[`channel-access:${channel.channelId}`])}
-                                    onClick={() => void setBuiltinChannelAccess(channel, action.mode)}
-                                  >
-                                    {pendingActions[`channel-access:${channel.channelId}`] ? "Saving…" : action.label}
+                          <ManageDetails label="Manage channel">
+                            <div className="grid gap-4">
+                              {channel.canRename ? (
+                                <label className="grid gap-2">
+                                  <span className="text-sm font-medium text-foreground">Display name</span>
+                                  <div className="grid gap-2 md:grid-cols-[minmax(0,1fr)_auto]">
+                                    <Input
+                                      value={channelNameDraftById[channel.channelId] ?? channel.name}
+                                      onChange={(event) =>
+                                        setChannelNameDraftById((prev) => ({ ...prev, [channel.channelId]: event.target.value }))
+                                      }
+                                    />
+                                    <Button
+                                      type="button"
+                                      variant="secondary"
+                                      disabled={!(channelNameDraftById[channel.channelId] ?? "").trim()}
+                                      onClick={() => void renameChannel(channel)}
+                                    >
+                                      <Pencil className="h-4 w-4" />
+                                      Rename
+                                    </Button>
+                                  </div>
+                                </label>
+                              ) : null}
+
+                              {channel.canSetKey ? (
+                                <label className="grid gap-2">
+                                  <span className="text-sm font-medium text-foreground">API key</span>
+                                  <div className="grid gap-2 md:grid-cols-[minmax(0,1fr)_auto]">
+                                    <Input
+                                      value={channelKeyDraftById[channel.channelId] ?? ""}
+                                      onChange={(event) =>
+                                        setChannelKeyDraftById((prev) => ({ ...prev, [channel.channelId]: event.target.value }))
+                                      }
+                                      placeholder={channel.apiKeyMasked ? "Replace existing key" : "Set API key"}
+                                      type="password"
+                                    />
+                                    <Button
+                                      type="button"
+                                      variant="secondary"
+                                      disabled={!channelKeyDraftById[channel.channelId]?.trim()}
+                                      onClick={() => void setChannelKey(channel)}
+                                    >
+                                      <KeyRound className="h-4 w-4" />
+                                      Save key
+                                    </Button>
+                                  </div>
+                                </label>
+                              ) : null}
+
+                              <div className="flex flex-wrap items-center gap-2 border-t border-border/60 pt-4">
+                                {channel.canAdminToggleAccess
+                                  ? gatewayAccessActions(channel).map((action) => (
+                                      <Button
+                                        key={`${channel.channelId}:${action.mode}`}
+                                        type="button"
+                                        variant={action.variant}
+                                        disabled={Boolean(pendingActions[`channel-access:${channel.channelId}`])}
+                                        onClick={() => void setBuiltinChannelAccess(channel, action.mode)}
+                                      >
+                                        {pendingActions[`channel-access:${channel.channelId}`] ? "Saving…" : action.label}
+                                      </Button>
+                                    ))
+                                  : null}
+                                {channel.canClearKey ? (
+                                  <Button type="button" variant="secondary" onClick={() => void clearChannelKey(channel)}>
+                                    Clear key
                                   </Button>
-                                ))
-                              : null}
-                            {channel.canRename ? (
-                              <Button type="button" size="sm" variant="secondary" onClick={() => void renameChannel(channel)}>
-                                <Pencil className="h-4 w-4" />
-                                Rename
-                              </Button>
-                            ) : null}
-                            {channel.canSetKey ? (
-                              <Button type="button" size="sm" variant="secondary" onClick={() => void setChannelKey(channel)}>
-                                <KeyRound className="h-4 w-4" />
-                                Set key
-                              </Button>
-                            ) : null}
-                            {channel.canClearKey ? (
-                              <Button type="button" size="sm" variant="secondary" onClick={() => void clearChannelKey(channel)}>
-                                Clear key
-                              </Button>
-                            ) : null}
-                            {channel.canDelete ? (
-                              <Button type="button" size="sm" variant="destructive" onClick={() => void deleteChannel(channel)}>
-                                <Trash2 className="h-4 w-4" />
-                                Delete
-                              </Button>
-                            ) : null}
-                          </div>
-                        </div>
-                      </div>
-                    ))}
+                                ) : null}
+                                {channel.canDelete ? (
+                                  <Button type="button" variant="destructive" onClick={() => void deleteChannel(channel)}>
+                                    <Trash2 className="h-4 w-4" />
+                                    Delete channel
+                                  </Button>
+                                ) : null}
+                              </div>
+                            </div>
+                          </ManageDetails>
+                        </article>
+                    )) : (
+                      <EmptyState title="No channels" />
+                    )}
                   </div>
                 </PanelCard>
               </div>
@@ -1158,6 +1331,20 @@ export default function UsersPage() {
         </section>
       </div>
     </ConsoleShell>
+  );
+}
+
+function ManageDetails({ label, children }: { label: string; children: React.ReactNode }) {
+  return (
+    <details className="group mt-4 border-t border-border/60 pt-3">
+      <summary className="flex cursor-pointer select-none items-center justify-between gap-3 rounded-lg px-1 py-2 text-sm font-medium text-muted-foreground hover:text-foreground focus-visible:outline-none focus-visible:ring-4 focus-visible:ring-ring/20 [&::-webkit-details-marker]:hidden">
+        <span>{label}</span>
+        <ChevronDown className="h-4 w-4 transition-transform group-open:rotate-180" />
+      </summary>
+      <div className="mt-3 rounded-xl border border-border/70 bg-background/24 p-4">
+        {children}
+      </div>
+    </details>
   );
 }
 

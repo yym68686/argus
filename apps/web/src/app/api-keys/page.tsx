@@ -43,6 +43,23 @@ function providerStatus(channel: AdminChannelEntry): { label: string; tone: "suc
   return { label: "pending", tone: "default" };
 }
 
+function isVisibleUserProvider(channel: AdminChannelEntry): boolean {
+  return channel.enabledForUser !== false && channel.disabledByAdmin !== true;
+}
+
+function visibleChannelsState(nextState: SelfChannelsResponse): SelfChannelsResponse {
+  const channels = nextState.channels.filter(isVisibleUserProvider);
+  const currentChannel =
+    channels.find((channel) => channel.channelId === nextState.currentChannelId) ??
+    (nextState.currentChannel && isVisibleUserProvider(nextState.currentChannel) ? nextState.currentChannel : null);
+  return {
+    ...nextState,
+    channels,
+    currentChannelId: currentChannel?.channelId ?? null,
+    currentChannel,
+  };
+}
+
 export default function ApiKeysPage() {
   const { user } = useAuth();
   const { confirm, confirmDialog } = useConfirmDialog();
@@ -87,23 +104,24 @@ export default function ApiKeysPage() {
 
   const applyChannels = React.useCallback(
     (nextState: SelfChannelsResponse, preferredChannelId?: string | null) => {
+      const visibleState = visibleChannelsState(nextState);
       const candidates = [
         preferredChannelId,
         selectedChannelIdRef.current,
-        nextState.currentChannelId,
-        nextState.channels[0]?.channelId,
+        visibleState.currentChannelId,
+        visibleState.channels[0]?.channelId,
       ];
       let nextSelectedId = "";
       for (const candidate of candidates) {
         if (!candidate) continue;
-        if (nextState.channels.some((channel) => channel.channelId === candidate)) {
+        if (visibleState.channels.some((channel) => channel.channelId === candidate)) {
           nextSelectedId = candidate;
           break;
         }
       }
-      const nextSelectedChannel = nextState.channels.find((channel) => channel.channelId === nextSelectedId) ?? null;
+      const nextSelectedChannel = visibleState.channels.find((channel) => channel.channelId === nextSelectedId) ?? null;
       selectedChannelIdRef.current = nextSelectedId;
-      setChannelsState(nextState);
+      setChannelsState(visibleState);
       setSelectedChannelId(nextSelectedId);
       setNameDraft(nextSelectedChannel?.name ?? "");
       setKeyDraft("");
@@ -179,7 +197,7 @@ export default function ApiKeysPage() {
       if (result.issuedKey) {
         setRevealedKey(result.issuedKey);
       }
-      toast.success("Developer key created");
+      toast.success("Argus API key created");
     } catch (nextError) {
       const message = (nextError as Error)?.message || String(nextError);
       setError(message);
@@ -192,7 +210,7 @@ export default function ApiKeysPage() {
   const revokeDeveloperKey = React.useCallback(async (keyId: string) => {
     if (!wsUrl.trim()) return;
     const confirmed = await confirm({
-      title: "Revoke developer key?",
+      title: "Revoke Argus API key?",
       body: "Applications using this key will no longer be able to access the gateway.",
       confirmLabel: "Revoke key",
       tone: "destructive",
@@ -203,7 +221,7 @@ export default function ApiKeysPage() {
     try {
       const result = await revokeMyDeveloperKey(wsUrl, keyId);
       setDeveloperKeysState(result);
-      toast.success("Developer key revoked");
+      toast.success("Argus API key revoked");
     } catch (nextError) {
       const message = (nextError as Error)?.message || String(nextError);
       setError(message);
@@ -360,15 +378,15 @@ export default function ApiKeysPage() {
             <Fact label="Providers" value={String(channels.length)} />
             <Fact label="Ready" value={`${readyCount}/${channels.length || 0}`} />
             <Fact label="Provider Keys" value={String(keyedCount)} />
-            <Fact label="Access keys" value={String(developerKeysState?.counts.apiKeys ?? developerKeys.length)} />
+            <Fact label="Argus API keys" value={String(developerKeysState?.counts.apiKeys ?? developerKeys.length)} />
           </div>
         </PanelCard>
 
         {revealedKey ? (
           <PanelCard
-            title="New developer key"
+            title="New Argus API key"
             action={
-              <Button type="button" size="sm" variant="secondary" onClick={() => copyText(revealedKey.token, "Developer key")}>
+              <Button type="button" size="sm" variant="secondary" onClick={() => copyText(revealedKey.token, "Argus API key")}>
                 <Copy className="h-4 w-4" />
                 Copy
               </Button>
@@ -378,17 +396,17 @@ export default function ApiKeysPage() {
               <div className="rounded-[16px] border border-primary/28 bg-primary/10 px-4 py-3 text-sm text-foreground">
                 This token is shown once. Save it in your application config now.
               </div>
-              <Fact label={revealedKey.name || "Developer key"} value={revealedKey.token} mono />
+              <Fact label={revealedKey.name || "Argus API key"} value={revealedKey.token} mono />
             </div>
           </PanelCard>
         ) : null}
 
         <PanelCard
-          title="Gateway access keys"
+          title="Argus API keys"
           action={
             <div className="flex flex-wrap items-center gap-2">
               <label htmlFor="developer-key-name" className="sr-only">
-                Access key name
+                Argus API key name
               </label>
               <Input
                 id="developer-key-name"
@@ -402,7 +420,7 @@ export default function ApiKeysPage() {
               />
               <Button type="button" disabled={loading || saving} onClick={() => void createDeveloperKey()}>
                 <Plus className="h-4 w-4" />
-                Create Access Key
+                Create Argus API Key
               </Button>
             </div>
           }
@@ -433,7 +451,7 @@ export default function ApiKeysPage() {
               ))}
             </div>
           ) : (
-            <EmptyState title="No developer keys" />
+            <EmptyState title="No Argus API keys" />
           )}
         </PanelCard>
 

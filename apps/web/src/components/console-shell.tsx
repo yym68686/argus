@@ -73,7 +73,7 @@ export function ConsoleShell({ title, subtitle, actions, children }: ConsoleShel
 function ConsoleSidebar() {
   return (
     <aside className="argus-sidebar-surface border-b border-border/68 xl:sticky xl:top-0 xl:h-dvh xl:border-b-0 xl:border-r">
-      <div className="flex h-full flex-col">
+      <div className="flex flex-col xl:h-full">
         <div className="px-4 py-5">
           <Link href="/dashboard" className="flex items-center gap-3">
             <span className="argus-shell-glyph flex h-10 w-10 shrink-0 items-center justify-center rounded-[14px] border border-border/72">
@@ -87,7 +87,7 @@ function ConsoleSidebar() {
           <ConsoleNav />
         </div>
 
-        <div className="mt-auto">
+        <div className="xl:mt-auto">
           <ConsoleSidebarAccount />
         </div>
       </div>
