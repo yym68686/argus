@@ -19654,7 +19654,7 @@ def _fugue_cfg() -> FugueProvisionConfig:
     runtime_app_id = (os.getenv("ARGUS_FUGUE_RUNTIME_APP_ID") or "").strip() or None
     runtime_app_name = (os.getenv("ARGUS_FUGUE_RUNTIME_APP_NAME") or "").strip() or None
     runtime_compose_service = (os.getenv("ARGUS_FUGUE_RUNTIME_COMPOSE_SERVICE") or "").strip() or None
-    runtime_id = (os.getenv("ARGUS_FUGUE_RUNTIME_ID") or os.getenv("FUGUE_RUNTIME_ID") or "runtime_managed_shared").strip() or "runtime_managed_shared"
+    runtime_id = (os.getenv("ARGUS_FUGUE_RUNTIME_ID") or "runtime_managed_shared").strip() or "runtime_managed_shared"
     gateway_internal_host = (
         os.getenv("ARGUS_GATEWAY_INTERNAL_HOST") or os.getenv("ARGUS_FUGUE_GATEWAY_INTERNAL_HOST") or ""
     ).strip()

@@ -236,6 +236,25 @@ class FugueApiHelperTests(unittest.TestCase):
         self.assertEqual(cfg.runtime_compose_service, "runtime")
         self.assertIsNone(cfg.image)
 
+    def test_fugue_cfg_ignores_platform_injected_runtime_id(self) -> None:
+        env = self._base_fugue_env(
+            ARGUS_FUGUE_RUNTIME_COMPOSE_SERVICE="runtime",
+            FUGUE_RUNTIME_ID="runtime_current_gateway_pod",
+        )
+        with mock.patch.dict(os.environ, env, clear=True):
+            cfg = argus_app._fugue_cfg()
+        self.assertEqual(cfg.runtime_id, "runtime_managed_shared")
+
+    def test_fugue_cfg_accepts_explicit_argus_runtime_id(self) -> None:
+        env = self._base_fugue_env(
+            ARGUS_FUGUE_RUNTIME_COMPOSE_SERVICE="runtime",
+            FUGUE_RUNTIME_ID="runtime_current_gateway_pod",
+            ARGUS_FUGUE_RUNTIME_ID="runtime_target_sessions",
+        )
+        with mock.patch.dict(os.environ, env, clear=True):
+            cfg = argus_app._fugue_cfg()
+        self.assertEqual(cfg.runtime_id, "runtime_target_sessions")
+
     def test_fugue_cfg_accepts_movable_rwo_workspace_storage_mode(self) -> None:
         env = self._base_fugue_env(
             ARGUS_FUGUE_RUNTIME_COMPOSE_SERVICE="runtime",
