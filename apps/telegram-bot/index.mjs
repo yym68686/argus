@@ -894,7 +894,21 @@ class ArgusClient {
     const userId = Number(profile?.userId);
     if (!Number.isFinite(userId) || userId <= 0) throw new Error("Missing userId");
     return await this._httpJson("POST", "/automation/user/telegram-profile", {
-      userId: Math.trunc(userId),
+      telegramUserId: Math.trunc(userId),
+      username: isNonEmptyString(profile?.username) ? String(profile.username).trim() : undefined,
+      firstName: isNonEmptyString(profile?.firstName) ? String(profile.firstName).trim() : undefined,
+      lastName: isNonEmptyString(profile?.lastName) ? String(profile.lastName).trim() : undefined
+    });
+  }
+
+  async automationTelegramLinkClaim(token, profile, chatKey) {
+    if (!isNonEmptyString(token)) throw new Error("Missing token");
+    const userId = Number(profile?.userId);
+    if (!Number.isFinite(userId) || userId <= 0) throw new Error("Missing userId");
+    return await this._httpJson("POST", "/automation/user/telegram-link/claim", {
+      token: String(token).trim(),
+      telegramUserId: Math.trunc(userId),
+      chatKey: isNonEmptyString(chatKey) ? String(chatKey).trim() : String(Math.trunc(userId)),
       username: isNonEmptyString(profile?.username) ? String(profile.username).trim() : undefined,
       firstName: isNonEmptyString(profile?.firstName) ? String(profile.firstName).trim() : undefined,
       lastName: isNonEmptyString(profile?.lastName) ? String(profile.lastName).trim() : undefined
@@ -1713,6 +1727,8 @@ function normalizeAvailableModels(models, currentModel) {
 
     notice_initialized_created: "Initialized: main created.",
     notice_initialized_exists: "Initialized: main exists.",
+    notice_telegram_linked: "Telegram linked to your Argus account.",
+    notice_telegram_link_failed: "Telegram link failed: {error}",
     notice_canceled: "Canceled.",
     notice_cancel_requested: "Stopping the current turn…",
     notice_stop_already_requested: "Stop already requested.",
@@ -1893,6 +1909,8 @@ function normalizeAvailableModels(models, currentModel) {
 
     notice_initialized_created: "已初始化：已创建 main。",
     notice_initialized_exists: "已初始化：main 已存在。",
+    notice_telegram_linked: "Telegram 已绑定到你的 Argus 账号。",
+    notice_telegram_link_failed: "Telegram 绑定失败：{error}",
     notice_canceled: "已取消。",
     notice_cancel_requested: "正在停止当前任务……",
     notice_stop_already_requested: "已经请求停止了。",
@@ -2636,14 +2654,29 @@ async function main() {
     return Number.isFinite(chatId) ? chatId : null;
   }
 
+  async function resolveUserIdForChatKey(chatKey, fallbackUserId = null) {
+    try {
+      const data = await argusHttp.automationAgentList(chatKey);
+      const resolved = Number(data?.userId);
+      if (Number.isFinite(resolved) && resolved > 0) return Math.trunc(resolved);
+    } catch {
+      // ignore and fall back
+    }
+    const fallback = Number(fallbackUserId);
+    if (Number.isFinite(fallback) && fallback > 0) return Math.trunc(fallback);
+    const parsed = Number(chatKey);
+    return Number.isFinite(parsed) && parsed > 0 ? Math.trunc(parsed) : null;
+  }
+
   async function resolveRouteForChatKey(chatKey) {
     const res = await argusHttp.automationAgentResolve(chatKey);
     const sessionId = isNonEmptyString(res?.sessionId) ? res.sessionId : null;
     const agentId = isNonEmptyString(res?.agentId) ? res.agentId : "main";
     const model = normalizeAgentModel(res?.model);
     const availableModels = normalizeAvailableModels(res?.availableModels, model);
+    const userId = Number(res?.userId);
     if (!sessionId) throw new Error("Missing sessionId");
-    return { agentId, sessionId, model, availableModels };
+    return { agentId, sessionId, model, availableModels, userId: Number.isFinite(userId) && userId > 0 ? Math.trunc(userId) : null };
   }
 
   async function resolveChannelStateForChatKey(chatKey) {
@@ -3119,8 +3152,9 @@ async function main() {
 
   async function resolveGroupActorContext(chatKey, actorUserId) {
     const route = await resolveRouteForChatKey(chatKey);
-    const actorChatKey = privateChatKeyForUserId(actorUserId);
-    const ownsCurrentAgent = isNonEmptyString(route?.agentId) && canActorManageAgent(route.agentId, actorUserId);
+    const resolvedActorUserId = await resolveUserIdForChatKey(privateChatKeyForUserId(actorUserId), actorUserId);
+    const actorChatKey = privateChatKeyForUserId(resolvedActorUserId);
+    const ownsCurrentAgent = isNonEmptyString(route?.agentId) && canActorManageAgent(route.agentId, resolvedActorUserId);
     let currentChannel = null;
     if (ownsCurrentAgent && isNonEmptyString(actorChatKey)) {
       try {
@@ -3132,6 +3166,7 @@ async function main() {
     }
     return {
       actorChatKey,
+      actorUserId: resolvedActorUserId,
       canRenameCurrentAgent: ownsCurrentAgent && isNonEmptyString(route?.agentId) && !route.agentId.endsWith("-main"),
       ownsCurrentAgent,
       currentChannel,
@@ -3157,7 +3192,9 @@ async function main() {
       lines.push(`${escapeHtml(S.label_model)}: ${htmlCode(route.model)}`);
       if (currentChannel) lines.push(`${escapeHtml(S.label_channel)}: ${htmlCode(channelDisplayName(currentChannel))}`);
       lines.push(`session: ${htmlCode(route.sessionId)}`);
-      const ownPrefix = isNonEmptyString(chatKey) ? `u${chatKey.trim()}-` : "";
+      const ownPrefix = Number.isFinite(route?.userId) && route.userId > 0
+        ? `u${Math.trunc(route.userId)}-`
+        : (isNonEmptyString(chatKey) ? `u${chatKey.trim()}-` : "");
       const canDelete = isNonEmptyString(ownPrefix)
         && isNonEmptyString(route?.agentId)
         && route.agentId.startsWith(ownPrefix);
@@ -5411,6 +5448,19 @@ async function main() {
                 await safeSendMessage({ ...target, text: S.msg_use_start_in_dm });
                 return;
               }
+              let linkNotice = null;
+              const startPayload = isNonEmptyString(slash.args) ? slash.args.trim() : "";
+              if (startPayload.startsWith("tgl_")) {
+                try {
+                  const profile = telegramProfileFromUser(message?.from);
+                  await argusHttp.automationTelegramLinkClaim(startPayload, profile, chatKey);
+                  linkNotice = S.notice_telegram_linked;
+                  syncedTelegramProfileKeysByUserId.delete(profile?.userId);
+                  syncTelegramProfile(message?.from);
+                } catch (e) {
+                  linkNotice = formatTemplate(S.notice_telegram_link_failed, { error: formatGatewayErrorForUser(e, { locale }) });
+                }
+              }
               const boot = await argusHttp.automationUserBootstrap(chatKey);
               const currentSessionId = isNonEmptyString(boot?.currentSessionId) ? boot.currentSessionId : null;
               if (currentSessionId) await getClient(currentSessionId);
@@ -5420,7 +5470,7 @@ async function main() {
                 chatType,
                 locale,
                 actorUserId: message?.from?.id,
-                notice: Boolean(boot?.createdMain) ? S.notice_initialized_created : S.notice_initialized_exists
+                notice: linkNotice || (Boolean(boot?.createdMain) ? S.notice_initialized_created : S.notice_initialized_exists)
               });
               return;
             }

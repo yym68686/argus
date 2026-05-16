@@ -1,7 +1,7 @@
 "use client";
 
 import * as React from "react";
-import { Bot, KeyRound, RefreshCw, Server, WalletCards } from "lucide-react";
+import { Bot, KeyRound, RefreshCw, Send, Server, WalletCards } from "lucide-react";
 import { toast } from "sonner";
 
 import { useAuth } from "@/components/admin-gate";
@@ -15,9 +15,13 @@ import { useGatewayWsUrlState } from "@/lib/gateway";
 import {
   fetchMyAgents,
   fetchMyDeveloperKeys,
+  fetchMyTelegramLinkStatus,
   fetchMyUsage,
+  createMyTelegramLink,
   type SelfAgentsResponse,
   type SelfDeveloperKeysResponse,
+  type SelfTelegramLinkIssueResponse,
+  type SelfTelegramLinkStatusResponse,
   type SelfUsageResponse,
 } from "@/lib/self";
 import { cn } from "@/lib/utils";
@@ -73,11 +77,29 @@ function usageStatus(event: UsageEventEntry): { label: string; className: string
   };
 }
 
+function telegramBotUrlFromIssue(issue: SelfTelegramLinkIssueResponse): string | null {
+  const direct = String(issue.botUrl || "").trim();
+  if (direct) return direct;
+  return null;
+}
+
+function telegramLinkLabel(state: SelfTelegramLinkStatusResponse | null): string {
+  if (!state) return "—";
+  if (!state.linked) return "Not linked";
+  const profile = state.link?.profile;
+  if (profile?.username) return `@${profile.username}`;
+  if (profile?.displayName) return profile.displayName;
+  if (state.link?.telegramUserId) return `TG ${state.link.telegramUserId}`;
+  return "Linked";
+}
+
 export default function DashboardPage() {
   const { user } = useAuth();
   const [wsUrl] = useGatewayWsUrlState();
   const [agentsState, setAgentsState] = React.useState<SelfAgentsResponse | null>(null);
   const [keysState, setKeysState] = React.useState<SelfDeveloperKeysResponse | null>(null);
+  const [telegramLinkState, setTelegramLinkState] = React.useState<SelfTelegramLinkStatusResponse | null>(null);
+  const [telegramLinkBusy, setTelegramLinkBusy] = React.useState(false);
   const [usage24h, setUsage24h] = React.useState<SelfUsageResponse | null>(null);
   const [usageTotal, setUsageTotal] = React.useState<SelfUsageResponse | null>(null);
   const [loading, setLoading] = React.useState(false);
@@ -91,9 +113,10 @@ export default function DashboardPage() {
 
       const recentParams = new URLSearchParams({ hours: "24", limit: "6" });
       const totalParams = new URLSearchParams({ hours: "0", limit: "6" });
-      const [agentsResult, keysResult, recentUsageResult, totalUsageResult] = await Promise.allSettled([
+      const [agentsResult, keysResult, telegramLinkResult, recentUsageResult, totalUsageResult] = await Promise.allSettled([
         fetchMyAgents(wsUrl),
         fetchMyDeveloperKeys(wsUrl),
+        fetchMyTelegramLinkStatus(wsUrl),
         fetchMyUsage(wsUrl, recentParams),
         fetchMyUsage(wsUrl, totalParams),
       ]);
@@ -110,6 +133,12 @@ export default function DashboardPage() {
         setKeysState(keysResult.value);
       } else {
         errors.push((keysResult.reason as Error)?.message || String(keysResult.reason));
+      }
+
+      if (telegramLinkResult.status === "fulfilled") {
+        setTelegramLinkState(telegramLinkResult.value);
+      } else {
+        errors.push((telegramLinkResult.reason as Error)?.message || String(telegramLinkResult.reason));
       }
 
       if (recentUsageResult.status === "fulfilled") {
@@ -144,6 +173,30 @@ export default function DashboardPage() {
     void run();
   }, [refresh, wsUrl]);
 
+  const handleTelegramLink = React.useCallback(async () => {
+    if (!wsUrl.trim()) return;
+    setTelegramLinkBusy(true);
+    try {
+      const issue = await createMyTelegramLink(wsUrl);
+      setTelegramLinkState(issue);
+      const url = telegramBotUrlFromIssue(issue);
+      if (!url) {
+        toast.error("Telegram bot token is not configured or invalid. Configure it in Settings first.");
+        return;
+      }
+      const opened = window.open(url, "_blank");
+      if (opened) {
+        opened.opener = null;
+      } else {
+        window.location.assign(url);
+      }
+    } catch (nextError) {
+      toast.error((nextError as Error)?.message || String(nextError));
+    } finally {
+      setTelegramLinkBusy(false);
+    }
+  }, [wsUrl]);
+
   const agents = agentsState?.agents ?? [];
   const agentCount = agentsState?.counts.agents ?? agents.length;
   const sessionCount = agentsState?.counts.sessions ?? 0;
@@ -161,7 +214,11 @@ export default function DashboardPage() {
     <ConsoleShell
       title="Dashboard"
       actions={
-        <div className="flex justify-start xl:justify-end">
+        <div className="flex flex-wrap justify-start gap-2 xl:justify-end">
+          <Button type="button" variant="secondary" onClick={() => void handleTelegramLink()} disabled={telegramLinkBusy || !wsUrl.trim()}>
+            <Send className={cn("h-4 w-4", telegramLinkBusy ? "animate-pulse" : null)} />
+            {telegramLinkState?.linked ? "Open Telegram" : "Connect Telegram"}
+          </Button>
           <Button type="button" variant="secondary" onClick={() => void refresh({ notify: true })} disabled={loading || !wsUrl.trim()}>
             <RefreshCw className={cn("h-4 w-4", loading ? "animate-spin" : null)} />
             Refresh
@@ -196,6 +253,7 @@ export default function DashboardPage() {
               <div className="grid gap-3 sm:grid-cols-2">
                 <Fact label="User" value={user?.email || `User ${user?.userId ?? "—"}`} />
                 <Fact label="Role" value={user?.isAdmin ? "Admin" : "User"} />
+                <Fact label="Telegram" value={telegramLinkLabel(telegramLinkState)} />
                 <Fact label="Current agent" value={currentAgent?.shortName || currentAgent?.agentId || "—"} mono />
                 <Fact label="Current model" value={currentAgent?.model || "—"} mono />
                 <Fact label="Sessions" value={formatInt(sessionCount)} />

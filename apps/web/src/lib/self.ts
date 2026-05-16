@@ -108,6 +108,36 @@ export interface SelfChannelsResponse {
   channels: AdminChannelEntry[];
 }
 
+export interface SelfTelegramLinkStatusResponse {
+  ok: true;
+  userId: number;
+  linked: boolean;
+  link?: {
+    telegramUserId: number;
+    consoleUserId: number;
+    chatKey: string;
+    createdAtMs?: number | null;
+    updatedAtMs?: number | null;
+    profile?: {
+      userId: number;
+      username?: string | null;
+      firstName?: string | null;
+      lastName?: string | null;
+      displayName?: string | null;
+      createdAtMs?: number | null;
+      updatedAtMs?: number | null;
+    } | null;
+  } | null;
+  botUsername?: string | null;
+}
+
+export interface SelfTelegramLinkIssueResponse extends SelfTelegramLinkStatusResponse {
+  token: string;
+  startParameter: string;
+  botUrl?: string | null;
+  expiresAtMs?: number | null;
+}
+
 export interface SelfUsageResponse {
   ok: true;
   user: ConsoleUser;
@@ -125,6 +155,16 @@ export interface SelfUsageResponse {
 
 export function fetchMyChannels(wsUrl: string): Promise<SelfChannelsResponse> {
   return gatewayFetchJson<SelfChannelsResponse>(wsUrl, "/me/channels");
+}
+
+export function fetchMyTelegramLinkStatus(wsUrl: string): Promise<SelfTelegramLinkStatusResponse> {
+  return gatewayFetchJson<SelfTelegramLinkStatusResponse>(wsUrl, "/me/telegram-link");
+}
+
+export function createMyTelegramLink(wsUrl: string): Promise<SelfTelegramLinkIssueResponse> {
+  return gatewayFetchJson<SelfTelegramLinkIssueResponse>(wsUrl, "/me/telegram-link", {
+    method: "POST",
+  });
 }
 
 export function fetchMyDeveloperKeys(wsUrl: string): Promise<SelfDeveloperKeysResponse> {

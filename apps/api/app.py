@@ -1928,6 +1928,14 @@ def _telegram_api_call_sync(token: str, method: str, params: dict[str, Any]) -> 
         raise RuntimeError(f"Telegram {method} failed: {desc}")
     return data.get("result")
 
+
+def _telegram_bot_username_from_token_sync(token: str) -> Optional[str]:
+    result = _telegram_api_call_sync(token, "getMe", {})
+    if not isinstance(result, dict):
+        raise RuntimeError("Telegram getMe failed: bad response")
+    username = _normalize_telegram_username(result.get("username"))
+    return username
+
 def _telegram_get_file_sync(token: str, file_id: str) -> dict[str, Any]:
     res = _telegram_api_call_sync(token, "getFile", {"file_id": file_id})
     if not isinstance(res, dict):
@@ -2689,7 +2697,8 @@ TELEGRAM_BOT_TOKEN_MAX_LEN = 512
 CONSOLE_EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 CONSOLE_SESSION_ID_RE = re.compile(r"^[a-f0-9]{24}$")
 DEVELOPER_API_KEY_ID_RE = re.compile(r"^[a-f0-9]{16}$")
-AUTOMATION_STATE_VERSION = 12
+TELEGRAM_LINK_TOKEN_ID_RE = re.compile(r"^[a-f0-9]{12}$")
+AUTOMATION_STATE_VERSION = 13
 ARGUS_AGENT_MODEL_DEFAULT = "gpt-5.5"
 ARGUS_GATEWAY_AGENT_MODELS = ("gpt-5.2", "gpt-5.4", "gpt-5.5")
 ARGUS_GATEWAY_AGENT_MODELS_SET = frozenset(ARGUS_GATEWAY_AGENT_MODELS)
@@ -2713,9 +2722,12 @@ BUILTIN_ACCESS_MODES = frozenset(
 )
 CONSOLE_SESSION_TOKEN_PREFIX = "argus-console-v1"
 DEVELOPER_API_KEY_TOKEN_PREFIX = "argus-dev-v1"
+TELEGRAM_LINK_TOKEN_PREFIX = "tgl"
 CONSOLE_PASSWORD_HASH_KIND = "pbkdf2_sha256"
 CONSOLE_PASSWORD_PBKDF2_ITERATIONS = 600_000
 CONSOLE_SESSION_TTL_MS = 30 * 24 * 60 * 60 * 1000
+TELEGRAM_LINK_TOKEN_TTL_MS = 10 * 60 * 1000
+TELEGRAM_LINK_TOKEN_MAX_TTL_MS = 60 * 60 * 1000
 STATE_SECRET_SEAL_PREFIX = "argus-seal-v1"
 AUTH_RATE_LIMIT_WINDOW_MS = 60_000
 USER_RATE_LIMIT_WINDOW_MS = 60_000
@@ -2811,6 +2823,20 @@ def _developer_api_key_ttl_days() -> Optional[int]:
     if value is None or value <= 0:
         return None
     return value
+
+
+def _telegram_link_token_ttl_ms() -> int:
+    value = _env_optional_int("ARGUS_TELEGRAM_LINK_TOKEN_TTL_SECONDS", default=TELEGRAM_LINK_TOKEN_TTL_MS // 1000, minimum=60)
+    seconds = int(value or (TELEGRAM_LINK_TOKEN_TTL_MS // 1000))
+    return max(60_000, min(seconds * 1000, TELEGRAM_LINK_TOKEN_MAX_TTL_MS))
+
+
+def _telegram_bot_deep_link(username: Optional[str], start_parameter: str) -> Optional[str]:
+    username_norm = str(username or "").strip().lstrip("@")
+    payload = str(start_parameter or "").strip()
+    if not username_norm or not payload:
+        return None
+    return f"https://t.me/{username_norm}?start={urllib.parse.quote(payload, safe='')}"
 
 
 def _state_encryption_key_material() -> Optional[bytes]:
@@ -3038,6 +3064,32 @@ def _issue_developer_api_key_token() -> tuple[str, str, Optional[int]]:
     ttl_days = _developer_api_key_ttl_days()
     expires_at_ms = _now_ms() + ttl_days * 24 * 60 * 60 * 1000 if isinstance(ttl_days, int) and ttl_days > 0 else None
     return key_id, token, expires_at_ms
+
+
+def _hash_telegram_link_token(token: Any) -> str:
+    return hashlib.sha256(str(token or "").encode("utf-8")).hexdigest()
+
+
+def _parse_telegram_link_token(token: Any) -> tuple[Optional[str], Optional[str]]:
+    raw = str(token or "").strip()
+    if not raw:
+        return None, None
+    parts = raw.split("_", 2)
+    if len(parts) != 3 or parts[0] != TELEGRAM_LINK_TOKEN_PREFIX:
+        return None, None
+    token_id = parts[1].strip().lower()
+    secret = parts[2].strip()
+    if not TELEGRAM_LINK_TOKEN_ID_RE.match(token_id) or not secret:
+        return None, None
+    return token_id, secret
+
+
+def _issue_telegram_link_token() -> tuple[str, str, str, int]:
+    token_id = uuid.uuid4().hex[:12]
+    secret = _b64url_no_pad(secrets.token_bytes(24))
+    token = f"{TELEGRAM_LINK_TOKEN_PREFIX}_{token_id}_{secret}"
+    expires_at_ms = _now_ms() + _telegram_link_token_ttl_ms()
+    return token_id, secret, token, expires_at_ms
 
 
 def _is_missing_thread_for_archive_error(msg: str) -> bool:
@@ -4275,6 +4327,134 @@ class PersistedTelegramUserProfile:
 
 
 @dataclass
+class PersistedTelegramConsoleLink:
+    telegram_user_id: int
+    console_user_id: int
+    chat_key: str
+    created_at_ms: int = field(default_factory=_now_ms)
+    updated_at_ms: int = field(default_factory=_now_ms)
+
+    def to_json(self) -> dict[str, Any]:
+        return {
+            "telegramUserId": int(self.telegram_user_id),
+            "consoleUserId": int(self.console_user_id),
+            "chatKey": self.chat_key,
+            "createdAtMs": int(self.created_at_ms),
+            "updatedAtMs": int(self.updated_at_ms),
+        }
+
+    def to_public_json(self, profile: Optional[PersistedTelegramUserProfile] = None) -> dict[str, Any]:
+        return {
+            **self.to_json(),
+            "profile": profile.to_public_json() if isinstance(profile, PersistedTelegramUserProfile) else None,
+        }
+
+    @staticmethod
+    def from_json(obj: Any) -> Optional["PersistedTelegramConsoleLink"]:
+        if not isinstance(obj, dict):
+            return None
+        try:
+            telegram_user_id = int(obj.get("telegramUserId"))
+            console_user_id = int(obj.get("consoleUserId"))
+        except Exception:
+            return None
+        if telegram_user_id <= 0 or console_user_id <= 0:
+            return None
+        chat_key = str(obj.get("chatKey") or telegram_user_id).strip()
+        if not chat_key:
+            chat_key = str(telegram_user_id)
+        try:
+            created_at_ms = int(obj.get("createdAtMs")) if obj.get("createdAtMs") is not None else _now_ms()
+        except Exception:
+            created_at_ms = _now_ms()
+        try:
+            updated_at_ms = int(obj.get("updatedAtMs")) if obj.get("updatedAtMs") is not None else created_at_ms
+        except Exception:
+            updated_at_ms = created_at_ms
+        return PersistedTelegramConsoleLink(
+            telegram_user_id=telegram_user_id,
+            console_user_id=console_user_id,
+            chat_key=chat_key,
+            created_at_ms=created_at_ms,
+            updated_at_ms=updated_at_ms,
+        )
+
+
+@dataclass
+class PersistedTelegramLinkToken:
+    token_id: str
+    console_user_id: int
+    token_hash: str
+    created_at_ms: int = field(default_factory=_now_ms)
+    expires_at_ms: int = field(default_factory=lambda: _now_ms() + TELEGRAM_LINK_TOKEN_TTL_MS)
+    claimed_at_ms: Optional[int] = None
+    claimed_telegram_user_id: Optional[int] = None
+
+    def is_active(self) -> bool:
+        if self.claimed_at_ms is not None:
+            return False
+        try:
+            return int(self.expires_at_ms) > _now_ms()
+        except Exception:
+            return False
+
+    def to_json(self, *, redact_secrets: bool = False) -> dict[str, Any]:
+        return {
+            "tokenId": self.token_id,
+            "consoleUserId": int(self.console_user_id),
+            "tokenHash": None if redact_secrets else str(self.token_hash or "").strip(),
+            "createdAtMs": int(self.created_at_ms),
+            "expiresAtMs": int(self.expires_at_ms),
+            "claimedAtMs": int(self.claimed_at_ms) if isinstance(self.claimed_at_ms, int) and self.claimed_at_ms > 0 else None,
+            "claimedTelegramUserId": (
+                int(self.claimed_telegram_user_id)
+                if isinstance(self.claimed_telegram_user_id, int) and self.claimed_telegram_user_id > 0
+                else None
+            ),
+        }
+
+    @staticmethod
+    def from_json(obj: Any) -> Optional["PersistedTelegramLinkToken"]:
+        if not isinstance(obj, dict):
+            return None
+        token_id = str(obj.get("tokenId") or "").strip().lower()
+        if not TELEGRAM_LINK_TOKEN_ID_RE.match(token_id):
+            return None
+        try:
+            console_user_id = int(obj.get("consoleUserId"))
+        except Exception:
+            return None
+        token_hash = str(obj.get("tokenHash") or "").strip()
+        if console_user_id <= 0 or not token_hash:
+            return None
+        try:
+            created_at_ms = int(obj.get("createdAtMs")) if obj.get("createdAtMs") is not None else _now_ms()
+        except Exception:
+            created_at_ms = _now_ms()
+        try:
+            expires_at_ms = int(obj.get("expiresAtMs")) if obj.get("expiresAtMs") is not None else created_at_ms + TELEGRAM_LINK_TOKEN_TTL_MS
+        except Exception:
+            expires_at_ms = created_at_ms + TELEGRAM_LINK_TOKEN_TTL_MS
+        try:
+            claimed_at_ms = int(obj.get("claimedAtMs")) if obj.get("claimedAtMs") is not None else None
+        except Exception:
+            claimed_at_ms = None
+        try:
+            claimed_telegram_user_id = int(obj.get("claimedTelegramUserId")) if obj.get("claimedTelegramUserId") is not None else None
+        except Exception:
+            claimed_telegram_user_id = None
+        return PersistedTelegramLinkToken(
+            token_id=token_id,
+            console_user_id=console_user_id,
+            token_hash=token_hash,
+            created_at_ms=created_at_ms,
+            expires_at_ms=expires_at_ms,
+            claimed_at_ms=claimed_at_ms,
+            claimed_telegram_user_id=claimed_telegram_user_id,
+        )
+
+
+@dataclass
 class PersistedConsoleUser:
     user_id: int
     email: str
@@ -4441,6 +4621,8 @@ class PersistedGatewayAutomationState:
     gateway_openai_default_enabled: bool = True
     telegram_bot_token: Optional[str] = None
     telegram_user_profiles: dict[str, PersistedTelegramUserProfile] = field(default_factory=dict)
+    telegram_console_links: dict[str, PersistedTelegramConsoleLink] = field(default_factory=dict)
+    telegram_link_tokens: dict[str, PersistedTelegramLinkToken] = field(default_factory=dict)
     console_users: dict[str, PersistedConsoleUser] = field(default_factory=dict)
     console_sessions: dict[str, PersistedConsoleSession] = field(default_factory=dict)
     host_enrollments: dict[str, PersistedHostEnrollment] = field(default_factory=dict)
@@ -4468,6 +4650,16 @@ class PersistedGatewayAutomationState:
                 user_id: profile.to_json()
                 for user_id, profile in (self.telegram_user_profiles or {}).items()
                 if isinstance(user_id, str) and user_id.strip() and isinstance(profile, PersistedTelegramUserProfile)
+            },
+            "telegramConsoleLinks": {
+                telegram_user_id: link.to_json()
+                for telegram_user_id, link in (self.telegram_console_links or {}).items()
+                if isinstance(telegram_user_id, str) and telegram_user_id.strip() and isinstance(link, PersistedTelegramConsoleLink)
+            },
+            "telegramLinkTokens": {
+                token_id: token.to_json(redact_secrets=redact_secrets)
+                for token_id, token in (self.telegram_link_tokens or {}).items()
+                if isinstance(token_id, str) and token_id.strip() and isinstance(token, PersistedTelegramLinkToken)
             },
             "consoleUsers": {
                 user_id: user.to_json(redact_secrets=redact_secrets)
@@ -4573,6 +4765,35 @@ class PersistedGatewayAutomationState:
                         key = str(profile.user_id)
                 telegram_user_profiles[key] = profile
 
+        telegram_console_links_raw = obj.get("telegramConsoleLinks")
+        telegram_console_links: dict[str, PersistedTelegramConsoleLink] = {}
+        if isinstance(telegram_console_links_raw, dict):
+            for raw_telegram_user_id, raw_link in telegram_console_links_raw.items():
+                link = PersistedTelegramConsoleLink.from_json(raw_link)
+                if link is None:
+                    continue
+                key = str(link.telegram_user_id)
+                if isinstance(raw_telegram_user_id, str) and raw_telegram_user_id.strip():
+                    try:
+                        key = str(int(raw_telegram_user_id))
+                    except Exception:
+                        key = str(link.telegram_user_id)
+                telegram_console_links[key] = link
+
+        telegram_link_tokens_raw = obj.get("telegramLinkTokens")
+        telegram_link_tokens: dict[str, PersistedTelegramLinkToken] = {}
+        if isinstance(telegram_link_tokens_raw, dict):
+            for raw_token_id, raw_token in telegram_link_tokens_raw.items():
+                token = PersistedTelegramLinkToken.from_json(raw_token)
+                if token is None:
+                    continue
+                key = token.token_id
+                if isinstance(raw_token_id, str):
+                    candidate = raw_token_id.strip().lower()
+                    if TELEGRAM_LINK_TOKEN_ID_RE.match(candidate):
+                        key = candidate
+                telegram_link_tokens[key] = token
+
         console_users_raw = obj.get("consoleUsers")
         console_users: dict[str, PersistedConsoleUser] = {}
         if isinstance(console_users_raw, dict):
@@ -4646,6 +4867,8 @@ class PersistedGatewayAutomationState:
             gateway_openai_default_enabled=gateway_openai_default_enabled,
             telegram_bot_token=telegram_bot_token,
             telegram_user_profiles=telegram_user_profiles,
+            telegram_console_links=telegram_console_links,
+            telegram_link_tokens=telegram_link_tokens,
             console_users=console_users,
             console_sessions=console_sessions,
             host_enrollments=host_enrollments,
@@ -4895,6 +5118,46 @@ class _SQLiteAutomationStateStore:
                         ],
                     )
 
+                conn.execute("DELETE FROM automation_telegram_console_links")
+                if state.telegram_console_links:
+                    conn.executemany(
+                        """
+                        INSERT INTO automation_telegram_console_links (telegram_user_id, payload_json, updated_at_ms)
+                        VALUES (?, ?, ?)
+                        """,
+                        [
+                            (
+                                telegram_user_id,
+                                json.dumps(link.to_json(), ensure_ascii=False, separators=(",", ":")),
+                                now_ms,
+                            )
+                            for telegram_user_id, link in state.telegram_console_links.items()
+                            if isinstance(telegram_user_id, str)
+                            and telegram_user_id.strip()
+                            and isinstance(link, PersistedTelegramConsoleLink)
+                        ],
+                    )
+
+                conn.execute("DELETE FROM automation_telegram_link_tokens")
+                if state.telegram_link_tokens:
+                    conn.executemany(
+                        """
+                        INSERT INTO automation_telegram_link_tokens (token_id, payload_json, updated_at_ms)
+                        VALUES (?, ?, ?)
+                        """,
+                        [
+                            (
+                                token_id,
+                                json.dumps(token.to_json(redact_secrets=False), ensure_ascii=False, separators=(",", ":")),
+                                now_ms,
+                            )
+                            for token_id, token in state.telegram_link_tokens.items()
+                            if isinstance(token_id, str)
+                            and token_id.strip()
+                            and isinstance(token, PersistedTelegramLinkToken)
+                        ],
+                    )
+
                 conn.execute("DELETE FROM automation_console_sessions")
                 if state.console_sessions:
                     conn.executemany(
@@ -5016,6 +5279,16 @@ class _SQLiteAutomationStateStore:
                 payload_json TEXT NOT NULL,
                 updated_at_ms INTEGER NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS automation_telegram_console_links (
+                telegram_user_id TEXT PRIMARY KEY,
+                payload_json TEXT NOT NULL,
+                updated_at_ms INTEGER NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS automation_telegram_link_tokens (
+                token_id TEXT PRIMARY KEY,
+                payload_json TEXT NOT NULL,
+                updated_at_ms INTEGER NOT NULL
+            );
             CREATE TABLE IF NOT EXISTS automation_console_sessions (
                 session_id TEXT PRIMARY KEY,
                 payload_json TEXT NOT NULL,
@@ -5049,6 +5322,8 @@ class _SQLiteAutomationStateStore:
             "automation_user_channels",
             "automation_console_users",
             "automation_telegram_user_profiles",
+            "automation_telegram_console_links",
+            "automation_telegram_link_tokens",
             "automation_console_sessions",
             "automation_host_enrollments",
             "automation_host_bindings",
@@ -5178,6 +5453,40 @@ class _SQLiteAutomationStateStore:
                 key = str(profile.user_id)
             telegram_user_profiles[key] = profile
 
+        telegram_console_links: dict[str, PersistedTelegramConsoleLink] = {}
+        for row in conn.execute("SELECT telegram_user_id, payload_json FROM automation_telegram_console_links"):
+            telegram_user_id = str(row["telegram_user_id"] or "").strip()
+            if not telegram_user_id:
+                continue
+            try:
+                payload = json.loads(str(row["payload_json"] or "{}"))
+            except Exception:
+                continue
+            link = PersistedTelegramConsoleLink.from_json(payload)
+            if link is None:
+                continue
+            key = telegram_user_id
+            try:
+                key = str(int(telegram_user_id))
+            except Exception:
+                key = str(link.telegram_user_id)
+            telegram_console_links[key] = link
+
+        telegram_link_tokens: dict[str, PersistedTelegramLinkToken] = {}
+        for row in conn.execute("SELECT token_id, payload_json FROM automation_telegram_link_tokens"):
+            token_id = str(row["token_id"] or "").strip().lower()
+            if not token_id:
+                continue
+            try:
+                payload = json.loads(str(row["payload_json"] or "{}"))
+            except Exception:
+                continue
+            token = PersistedTelegramLinkToken.from_json(payload)
+            if token is None:
+                continue
+            key = token_id if TELEGRAM_LINK_TOKEN_ID_RE.match(token_id) else token.token_id
+            telegram_link_tokens[key] = token
+
         console_sessions: dict[str, PersistedConsoleSession] = {}
         for row in conn.execute("SELECT session_id, payload_json FROM automation_console_sessions"):
             try:
@@ -5242,6 +5551,8 @@ class _SQLiteAutomationStateStore:
             gateway_openai_default_enabled=gateway_openai_default_enabled,
             telegram_bot_token=telegram_bot_token,
             telegram_user_profiles=telegram_user_profiles,
+            telegram_console_links=telegram_console_links,
+            telegram_link_tokens=telegram_link_tokens,
             console_users=console_users,
             console_sessions=console_sessions,
             host_enrollments=host_enrollments,
@@ -6095,6 +6406,46 @@ class _PostgresAutomationStateStore:
                             ],
                         )
 
+                    cur.execute("DELETE FROM automation_telegram_console_links")
+                    if state.telegram_console_links:
+                        cur.executemany(
+                            """
+                            INSERT INTO automation_telegram_console_links (telegram_user_id, payload_json, updated_at_ms)
+                            VALUES (%s, %s, %s)
+                            """,
+                            [
+                                (
+                                    telegram_user_id,
+                                    json.dumps(link.to_json(), ensure_ascii=False, separators=(",", ":")),
+                                    now_ms,
+                                )
+                                for telegram_user_id, link in state.telegram_console_links.items()
+                                if isinstance(telegram_user_id, str)
+                                and telegram_user_id.strip()
+                                and isinstance(link, PersistedTelegramConsoleLink)
+                            ],
+                        )
+
+                    cur.execute("DELETE FROM automation_telegram_link_tokens")
+                    if state.telegram_link_tokens:
+                        cur.executemany(
+                            """
+                            INSERT INTO automation_telegram_link_tokens (token_id, payload_json, updated_at_ms)
+                            VALUES (%s, %s, %s)
+                            """,
+                            [
+                                (
+                                    token_id,
+                                    json.dumps(token.to_json(redact_secrets=False), ensure_ascii=False, separators=(",", ":")),
+                                    now_ms,
+                                )
+                                for token_id, token in state.telegram_link_tokens.items()
+                                if isinstance(token_id, str)
+                                and token_id.strip()
+                                and isinstance(token, PersistedTelegramLinkToken)
+                            ],
+                        )
+
                     cur.execute("DELETE FROM automation_console_sessions")
                     if state.console_sessions:
                         cur.executemany(
@@ -6229,6 +6580,20 @@ class _PostgresAutomationStateStore:
             )
             """,
             """
+            CREATE TABLE IF NOT EXISTS automation_telegram_console_links (
+                telegram_user_id TEXT PRIMARY KEY,
+                payload_json TEXT NOT NULL,
+                updated_at_ms BIGINT NOT NULL
+            )
+            """,
+            """
+            CREATE TABLE IF NOT EXISTS automation_telegram_link_tokens (
+                token_id TEXT PRIMARY KEY,
+                payload_json TEXT NOT NULL,
+                updated_at_ms BIGINT NOT NULL
+            )
+            """,
+            """
             CREATE TABLE IF NOT EXISTS automation_console_sessions (
                 session_id TEXT PRIMARY KEY,
                 payload_json TEXT NOT NULL,
@@ -6269,6 +6634,8 @@ class _PostgresAutomationStateStore:
             "automation_user_channels",
             "automation_console_users",
             "automation_telegram_user_profiles",
+            "automation_telegram_console_links",
+            "automation_telegram_link_tokens",
             "automation_console_sessions",
             "automation_host_enrollments",
             "automation_host_bindings",
@@ -6398,6 +6765,40 @@ class _PostgresAutomationStateStore:
                 key = str(profile.user_id)
             telegram_user_profiles[key] = profile
 
+        telegram_console_links: dict[str, PersistedTelegramConsoleLink] = {}
+        for row in conn.execute("SELECT telegram_user_id, payload_json FROM automation_telegram_console_links").fetchall():
+            telegram_user_id = str(row["telegram_user_id"] or "").strip()
+            if not telegram_user_id:
+                continue
+            try:
+                payload = json.loads(str(row["payload_json"] or "{}"))
+            except Exception:
+                continue
+            link = PersistedTelegramConsoleLink.from_json(payload)
+            if link is None:
+                continue
+            key = telegram_user_id
+            try:
+                key = str(int(telegram_user_id))
+            except Exception:
+                key = str(link.telegram_user_id)
+            telegram_console_links[key] = link
+
+        telegram_link_tokens: dict[str, PersistedTelegramLinkToken] = {}
+        for row in conn.execute("SELECT token_id, payload_json FROM automation_telegram_link_tokens").fetchall():
+            token_id = str(row["token_id"] or "").strip().lower()
+            if not token_id:
+                continue
+            try:
+                payload = json.loads(str(row["payload_json"] or "{}"))
+            except Exception:
+                continue
+            token = PersistedTelegramLinkToken.from_json(payload)
+            if token is None:
+                continue
+            key = token_id if TELEGRAM_LINK_TOKEN_ID_RE.match(token_id) else token.token_id
+            telegram_link_tokens[key] = token
+
         console_sessions: dict[str, PersistedConsoleSession] = {}
         for row in conn.execute("SELECT session_id, payload_json FROM automation_console_sessions").fetchall():
             try:
@@ -6462,6 +6863,8 @@ class _PostgresAutomationStateStore:
             gateway_openai_default_enabled=gateway_openai_default_enabled,
             telegram_bot_token=telegram_bot_token,
             telegram_user_profiles=telegram_user_profiles,
+            telegram_console_links=telegram_console_links,
+            telegram_link_tokens=telegram_link_tokens,
             console_users=console_users,
             console_sessions=console_sessions,
             host_enrollments=host_enrollments,
@@ -7135,6 +7538,7 @@ class AutomationManager:
         self._model_catalog_cache: dict[tuple[int, str], dict[str, Any]] = {}
         self._agent_provision_tasks: dict[str, asyncio.Task[None]] = {}
         self._agent_cleanup_tasks: set[asyncio.Task[None]] = set()
+        self._telegram_bot_username_cache: dict[str, Any] = {}
 
     async def start(self) -> None:
         await self._store.load()
@@ -7859,6 +8263,9 @@ class AutomationManager:
             user_id = _parse_telegram_private_user_id(chat_key)
             if isinstance(user_id, int) and user_id > 0:
                 used.add(user_id)
+        for link in (st.telegram_console_links or {}).values():
+            if isinstance(link, PersistedTelegramConsoleLink) and link.console_user_id > 0:
+                used.add(link.console_user_id)
         for agent in (st.agents or {}).values():
             if not isinstance(agent, PersistedAgentRuntime):
                 continue
@@ -7891,6 +8298,56 @@ class AutomationManager:
         raw = self._store.state.telegram_user_profiles.get(str(user_id))
         return raw if isinstance(raw, PersistedTelegramUserProfile) else None
 
+    def get_telegram_console_link_for_telegram_user(self, telegram_user_id: int) -> Optional[PersistedTelegramConsoleLink]:
+        if not isinstance(telegram_user_id, int) or telegram_user_id <= 0:
+            return None
+        raw = self._store.state.telegram_console_links.get(str(telegram_user_id))
+        return raw if isinstance(raw, PersistedTelegramConsoleLink) else None
+
+    def get_telegram_console_link_for_console_user(self, console_user_id: int) -> Optional[PersistedTelegramConsoleLink]:
+        if not isinstance(console_user_id, int) or console_user_id <= 0:
+            return None
+        links = [
+            link
+            for link in (self._store.state.telegram_console_links or {}).values()
+            if isinstance(link, PersistedTelegramConsoleLink) and link.console_user_id == console_user_id
+        ]
+        if not links:
+            return None
+        links.sort(key=lambda item: int(item.updated_at_ms or 0), reverse=True)
+        return links[0]
+
+    def resolve_console_user_id_for_telegram_user_id(self, telegram_user_id: int) -> Optional[int]:
+        link = self.get_telegram_console_link_for_telegram_user(telegram_user_id)
+        if not isinstance(link, PersistedTelegramConsoleLink):
+            return None
+        console_user_id = int(link.console_user_id)
+        if console_user_id <= 0:
+            return None
+        if self.get_console_user(console_user_id) is None:
+            return None
+        return console_user_id
+
+    def resolve_owner_user_id_for_private_chat_key(self, chat_key: Any) -> Optional[int]:
+        telegram_user_id = _parse_telegram_private_user_id(chat_key)
+        if telegram_user_id is None:
+            return None
+        return self.resolve_console_user_id_for_telegram_user_id(telegram_user_id) or telegram_user_id
+
+    def primary_private_chat_key_for_user(self, *, user_id: int) -> str:
+        link = self.get_telegram_console_link_for_console_user(user_id)
+        if isinstance(link, PersistedTelegramConsoleLink) and str(link.chat_key or "").strip():
+            return str(link.chat_key).strip()
+        return str(int(user_id))
+
+    def telegram_link_status_for_user(self, *, user_id: int) -> dict[str, Any]:
+        link = self.get_telegram_console_link_for_console_user(user_id)
+        profile = self.get_telegram_user_profile(user_id)
+        return {
+            "linked": isinstance(link, PersistedTelegramConsoleLink),
+            "link": link.to_public_json(profile=profile) if isinstance(link, PersistedTelegramConsoleLink) else None,
+        }
+
     def get_console_user_by_email(self, email: str) -> Optional[PersistedConsoleUser]:
         normalized_email = _normalize_console_email(email)
         if not normalized_email:
@@ -7915,15 +8372,35 @@ class AutomationManager:
         first_name: Optional[str] = None,
         last_name: Optional[str] = None,
     ) -> PersistedTelegramUserProfile:
-        if not isinstance(user_id, int) or user_id <= 0:
-            raise ValueError("Invalid userId")
+        return await self.upsert_telegram_user_profile_for_owner(
+            owner_user_id=user_id,
+            telegram_user_id=user_id,
+            username=username,
+            first_name=first_name,
+            last_name=last_name,
+        )
+
+    async def upsert_telegram_user_profile_for_owner(
+        self,
+        *,
+        owner_user_id: int,
+        telegram_user_id: int,
+        username: Optional[str] = None,
+        first_name: Optional[str] = None,
+        last_name: Optional[str] = None,
+    ) -> PersistedTelegramUserProfile:
+        if not isinstance(owner_user_id, int) or owner_user_id <= 0:
+            raise ValueError("Invalid owner userId")
+        if not isinstance(telegram_user_id, int) or telegram_user_id <= 0:
+            raise ValueError("Invalid Telegram userId")
         username_norm = _normalize_telegram_username(username)
         first_name_norm = _normalize_telegram_profile_text(first_name)
         last_name_norm = _normalize_telegram_profile_text(last_name)
 
-        current = self.get_telegram_user_profile(user_id)
+        current = self.get_telegram_user_profile(owner_user_id)
         if (
             isinstance(current, PersistedTelegramUserProfile)
+            and current.user_id == telegram_user_id
             and current.username == username_norm
             and current.first_name == first_name_norm
             and current.last_name == last_name_norm
@@ -7936,9 +8413,10 @@ class AutomationManager:
         def _write(st: PersistedGatewayAutomationState) -> None:
             nonlocal stored
             st.version = max(int(getattr(st, "version", 1) or 1), AUTOMATION_STATE_VERSION)
-            existing = st.telegram_user_profiles.get(str(user_id))
+            existing = st.telegram_user_profiles.get(str(owner_user_id))
             if (
                 isinstance(existing, PersistedTelegramUserProfile)
+                and existing.user_id == telegram_user_id
                 and existing.username == username_norm
                 and existing.first_name == first_name_norm
                 and existing.last_name == last_name_norm
@@ -7947,20 +8425,139 @@ class AutomationManager:
                 return
             created_at_ms = existing.created_at_ms if isinstance(existing, PersistedTelegramUserProfile) else now_ms
             profile = PersistedTelegramUserProfile(
-                user_id=user_id,
+                user_id=telegram_user_id,
                 username=username_norm,
                 first_name=first_name_norm,
                 last_name=last_name_norm,
                 created_at_ms=created_at_ms,
                 updated_at_ms=now_ms,
             )
-            st.telegram_user_profiles[str(user_id)] = profile
+            st.telegram_user_profiles[str(owner_user_id)] = profile
             stored = profile
 
         await self._store.update(_write)
         if stored is None:
             raise RuntimeError("Failed to store Telegram user profile")
         return stored
+
+    async def issue_telegram_link_token(self, *, user_id: int) -> tuple[PersistedTelegramLinkToken, str]:
+        if not isinstance(user_id, int) or user_id <= 0:
+            raise ValueError("Invalid userId")
+        if self.get_console_user(user_id) is None:
+            raise ValueError("Unknown user")
+        token_id, _secret, raw_token, expires_at_ms = _issue_telegram_link_token()
+        now_ms = _now_ms()
+        pending = PersistedTelegramLinkToken(
+            token_id=token_id,
+            console_user_id=user_id,
+            token_hash=_hash_telegram_link_token(raw_token),
+            created_at_ms=now_ms,
+            expires_at_ms=expires_at_ms,
+        )
+
+        def _write(st: PersistedGatewayAutomationState) -> None:
+            st.version = max(int(getattr(st, "version", 1) or 1), AUTOMATION_STATE_VERSION)
+            for key, existing in list((st.telegram_link_tokens or {}).items()):
+                if not isinstance(existing, PersistedTelegramLinkToken):
+                    st.telegram_link_tokens.pop(key, None)
+                    continue
+                if existing.claimed_at_ms is not None or existing.expires_at_ms <= now_ms:
+                    st.telegram_link_tokens.pop(key, None)
+            st.telegram_link_tokens[pending.token_id] = pending
+
+        await self._store.update(_write)
+        return pending, raw_token
+
+    async def claim_telegram_link_token(
+        self,
+        *,
+        token: str,
+        telegram_user_id: int,
+        chat_key: Optional[str] = None,
+        username: Optional[str] = None,
+        first_name: Optional[str] = None,
+        last_name: Optional[str] = None,
+    ) -> tuple[PersistedTelegramConsoleLink, PersistedTelegramUserProfile]:
+        token_id, _secret = _parse_telegram_link_token(token)
+        if not token_id:
+            raise ValueError("Invalid link token")
+        if not isinstance(telegram_user_id, int) or telegram_user_id <= 0:
+            raise ValueError("Invalid Telegram userId")
+        chat_key_norm = str(chat_key or telegram_user_id).strip() or str(telegram_user_id)
+        private_id = _parse_telegram_private_user_id(chat_key_norm)
+        if private_id is not None and private_id != telegram_user_id:
+            raise ValueError("chatKey does not match Telegram user")
+        token_hash = _hash_telegram_link_token(token)
+        now_ms = _now_ms()
+        link_out: Optional[PersistedTelegramConsoleLink] = None
+        profile_out: Optional[PersistedTelegramUserProfile] = None
+
+        username_norm = _normalize_telegram_username(username)
+        first_name_norm = _normalize_telegram_profile_text(first_name)
+        last_name_norm = _normalize_telegram_profile_text(last_name)
+
+        def _write(st: PersistedGatewayAutomationState) -> None:
+            nonlocal link_out, profile_out
+            st.version = max(int(getattr(st, "version", 1) or 1), AUTOMATION_STATE_VERSION)
+            pending = st.telegram_link_tokens.get(token_id) if isinstance(st.telegram_link_tokens, dict) else None
+            if not isinstance(pending, PersistedTelegramLinkToken):
+                raise ValueError("Unknown link token")
+            if pending.claimed_at_ms is not None:
+                raise ValueError("Link token already used")
+            if pending.expires_at_ms <= now_ms:
+                raise ValueError("Link token expired")
+            if not hmac.compare_digest(str(pending.token_hash or ""), token_hash):
+                raise ValueError("Link token mismatch")
+            console_user_id = int(pending.console_user_id)
+            if console_user_id <= 0 or str(console_user_id) not in (st.console_users or {}):
+                raise ValueError("Unknown console user")
+
+            for key, existing in list((st.telegram_console_links or {}).items()):
+                if (
+                    isinstance(existing, PersistedTelegramConsoleLink)
+                    and existing.console_user_id == console_user_id
+                    and existing.telegram_user_id != telegram_user_id
+                ):
+                    st.telegram_console_links.pop(key, None)
+
+            existing_link = st.telegram_console_links.get(str(telegram_user_id))
+            created_at_ms = existing_link.created_at_ms if isinstance(existing_link, PersistedTelegramConsoleLink) else now_ms
+            link = PersistedTelegramConsoleLink(
+                telegram_user_id=telegram_user_id,
+                console_user_id=console_user_id,
+                chat_key=chat_key_norm,
+                created_at_ms=created_at_ms,
+                updated_at_ms=now_ms,
+            )
+            st.telegram_console_links[str(telegram_user_id)] = link
+
+            existing_profile = st.telegram_user_profiles.get(str(console_user_id))
+            profile_created_at_ms = existing_profile.created_at_ms if isinstance(existing_profile, PersistedTelegramUserProfile) else now_ms
+            profile = PersistedTelegramUserProfile(
+                user_id=telegram_user_id,
+                username=username_norm,
+                first_name=first_name_norm,
+                last_name=last_name_norm,
+                created_at_ms=profile_created_at_ms,
+                updated_at_ms=now_ms,
+            )
+            st.telegram_user_profiles[str(console_user_id)] = profile
+
+            console_chat_key = str(console_user_id)
+            current_agent_id = st.chat_bindings.get(console_chat_key) if isinstance(st.chat_bindings, dict) else None
+            if isinstance(current_agent_id, str) and current_agent_id.strip():
+                st.chat_bindings[chat_key_norm] = current_agent_id.strip()
+
+            pending.claimed_at_ms = now_ms
+            pending.claimed_telegram_user_id = telegram_user_id
+            st.telegram_link_tokens[token_id] = pending
+            link_out = link
+            profile_out = profile
+
+        await self._store.update(_write)
+        if link_out is None or profile_out is None:
+            raise RuntimeError("Failed to claim Telegram link")
+        return link_out, profile_out
 
     def developer_limits_for_user(self, *, user_id: int) -> dict[str, Any]:
         return {
@@ -8505,7 +9102,7 @@ class AutomationManager:
                 meta = removed_agent_meta.get(bound_aid) or {}
                 owner_user_id = meta.get("ownerUserId")
                 main_agent_id = meta.get("mainAgentId")
-                private_user_id = _parse_telegram_private_user_id(bound_ck) if isinstance(bound_ck, str) else None
+                private_user_id = self.resolve_owner_user_id_for_private_chat_key(bound_ck) if isinstance(bound_ck, str) else None
                 if (
                     isinstance(owner_user_id, int)
                     and private_user_id == owner_user_id
@@ -9360,6 +9957,36 @@ class AutomationManager:
         if stored_token:
             return stored_token
         return _normalize_telegram_bot_token(os.getenv("TELEGRAM_BOT_TOKEN"))
+
+    async def get_effective_telegram_bot_username(self) -> tuple[Optional[str], Optional[str]]:
+        token = self.get_effective_telegram_bot_token()
+        if not token:
+            return None, "Telegram bot token is not configured"
+        token_hash = hashlib.sha256(token.encode("utf-8")).hexdigest()
+        cache = self._telegram_bot_username_cache
+        now_ms = _now_ms()
+        if cache.get("tokenHash") == token_hash and int(cache.get("expiresAtMs") or 0) > now_ms:
+            username = cache.get("username")
+            error = cache.get("error")
+            return (str(username).strip() or None, str(error).strip() or None)
+        try:
+            username = await asyncio.to_thread(_telegram_bot_username_from_token_sync, token)
+            self._telegram_bot_username_cache = {
+                "tokenHash": token_hash,
+                "username": username,
+                "error": None,
+                "expiresAtMs": now_ms + 10 * 60 * 1000,
+            }
+            return username, None
+        except Exception as e:
+            error = str(e)
+            self._telegram_bot_username_cache = {
+                "tokenHash": token_hash,
+                "username": None,
+                "error": error,
+                "expiresAtMs": now_ms + 60 * 1000,
+            }
+            return None, error
 
     def get_telegram_bot_token_settings(self, *, include_token: bool = False) -> dict[str, Any]:
         raw_stored = getattr(self._store.state, "telegram_bot_token", None)
@@ -10222,9 +10849,13 @@ class AutomationManager:
             or str(user_id) in (st0.console_users or {})
             or str(user_id) in (st0.telegram_user_profiles or {})
             or any(
+                isinstance(link, PersistedTelegramConsoleLink) and link.console_user_id == user_id
+                for link in (st0.telegram_console_links or {}).values()
+            )
+            or any(
                 isinstance(chat_key, str)
                 and (
-                    _parse_telegram_private_user_id(chat_key) == user_id
+                    self.resolve_owner_user_id_for_private_chat_key(chat_key) == user_id
                     or (isinstance(agent_id, str) and any(agent_id == aid for aid, _agent in owned_agents))
                 )
                 for chat_key, agent_id in (st0.chat_bindings or {}).items()
@@ -10316,7 +10947,7 @@ class AutomationManager:
 
             for bound_ck, bound_aid in list((st.chat_bindings or {}).items()):
                 remove_binding = False
-                if isinstance(bound_ck, str) and _parse_telegram_private_user_id(bound_ck) == user_id:
+                if isinstance(bound_ck, str) and self.resolve_owner_user_id_for_private_chat_key(bound_ck) == user_id:
                     remove_binding = True
                 if isinstance(bound_aid, str) and bound_aid in removed_agent_ids:
                     remove_binding = True
@@ -10335,6 +10966,14 @@ class AutomationManager:
             if str(user_id) in (st.telegram_user_profiles or {}):
                 st.telegram_user_profiles.pop(str(user_id), None)
                 deleted_telegram_profile = True
+
+            for telegram_user_id, link in list((st.telegram_console_links or {}).items()):
+                if isinstance(link, PersistedTelegramConsoleLink) and link.console_user_id == user_id:
+                    st.telegram_console_links.pop(telegram_user_id, None)
+
+            for token_id, token in list((st.telegram_link_tokens or {}).items()):
+                if isinstance(token, PersistedTelegramLinkToken) and token.console_user_id == user_id:
+                    st.telegram_link_tokens.pop(token_id, None)
 
             for console_session_id, console_session in list((st.console_sessions or {}).items()):
                 if not isinstance(console_session, PersistedConsoleSession):
@@ -10452,7 +11091,19 @@ class AutomationManager:
 
         def _write(st: PersistedGatewayAutomationState) -> None:
             st.version = max(int(getattr(st, "version", 1) or 1), AUTOMATION_STATE_VERSION)
-            st.chat_bindings[ck] = aid
+            binding_keys = {ck, str(int(user_id))}
+            for link in (st.telegram_console_links or {}).values():
+                if not isinstance(link, PersistedTelegramConsoleLink):
+                    continue
+                if link.console_user_id != user_id:
+                    continue
+                if isinstance(link.chat_key, str) and link.chat_key.strip():
+                    binding_keys.add(link.chat_key.strip())
+                if isinstance(link.telegram_user_id, int) and link.telegram_user_id > 0:
+                    binding_keys.add(str(link.telegram_user_id))
+            for binding_key in binding_keys:
+                if isinstance(binding_key, str) and binding_key.strip():
+                    st.chat_bindings[binding_key.strip()] = aid
 
         await self._store.update(_write)
         agent2 = self._get_agent(aid)
@@ -16338,6 +16989,46 @@ async def me_developer_key_delete(key_id: str, request: Request):
     }
 
 
+@app.get("/me/telegram-link")
+async def me_telegram_link_status(request: Request):
+    principal = _http_require_auth(request)
+    if principal.user_id is None:
+        raise HTTPException(status_code=403, detail="Console session or developer API key required")
+    automation = _get_automation_or_500()
+    status = automation.telegram_link_status_for_user(user_id=principal.user_id)
+    return {
+        "ok": True,
+        "userId": principal.user_id,
+        **status,
+    }
+
+
+@app.post("/me/telegram-link")
+async def me_telegram_link_create(request: Request):
+    principal = _http_require_auth(request)
+    if principal.user_id is None:
+        raise HTTPException(status_code=403, detail="Console session or developer API key required")
+    automation = _get_automation_or_500()
+    bot_username, bot_username_error = await automation.get_effective_telegram_bot_username()
+    if not bot_username:
+        raise HTTPException(status_code=400, detail=bot_username_error or "Telegram bot username is unavailable")
+    try:
+        pending, token = await automation.issue_telegram_link_token(user_id=principal.user_id)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    status = automation.telegram_link_status_for_user(user_id=principal.user_id)
+    return {
+        "ok": True,
+        "userId": principal.user_id,
+        "token": token,
+        "startParameter": token,
+        "botUsername": bot_username,
+        "botUrl": _telegram_bot_deep_link(bot_username, token),
+        "expiresAtMs": pending.expires_at_ms,
+        **status,
+    }
+
+
 @app.get("/me/agents")
 async def me_agents(request: Request):
     principal = _http_require_auth(request)
@@ -21866,6 +22557,18 @@ def _admin_private_chat_key_for_user(user_id: int) -> str:
     return str(int(user_id))
 
 
+def _automation_owner_user_id_for_chat_key_or_400(
+    automation: AutomationManager,
+    chat_key: str,
+    *,
+    detail: str = "Invalid 'chatKey'",
+) -> int:
+    user_id = automation.resolve_owner_user_id_for_private_chat_key(chat_key)
+    if user_id is None:
+        raise HTTPException(status_code=400, detail=detail)
+    return user_id
+
+
 def _self_normalize_agent_id_for_user(user_id: int, raw_agent_id: Any) -> str:
     aid_raw = _normalize_agent_id(raw_agent_id)
     if not aid_raw:
@@ -21877,7 +22580,7 @@ def _self_normalize_agent_id_for_user(user_id: int, raw_agent_id: Any) -> str:
 
 async def _self_bootstrap_user_agent_context(automation: AutomationManager, *, user_id: int) -> dict[str, Any]:
     agent, created_main = await automation.ensure_user_main_agent(user_id=user_id)
-    chat_key = _admin_private_chat_key_for_user(user_id)
+    chat_key = automation.primary_private_chat_key_for_user(user_id=user_id)
     st = automation._store.state
     bound = st.chat_bindings.get(chat_key) if isinstance(getattr(st, "chat_bindings", None), dict) else None
     current_agent_id = bound if isinstance(bound, str) and bound.strip() else None
@@ -22041,9 +22744,13 @@ def _admin_collect_user_ids(automation: AutomationManager) -> list[int]:
         owner_user_id = getattr(agent, "owner_user_id", None)
         if isinstance(owner_user_id, int) and owner_user_id > 0:
             ids.add(owner_user_id)
+    if isinstance(getattr(st, "telegram_console_links", None), dict):
+        for link in st.telegram_console_links.values():
+            if isinstance(link, PersistedTelegramConsoleLink) and link.console_user_id > 0:
+                ids.add(link.console_user_id)
     if isinstance(getattr(st, "chat_bindings", None), dict):
         for chat_key in st.chat_bindings.keys():
-            user_id = _parse_telegram_private_user_id(chat_key)
+            user_id = automation.resolve_owner_user_id_for_private_chat_key(chat_key)
             if isinstance(user_id, int) and user_id > 0:
                 ids.add(user_id)
     return sorted(ids)
@@ -22101,7 +22808,7 @@ def _admin_resolve_current_agent_id_for_user(
             return automation.can_user_access_agent_id(user_id=user_id, agent_id=agent_id)
 
     st = automation._store.state
-    private_chat_key = _admin_private_chat_key_for_user(user_id)
+    private_chat_key = automation.primary_private_chat_key_for_user(user_id=user_id)
     bound = st.chat_bindings.get(private_chat_key) if isinstance(getattr(st, "chat_bindings", None), dict) else None
     bound_id = bound.strip() if isinstance(bound, str) and bound.strip() else None
     if bound_id and _visible(bound_id):
@@ -22219,7 +22926,7 @@ def _admin_user_summary_payload(
         "userId": user_id,
         "email": console_user.email if isinstance(console_user, PersistedConsoleUser) else None,
         "telegramProfile": telegram_profile.to_public_json() if isinstance(telegram_profile, PersistedTelegramUserProfile) else None,
-        "privateChatKey": _admin_private_chat_key_for_user(user_id),
+        "privateChatKey": automation.primary_private_chat_key_for_user(user_id=user_id),
         "agentCount": len(agents),
         "sessionCount": sum(1 for item in agents if isinstance(item, dict) and str(item.get("sessionId") or "").strip()),
         "defaultAgentId": _user_agent_id(user_id=user_id, short_name="main"),
@@ -22322,7 +23029,7 @@ async def automation_user_bootstrap(request: Request):
         raise HTTPException(status_code=400, detail="Missing 'chatKey'")
     chat_key = raw_chat_key.strip()
 
-    user_id = _parse_telegram_private_user_id(chat_key)
+    user_id = _automation_owner_user_id_for_chat_key_or_400(automation, chat_key)
     if user_id is None:
         raise HTTPException(status_code=400, detail="Invalid 'chatKey' (expected a Telegram private chat id)")
 
@@ -22371,17 +23078,19 @@ async def automation_user_telegram_profile(request: Request):
     if not isinstance(body, dict):
         raise HTTPException(status_code=400, detail="Invalid JSON body")
 
-    raw_user_id = body.get("userId")
+    raw_user_id = body.get("telegramUserId") or body.get("userId")
     try:
-        user_id = int(raw_user_id)
+        telegram_user_id = int(raw_user_id)
     except Exception as e:
         raise HTTPException(status_code=400, detail="Invalid 'userId'") from e
-    if user_id <= 0:
+    if telegram_user_id <= 0:
         raise HTTPException(status_code=400, detail="Invalid 'userId'")
+    owner_user_id = automation.resolve_console_user_id_for_telegram_user_id(telegram_user_id) or telegram_user_id
 
     try:
-        profile = await automation.upsert_telegram_user_profile(
-            user_id=user_id,
+        profile = await automation.upsert_telegram_user_profile_for_owner(
+            owner_user_id=owner_user_id,
+            telegram_user_id=telegram_user_id,
             username=body.get("username"),
             first_name=body.get("firstName"),
             last_name=body.get("lastName"),
@@ -22394,6 +23103,48 @@ async def automation_user_telegram_profile(request: Request):
     return {
         "ok": True,
         "profile": profile.to_public_json(),
+    }
+
+
+@app.post("/automation/user/telegram-link/claim")
+async def automation_user_telegram_link_claim(request: Request):
+    _http_require_token(request)
+    automation = _get_automation_or_500()
+    try:
+        body = await request.json()
+    except Exception as e:
+        raise HTTPException(status_code=400, detail="Invalid JSON body") from e
+    if not isinstance(body, dict):
+        raise HTTPException(status_code=400, detail="Invalid JSON body")
+
+    token = str(body.get("token") or body.get("startParameter") or "").strip()
+    if not token:
+        raise HTTPException(status_code=400, detail="Missing 'token'")
+    try:
+        telegram_user_id = int(body.get("telegramUserId") or body.get("userId"))
+    except Exception as e:
+        raise HTTPException(status_code=400, detail="Invalid 'telegramUserId'") from e
+    if telegram_user_id <= 0:
+        raise HTTPException(status_code=400, detail="Invalid 'telegramUserId'")
+    chat_key = str(body.get("chatKey") or telegram_user_id).strip() or str(telegram_user_id)
+
+    try:
+        link, profile = await automation.claim_telegram_link_token(
+            token=token,
+            telegram_user_id=telegram_user_id,
+            chat_key=chat_key,
+            username=body.get("username"),
+            first_name=body.get("firstName"),
+            last_name=body.get("lastName"),
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    except RuntimeError as e:
+        raise HTTPException(status_code=500, detail=str(e)) from e
+
+    return {
+        "ok": True,
+        "link": link.to_public_json(profile=profile),
     }
 
 
@@ -22413,7 +23164,7 @@ async def automation_agent_list(request: Request):
         raise HTTPException(status_code=400, detail="Missing 'chatKey'")
     chat_key = raw_chat_key.strip()
 
-    user_id = _parse_telegram_private_user_id(chat_key)
+    user_id = _automation_owner_user_id_for_chat_key_or_400(automation, chat_key)
     if user_id is None:
         raise HTTPException(status_code=400, detail="Invalid 'chatKey'")
 
@@ -22435,6 +23186,7 @@ async def automation_agent_list(request: Request):
 
     return {
         "ok": True,
+        "userId": user_id,
         "agents": automation.list_agents_for_user(user_id=user_id),
         "currentAgentId": current_agent_id,
         "currentSessionId": current_session_id,
@@ -22464,7 +23216,7 @@ async def automation_agent_resolve(request: Request):
         raise HTTPException(status_code=400, detail="Missing 'chatKey'")
     chat_key = raw_chat_key.strip()
 
-    user_id = _parse_telegram_private_user_id(chat_key)
+    user_id = automation.resolve_owner_user_id_for_private_chat_key(chat_key)
     if user_id is None:
         agent_id = automation.resolve_agent_for_chat_key(chat_key)
         if not agent_id:
@@ -22506,6 +23258,7 @@ async def automation_agent_resolve(request: Request):
     return {
         "ok": True,
         "chatKey": chat_key,
+        "userId": user_id,
         "agentId": agent_id,
         "sessionId": sess_id,
         "model": automation._channel_adjusted_agent_model(agent),
@@ -22535,7 +23288,7 @@ async def automation_agent_create(request: Request):
         raise HTTPException(status_code=400, detail="Missing 'chatKey'")
     chat_key = raw_chat_key.strip()
 
-    user_id = _parse_telegram_private_user_id(chat_key)
+    user_id = _automation_owner_user_id_for_chat_key_or_400(automation, chat_key)
     if user_id is None:
         raise HTTPException(status_code=400, detail="Invalid 'chatKey'")
 
@@ -22581,7 +23334,7 @@ async def automation_agent_use(request: Request):
         raise HTTPException(status_code=400, detail="Missing 'chatKey'")
     chat_key = raw_chat_key.strip()
 
-    user_id = _parse_telegram_private_user_id(chat_key)
+    user_id = _automation_owner_user_id_for_chat_key_or_400(automation, chat_key)
     if user_id is None:
         raise HTTPException(status_code=400, detail="Invalid 'chatKey'")
 
@@ -22633,7 +23386,7 @@ async def automation_agent_model_set(request: Request):
         raise HTTPException(status_code=400, detail="Missing 'chatKey'")
     chat_key = raw_chat_key.strip()
 
-    user_id = _parse_telegram_private_user_id(chat_key)
+    user_id = _automation_owner_user_id_for_chat_key_or_400(automation, chat_key)
     if user_id is None:
         raise HTTPException(status_code=400, detail="Invalid 'chatKey'")
 
@@ -22687,7 +23440,7 @@ async def automation_agent_rename(request: Request):
         raise HTTPException(status_code=400, detail="Missing 'chatKey'")
     chat_key = raw_chat_key.strip()
 
-    user_id = _parse_telegram_private_user_id(chat_key)
+    user_id = _automation_owner_user_id_for_chat_key_or_400(automation, chat_key)
     if user_id is None:
         raise HTTPException(status_code=400, detail="Invalid 'chatKey'")
 
@@ -22731,7 +23484,7 @@ async def automation_agent_delete(request: Request):
         raise HTTPException(status_code=400, detail="Missing 'chatKey'")
     chat_key = raw_chat_key.strip()
 
-    user_id = _parse_telegram_private_user_id(chat_key)
+    user_id = _automation_owner_user_id_for_chat_key_or_400(automation, chat_key)
     if user_id is None:
         raise HTTPException(status_code=400, detail="Invalid 'chatKey'")
 
@@ -22772,7 +23525,7 @@ async def automation_channel_list(request: Request):
         raise HTTPException(status_code=400, detail="Missing 'chatKey'")
     chat_key = raw_chat_key.strip()
 
-    user_id = _parse_telegram_private_user_id(chat_key)
+    user_id = _automation_owner_user_id_for_chat_key_or_400(automation, chat_key)
     if user_id is None:
         raise HTTPException(status_code=400, detail="Invalid 'chatKey'")
 
@@ -22796,7 +23549,7 @@ async def automation_channel_select(request: Request):
         raise HTTPException(status_code=400, detail="Missing 'chatKey'")
     chat_key = raw_chat_key.strip()
 
-    user_id = _parse_telegram_private_user_id(chat_key)
+    user_id = _automation_owner_user_id_for_chat_key_or_400(automation, chat_key)
     if user_id is None:
         raise HTTPException(status_code=400, detail="Invalid 'chatKey'")
     if not isinstance(raw_channel, str) or not raw_channel.strip():
@@ -22830,7 +23583,7 @@ async def automation_channel_create(request: Request):
         raise HTTPException(status_code=400, detail="Missing 'chatKey'")
     chat_key = raw_chat_key.strip()
 
-    user_id = _parse_telegram_private_user_id(chat_key)
+    user_id = _automation_owner_user_id_for_chat_key_or_400(automation, chat_key)
     if user_id is None:
         raise HTTPException(status_code=400, detail="Invalid 'chatKey'")
 
@@ -22870,7 +23623,7 @@ async def automation_channel_rename(request: Request):
         raise HTTPException(status_code=400, detail="Missing 'chatKey'")
     chat_key = raw_chat_key.strip()
 
-    user_id = _parse_telegram_private_user_id(chat_key)
+    user_id = _automation_owner_user_id_for_chat_key_or_400(automation, chat_key)
     if user_id is None:
         raise HTTPException(status_code=400, detail="Invalid 'chatKey'")
     if not isinstance(raw_channel, str) or not raw_channel.strip():
@@ -22906,7 +23659,7 @@ async def automation_channel_delete(request: Request):
         raise HTTPException(status_code=400, detail="Missing 'chatKey'")
     chat_key = raw_chat_key.strip()
 
-    user_id = _parse_telegram_private_user_id(chat_key)
+    user_id = _automation_owner_user_id_for_chat_key_or_400(automation, chat_key)
     if user_id is None:
         raise HTTPException(status_code=400, detail="Invalid 'chatKey'")
     if not isinstance(raw_channel, str) or not raw_channel.strip():
@@ -22939,7 +23692,7 @@ async def automation_channel_key_set(request: Request):
         raise HTTPException(status_code=400, detail="Missing 'chatKey'")
     chat_key = raw_chat_key.strip()
 
-    user_id = _parse_telegram_private_user_id(chat_key)
+    user_id = _automation_owner_user_id_for_chat_key_or_400(automation, chat_key)
     if user_id is None:
         raise HTTPException(status_code=400, detail="Invalid 'chatKey'")
     if not isinstance(raw_channel, str) or not raw_channel.strip():
@@ -22971,7 +23724,7 @@ async def automation_channel_key_clear(request: Request):
         raise HTTPException(status_code=400, detail="Missing 'chatKey'")
     chat_key = raw_chat_key.strip()
 
-    user_id = _parse_telegram_private_user_id(chat_key)
+    user_id = _automation_owner_user_id_for_chat_key_or_400(automation, chat_key)
     if user_id is None:
         raise HTTPException(status_code=400, detail="Invalid 'chatKey'")
     if not isinstance(raw_channel, str) or not raw_channel.strip():
@@ -23717,19 +24470,20 @@ async def automation_chat_bind(request: Request):
     is_topic_chat = isinstance(group_binding_key, str) and group_binding_key and chat_key != group_binding_key
     is_general_topic = topic_id == 1
 
-    actor_user_id: Optional[int] = None
+    actor_telegram_user_id: Optional[int] = None
     if raw_actor is not None:
         try:
-            actor_user_id = int(raw_actor)
+            actor_telegram_user_id = int(raw_actor)
         except Exception:
-            actor_user_id = None
-    if actor_user_id is None or actor_user_id <= 0:
+            actor_telegram_user_id = None
+    if actor_telegram_user_id is None or actor_telegram_user_id <= 0:
         raise HTTPException(status_code=400, detail="Missing/invalid 'actorUserId'")
 
     # Prevent binding someone else's private chat key.
     private_id = _parse_telegram_private_user_id(chat_key)
-    if private_id is not None and private_id != actor_user_id:
+    if private_id is not None and private_id != actor_telegram_user_id:
         raise HTTPException(status_code=403, detail="Forbidden")
+    actor_user_id = automation.resolve_console_user_id_for_telegram_user_id(actor_telegram_user_id) or actor_telegram_user_id
 
     aid_raw = _normalize_agent_id(raw_aid)
     if not aid_raw:
@@ -24983,7 +25737,7 @@ async def ws_proxy(ws: WebSocket):
                                     )
                                 continue
                             chat_key = raw_chat_key.strip()
-                            user_id = _parse_telegram_private_user_id(chat_key)
+                            user_id = automation.resolve_owner_user_id_for_private_chat_key(chat_key)
                             if user_id is None:
                                 if has_id:
                                     await ws.send_text(
@@ -25028,7 +25782,7 @@ async def ws_proxy(ws: WebSocket):
                                     )
                                 continue
                             chat_key = raw_chat_key.strip()
-                            user_id = _parse_telegram_private_user_id(chat_key)
+                            user_id = automation.resolve_owner_user_id_for_private_chat_key(chat_key)
                             if user_id is None:
                                 if has_id:
                                     await ws.send_text(
@@ -25052,6 +25806,7 @@ async def ws_proxy(ws: WebSocket):
                             result = {
                                 "ok": True,
                                 "agents": automation.list_agents_for_user(user_id=user_id),
+                                "userId": user_id,
                                 "currentAgentId": current_agent_id,
                                 "currentSessionId": current_session_id,
                             }
@@ -25068,7 +25823,7 @@ async def ws_proxy(ws: WebSocket):
                                     )
                                 continue
                             chat_key = raw_chat_key.strip()
-                            user_id = _parse_telegram_private_user_id(chat_key)
+                            user_id = automation.resolve_owner_user_id_for_private_chat_key(chat_key)
                             if user_id is None:
                                 agent_id = automation.resolve_agent_for_chat_key(chat_key)
                                 if not agent_id:
@@ -25096,7 +25851,7 @@ async def ws_proxy(ws: WebSocket):
                                 sess_id = automation.resolve_agent_session_id(agent_id)
                                 if not sess_id:
                                     raise RuntimeError("Agent has no sessionId")
-                                result = {"ok": True, "chatKey": chat_key, "agentId": agent_id, "sessionId": sess_id}
+                                result = {"ok": True, "chatKey": chat_key, "userId": user_id, "agentId": agent_id, "sessionId": sess_id}
                             if has_id:
                                 await ws.send_text(json.dumps({"id": req_id, "result": result}))
                             continue
@@ -25134,7 +25889,7 @@ async def ws_proxy(ws: WebSocket):
                                     )
                                 continue
                             chat_key = raw_chat_key.strip()
-                            user_id = _parse_telegram_private_user_id(chat_key)
+                            user_id = automation.resolve_owner_user_id_for_private_chat_key(chat_key)
                             if user_id is None:
                                 if has_id:
                                     await ws.send_text(
@@ -25168,7 +25923,7 @@ async def ws_proxy(ws: WebSocket):
                                     )
                                 continue
                             chat_key = raw_chat_key.strip()
-                            user_id = _parse_telegram_private_user_id(chat_key)
+                            user_id = automation.resolve_owner_user_id_for_private_chat_key(chat_key)
                             if user_id is None:
                                 if has_id:
                                     await ws.send_text(
