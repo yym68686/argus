@@ -422,20 +422,21 @@ export default function ApiKeysPage() {
           )}
         </PanelCard>
 
-        <PanelCard title="Upstream channels" contentClassName="min-w-0">
-          <div className="grid gap-0 overflow-hidden rounded-[18px] border border-border/72 bg-background/16 xl:grid-cols-[minmax(17rem,20rem)_minmax(0,1fr)]">
-            <aside className="border-b border-border/68 bg-background/18 xl:border-b-0 xl:border-r">
-              <div className="flex items-center justify-between gap-3 border-b border-border/60 px-4 py-3">
-                <div>
-                  <div className="text-sm font-semibold text-foreground">Channels</div>
-                  <div className="mt-0.5 text-xs text-muted-foreground">
-                    {readyCount} ready · {keyedCount} with keys
-                  </div>
-                </div>
-                <Badge tone={customCount ? "default" : "warning"}>{customCount} custom</Badge>
-              </div>
-
-              <div className="max-h-[28rem] space-y-1 overflow-y-auto p-2">
+        <PanelCard
+          title="Upstream channels"
+          className="overflow-hidden"
+          contentClassName="-mx-4 -mb-4 -mt-4 min-w-0 md:-mx-5 md:-mb-5"
+          action={
+            <div className="flex flex-wrap items-center gap-2 md:justify-end">
+              <Badge tone="success">{readyCount} ready</Badge>
+              <Badge tone={keyedCount ? "success" : "default"}>{keyedCount} with keys</Badge>
+              <Badge tone={customCount ? "default" : "warning"}>{customCount} custom</Badge>
+            </div>
+          }
+        >
+          <div className="grid min-h-[32rem] xl:grid-cols-[minmax(16rem,19rem)_minmax(0,1fr)]">
+            <aside className="border-b border-border/60 bg-background/10 xl:border-b-0 xl:border-r" aria-label="Channels">
+              <div className="max-h-[28rem] overflow-y-auto">
                 {channels.length ? (
                   channels.map((channel) => {
                     const active = selectedChannel?.channelId === channel.channelId;
@@ -443,11 +444,12 @@ export default function ApiKeysPage() {
                       <button
                         key={channel.channelId}
                         type="button"
+                        aria-current={active ? "true" : undefined}
                         onClick={() => focusChannel(channel)}
                         className={cn(
-                          "group w-full rounded-xl px-3 py-3 text-left transition",
-                          "hover:bg-background/42 focus-visible:outline-none focus-visible:ring-4 focus-visible:ring-ring/18",
-                          active ? "bg-primary/10 shadow-[inset_3px_0_0_0_oklch(var(--primary)/0.72)]" : null
+                          "group w-full border-b border-border/42 px-4 py-3.5 text-left transition last:border-b-0",
+                          "hover:bg-background/34 focus-visible:bg-primary/10 focus-visible:outline-none focus-visible:shadow-[inset_2px_0_0_0_oklch(var(--primary)/0.6)]",
+                          active ? "bg-primary/10 shadow-[inset_2px_0_0_0_oklch(var(--primary)/0.6)]" : null
                         )}
                       >
                         <div className="flex items-start justify-between gap-3">
@@ -470,7 +472,7 @@ export default function ApiKeysPage() {
                     );
                   })
                 ) : (
-                  <EmptyState title="No channels" />
+                  <div className="px-4 py-8 text-sm text-muted-foreground">No channels</div>
                 )}
               </div>
 
@@ -483,9 +485,6 @@ export default function ApiKeysPage() {
               >
                 <div>
                   <div className="text-sm font-semibold text-foreground">Add channel</div>
-                  <div className="mt-1 text-xs leading-5 text-muted-foreground">
-                    Store one upstream endpoint and its API key.
-                  </div>
                 </div>
                 <LabeledInput
                   id="new-channel-name"
@@ -518,7 +517,7 @@ export default function ApiKeysPage() {
               </form>
             </aside>
 
-            <section className="min-w-0 p-4 md:p-5">
+            <section className="min-w-0 p-5 md:p-6">
               <PanelReveal key={selectedChannel?.channelId ?? "channel-none"} open travel="12px">
                 {selectedChannel ? (
                   <div className="grid gap-6">
@@ -565,16 +564,16 @@ export default function ApiKeysPage() {
                       </div>
                     </div>
 
-                    <div className="grid gap-5 2xl:grid-cols-[minmax(0,0.95fr)_minmax(22rem,1.05fr)]">
+                    <div className="grid gap-6 2xl:grid-cols-[minmax(0,0.95fr)_minmax(22rem,1.05fr)]">
                       <div className="grid content-start gap-5">
                         <div>
                           <SectionHeading title="Status" />
-                          <div className="mt-3 grid gap-0 overflow-hidden rounded-[14px] border border-border/64">
+                          <dl className="mt-3 divide-y divide-border/54 border-y border-border/54">
                             <DetailRow label="State" value={selectedChannel.ready ? "ready" : selectedChannel.reason || "pending"} />
                             <DetailRow label="ID" value={selectedChannel.channelId} mono />
                             <DetailRow label="Type" value={channelKind(selectedChannel)} />
                             <DetailRow label="Models" value={selectedChannel.modelsUrl || "—"} mono />
-                          </div>
+                          </dl>
                         </div>
 
                         {selectedChannel.canRename ? (
@@ -607,7 +606,7 @@ export default function ApiKeysPage() {
                       </div>
 
                       <form
-                        className="grid content-start gap-4 rounded-[16px] border border-border/64 bg-background/20 p-4"
+                        className="grid content-start gap-4 border-t border-border/54 pt-5 2xl:border-l 2xl:border-t-0 2xl:pl-6 2xl:pt-0"
                         onSubmit={(event) => {
                           event.preventDefault();
                           void saveKey();
@@ -649,7 +648,7 @@ export default function ApiKeysPage() {
                             </div>
                           </div>
                         ) : (
-                          <div className="rounded-[14px] border border-border/60 bg-background/22 px-3 py-3 text-sm text-muted-foreground">
+                          <div className="text-sm leading-6 text-muted-foreground">
                             This channel does not accept user-managed keys.
                           </div>
                         )}
@@ -657,7 +656,7 @@ export default function ApiKeysPage() {
                     </div>
                   </div>
                 ) : (
-                  <EmptyState title="No channel selected" />
+                  <div className="py-8 text-sm text-muted-foreground">No channel selected</div>
                 )}
               </PanelReveal>
             </section>
@@ -674,11 +673,11 @@ function SectionHeading({ title }: { title: string }) {
 
 function DetailRow({ label, value, mono = false }: { label: string; value: string; mono?: boolean }) {
   return (
-    <div className="grid gap-2 border-b border-border/54 bg-background/14 px-3.5 py-3 last:border-b-0 sm:grid-cols-[7rem_minmax(0,1fr)]">
-      <div className="text-xs font-medium text-muted-foreground">{label}</div>
-      <div className={cn("min-w-0 break-words text-sm font-medium leading-6 text-foreground", mono ? "font-mono text-[12.5px]" : null)}>
+    <div className="grid gap-2 py-3 sm:grid-cols-[7rem_minmax(0,1fr)]">
+      <dt className="text-xs font-medium text-muted-foreground">{label}</dt>
+      <dd className={cn("min-w-0 break-words text-sm font-medium leading-6 text-foreground", mono ? "font-mono text-[12.5px]" : null)}>
         {value}
-      </div>
+      </dd>
     </div>
   );
 }

@@ -26,11 +26,11 @@ export function PanelCard({
   return (
     <section className={cn("argus-shell-panel-soft rounded-[22px] p-4 md:p-5", className)}>
       <div className="mb-4 border-b border-border/60 pb-3">
-        <div className="flex flex-col gap-3">
+        <div className="flex flex-col gap-3 md:flex-row md:items-start md:justify-between">
           <div className="min-w-0">
             <div className="text-[1.02rem] font-semibold tracking-[-0.02em] text-foreground">{title}</div>
           </div>
-          {action ? <div className="w-full">{action}</div> : null}
+          {action ? <div className="w-full md:w-auto md:max-w-[min(100%,40rem)]">{action}</div> : null}
         </div>
       </div>
       <div className={cn("min-w-0", contentClassName)}>{children}</div>
