@@ -272,10 +272,22 @@ class FugueApiHelperTests(unittest.TestCase):
         with (
             mock.patch.object(
                 argus_app,
+                "_fugue_resolve_runtime_image_source_sync",
+                return_value=argus_app.FugueRuntimeImageResolution(
+                    image_ref="registry.invalid/runtime@sha256:available",
+                    source="runtime_compose_service",
+                    runtime_app_id="app_template",
+                    runtime_app_name="runtime",
+                ),
+            ),
+            mock.patch.object(
+                argus_app,
                 "_fugue_preflight_runtime_image_sync",
                 return_value=argus_app.FugueRuntimeImageResolution(
                     image_ref="registry.invalid/runtime@sha256:available",
                     source="runtime_compose_service",
+                    runtime_app_id="app_template",
+                    runtime_app_name="runtime",
                 ),
             ),
             mock.patch.object(argus_app, "_fugue_request_json_sync", side_effect=fake_request_json_sync),
@@ -312,10 +324,22 @@ class FugueApiHelperTests(unittest.TestCase):
         with (
             mock.patch.object(
                 argus_app,
+                "_fugue_resolve_runtime_image_source_sync",
+                return_value=argus_app.FugueRuntimeImageResolution(
+                    image_ref="registry.invalid/runtime@sha256:available",
+                    source="runtime_compose_service",
+                    runtime_app_id="app_template",
+                    runtime_app_name="runtime",
+                ),
+            ),
+            mock.patch.object(
+                argus_app,
                 "_fugue_preflight_runtime_image_sync",
                 return_value=argus_app.FugueRuntimeImageResolution(
                     image_ref="registry.invalid/runtime@sha256:available",
                     source="runtime_compose_service",
+                    runtime_app_id="app_template",
+                    runtime_app_name="runtime",
                 ),
             ),
             mock.patch.object(
@@ -336,6 +360,62 @@ class FugueApiHelperTests(unittest.TestCase):
         self.assertTrue(network_policy["egress"]["allow_public_internet"])
         self.assertEqual(network_policy["egress"]["allow_apps"], [{"app_id": "app_gateway", "ports": [8080]}])
         self.assertEqual(network_policy["ingress"]["allow_apps"], [{"app_id": "app_gateway", "ports": [7777]}])
+
+    def test_fugue_create_session_rebuilds_missing_runtime_image_before_import(self) -> None:
+        cfg = argus_app.FugueProvisionConfig(
+            base_url="https://fugue.invalid",
+            token="token",
+            project_id="project_123",
+            runtime_id="runtime_123",
+            gateway_internal_host="gateway.internal",
+            runtime_compose_service="runtime",
+            runtime_cmd="codex serve",
+            connect_timeout_s=1.0,
+        )
+        initial_resolution = argus_app.FugueRuntimeImageResolution(
+            image_ref="registry.invalid/runtime@sha256:missing",
+            source="runtime_compose_service",
+            runtime_app_id="app_template",
+            runtime_app_name="runtime",
+        )
+        rebuilt_resolution = argus_app.FugueRuntimeImageResolution(
+            image_ref="registry.invalid/runtime@sha256:available",
+            source="runtime_compose_service",
+            runtime_app_id="app_template",
+            runtime_app_name="runtime",
+        )
+        captured_body: dict[str, object] = {}
+
+        def fake_request_json_sync(patched_cfg, method, path, **kwargs):
+            self.assertIs(patched_cfg, cfg)
+            self.assertEqual(method, "POST")
+            self.assertEqual(path, "/v1/apps/import-image")
+            captured_body.update(kwargs["body"])
+            return {"app": {"id": "app_session"}}
+
+        with (
+            mock.patch.object(argus_app, "_fugue_resolve_runtime_image_source_sync", return_value=initial_resolution),
+            mock.patch.object(
+                argus_app,
+                "_fugue_preflight_runtime_image_sync",
+                side_effect=argus_app.FugueRuntimeImageMissingError(
+                    "configured runtime image digest is missing: registry.invalid/runtime@sha256:missing",
+                    image_ref=initial_resolution.image_ref,
+                    runtime_app_id=initial_resolution.runtime_app_id,
+                ),
+            ),
+            mock.patch.object(
+                argus_app,
+                "_fugue_rebuild_runtime_app_sync",
+                return_value=rebuilt_resolution,
+            ) as rebuild,
+            mock.patch.object(argus_app, "_fugue_request_json_sync", side_effect=fake_request_json_sync),
+        ):
+            app_data = argus_app._fugue_create_session_app_sync(cfg, "3416ab8781ab")
+
+        self.assertEqual(app_data["id"], "app_session")
+        rebuild.assert_called_once()
+        self.assertEqual(captured_body["image_ref"], rebuilt_resolution.image_ref)
 
     def test_fugue_runtime_image_from_app_prefers_current_spec_image(self) -> None:
         app_data = {
@@ -498,6 +578,11 @@ class FugueApiHelperTests(unittest.TestCase):
         )
 
         with (
+            mock.patch.object(
+                argus_app,
+                "_fugue_resolve_runtime_image_source_sync",
+                return_value=resolution,
+            ),
             mock.patch.object(argus_app, "_fugue_preflight_runtime_image_sync", side_effect=err),
             mock.patch.object(argus_app, "_fugue_request_json_sync") as request_mock,
         ):

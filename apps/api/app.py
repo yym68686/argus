@@ -20352,7 +20352,19 @@ def _fugue_preflight_runtime_image_sync(
 def _fugue_create_session_app_sync(cfg: FugueProvisionConfig, session_id: str) -> dict[str, Any]:
     if not cfg.runtime_cmd:
         raise RuntimeError("ARGUS_RUNTIME_CMD is required in fugue provision mode")
-    image_resolution = _fugue_preflight_runtime_image_sync(cfg)
+    image_resolution = _fugue_resolve_runtime_image_source_sync(cfg)
+    try:
+        image_resolution = _fugue_preflight_runtime_image_sync(cfg, image_resolution)
+    except FugueRuntimeImageMissingError:
+        if not image_resolution.runtime_app_id or image_resolution.source == "static":
+            raise
+        log.info(
+            "Fugue runtime image %s is missing for session %s; rebuilding runtime app %s before provisioning",
+            image_resolution.image_ref,
+            session_id,
+            image_resolution.runtime_app_id,
+        )
+        image_resolution = _fugue_rebuild_runtime_app_sync(cfg, image_resolution)
     log.info(
         "Creating Fugue session app session=%s runtime_image_source=%s resolved_image=%s template_app_id=%s",
         session_id,
@@ -20410,7 +20422,12 @@ def _fugue_create_session_app_sync(cfg: FugueProvisionConfig, session_id: str) -
     return app_data
 
 
-def _fugue_wait_for_app_ready_sync(cfg: FugueProvisionConfig, app_id: str) -> dict[str, Any]:
+def _fugue_wait_for_app_ready_sync(
+    cfg: FugueProvisionConfig,
+    app_id: str,
+    *,
+    recovery_operation_id: Optional[str] = None,
+) -> dict[str, Any]:
     deadline = time.time() + max(60.0, cfg.connect_timeout_s * 6.0)
     last_phase = ""
     last_message = ""
@@ -20442,18 +20459,28 @@ def _fugue_wait_for_app_ready_sync(cfg: FugueProvisionConfig, app_id: str) -> di
                 last_operation_status = operation_status or last_operation_status
                 last_operation_detail = operation_detail or last_operation_detail
                 if operation_status in ("failed", "error", "canceled", "cancelled", "deleted"):
-                    detail = operation_detail or last_message
-                    suffix = f": {detail}" if detail else ""
-                    message = f"Fugue app {app_id} last operation {operation_id} entered status {operation_status}{suffix}"
-                    if _is_manifest_missing_error_text(message):
-                        raise FugueRuntimeImageMissingError(
-                            message,
-                            runtime_app_id=app_id,
-                            operation_id=operation_id,
-                            last_message=detail or last_message or None,
-                        )
-                    raise RuntimeError(message)
+                    if not recovery_operation_id or operation_id == recovery_operation_id:
+                        detail = operation_detail or last_message
+                        suffix = f": {detail}" if detail else ""
+                        message = f"Fugue app {app_id} last operation {operation_id} entered status {operation_status}{suffix}"
+                        if _is_manifest_missing_error_text(message):
+                            raise FugueRuntimeImageMissingError(
+                                message,
+                                runtime_app_id=app_id,
+                                operation_id=operation_id,
+                                last_message=detail or last_message or None,
+                            )
+                        raise RuntimeError(message)
         if phase in ("failed", "deleted"):
+            if recovery_operation_id:
+                if last_operation_id != recovery_operation_id:
+                    if time.time() < deadline:
+                        time.sleep(1.0)
+                        continue
+                elif last_operation_status not in ("failed", "error", "canceled", "cancelled", "deleted"):
+                    if time.time() < deadline:
+                        time.sleep(1.0)
+                        continue
             detail_parts: list[str] = []
             if last_message:
                 detail_parts.append(last_message)
@@ -20484,6 +20511,47 @@ def _fugue_wait_for_app_ready_sync(cfg: FugueProvisionConfig, app_id: str) -> di
             phase_label = last_phase or "unknown"
             raise TimeoutError(f"Timed out waiting for Fugue app {app_id} to become ready (phase={phase_label}){detail}")
         time.sleep(1.0)
+
+
+def _fugue_rebuild_runtime_app_sync(
+    cfg: FugueProvisionConfig,
+    resolution: FugueRuntimeImageResolution,
+) -> FugueRuntimeImageResolution:
+    runtime_app_id = str(resolution.runtime_app_id or "").strip()
+    if not runtime_app_id:
+        raise RuntimeError("Fugue runtime image is missing and cannot be rebuilt because the runtime app id is unavailable")
+
+    payload = _fugue_request_json_sync(
+        cfg,
+        "POST",
+        f"/v1/apps/{runtime_app_id}/rebuild",
+        body={},
+        expected_statuses=(202,),
+    )
+    operation_data = payload.get("operation") if isinstance(payload, dict) else None
+    operation_id = ""
+    if isinstance(operation_data, dict):
+        operation_id = str(operation_data.get("id") or "").strip()
+    if not operation_id:
+        raise RuntimeError(f"Fugue rebuild response for runtime app {runtime_app_id} did not include an operation id")
+    log.info(
+        "Queued Fugue runtime rebuild runtime_app_id=%s operation_id=%s missing_image=%s",
+        runtime_app_id,
+        operation_id,
+        resolution.image_ref,
+    )
+    rebuilt_app = _fugue_wait_for_app_ready_sync(cfg, runtime_app_id, recovery_operation_id=operation_id)
+    rebuilt_resolution = _fugue_runtime_image_resolution_from_app(cfg, rebuilt_app, source_label=resolution.source)
+    return FugueRuntimeImageResolution(
+        image_ref=rebuilt_resolution.image_ref,
+        source=rebuilt_resolution.source,
+        registry_check_ref=rebuilt_resolution.registry_check_ref,
+        runtime_app_id=rebuilt_resolution.runtime_app_id or runtime_app_id,
+        runtime_app_name=rebuilt_resolution.runtime_app_name,
+        runtime_operation_id=rebuilt_resolution.runtime_operation_id,
+        runtime_last_message=rebuilt_resolution.runtime_last_message,
+        runtime_phase=rebuilt_resolution.runtime_phase,
+    )
 
 
 def _fugue_ensure_session_app_ready_sync(cfg: FugueProvisionConfig, session_id: str, allow_create: bool) -> tuple[dict[str, Any], bool]:
@@ -21714,6 +21782,28 @@ async def _self_agent_connection_payload(
             waited = await automation.wait_for_user_agent_provisioning(agent_id=normalized_agent_id, timeout_ms=timeout_ms)
             if isinstance(waited, PersistedAgentRuntime):
                 agent = waited
+        if _normalize_agent_provisioning_state(agent.provisioning_state) == AGENT_PROVISIONING_STATE_FAILED:
+            session_id = str(agent.session_id or "").strip()
+            runtime_status = automation.runtime_status_for_session(session_id) if session_id else {}
+            if (
+                str(runtime_status.get("runtimeErrorClass") or "").strip() == "runtime_image_digest_missing"
+                and str(runtime_status.get("runtimeAppId") or "").strip()
+            ):
+                try:
+                    agent = await automation.retry_user_agent_provisioning(
+                        user_id=user_id,
+                        agent_id=normalized_agent_id,
+                    )
+                except Exception:
+                    log.exception("Failed to auto-retry agent %s after missing runtime image", normalized_agent_id)
+                else:
+                    if wait_requested:
+                        waited = await automation.wait_for_user_agent_provisioning(
+                            agent_id=normalized_agent_id,
+                            timeout_ms=timeout_ms,
+                        )
+                        if isinstance(waited, PersistedAgentRuntime):
+                            agent = waited
         if not _agent_is_ready(agent):
             return JSONResponse(
                 status_code=409,
