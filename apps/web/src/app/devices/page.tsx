@@ -8,7 +8,6 @@ import { Badge, EmptyState, Fact, InlineError, PanelCard, Skeleton } from "@/com
 import { ConsoleShell } from "@/components/console-shell";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
-import { Textarea } from "@/components/ui/textarea";
 import {
   type HostAgentEnrollTokenResponse,
   type HostAgentSummary,
@@ -46,12 +45,24 @@ function formatStamp(value?: number | null): string {
   return new Date(value).toLocaleString();
 }
 
+function formatExpiry(value?: number | null): string {
+  if (!value || !Number.isFinite(value)) return "Refresh to issue a token";
+  return `Valid until ${formatStamp(value)}`;
+}
+
+function workspaceLabel(value?: string | null): string {
+  const trimmed = value?.trim();
+  if (!trimmed) return "Desktop workspace";
+  return trimmed;
+}
+
 function hostLabel(host: HostAgentSummary): string {
   return host.displayName?.trim() || host.hostId;
 }
 
 export default function DevicesPage() {
   const [wsUrl, setWsUrl] = useGatewayWsUrlState();
+  const [detectedPlatform] = React.useState<ClientPlatform>(detectClientPlatform);
   const [platform, setPlatform] = React.useState<ClientPlatform>(detectClientPlatform);
   const [tokenInfo, setTokenInfo] = React.useState<HostAgentEnrollTokenResponse | null>(null);
   const [hosts, setHosts] = React.useState<HostAgentSummary[]>([]);
@@ -116,96 +127,158 @@ export default function DevicesPage() {
   const showSkeleton = loading && !tokenInfo;
 
   return (
-    <ConsoleShell
-      title="Devices"
-      actions={
-        <div className="flex flex-wrap items-center gap-2">
-          <Input
-            value={wsUrl}
-            onChange={(event) => setWsUrl(event.target.value)}
-            className="w-[min(30rem,100%)]"
-            placeholder="Gateway wss://.../ws"
-            spellCheck={false}
-          />
-          <Button type="button" variant="secondary" disabled={loading} onClick={() => void refresh({ notify: true })}>
-            <RefreshCw className={cn("h-4 w-4", loading ? "animate-spin" : null)} />
-            Regenerate
-          </Button>
-          <Button type="button" disabled={!command} onClick={() => copyText(command, "Connect command copied")}>
-            <Copy className="h-4 w-4" />
-            Copy Command
-          </Button>
-        </div>
-      }
-    >
+    <ConsoleShell title="Devices">
       {error ? <InlineError message={error} /> : null}
 
-      <div className="grid gap-4">
+      <div className="grid gap-5">
         <section className="space-y-4">
-          <PanelCard
-            title="One-Step Connect"
-            action={
-              <div className="flex flex-wrap items-center gap-2">
-                <PlatformButton
-                  active={platform === "unix"}
-                  icon={<Laptop className="h-4 w-4" />}
-                  label="macOS/Linux"
-                  onClick={() => setPlatform("unix")}
-                />
-                <PlatformButton
-                  active={platform === "windows"}
-                  icon={<Monitor className="h-4 w-4" />}
-                  label="Windows"
-                  onClick={() => setPlatform("windows")}
-                />
-              </div>
-            }
+          <section
+            aria-labelledby="host-connect-heading"
+            className="argus-shell-panel-soft overflow-hidden rounded-[22px]"
           >
             {showSkeleton ? (
-              <div className="space-y-3">
-                <Skeleton className="h-4 w-40 rounded-full" />
-                <Skeleton className="h-28 rounded-[18px]" />
-                <Skeleton className="h-10 rounded-xl" />
+              <div className="grid gap-0 lg:grid-cols-[minmax(22rem,0.42fr)_minmax(0,1fr)]">
+                <div className="border-b border-border/60 p-4 md:p-5 lg:border-b-0 lg:border-r">
+                  <Skeleton className="h-5 w-40 rounded-full" />
+                  <Skeleton className="mt-3 h-4 w-56 rounded-full" />
+                  <Skeleton className="mt-6 h-10 rounded-xl" />
+                  <Skeleton className="mt-4 h-20 rounded-[16px]" />
+                </div>
+                <div className="p-4 md:p-5">
+                  <Skeleton className="h-5 w-56 rounded-full" />
+                  <Skeleton className="mt-4 h-28 rounded-[18px]" />
+                  <Skeleton className="mt-4 h-10 w-40 rounded-xl" />
+                </div>
               </div>
             ) : (
-              <div className="space-y-4">
-                <div className="flex flex-wrap items-center gap-2">
-                  <Badge tone="primary">{platform === "windows" ? "Detected Windows" : "Detected macOS/Linux"}</Badge>
-                  <Badge tone="success">One command</Badge>
-                  <Badge tone="default">Desktop workspace</Badge>
-                </div>
+              <div className="grid gap-0 lg:grid-cols-[minmax(22rem,0.42fr)_minmax(0,1fr)]">
+                <div className="border-b border-border/60 p-4 md:p-5 lg:border-b-0 lg:border-r">
+                  <h2 id="host-connect-heading" className="text-[1.05rem] font-semibold text-foreground">
+                    One-Step Connect
+                  </h2>
+                  <p className="mt-2 max-w-[28rem] text-sm leading-6 text-muted-foreground">
+                    Generate a host install command for this gateway.
+                  </p>
 
-                <div className="rounded-[18px] border border-border/70 bg-background/18 p-3">
-                  <div className="mb-2 flex items-center gap-2 text-sm font-medium text-foreground">
-                    <Laptop className="h-4 w-4 text-primary" />
-                    Run this on the computer you want to connect
+                  <div className="mt-6 space-y-4">
+                    <div>
+                      <label
+                        htmlFor="devices-gateway-url"
+                        className="argus-surface-label block"
+                      >
+                        Gateway URL
+                      </label>
+                      <div className="mt-2 flex min-w-0 flex-col gap-2 sm:flex-row">
+                        <Input
+                          id="devices-gateway-url"
+                          name="gateway-url"
+                          type="url"
+                          value={wsUrl}
+                          onChange={(event) => setWsUrl(event.target.value)}
+                          className="min-w-0 flex-1"
+                          placeholder="wss://example.com/ws"
+                          autoComplete="off"
+                          spellCheck={false}
+                          translate="no"
+                        />
+                        <Button
+                          type="button"
+                          variant="secondary"
+                          disabled={loading}
+                          onClick={() => void refresh({ notify: true })}
+                          className="shrink-0"
+                        >
+                          <RefreshCw className={cn("h-4 w-4", loading ? "animate-spin" : null)} />
+                          {loading ? "Refreshing…" : "Regenerate"}
+                        </Button>
+                      </div>
+                    </div>
+
+                    <div>
+                      <div className="argus-surface-label">Platform</div>
+                      <div className="mt-2 grid grid-cols-2 gap-2">
+                        <PlatformButton
+                          active={platform === "unix"}
+                          icon={<Laptop className="h-4 w-4" aria-hidden="true" />}
+                          label="macOS/Linux"
+                          onClick={() => setPlatform("unix")}
+                        />
+                        <PlatformButton
+                          active={platform === "windows"}
+                          icon={<Monitor className="h-4 w-4" aria-hidden="true" />}
+                          label="Windows"
+                          onClick={() => setPlatform("windows")}
+                        />
+                      </div>
+                      <p className="mt-2 text-xs leading-5 text-muted-foreground">
+                        Detected {detectedPlatform === "windows" ? "Windows" : "macOS/Linux"}. Switch if this command
+                        is for another machine.
+                      </p>
+                    </div>
+
+                    <div className="grid gap-3 border-t border-border/56 pt-4">
+                      <ConnectMeta label="Workspace" value={workspaceLabel(tokenInfo?.workspaceBasePath)} />
+                      <div className="grid gap-1">
+                        <div className="argus-surface-label">Token</div>
+                        <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
+                          <div className="break-words text-sm leading-6 text-foreground">
+                            {formatExpiry(tokenInfo?.expiresAtMs)}
+                          </div>
+                          <Button
+                            type="button"
+                            size="sm"
+                            variant="secondary"
+                            disabled={!tokenInfo?.token}
+                            onClick={() => copyText(tokenInfo?.token ?? "", "Token copied")}
+                            className="shrink-0"
+                          >
+                            <KeyRound className="h-4 w-4" />
+                            Copy Token
+                          </Button>
+                        </div>
+                      </div>
+                    </div>
                   </div>
-                  <Textarea readOnly value={command} rows={4} className="font-mono text-[12.5px] leading-6" />
                 </div>
 
-                <div className="flex flex-wrap gap-2">
-                  <Button type="button" disabled={!command} onClick={() => copyText(command, "Connect command copied")}>
-                    <Copy className="h-4 w-4" />
-                    Copy Command
-                  </Button>
-                  <Button
-                    type="button"
-                    variant="secondary"
-                    disabled={!tokenInfo?.token}
-                    onClick={() => copyText(tokenInfo?.token ?? "", "Token copied")}
+                <div className="flex min-w-0 flex-col p-4 md:p-5">
+                  <div className="flex flex-col gap-3 md:flex-row md:items-start md:justify-between">
+                    <div className="min-w-0">
+                      <div className="flex items-center gap-2 text-sm font-semibold text-foreground">
+                        <Laptop className="h-4 w-4 text-primary" aria-hidden="true" />
+                        Run on the computer you want to connect
+                      </div>
+                      <p className="mt-2 max-w-[44rem] text-sm leading-6 text-muted-foreground">
+                        The installer adds the Argus CLI, sets the desktop workspace, and links the local Codex host to this gateway.
+                      </p>
+                    </div>
+                    <Button
+                      type="button"
+                      disabled={!command}
+                      onClick={() => copyText(command, "Connect command copied")}
+                      className="shrink-0 md:self-start"
+                    >
+                      <Copy className="h-4 w-4" />
+                      Copy Command
+                    </Button>
+                  </div>
+
+                  <div
+                    className="mt-4 min-h-[8.5rem] rounded-[18px] border border-border/72 bg-background/24 p-4 shadow-[inset_0_1px_0_0_oklch(var(--foreground)/0.04)]"
+                    translate="no"
                   >
-                    <KeyRound className="h-4 w-4" />
-                    Copy Token
-                  </Button>
-                </div>
+                    <pre className="max-h-[14rem] overflow-auto whitespace-pre-wrap break-words font-mono text-[12.5px] leading-6 text-foreground">
+                      <code>{command || "Refresh to generate an install command."}</code>
+                    </pre>
+                  </div>
 
-                <p className="text-sm leading-6 text-muted-foreground">
-                  The installer downloads the right Argus CLI, installs the system argus command, sets the default
-                  workspace under the Desktop, and connects the local Codex host to this gateway.
-                </p>
+                  <p className="mt-4 text-sm leading-6 text-muted-foreground">
+                    After the command succeeds, the host appears in Connected Devices below.
+                  </p>
+                </div>
               </div>
             )}
-          </PanelCard>
+          </section>
 
           <PanelCard title="Connected Devices">
             {showSkeleton ? (
@@ -259,9 +332,24 @@ function PlatformButton({
   onClick: () => void;
 }) {
   return (
-    <Button type="button" size="sm" variant={active ? "default" : "secondary"} onClick={onClick}>
+    <Button
+      type="button"
+      size="sm"
+      variant={active ? "default" : "secondary"}
+      onClick={onClick}
+      className="h-10 min-w-0 justify-center px-3"
+    >
       {icon}
-      {label}
+      <span className="min-w-0 truncate">{label}</span>
     </Button>
+  );
+}
+
+function ConnectMeta({ label, value }: { label: string; value: string }) {
+  return (
+    <div className="grid gap-1">
+      <div className="argus-surface-label">{label}</div>
+      <div className="mt-1 break-words text-sm leading-6 text-foreground">{value}</div>
+    </div>
   );
 }

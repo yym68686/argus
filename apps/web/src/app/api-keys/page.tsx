@@ -422,12 +422,22 @@ export default function ApiKeysPage() {
           )}
         </PanelCard>
 
-        <div className="grid gap-4 xl:grid-cols-[320px_minmax(0,1fr)]">
-          <section className="space-y-4">
-            <PanelCard title="Channels">
-              {channels.length ? (
-                <div className="space-y-2">
-                  {channels.map((channel) => {
+        <PanelCard title="Upstream channels" contentClassName="min-w-0">
+          <div className="grid gap-0 overflow-hidden rounded-[18px] border border-border/72 bg-background/16 xl:grid-cols-[minmax(17rem,20rem)_minmax(0,1fr)]">
+            <aside className="border-b border-border/68 bg-background/18 xl:border-b-0 xl:border-r">
+              <div className="flex items-center justify-between gap-3 border-b border-border/60 px-4 py-3">
+                <div>
+                  <div className="text-sm font-semibold text-foreground">Channels</div>
+                  <div className="mt-0.5 text-xs text-muted-foreground">
+                    {readyCount} ready · {keyedCount} with keys
+                  </div>
+                </div>
+                <Badge tone={customCount ? "default" : "warning"}>{customCount} custom</Badge>
+              </div>
+
+              <div className="max-h-[28rem] space-y-1 overflow-y-auto p-2">
+                {channels.length ? (
+                  channels.map((channel) => {
                     const active = selectedChannel?.channelId === channel.channelId;
                     return (
                       <button
@@ -435,18 +445,19 @@ export default function ApiKeysPage() {
                         type="button"
                         onClick={() => focusChannel(channel)}
                         className={cn(
-                          "argus-row-shell w-full rounded-[16px] px-4 py-3 text-left",
-                          active ? "border-primary/28 bg-primary/10" : "hover:border-border hover:bg-background/36"
+                          "group w-full rounded-xl px-3 py-3 text-left transition",
+                          "hover:bg-background/42 focus-visible:outline-none focus-visible:ring-4 focus-visible:ring-ring/18",
+                          active ? "bg-primary/10 shadow-[inset_3px_0_0_0_oklch(var(--primary)/0.72)]" : null
                         )}
                       >
                         <div className="flex items-start justify-between gap-3">
                           <div className="min-w-0">
-                            <div className="truncate font-medium text-foreground">{channel.name}</div>
-                            <div className="mt-1 truncate text-xs text-muted-foreground">{channel.channelId}</div>
+                            <div className="truncate text-sm font-semibold text-foreground">{channel.name}</div>
+                            <div className="mt-1 truncate font-mono text-[11px] text-muted-foreground">{channel.channelId}</div>
                           </div>
-                          <Badge tone={channelTone(channel)}>{channelKind(channel)}</Badge>
+                          <ChannelStatusDot channel={channel} />
                         </div>
-                        <div className="mt-3 flex flex-wrap gap-2">
+                        <div className="mt-2 flex flex-wrap items-center gap-1.5">
                           {channel.selected ? <Badge tone="primary">current</Badge> : null}
                           <Badge tone={channel.ready ? "success" : "default"}>
                             <TextSwap value={channel.ready ? "ready" : "pending"} />
@@ -457,151 +468,238 @@ export default function ApiKeysPage() {
                         </div>
                       </button>
                     );
-                  })}
-                </div>
-              ) : (
-                <EmptyState title="No channels" />
-              )}
-            </PanelCard>
+                  })
+                ) : (
+                  <EmptyState title="No channels" />
+                )}
+              </div>
 
-            <PanelCard title="New">
-              <div className="grid gap-3">
-                <Input value={newName} onChange={(event) => setNewName(event.target.value)} placeholder="name" />
-                <Input value={newBaseUrl} onChange={(event) => setNewBaseUrl(event.target.value)} placeholder="https://api.openai.com/v1" />
-                <Input
+              <form
+                className="grid gap-3 border-t border-border/60 p-4"
+                onSubmit={(event) => {
+                  event.preventDefault();
+                  void createChannel();
+                }}
+              >
+                <div>
+                  <div className="text-sm font-semibold text-foreground">Add channel</div>
+                  <div className="mt-1 text-xs leading-5 text-muted-foreground">
+                    Store one upstream endpoint and its API key.
+                  </div>
+                </div>
+                <LabeledInput
+                  id="new-channel-name"
+                  label="Name"
+                  value={newName}
+                  onChange={(event) => setNewName(event.target.value)}
+                  placeholder="0-0.pro"
+                />
+                <LabeledInput
+                  id="new-channel-base-url"
+                  label="Base URL"
+                  value={newBaseUrl}
+                  onChange={(event) => setNewBaseUrl(event.target.value)}
+                  placeholder="https://api.openai.com/v1"
+                />
+                <LabeledInput
+                  id="new-channel-api-key"
+                  label="API key"
                   value={newApiKey}
                   onChange={(event) => setNewApiKey(event.target.value)}
-                  placeholder="api key"
+                  placeholder="sk-..."
                   type="password"
                   autoComplete="off"
                   spellCheck={false}
                 />
-                <Button type="button" disabled={loading || saving} onClick={() => void createChannel()}>
+                <Button type="submit" disabled={loading || saving}>
                   <Plus className="h-4 w-4" />
-                  Add
+                  Add channel
                 </Button>
-              </div>
-            </PanelCard>
-          </section>
+              </form>
+            </aside>
 
-          <section className="space-y-4">
-            <PanelReveal key={selectedChannel?.channelId ?? "channel-none"} open className="space-y-4" travel="12px">
-            <PanelCard
-              title={selectedChannel?.name || "Channel"}
-              action={
-                selectedChannel ? (
-                  <div className="flex flex-wrap items-center gap-2">
-                    {!selectedChannel.selected ? (
-                      <Button
-                        type="button"
-                        size="sm"
-                        disabled={loading || saving || !selectedChannel.ready}
-                        onClick={() => void selectChannel()}
-                      >
-                        <Check className="h-4 w-4" />
-                        Use
-                      </Button>
-                    ) : null}
-                    {selectedChannel.canDelete ? (
-                      <Button
-                        type="button"
-                        size="sm"
-                        variant="destructive"
-                        disabled={loading || saving}
-                        onClick={() => void removeChannel()}
-                      >
-                        <Trash2 className="h-4 w-4" />
-                        Delete
-                      </Button>
-                    ) : null}
-                  </div>
-                ) : null
-              }
-            >
-              {selectedChannel ? (
-                <div className="grid gap-4">
-                  {selectedChannel.canRename ? (
-                    <div className="grid gap-2 md:grid-cols-[minmax(0,1fr)_auto]">
-                      <Input value={nameDraft} onChange={(event) => setNameDraft(event.target.value)} placeholder="name" />
-                      <Button
-                        type="button"
-                        variant="secondary"
-                        disabled={loading || saving || !nameDraft.trim() || nameDraft.trim() === selectedChannel.name}
-                        onClick={() => void saveName()}
-                      >
-                        <Pencil className="h-4 w-4" />
-                        Rename
-                      </Button>
+            <section className="min-w-0 p-4 md:p-5">
+              <PanelReveal key={selectedChannel?.channelId ?? "channel-none"} open travel="12px">
+                {selectedChannel ? (
+                  <div className="grid gap-6">
+                    <div className="flex flex-col gap-4 border-b border-border/60 pb-5 lg:flex-row lg:items-start lg:justify-between">
+                      <div className="min-w-0">
+                        <div className="flex flex-wrap items-center gap-2">
+                          <h2 className="min-w-0 truncate text-[clamp(1.45rem,2vw,2rem)] font-semibold tracking-[-0.045em] text-foreground">
+                            {selectedChannel.name}
+                          </h2>
+                          <Badge tone={channelTone(selectedChannel)}>{channelKind(selectedChannel)}</Badge>
+                        </div>
+                        <div className="mt-2 truncate font-mono text-xs text-muted-foreground">
+                          {selectedChannel.baseUrl || "No base URL"}
+                        </div>
+                      </div>
+
+                      <div className="flex flex-wrap items-center gap-2">
+                        {!selectedChannel.selected ? (
+                          <Button
+                            type="button"
+                            size="sm"
+                            disabled={loading || saving || !selectedChannel.ready}
+                            onClick={() => void selectChannel()}
+                          >
+                            <Check className="h-4 w-4" />
+                            Use channel
+                          </Button>
+                        ) : (
+                          <Badge tone="primary">current channel</Badge>
+                        )}
+                        {selectedChannel.canDelete ? (
+                          <Button
+                            type="button"
+                            size="sm"
+                            variant="ghost"
+                            disabled={loading || saving}
+                            onClick={() => void removeChannel()}
+                            className="text-destructive hover:border-destructive/48 hover:bg-destructive/10"
+                          >
+                            <Trash2 className="h-4 w-4" />
+                            Delete
+                          </Button>
+                        ) : null}
+                      </div>
                     </div>
-                  ) : null}
 
-                  <div className="grid gap-3 md:grid-cols-2">
-                    <Fact label="ID" value={selectedChannel.channelId} mono />
-                    <Fact label="Type" value={channelKind(selectedChannel)} />
-                    <Fact label="Base" value={selectedChannel.baseUrl || "—"} mono />
-                    <Fact label="State" value={selectedChannel.ready ? "ready" : selectedChannel.reason || "pending"} />
+                    <div className="grid gap-5 2xl:grid-cols-[minmax(0,0.95fr)_minmax(22rem,1.05fr)]">
+                      <div className="grid content-start gap-5">
+                        <div>
+                          <SectionHeading title="Status" />
+                          <div className="mt-3 grid gap-0 overflow-hidden rounded-[14px] border border-border/64">
+                            <DetailRow label="State" value={selectedChannel.ready ? "ready" : selectedChannel.reason || "pending"} />
+                            <DetailRow label="ID" value={selectedChannel.channelId} mono />
+                            <DetailRow label="Type" value={channelKind(selectedChannel)} />
+                            <DetailRow label="Models" value={selectedChannel.modelsUrl || "—"} mono />
+                          </div>
+                        </div>
+
+                        {selectedChannel.canRename ? (
+                          <form
+                            className="grid gap-3"
+                            onSubmit={(event) => {
+                              event.preventDefault();
+                              void saveName();
+                            }}
+                          >
+                            <SectionHeading title="Display name" />
+                            <div className="grid gap-2 sm:grid-cols-[minmax(0,1fr)_auto]">
+                              <Input
+                                id="selected-channel-name"
+                                value={nameDraft}
+                                onChange={(event) => setNameDraft(event.target.value)}
+                                placeholder="name"
+                              />
+                              <Button
+                                type="submit"
+                                variant="secondary"
+                                disabled={loading || saving || !nameDraft.trim() || nameDraft.trim() === selectedChannel.name}
+                              >
+                                <Pencil className="h-4 w-4" />
+                                Rename
+                              </Button>
+                            </div>
+                          </form>
+                        ) : null}
+                      </div>
+
+                      <form
+                        className="grid content-start gap-4 rounded-[16px] border border-border/64 bg-background/20 p-4"
+                        onSubmit={(event) => {
+                          event.preventDefault();
+                          void saveKey();
+                        }}
+                      >
+                        <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
+                          <div>
+                            <SectionHeading title="Upstream key" />
+                            <div className="mt-1 text-sm text-muted-foreground">
+                              Stored: {selectedChannel.apiKeyMasked || (selectedChannel.hasApiKey ? "set" : "none")}
+                            </div>
+                          </div>
+                          {selectedChannel.canClearKey ? (
+                            <Button type="button" size="sm" variant="secondary" disabled={loading || saving} onClick={() => void clearKey()}>
+                              Clear
+                            </Button>
+                          ) : null}
+                        </div>
+
+                        {selectedChannel.canSetKey ? (
+                          <div className="grid gap-2">
+                            <label htmlFor="selected-channel-api-key" className="text-xs font-medium text-muted-foreground">
+                              New API key
+                            </label>
+                            <div className="grid gap-2 sm:grid-cols-[minmax(0,1fr)_auto]">
+                              <Input
+                                id="selected-channel-api-key"
+                                value={keyDraft}
+                                onChange={(event) => setKeyDraft(event.target.value)}
+                                placeholder={selectedChannel.hasApiKey ? "Paste replacement key" : "Paste API key"}
+                                type="password"
+                                autoComplete="off"
+                                spellCheck={false}
+                              />
+                              <Button type="submit" disabled={loading || saving || !keyDraft.trim()}>
+                                <KeyRound className="h-4 w-4" />
+                                Save key
+                              </Button>
+                            </div>
+                          </div>
+                        ) : (
+                          <div className="rounded-[14px] border border-border/60 bg-background/22 px-3 py-3 text-sm text-muted-foreground">
+                            This channel does not accept user-managed keys.
+                          </div>
+                        )}
+                      </form>
+                    </div>
                   </div>
-                </div>
-              ) : (
-                <EmptyState title="No selection" />
-              )}
-            </PanelCard>
-
-            <PanelCard
-              title="Key"
-              action={
-                selectedChannel?.canSetKey ? (
-                  <div className="flex flex-wrap items-center gap-2">
-                    <Button
-                      type="button"
-                      size="sm"
-                      disabled={loading || saving || !keyDraft.trim()}
-                      onClick={() => void saveKey()}
-                    >
-                      <KeyRound className="h-4 w-4" />
-                      Save
-                    </Button>
-                    {selectedChannel.canClearKey ? (
-                      <Button type="button" size="sm" variant="secondary" disabled={loading || saving} onClick={() => void clearKey()}>
-                        Clear
-                      </Button>
-                    ) : null}
-                  </div>
-                ) : null
-              }
-            >
-              {selectedChannel ? (
-                <div className="grid gap-4">
-                  {selectedChannel.canSetKey ? (
-                    <Input
-                      value={keyDraft}
-                      onChange={(event) => setKeyDraft(event.target.value)}
-                      placeholder={selectedChannel.hasApiKey ? "new api key" : "api key"}
-                      type="password"
-                      autoComplete="off"
-                      spellCheck={false}
-                    />
-                  ) : null}
-
-                  <div className="grid gap-3 md:grid-cols-2">
-                    <Fact label="Stored" value={selectedChannel.apiKeyMasked || (selectedChannel.hasApiKey ? "set" : "none")} />
-                    <Fact label="Models" value={selectedChannel.modelsUrl || "—"} mono />
-                  </div>
-                </div>
-              ) : (
-                <EmptyState title="No key" />
-              )}
-            </PanelCard>
-
-            {customCount ? null : (
-              <PanelCard title="Custom">
-                <EmptyState title="No custom keys" />
-              </PanelCard>
-            )}
-            </PanelReveal>
-          </section>
-        </div>
+                ) : (
+                  <EmptyState title="No channel selected" />
+                )}
+              </PanelReveal>
+            </section>
+          </div>
+        </PanelCard>
       </div>
     </ConsoleShell>
   );
+}
+
+function SectionHeading({ title }: { title: string }) {
+  return <h3 className="text-xs font-semibold uppercase tracking-[0.08em] text-muted-foreground">{title}</h3>;
+}
+
+function DetailRow({ label, value, mono = false }: { label: string; value: string; mono?: boolean }) {
+  return (
+    <div className="grid gap-2 border-b border-border/54 bg-background/14 px-3.5 py-3 last:border-b-0 sm:grid-cols-[7rem_minmax(0,1fr)]">
+      <div className="text-xs font-medium text-muted-foreground">{label}</div>
+      <div className={cn("min-w-0 break-words text-sm font-medium leading-6 text-foreground", mono ? "font-mono text-[12.5px]" : null)}>
+        {value}
+      </div>
+    </div>
+  );
+}
+
+function LabeledInput({
+  id,
+  label,
+  className,
+  ...props
+}: React.ComponentProps<typeof Input> & { id: string; label: string }) {
+  return (
+    <div className={cn("grid gap-1.5", className)}>
+      <label htmlFor={id} className="text-xs font-medium text-muted-foreground">
+        {label}
+      </label>
+      <Input id={id} {...props} />
+    </div>
+  );
+}
+
+function ChannelStatusDot({ channel }: { channel: AdminChannelEntry }) {
+  const state = channel.ready ? "ok" : channel.hasApiKey ? "warn" : "idle";
+  return <span aria-hidden className="argus-status-dot mt-1" data-state={state} />;
 }
