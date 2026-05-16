@@ -21942,18 +21942,43 @@ def _admin_last_active_ms_for_user(automation: AutomationManager, user_id: int) 
     return latest or None
 
 
-def _admin_resolve_current_agent_id_for_user(automation: AutomationManager, user_id: int) -> Optional[str]:
+def _admin_resolve_current_agent_id_for_user(
+    automation: AutomationManager,
+    user_id: int,
+    agents: Optional[list[dict[str, Any]]] = None,
+) -> Optional[str]:
     if not isinstance(user_id, int) or user_id <= 0:
         return None
+    visible_agent_ids: Optional[set[str]] = None
+    if agents is not None:
+        visible_agent_ids = {
+            str(item.get("agentId") or "").strip()
+            for item in agents
+            if isinstance(item, dict) and str(item.get("agentId") or "").strip()
+        }
+
+        def _visible(agent_id: str) -> bool:
+            return agent_id in visible_agent_ids
+    else:
+        def _visible(agent_id: str) -> bool:
+            return automation.can_user_access_agent_id(user_id=user_id, agent_id=agent_id)
+
     st = automation._store.state
     private_chat_key = _admin_private_chat_key_for_user(user_id)
     bound = st.chat_bindings.get(private_chat_key) if isinstance(getattr(st, "chat_bindings", None), dict) else None
     bound_id = bound.strip() if isinstance(bound, str) and bound.strip() else None
-    if bound_id and automation.can_user_access_agent_id(user_id=user_id, agent_id=bound_id):
+    if bound_id and _visible(bound_id):
         return bound_id
     main_id = _user_agent_id(user_id=user_id, short_name="main")
-    if automation.can_user_access_agent_id(user_id=user_id, agent_id=main_id):
+    if _visible(main_id):
         return main_id
+    if agents is not None:
+        for item in agents:
+            if not isinstance(item, dict):
+                continue
+            agent_id = str(item.get("agentId") or "").strip()
+            if agent_id:
+                return agent_id
     return None
 
 
@@ -21964,6 +21989,44 @@ def _admin_normalize_agent_id_for_user(user_id: int, raw_agent_id: Any) -> str:
     if re.match(r"^u\d+-", aid_raw):
         return aid_raw
     return _user_agent_id(user_id=user_id, short_name=aid_raw)
+
+
+def _admin_filter_agents_by_live_session_ids(
+    agents: list[dict[str, Any]],
+    live_session_ids: Optional[set[str]],
+) -> list[dict[str, Any]]:
+    if live_session_ids is None:
+        return agents
+    out: list[dict[str, Any]] = []
+    for agent in agents:
+        if not isinstance(agent, dict):
+            continue
+        state = _normalize_agent_provisioning_state(agent.get("provisioningState"))
+        session_id = str(agent.get("sessionId") or "").strip()
+        if state == AGENT_PROVISIONING_STATE_READY and session_id and session_id not in live_session_ids:
+            continue
+        out.append(agent)
+    return out
+
+
+async def _admin_live_managed_session_ids_or_none() -> Optional[set[str]]:
+    if not _provisioner_manages_runtime_sessions():
+        return None
+    try:
+        sessions = await _list_managed_sessions()
+    except Exception as e:
+        log.warning("Failed to list managed sessions for admin agent filtering: %s", str(e))
+        return None
+    live: set[str] = set()
+    for item in sessions:
+        if not isinstance(item, dict):
+            continue
+        if str(item.get("runtimeLayout") or "").strip() != RUNTIME_LAYOUT:
+            continue
+        session_id = str(item.get("sessionId") or "").strip()
+        if session_id:
+            live.add(session_id)
+    return live
 
 
 def _admin_usage_since_ms(request: Request, *, default_hours: int = 24) -> Optional[int]:
@@ -21991,14 +22054,15 @@ def _admin_user_summary_payload(
     usage_store: UsageLedgerStore,
     user_id: int,
     *,
+    agents: Optional[list[dict[str, Any]]] = None,
     usage_24h: Optional[dict[str, Any]] = None,
     usage_total: Optional[dict[str, Any]] = None,
 ) -> dict[str, Any]:
     if not isinstance(user_id, int) or user_id <= 0:
         raise ValueError("Invalid userId")
 
-    agents = automation.list_agents_for_user(user_id=user_id)
-    current_agent_id = _admin_resolve_current_agent_id_for_user(automation, user_id)
+    agents = list(agents) if agents is not None else automation.list_agents_for_user(user_id=user_id)
+    current_agent_id = _admin_resolve_current_agent_id_for_user(automation, user_id, agents=agents)
     current_agent = automation._get_agent(current_agent_id) if current_agent_id else None
     current_session_id = automation.resolve_agent_session_id(current_agent_id) if current_agent_id else None
     console_user = automation.get_console_user(user_id)
@@ -22792,11 +22856,20 @@ async def admin_overview(request: Request):
     usage_store = _get_usage_store_or_500()
 
     user_ids = _admin_collect_user_ids(automation)
+    live_session_ids = await _admin_live_managed_session_ids_or_none()
     usage_24h = await asyncio.to_thread(usage_store.summarize, since_ms=_now_ms() - 24 * 60 * 60 * 1000)
     usage_total = await asyncio.to_thread(usage_store.summarize)
     st = automation._store.state
-    agent_count = sum(1 for agent in (st.agents or {}).values() if isinstance(agent, PersistedAgentRuntime))
-    session_count = sum(1 for sid in (st.sessions or {}).keys() if isinstance(sid, str) and sid.strip())
+    if live_session_ids is None:
+        agent_count = sum(1 for agent in (st.agents or {}).values() if isinstance(agent, PersistedAgentRuntime))
+        session_count = sum(1 for sid in (st.sessions or {}).keys() if isinstance(sid, str) and sid.strip())
+    else:
+        active_agents = _admin_filter_agents_by_live_session_ids(
+            [agent.to_json() for agent in (st.agents or {}).values() if isinstance(agent, PersistedAgentRuntime)],
+            live_session_ids,
+        )
+        agent_count = len(active_agents)
+        session_count = len(live_session_ids)
     channel_count = 0
     for user_id in user_ids:
         listed = automation.list_channels_for_user(user_id=user_id)
@@ -22935,6 +23008,7 @@ async def admin_users(request: Request):
     usage_store = _get_usage_store_or_500()
 
     user_ids = _admin_collect_user_ids(automation)
+    live_session_ids = await _admin_live_managed_session_ids_or_none()
     usage_24h_by_user = await asyncio.to_thread(
         usage_store.summarize_by_user,
         since_ms=_now_ms() - 24 * 60 * 60 * 1000,
@@ -22943,11 +23017,16 @@ async def admin_users(request: Request):
 
     users: list[dict[str, Any]] = []
     for user_id in user_ids:
+        agents = _admin_filter_agents_by_live_session_ids(
+            automation.list_agents_for_user(user_id=user_id),
+            live_session_ids,
+        )
         users.append(
             _admin_user_summary_payload(
                 automation,
                 usage_store,
                 user_id,
+                agents=agents,
                 usage_24h=usage_24h_by_user.get(user_id),
                 usage_total=usage_total_by_user.get(user_id),
             )
@@ -23004,20 +23083,26 @@ async def admin_user_detail(user_id: int, request: Request):
     if user_id not in known_user_ids and int(usage_total.get("requestCount") or 0) <= 0:
         raise HTTPException(status_code=404, detail="Unknown user")
 
-    current_agent_id = _admin_resolve_current_agent_id_for_user(automation, user_id)
+    live_session_ids = await _admin_live_managed_session_ids_or_none()
+    agents = _admin_filter_agents_by_live_session_ids(
+        automation.list_agents_for_user(user_id=user_id),
+        live_session_ids,
+    )
+    current_agent_id = _admin_resolve_current_agent_id_for_user(automation, user_id, agents=agents)
     current_agent = automation._get_agent(current_agent_id) if current_agent_id else None
     model_info = await _automation_model_payload(automation, agent=current_agent, user_id=user_id)
     detail = _admin_user_summary_payload(
         automation,
         usage_store,
         user_id,
+        agents=agents,
         usage_total=usage_total,
     )
     recent_usage = await asyncio.to_thread(usage_store.list_events, owner_user_id=user_id, limit=100)
     return {
         "ok": True,
         "user": detail,
-        "agents": automation.list_agents_for_user(user_id=user_id),
+        "agents": agents,
         "channels": automation.list_channels_for_user(user_id=user_id),
         "availableModels": model_info.get("availableModels"),
         "models": model_info.get("models"),

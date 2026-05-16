@@ -370,6 +370,67 @@ class UserAgentProvisioningTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("provision", response.body.decode("utf-8").lower())
         retry_mock.assert_awaited_once_with(user_id=1, agent_id=agent_id)
 
+    async def test_admin_user_summary_filters_ready_agents_without_live_managed_sessions(self) -> None:
+        now_ms = 1778906342029
+        stale_session_id = "aaaaaaaaaaaa"
+        live_session_id = "bbbbbbbbbbbb"
+        pending_session_id = "cccccccccccc"
+
+        def ready_agent(agent_id: str, session_id: str, short_name: str) -> argus_app.PersistedAgentRuntime:
+            return argus_app.PersistedAgentRuntime(
+                agent_id=agent_id,
+                session_id=session_id,
+                workspace_host_path=str(pathlib.Path(self.tmpdir.name) / short_name),
+                created_at_ms=now_ms,
+                owner_user_id=1,
+                short_name=short_name,
+                allowed_user_ids=[],
+                model=argus_app.ARGUS_AGENT_MODEL_DEFAULT,
+                provisioning_state=argus_app.AGENT_PROVISIONING_STATE_READY,
+                provisioning_updated_at_ms=now_ms,
+                last_ready_at_ms=now_ms,
+            )
+
+        await self.manager._store.update(
+            lambda st: (
+                st.agents.__setitem__("u1-main", ready_agent("u1-main", stale_session_id, "main")),
+                st.agents.__setitem__("u1-live", ready_agent("u1-live", live_session_id, "live")),
+                st.agents.__setitem__(
+                    "u1-pending",
+                    argus_app.PersistedAgentRuntime(
+                        agent_id="u1-pending",
+                        session_id=pending_session_id,
+                        workspace_host_path=str(pathlib.Path(self.tmpdir.name) / "pending"),
+                        created_at_ms=now_ms,
+                        owner_user_id=1,
+                        short_name="pending",
+                        allowed_user_ids=[],
+                        model=argus_app.ARGUS_AGENT_MODEL_DEFAULT,
+                        provisioning_state=argus_app.AGENT_PROVISIONING_STATE_PENDING,
+                        provisioning_updated_at_ms=now_ms,
+                    ),
+                ),
+                st.chat_bindings.__setitem__("1", "u1-main"),
+            )
+        )
+
+        raw_agents = self.manager.list_agents_for_user(user_id=1)
+        filtered_agents = argus_app._admin_filter_agents_by_live_session_ids(raw_agents, {live_session_id})
+        summary = argus_app._admin_user_summary_payload(
+            self.manager,
+            usage_store=object(),
+            user_id=1,
+            agents=filtered_agents,
+            usage_24h={},
+            usage_total={},
+        )
+
+        self.assertEqual([item["agentId"] for item in filtered_agents], ["u1-live", "u1-pending"])
+        self.assertEqual(summary["agentCount"], 2)
+        self.assertEqual(summary["sessionCount"], 2)
+        self.assertEqual(summary["currentAgentId"], "u1-live")
+        self.assertEqual(summary["currentSessionId"], live_session_id)
+
     async def test_connection_payload_caps_wait_timeout(self) -> None:
         gate = asyncio.Event()
 
