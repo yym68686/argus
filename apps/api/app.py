@@ -21715,6 +21715,16 @@ def _agent_provisioning_message(agent: PersistedAgentRuntime) -> str:
     return f"Agent {agent.agent_id} is ready"
 
 
+def _agent_missing_runtime_image_hint(agent: PersistedAgentRuntime, runtime_status: dict[str, Any]) -> bool:
+    error_class = str(runtime_status.get("runtimeErrorClass") or "").strip()
+    if error_class == "runtime_image_digest_missing":
+        return True
+    for key in ("runtimeErrorMessage", "lastMessage", "imageRef"):
+        if _is_manifest_missing_error_text(runtime_status.get(key)):
+            return True
+    return _is_manifest_missing_error_text(getattr(agent, "provisioning_error", None))
+
+
 def _admin_private_chat_key_for_user(user_id: int) -> str:
     return str(int(user_id))
 
@@ -21785,10 +21795,7 @@ async def _self_agent_connection_payload(
         if _normalize_agent_provisioning_state(agent.provisioning_state) == AGENT_PROVISIONING_STATE_FAILED:
             session_id = str(agent.session_id or "").strip()
             runtime_status = automation.runtime_status_for_session(session_id) if session_id else {}
-            if (
-                str(runtime_status.get("runtimeErrorClass") or "").strip() == "runtime_image_digest_missing"
-                and str(runtime_status.get("runtimeAppId") or "").strip()
-            ):
+            if _agent_missing_runtime_image_hint(agent, runtime_status):
                 try:
                     agent = await automation.retry_user_agent_provisioning(
                         user_id=user_id,

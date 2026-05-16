@@ -320,6 +320,56 @@ class UserAgentProvisioningTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("provision", response.body.decode("utf-8").lower())
         retry_mock.assert_awaited_once_with(user_id=1, agent_id=agent_id)
 
+    async def test_connection_payload_auto_retries_missing_runtime_image_from_agent_error(self) -> None:
+        agent_id = "u1-runtime-missing-agent-error"
+        session_id = "feedfacecafe"
+        now_ms = 1778906342029
+        failed_agent = argus_app.PersistedAgentRuntime(
+            agent_id=agent_id,
+            session_id=session_id,
+            workspace_host_path=self.tmpdir.name,
+            created_at_ms=now_ms,
+            owner_user_id=1,
+            short_name="runtime-missing-agent-error",
+            allowed_user_ids=[],
+            model=argus_app.ARGUS_AGENT_MODEL_DEFAULT,
+            provisioning_state=argus_app.AGENT_PROVISIONING_STATE_FAILED,
+            provisioning_error="configured runtime image digest is missing: registry.invalid/runtime@sha256:missing",
+            provisioning_updated_at_ms=now_ms,
+            retry_count=1,
+        )
+        retrying_agent = argus_app.replace(
+            failed_agent,
+            provisioning_state=argus_app.AGENT_PROVISIONING_STATE_PENDING,
+            provisioning_error=None,
+            provisioning_updated_at_ms=now_ms + 1,
+            retry_count=1,
+        )
+
+        await self.manager._store.update(
+            lambda st: (
+                st.agents.__setitem__(agent_id, failed_agent),
+                st.sessions.__setitem__(session_id, argus_app.PersistedSessionAutomation(owner_user_id=1)),
+            )
+        )
+
+        with mock.patch.object(
+            self.manager,
+            "retry_user_agent_provisioning",
+            new=mock.AsyncMock(return_value=retrying_agent),
+        ) as retry_mock:
+            response = await argus_app._self_agent_connection_payload(
+                self.manager,
+                request=make_request(),
+                user_id=1,
+                agent_id=agent_id,
+            )
+
+        self.assertIsInstance(response, argus_app.JSONResponse)
+        self.assertEqual(response.status_code, 409)
+        self.assertIn("provision", response.body.decode("utf-8").lower())
+        retry_mock.assert_awaited_once_with(user_id=1, agent_id=agent_id)
+
     async def test_connection_payload_caps_wait_timeout(self) -> None:
         gate = asyncio.Event()
 
@@ -386,6 +436,7 @@ class UserAgentProvisioningTests(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(result.get("cleanupScheduled"))
             self.assertIsNone(self.manager._get_agent(agent.agent_id))
             self.assertTrue(self.manager._agent_cleanup_tasks)
+            provision_gate.set()
             cleanup_gate.set()
             await asyncio.wait_for(asyncio.gather(*list(self.manager._agent_cleanup_tasks)), timeout=1.0)
 
