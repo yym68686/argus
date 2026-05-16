@@ -31,7 +31,7 @@ interface AuthContextValue {
 }
 
 const AuthContext = React.createContext<AuthContextValue | null>(null);
-const ADMIN_ONLY_PATH_PREFIXES = ["/usage", "/users", "/settings", "/nodes", "/session-fleet"];
+const ADMIN_ONLY_PATH_PREFIXES = ["/workbench", "/usage", "/users", "/settings", "/nodes", "/session-fleet"];
 const NOOP_SUBSCRIBE = () => () => {};
 
 export function useAuth(): AuthContextValue {
@@ -118,11 +118,17 @@ export function AdminGate({ children }: AdminGateProps) {
   }, [hydrated, refreshSession]);
 
   React.useEffect(() => {
+    if (!hydrated) return;
+    if (pathname !== "/") return;
+    router.replace("/dashboard");
+  }, [hydrated, pathname, router]);
+
+  React.useEffect(() => {
     if (loading) return;
     if (!user) return;
     if (user.isAdmin) return;
     if (!adminRouteRequested) return;
-    router.replace("/");
+    router.replace("/dashboard");
   }, [adminRouteRequested, loading, router, user]);
 
   const handleSubmit = React.useCallback(
@@ -169,7 +175,7 @@ export function AdminGate({ children }: AdminGateProps) {
       setUser(null);
       setPassword("");
       setMode(hasUsers || !allowRegistration ? "login" : "register");
-      router.replace("/");
+      router.replace("/dashboard");
     }
   }, [allowRegistration, hasUsers, router, storedToken, wsUrl]);
 

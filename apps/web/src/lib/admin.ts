@@ -110,6 +110,18 @@ export interface GatewayApiAccessSettingsResponse {
   denyOverrideCount?: number;
 }
 
+export interface TelegramBotTokenSettingsResponse {
+  ok: true;
+  configured: boolean;
+  source: "stored" | "env" | "unset" | string;
+  hasStoredToken: boolean;
+  tokenMasked?: string | null;
+  storedTokenMasked?: string | null;
+  envTokenMasked?: string | null;
+  storedTokenReadable?: boolean;
+  error?: string | null;
+}
+
 export interface AdminUsersResponse {
   ok: true;
   users: AdminUserSummary[];
@@ -242,6 +254,20 @@ export async function updateGatewayApiAccessSettings(
   return gatewayFetchJson<GatewayApiAccessSettingsResponse>(wsUrl, "/admin/settings/gateway-api-access", {
     method: "PUT",
     body: JSON.stringify({ enabled }),
+  });
+}
+
+export async function fetchTelegramBotTokenSettings(wsUrl: string): Promise<TelegramBotTokenSettingsResponse> {
+  return gatewayFetchJson<TelegramBotTokenSettingsResponse>(wsUrl, "/admin/settings/telegram-bot-token");
+}
+
+export async function updateTelegramBotTokenSettings(
+  wsUrl: string,
+  token: string | null,
+): Promise<TelegramBotTokenSettingsResponse> {
+  return gatewayFetchJson<TelegramBotTokenSettingsResponse>(wsUrl, "/admin/settings/telegram-bot-token", {
+    method: "PUT",
+    body: JSON.stringify({ token }),
   });
 }
 

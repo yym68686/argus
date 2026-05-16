@@ -75,7 +75,7 @@ function ConsoleSidebar() {
     <aside className="argus-sidebar-surface border-b border-border/68 xl:sticky xl:top-0 xl:h-dvh xl:border-b-0 xl:border-r">
       <div className="flex h-full flex-col">
         <div className="px-4 py-5">
-          <Link href="/" className="flex items-center gap-3">
+          <Link href="/dashboard" className="flex items-center gap-3">
             <span className="argus-shell-glyph flex h-10 w-10 shrink-0 items-center justify-center rounded-[14px] border border-border/72">
               <PlugZap className="h-[18px] w-[18px] text-primary" />
             </span>

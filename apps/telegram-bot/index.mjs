@@ -880,6 +880,11 @@ class ArgusClient {
     return await this._httpJson("GET", "/automation/state");
   }
 
+  async adminTelegramBotTokenSettings({ includeToken = false } = {}) {
+    const suffix = includeToken ? "?includeToken=true" : "";
+    return await this._httpJson("GET", `/admin/settings/telegram-bot-token${suffix}`);
+  }
+
   async automationUserBootstrap(chatKey) {
     if (!isNonEmptyString(chatKey)) throw new Error("Missing chatKey");
     return await this._httpJson("POST", "/automation/user/bootstrap", { chatKey });
@@ -2286,13 +2291,6 @@ class TypingController {
 }
 
 async function main() {
-  const telegramToken = process.env.TELEGRAM_BOT_TOKEN;
-  if (!isNonEmptyString(telegramToken)) {
-    // eslint-disable-next-line no-console
-    console.error("Missing TELEGRAM_BOT_TOKEN");
-    process.exit(1);
-  }
-
   const gatewayWsUrlRaw =
     stripSessionFromWsUrl(process.env.ARGUS_GATEWAY_WS_URL);
   const gatewayHttpUrlRaw = stripOuterQuotes(process.env.ARGUS_GATEWAY_HTTP_URL);
@@ -2306,6 +2304,28 @@ async function main() {
 
   const argusToken = isNonEmptyString(process.env.ARGUS_TOKEN) ? process.env.ARGUS_TOKEN : null;
   const cwd = process.env.ARGUS_CWD || "/workspace";
+  const argusHttp = new ArgusClient({ gatewayHttpUrl, gatewayWsUrl, token: argusToken, cwd });
+
+  let telegramToken = stripOuterQuotes(process.env.TELEGRAM_BOT_TOKEN);
+  let telegramTokenSource = isNonEmptyString(telegramToken) ? "env" : "unset";
+  try {
+    const settings = await argusHttp.adminTelegramBotTokenSettings({ includeToken: true });
+    const configuredToken = stripOuterQuotes(settings?.token);
+    if (isNonEmptyString(configuredToken) && (settings?.source === "stored" || !isNonEmptyString(telegramToken))) {
+      telegramToken = configuredToken;
+      telegramTokenSource = settings?.source === "stored" ? "gateway-stored" : "gateway";
+    }
+  } catch (e) {
+    if (!isNonEmptyString(telegramToken)) {
+      log("Failed to load Telegram bot token from gateway:", e instanceof Error ? e.message : String(e));
+    }
+  }
+  if (!isNonEmptyString(telegramToken)) {
+    // eslint-disable-next-line no-console
+    console.error("Missing TELEGRAM_BOT_TOKEN");
+    process.exit(1);
+  }
+
   const statePathEnv = stripOuterQuotes(process.env.STATE_PATH);
   let statePath;
   if (isNonEmptyString(statePathEnv)) {
@@ -2317,6 +2337,7 @@ async function main() {
   }
 
   log("Argus Telegram bot starting:", `version=${BOT_VERSION}`);
+  log("Telegram bot token source:", telegramTokenSource);
   const tg = new TelegramApi(telegramToken);
   const typing = new TypingController(tg);
   let botUsername = await refreshTelegramBotIdentity(tg);
@@ -2391,9 +2412,6 @@ async function main() {
   });
   const webhookListenPort = Math.max(1, clampNumber(process.env.PORT, 8080));
   let webhookServer = null;
-
-  // HTTP-only helper (does not need a WS connection).
-  const argusHttp = new ArgusClient({ gatewayHttpUrl, gatewayWsUrl, token: argusToken, cwd });
 
   // Keep one WS per gateway sessionId to avoid reconnect churn when routing between agents.
   const clients = new Map(); // sessionId -> ArgusClient

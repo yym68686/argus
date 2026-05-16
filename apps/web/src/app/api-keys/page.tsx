@@ -1,7 +1,7 @@
 "use client";
 
 import * as React from "react";
-import { Check, Copy, KeyRound, Pencil, Plus, Trash2 } from "lucide-react";
+import { Check, Copy, KeyRound, Pencil, Plus, Trash2, X } from "lucide-react";
 import { toast } from "sonner";
 
 import { useConfirmDialog } from "@/components/confirm-dialog";
@@ -32,15 +32,15 @@ import {
 } from "@/lib/self";
 import { cn } from "@/lib/utils";
 
-function channelTone(channel: AdminChannelEntry): "primary" | "success" | "warning" | "default" {
-  if (channel.selected) return "primary";
-  if (channel.ready) return "success";
-  if (channel.hasApiKey) return "warning";
-  return "default";
-}
-
 function channelKind(channel: AdminChannelEntry): string {
   return channel.builtinKind || channel.kind || (channel.isBuiltin ? "builtin" : "custom");
+}
+
+function providerStatus(channel: AdminChannelEntry): { label: string; tone: "success" | "warning" | "default" } {
+  if (channel.ready) return { label: "ready", tone: "success" };
+  if (channel.disabledByAdmin) return { label: "disabled", tone: "default" };
+  if (!channel.hasApiKey && channel.canSetKey) return { label: "needs key", tone: "warning" };
+  return { label: "pending", tone: "default" };
 }
 
 export default function ApiKeysPage() {
@@ -62,6 +62,7 @@ export default function ApiKeysPage() {
 
   const [nameDraft, setNameDraft] = React.useState("");
   const [keyDraft, setKeyDraft] = React.useState("");
+  const [addingChannel, setAddingChannel] = React.useState(false);
   const [newName, setNewName] = React.useState("");
   const [newBaseUrl, setNewBaseUrl] = React.useState("");
   const [newApiKey, setNewApiKey] = React.useState("");
@@ -70,7 +71,6 @@ export default function ApiKeysPage() {
   const developerKeys = React.useMemo(() => developerKeysState?.keys ?? [], [developerKeysState?.keys]);
   const currentChannelId = channelsState?.currentChannelId ?? "";
   const readyCount = channels.filter((channel) => channel.ready).length;
-  const customCount = channels.filter((channel) => !channel.isBuiltin).length;
   const keyedCount = channels.filter((channel) => channel.hasApiKey).length;
 
   const selectedChannel = React.useMemo(() => {
@@ -124,6 +124,12 @@ export default function ApiKeysPage() {
       () => toast.success(`${label} copied`),
       () => toast.error("Copy failed")
     );
+  }, []);
+
+  const resetNewChannelDraft = React.useCallback(() => {
+    setNewName("");
+    setNewBaseUrl("");
+    setNewApiKey("");
   }, []);
 
   const refresh = React.useCallback(
@@ -209,23 +215,25 @@ export default function ApiKeysPage() {
 
   const createChannel = React.useCallback(async () => {
     if (!wsUrl.trim()) return;
-    if (!newName.trim() || !newBaseUrl.trim() || !newApiKey.trim()) {
-      toast.error("Name, base URL, and API key are required");
+    const providerName = newName.trim();
+    const providerBaseUrl = newBaseUrl.trim();
+    const providerApiKey = newApiKey.trim();
+    if (!providerName || !providerBaseUrl || !providerApiKey) {
+      toast.error("Provider name, base URL, and API key are required");
       return;
     }
     setSaving(true);
     setError(null);
     try {
       const result = await createMyChannel(wsUrl, {
-        name: newName,
-        baseUrl: newBaseUrl,
-        apiKey: newApiKey,
+        name: providerName,
+        baseUrl: providerBaseUrl,
+        apiKey: providerApiKey,
       });
       applyChannels(result, result.channel?.channelId || null);
-      setNewName("");
-      setNewBaseUrl("");
-      setNewApiKey("");
-      toast.success("Channel added");
+      resetNewChannelDraft();
+      setAddingChannel(false);
+      toast.success("Provider added");
     } catch (nextError) {
       const message = (nextError as Error)?.message || String(nextError);
       setError(message);
@@ -233,7 +241,7 @@ export default function ApiKeysPage() {
     } finally {
       setSaving(false);
     }
-  }, [applyChannels, newApiKey, newBaseUrl, newName, wsUrl]);
+  }, [applyChannels, newApiKey, newBaseUrl, newName, resetNewChannelDraft, wsUrl]);
 
   const selectChannel = React.useCallback(async () => {
     if (!selectedChannel || !wsUrl.trim() || selectedChannel.selected) return;
@@ -242,7 +250,7 @@ export default function ApiKeysPage() {
     try {
       const result = await selectMyChannel(wsUrl, selectedChannel.channelId);
       applyChannels(result, selectedChannel.channelId);
-      toast.success("Current channel updated");
+      toast.success("Default provider updated");
     } catch (nextError) {
       const message = (nextError as Error)?.message || String(nextError);
       setError(message);
@@ -317,9 +325,9 @@ export default function ApiKeysPage() {
   const removeChannel = React.useCallback(async () => {
     if (!selectedChannel || !selectedChannel.canDelete || !wsUrl.trim()) return;
     const confirmed = await confirm({
-      title: "Delete channel?",
-      body: `Delete ${selectedChannel.name}? Stored upstream key settings for this channel will be removed.`,
-      confirmLabel: "Delete channel",
+      title: "Delete provider?",
+      body: `Delete ${selectedChannel.name}? Stored API key settings for this provider will be removed.`,
+      confirmLabel: "Delete provider",
       tone: "destructive",
     });
     if (!confirmed) return;
@@ -328,7 +336,7 @@ export default function ApiKeysPage() {
     try {
       const result = await deleteMyChannel(wsUrl, selectedChannel.channelId);
       applyChannels(result, result.currentChannelId || null);
-      toast.success("Channel deleted");
+      toast.success("Provider deleted");
     } catch (nextError) {
       const message = (nextError as Error)?.message || String(nextError);
       setError(message);
@@ -348,10 +356,10 @@ export default function ApiKeysPage() {
       <div className="grid gap-4">
         <PanelCard title={user.email} className="argus-data-grid">
           <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-5">
-            <Fact label="Current" value={channelsState?.currentChannel?.name || "—"} />
-            <Fact label="Channels" value={String(channels.length)} />
+            <Fact label="Default Provider" value={channelsState?.currentChannel?.name || "—"} />
+            <Fact label="Providers" value={String(channels.length)} />
             <Fact label="Ready" value={`${readyCount}/${channels.length || 0}`} />
-            <Fact label="Upstream keys" value={String(keyedCount)} />
+            <Fact label="Provider Keys" value={String(keyedCount)} />
             <Fact label="Access keys" value={String(developerKeysState?.counts.apiKeys ?? developerKeys.length)} />
           </div>
         </PanelCard>
@@ -379,15 +387,22 @@ export default function ApiKeysPage() {
           title="Gateway access keys"
           action={
             <div className="flex flex-wrap items-center gap-2">
+              <label htmlFor="developer-key-name" className="sr-only">
+                Access key name
+              </label>
               <Input
+                id="developer-key-name"
+                name="developer-key-name"
                 value={developerKeyName}
                 onChange={(event) => setDeveloperKeyName(event.target.value)}
-                placeholder="key name"
+                placeholder="default…"
+                autoComplete="off"
+                spellCheck={false}
                 className="w-[13rem]"
               />
               <Button type="button" disabled={loading || saving} onClick={() => void createDeveloperKey()}>
                 <Plus className="h-4 w-4" />
-                Create
+                Create Access Key
               </Button>
             </div>
           }
@@ -423,28 +438,98 @@ export default function ApiKeysPage() {
         </PanelCard>
 
         <PanelCard
-          title="Upstream channels"
+          title="LLM providers"
           className="overflow-hidden"
           contentClassName="-mx-4 -mb-4 -mt-4 min-w-0 md:-mx-5 md:-mb-5"
           action={
-            <div className="flex flex-wrap items-center gap-2 md:justify-end">
-              <Badge tone="success">{readyCount} ready</Badge>
-              <Badge tone={keyedCount ? "success" : "default"}>{keyedCount} with keys</Badge>
-              <Badge tone={customCount ? "default" : "warning"}>{customCount} custom</Badge>
-            </div>
+            <Button
+              type="button"
+              variant={addingChannel ? "secondary" : "default"}
+              disabled={loading || saving}
+              aria-expanded={addingChannel}
+              aria-controls="new-provider-form"
+              onClick={() => setAddingChannel((open) => !open)}
+            >
+              {addingChannel ? <X className="h-4 w-4" /> : <Plus className="h-4 w-4" />}
+              {addingChannel ? "Close Form" : "Add Provider"}
+            </Button>
           }
         >
+          <PanelReveal open={addingChannel} travel="10px">
+            <form
+              id="new-provider-form"
+              className="border-b border-border/60 bg-background/16 p-4 md:p-5"
+              onSubmit={(event) => {
+                event.preventDefault();
+                void createChannel();
+              }}
+            >
+              <div className="grid gap-3 xl:grid-cols-[minmax(10rem,0.85fr)_minmax(16rem,1.15fr)_minmax(13rem,1fr)_auto] xl:items-end">
+                <LabeledInput
+                  id="new-channel-name"
+                  name="new-channel-name"
+                  label="Provider"
+                  value={newName}
+                  onChange={(event) => setNewName(event.target.value)}
+                  placeholder="0-0.pro…"
+                  autoComplete="off"
+                  spellCheck={false}
+                />
+                <LabeledInput
+                  id="new-channel-base-url"
+                  name="new-channel-base-url"
+                  label="Base URL"
+                  value={newBaseUrl}
+                  onChange={(event) => setNewBaseUrl(event.target.value)}
+                  placeholder="https://api.openai.com/v1…"
+                  type="url"
+                  autoComplete="off"
+                  spellCheck={false}
+                />
+                <LabeledInput
+                  id="new-channel-api-key"
+                  name="new-channel-api-key"
+                  label="Provider API key"
+                  value={newApiKey}
+                  onChange={(event) => setNewApiKey(event.target.value)}
+                  placeholder="sk-…"
+                  type="password"
+                  autoComplete="off"
+                  spellCheck={false}
+                />
+                <div className="flex flex-wrap items-center gap-2 xl:justify-end">
+                  <Button type="submit" disabled={loading || saving}>
+                    <Plus className="h-4 w-4" />
+                    Add Provider
+                  </Button>
+                  <Button
+                    type="button"
+                    variant="ghost"
+                    disabled={loading || saving}
+                    onClick={() => {
+                      setAddingChannel(false);
+                      resetNewChannelDraft();
+                    }}
+                  >
+                    Cancel
+                  </Button>
+                </div>
+              </div>
+            </form>
+          </PanelReveal>
+
           <div className="grid min-h-[32rem] xl:grid-cols-[minmax(16rem,19rem)_minmax(0,1fr)]">
-            <aside className="border-b border-border/60 bg-background/10 xl:border-b-0 xl:border-r" aria-label="Channels">
+            <aside className="border-b border-border/60 bg-background/10 xl:border-b-0 xl:border-r" aria-label="LLM providers">
               <div className="max-h-[28rem] overflow-y-auto">
                 {channels.length ? (
                   channels.map((channel) => {
                     const active = selectedChannel?.channelId === channel.channelId;
+                    const status = providerStatus(channel);
                     return (
                       <button
                         key={channel.channelId}
                         type="button"
-                        aria-current={active ? "true" : undefined}
+                        aria-current={active ? "page" : undefined}
                         onClick={() => focusChannel(channel)}
                         className={cn(
                           "group w-full border-b border-border/42 px-4 py-3.5 text-left transition last:border-b-0",
@@ -460,9 +545,9 @@ export default function ApiKeysPage() {
                           <ChannelStatusDot channel={channel} />
                         </div>
                         <div className="mt-2 flex flex-wrap items-center gap-1.5">
-                          {channel.selected ? <Badge tone="primary">current</Badge> : null}
-                          <Badge tone={channel.ready ? "success" : "default"}>
-                            <TextSwap value={channel.ready ? "ready" : "pending"} />
+                          {channel.selected ? <Badge tone="primary">default</Badge> : null}
+                          <Badge tone={status.tone}>
+                            <TextSwap value={status.label} />
                           </Badge>
                           <Badge tone={channel.hasApiKey ? "success" : "default"}>
                             {channel.hasApiKey ? "key" : "no key"}
@@ -472,49 +557,9 @@ export default function ApiKeysPage() {
                     );
                   })
                 ) : (
-                  <div className="px-4 py-8 text-sm text-muted-foreground">No channels</div>
+                  <div className="px-4 py-8 text-sm text-muted-foreground">No providers</div>
                 )}
               </div>
-
-              <form
-                className="grid gap-3 border-t border-border/60 p-4"
-                onSubmit={(event) => {
-                  event.preventDefault();
-                  void createChannel();
-                }}
-              >
-                <div>
-                  <div className="text-sm font-semibold text-foreground">Add channel</div>
-                </div>
-                <LabeledInput
-                  id="new-channel-name"
-                  label="Name"
-                  value={newName}
-                  onChange={(event) => setNewName(event.target.value)}
-                  placeholder="0-0.pro"
-                />
-                <LabeledInput
-                  id="new-channel-base-url"
-                  label="Base URL"
-                  value={newBaseUrl}
-                  onChange={(event) => setNewBaseUrl(event.target.value)}
-                  placeholder="https://api.openai.com/v1"
-                />
-                <LabeledInput
-                  id="new-channel-api-key"
-                  label="API key"
-                  value={newApiKey}
-                  onChange={(event) => setNewApiKey(event.target.value)}
-                  placeholder="sk-..."
-                  type="password"
-                  autoComplete="off"
-                  spellCheck={false}
-                />
-                <Button type="submit" disabled={loading || saving}>
-                  <Plus className="h-4 w-4" />
-                  Add channel
-                </Button>
-              </form>
             </aside>
 
             <section className="min-w-0 p-5 md:p-6">
@@ -527,7 +572,7 @@ export default function ApiKeysPage() {
                           <h2 className="min-w-0 truncate text-[clamp(1.45rem,2vw,2rem)] font-semibold tracking-[-0.045em] text-foreground">
                             {selectedChannel.name}
                           </h2>
-                          <Badge tone={channelTone(selectedChannel)}>{channelKind(selectedChannel)}</Badge>
+                          <Badge tone="default">{channelKind(selectedChannel)}</Badge>
                         </div>
                         <div className="mt-2 truncate font-mono text-xs text-muted-foreground">
                           {selectedChannel.baseUrl || "No base URL"}
@@ -543,10 +588,10 @@ export default function ApiKeysPage() {
                             onClick={() => void selectChannel()}
                           >
                             <Check className="h-4 w-4" />
-                            Use channel
+                            Set as Default
                           </Button>
                         ) : (
-                          <Badge tone="primary">current channel</Badge>
+                          <Badge tone="primary">Default provider</Badge>
                         )}
                         {selectedChannel.canDelete ? (
                           <Button
@@ -558,7 +603,7 @@ export default function ApiKeysPage() {
                             className="text-destructive hover:border-destructive/48 hover:bg-destructive/10"
                           >
                             <Trash2 className="h-4 w-4" />
-                            Delete
+                            Delete Provider
                           </Button>
                         ) : null}
                       </div>
@@ -570,9 +615,9 @@ export default function ApiKeysPage() {
                           <SectionHeading title="Status" />
                           <dl className="mt-3 divide-y divide-border/54 border-y border-border/54">
                             <DetailRow label="State" value={selectedChannel.ready ? "ready" : selectedChannel.reason || "pending"} />
-                            <DetailRow label="ID" value={selectedChannel.channelId} mono />
+                            <DetailRow label="Provider ID" value={selectedChannel.channelId} mono />
                             <DetailRow label="Type" value={channelKind(selectedChannel)} />
-                            <DetailRow label="Models" value={selectedChannel.modelsUrl || "—"} mono />
+                            <DetailRow label="Models endpoint" value={selectedChannel.modelsUrl || "—"} mono />
                           </dl>
                         </div>
 
@@ -584,13 +629,16 @@ export default function ApiKeysPage() {
                               void saveName();
                             }}
                           >
-                            <SectionHeading title="Display name" />
+                            <SectionHeading title="Provider name" />
                             <div className="grid gap-2 sm:grid-cols-[minmax(0,1fr)_auto]">
                               <Input
                                 id="selected-channel-name"
+                                name="selected-channel-name"
                                 value={nameDraft}
                                 onChange={(event) => setNameDraft(event.target.value)}
-                                placeholder="name"
+                                placeholder="Provider name…"
+                                autoComplete="off"
+                                spellCheck={false}
                               />
                               <Button
                                 type="submit"
@@ -614,14 +662,14 @@ export default function ApiKeysPage() {
                       >
                         <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
                           <div>
-                            <SectionHeading title="Upstream key" />
+                            <SectionHeading title="Provider API key" />
                             <div className="mt-1 text-sm text-muted-foreground">
                               Stored: {selectedChannel.apiKeyMasked || (selectedChannel.hasApiKey ? "set" : "none")}
                             </div>
                           </div>
                           {selectedChannel.canClearKey ? (
                             <Button type="button" size="sm" variant="secondary" disabled={loading || saving} onClick={() => void clearKey()}>
-                              Clear
+                              Remove Key
                             </Button>
                           ) : null}
                         </div>
@@ -634,29 +682,30 @@ export default function ApiKeysPage() {
                             <div className="grid gap-2 sm:grid-cols-[minmax(0,1fr)_auto]">
                               <Input
                                 id="selected-channel-api-key"
+                                name="selected-channel-api-key"
                                 value={keyDraft}
                                 onChange={(event) => setKeyDraft(event.target.value)}
-                                placeholder={selectedChannel.hasApiKey ? "Paste replacement key" : "Paste API key"}
+                                placeholder={selectedChannel.hasApiKey ? "Paste replacement key…" : "Paste API key…"}
                                 type="password"
                                 autoComplete="off"
                                 spellCheck={false}
                               />
                               <Button type="submit" disabled={loading || saving || !keyDraft.trim()}>
                                 <KeyRound className="h-4 w-4" />
-                                Save key
+                                Save API Key
                               </Button>
                             </div>
                           </div>
                         ) : (
                           <div className="text-sm leading-6 text-muted-foreground">
-                            This channel does not accept user-managed keys.
+                            This provider is managed by the gateway.
                           </div>
                         )}
                       </form>
                     </div>
                   </div>
                 ) : (
-                  <div className="py-8 text-sm text-muted-foreground">No channel selected</div>
+                  <div className="py-8 text-sm text-muted-foreground">No provider selected</div>
                 )}
               </PanelReveal>
             </section>

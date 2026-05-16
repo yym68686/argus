@@ -2685,6 +2685,7 @@ class PersistedStagedAttachment:
 AGENT_ID_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9_-]{0,63}$")
 CHANNEL_ID_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,63}$")
 TELEGRAM_PRIVATE_CHAT_ID_RE = re.compile(r"^[1-9]\d{0,19}$")
+TELEGRAM_BOT_TOKEN_MAX_LEN = 512
 CONSOLE_EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 CONSOLE_SESSION_ID_RE = re.compile(r"^[a-f0-9]{24}$")
 DEVELOPER_API_KEY_ID_RE = re.compile(r"^[a-f0-9]{16}$")
@@ -3119,6 +3120,22 @@ def _normalize_channel_api_key(raw: Any) -> Optional[str]:
         return None
     value = str(raw).strip()
     return value or None
+
+
+def _normalize_telegram_bot_token(raw: Any) -> Optional[str]:
+    if raw is None:
+        return None
+    value = str(raw).strip()
+    if not value:
+        return None
+    if len(value) > TELEGRAM_BOT_TOKEN_MAX_LEN:
+        return None
+    if ":" not in value:
+        return None
+    left, right = value.split(":", 1)
+    if not left or not right:
+        return None
+    return value
 
 
 def _normalize_openai_base_url(raw: Any) -> str:
@@ -4422,6 +4439,7 @@ class PersistedGatewayAutomationState:
     chat_bindings: dict[str, str] = field(default_factory=dict)
     user_channels: dict[str, PersistedUserChannelState] = field(default_factory=dict)
     gateway_openai_default_enabled: bool = True
+    telegram_bot_token: Optional[str] = None
     telegram_user_profiles: dict[str, PersistedTelegramUserProfile] = field(default_factory=dict)
     console_users: dict[str, PersistedConsoleUser] = field(default_factory=dict)
     console_sessions: dict[str, PersistedConsoleSession] = field(default_factory=dict)
@@ -4441,6 +4459,11 @@ class PersistedGatewayAutomationState:
                 if isinstance(user_id, str) and user_id.strip() and isinstance(channel_state, PersistedUserChannelState)
             },
             "gatewayOpenaiDefaultEnabled": bool(self.gateway_openai_default_enabled),
+            "telegramBotToken": (
+                _mask_secret(_secret_storage_resolve(self.telegram_bot_token)[0])
+                if redact_secrets
+                else _secret_storage_prepare(self.telegram_bot_token)
+            ),
             "telegramUserProfiles": {
                 user_id: profile.to_json()
                 for user_id, profile in (self.telegram_user_profiles or {}).items()
@@ -4528,6 +4551,12 @@ class PersistedGatewayAutomationState:
                     continue
                 user_channels[str(user_id_int)] = PersistedUserChannelState.from_json(raw_state)
         gateway_openai_default_enabled = _normalize_bool_flag(obj.get("gatewayOpenaiDefaultEnabled"), default=True)
+        raw_telegram_bot_token = obj.get("telegramBotToken")
+        telegram_bot_token = (
+            str(raw_telegram_bot_token).strip()
+            if _secret_storage_is_sealed(raw_telegram_bot_token)
+            else _normalize_telegram_bot_token(raw_telegram_bot_token)
+        )
 
         telegram_user_profiles_raw = obj.get("telegramUserProfiles")
         telegram_user_profiles: dict[str, PersistedTelegramUserProfile] = {}
@@ -4615,6 +4644,7 @@ class PersistedGatewayAutomationState:
             chat_bindings=chat_bindings,
             user_channels=user_channels,
             gateway_openai_default_enabled=gateway_openai_default_enabled,
+            telegram_bot_token=telegram_bot_token,
             telegram_user_profiles=telegram_user_profiles,
             console_users=console_users,
             console_sessions=console_sessions,
@@ -4730,6 +4760,20 @@ class _SQLiteAutomationStateStore:
                     (
                         "gateway_openai_default_enabled",
                         "true" if _normalize_bool_flag(getattr(state, "gateway_openai_default_enabled", True), default=True) else "false",
+                        now_ms,
+                    ),
+                )
+                conn.execute(
+                    """
+                    INSERT INTO automation_state_meta (key, value_text, updated_at_ms)
+                    VALUES (?, ?, ?)
+                    ON CONFLICT(key) DO UPDATE SET
+                        value_text = excluded.value_text,
+                        updated_at_ms = excluded.updated_at_ms
+                    """,
+                    (
+                        "telegram_bot_token",
+                        _secret_storage_prepare(getattr(state, "telegram_bot_token", None)) or "",
                         now_ms,
                     ),
                 )
@@ -5036,6 +5080,18 @@ class _SQLiteAutomationStateStore:
                 gateway_default_row["value_text"],
                 default=True,
             )
+        telegram_bot_token = None
+        telegram_bot_token_row = conn.execute(
+            "SELECT value_text FROM automation_state_meta WHERE key = ? LIMIT 1",
+            ("telegram_bot_token",),
+        ).fetchone()
+        if telegram_bot_token_row is not None:
+            raw_telegram_bot_token = str(telegram_bot_token_row["value_text"] or "").strip()
+            telegram_bot_token = (
+                raw_telegram_bot_token
+                if _secret_storage_is_sealed(raw_telegram_bot_token)
+                else _normalize_telegram_bot_token(raw_telegram_bot_token)
+            )
 
         sessions: dict[str, PersistedSessionAutomation] = {}
         for row in conn.execute("SELECT session_id, payload_json FROM automation_sessions"):
@@ -5184,6 +5240,7 @@ class _SQLiteAutomationStateStore:
             chat_bindings=chat_bindings,
             user_channels=user_channels,
             gateway_openai_default_enabled=gateway_openai_default_enabled,
+            telegram_bot_token=telegram_bot_token,
             telegram_user_profiles=telegram_user_profiles,
             console_users=console_users,
             console_sessions=console_sessions,
@@ -5905,6 +5962,20 @@ class _PostgresAutomationStateStore:
                         now_ms,
                     ),
                 )
+                conn.execute(
+                    """
+                    INSERT INTO automation_state_meta (key, value_text, updated_at_ms)
+                    VALUES (%s, %s, %s)
+                    ON CONFLICT(key) DO UPDATE SET
+                        value_text = EXCLUDED.value_text,
+                        updated_at_ms = EXCLUDED.updated_at_ms
+                    """,
+                    (
+                        "telegram_bot_token",
+                        _secret_storage_prepare(getattr(state, "telegram_bot_token", None)) or "",
+                        now_ms,
+                    ),
+                )
 
                 with conn.cursor() as cur:
                     cur.execute("DELETE FROM automation_sessions")
@@ -6229,6 +6300,18 @@ class _PostgresAutomationStateStore:
                 gateway_default_row["value_text"],
                 default=True,
             )
+        telegram_bot_token = None
+        telegram_bot_token_row = conn.execute(
+            "SELECT value_text FROM automation_state_meta WHERE key = %s LIMIT 1",
+            ("telegram_bot_token",),
+        ).fetchone()
+        if telegram_bot_token_row is not None:
+            raw_telegram_bot_token = str(telegram_bot_token_row["value_text"] or "").strip()
+            telegram_bot_token = (
+                raw_telegram_bot_token
+                if _secret_storage_is_sealed(raw_telegram_bot_token)
+                else _normalize_telegram_bot_token(raw_telegram_bot_token)
+            )
 
         sessions: dict[str, PersistedSessionAutomation] = {}
         for row in conn.execute("SELECT session_id, payload_json FROM automation_sessions").fetchall():
@@ -6377,6 +6460,7 @@ class _PostgresAutomationStateStore:
             chat_bindings=chat_bindings,
             user_channels=user_channels,
             gateway_openai_default_enabled=gateway_openai_default_enabled,
+            telegram_bot_token=telegram_bot_token,
             telegram_user_profiles=telegram_user_profiles,
             console_users=console_users,
             console_sessions=console_sessions,
@@ -9259,6 +9343,59 @@ class AutomationManager:
             await self._sync_user_agent_models_for_current_channel(user_id=user_id)
         return self.get_gateway_openai_access_settings()
 
+    def _stored_telegram_bot_token(self) -> tuple[Optional[str], Optional[str]]:
+        raw = getattr(self._store.state, "telegram_bot_token", None)
+        token, err = _secret_storage_resolve(raw)
+        normalized = _normalize_telegram_bot_token(token)
+        if normalized:
+            return normalized, None
+        if err:
+            return None, err
+        if str(raw or "").strip():
+            return None, "Stored Telegram bot token is invalid"
+        return None, None
+
+    def get_effective_telegram_bot_token(self) -> Optional[str]:
+        stored_token, _stored_error = self._stored_telegram_bot_token()
+        if stored_token:
+            return stored_token
+        return _normalize_telegram_bot_token(os.getenv("TELEGRAM_BOT_TOKEN"))
+
+    def get_telegram_bot_token_settings(self, *, include_token: bool = False) -> dict[str, Any]:
+        raw_stored = getattr(self._store.state, "telegram_bot_token", None)
+        has_stored_token = bool(str(raw_stored or "").strip())
+        stored_token, stored_error = self._stored_telegram_bot_token()
+        env_token = _normalize_telegram_bot_token(os.getenv("TELEGRAM_BOT_TOKEN"))
+        effective_token = stored_token or env_token
+        source = "stored" if stored_token else "env" if env_token else "unset"
+        result: dict[str, Any] = {
+            "ok": True,
+            "configured": bool(effective_token),
+            "source": source,
+            "hasStoredToken": has_stored_token,
+            "tokenMasked": _mask_secret(effective_token),
+            "storedTokenMasked": _mask_secret(stored_token),
+            "envTokenMasked": _mask_secret(env_token),
+            "storedTokenReadable": stored_error is None,
+            "error": stored_error,
+        }
+        if include_token:
+            result["token"] = effective_token
+        return result
+
+    async def set_telegram_bot_token(self, *, token: Optional[str]) -> dict[str, Any]:
+        normalized = _normalize_telegram_bot_token(token)
+        if token is not None and not normalized:
+            raise ValueError("Invalid Telegram bot token")
+        stored_token = _secret_storage_prepare(normalized) if normalized else None
+
+        def _write(st: PersistedGatewayAutomationState) -> None:
+            st.version = max(int(getattr(st, "version", 1) or 1), AUTOMATION_STATE_VERSION)
+            st.telegram_bot_token = stored_token
+
+        await self._store.update(_write)
+        return self.get_telegram_bot_token_settings()
+
     async def set_user_builtin_channel_access(self, *, user_id: int, channel_id: str, access_mode: str) -> dict[str, Any]:
         if not isinstance(user_id, int) or user_id <= 0:
             raise ValueError("Invalid userId")
@@ -11237,8 +11374,8 @@ class AutomationManager:
         channel = source_channel.strip().lower() if isinstance(source_channel, str) and source_channel.strip() else ""
         if channel not in ("telegram", "tg"):
             return None
-        token = os.getenv("TELEGRAM_BOT_TOKEN") or ""
-        if not token.strip():
+        token = self.get_effective_telegram_bot_token()
+        if not token:
             return None
         chat_key = source_chat_key.strip() if isinstance(source_chat_key, str) and source_chat_key.strip() else ""
         if not chat_key:
@@ -12954,8 +13091,8 @@ class AutomationManager:
         if not telegram_attachments:
             return []
 
-        token = os.getenv("TELEGRAM_BOT_TOKEN") or ""
-        if not token.strip():
+        token = self.get_effective_telegram_bot_token()
+        if not token:
             return []
 
         root = self._workspace_root_for_session(session_id)
@@ -17145,8 +17282,22 @@ async def _mcp_handle_single_message(request: Request, body: dict[str, Any]) -> 
                     {"MCP-Protocol-Version": sess.protocol_version},
                 )
 
-            token = os.getenv("TELEGRAM_BOT_TOKEN") or ""
-            if not token.strip():
+            automation: Optional[AutomationManager] = getattr(app.state, "automation", None)
+            if automation is None:
+                return (
+                    _jsonrpc_result(
+                        request_id=request_id,
+                        result=_mcp_call_tool_result(
+                            content=[{"type": "text", "text": "Automation is not initialized; cannot validate target"}],
+                            structured={"ok": False, "error": {"code": "NOT_READY", "message": "automation is not initialized"}},
+                            is_error=True,
+                        ),
+                    ),
+                    {"MCP-Protocol-Version": sess.protocol_version},
+                )
+
+            token = automation.get_effective_telegram_bot_token()
+            if not token:
                 return (
                     _jsonrpc_result(
                         request_id=request_id,
@@ -17167,20 +17318,6 @@ async def _mcp_handle_single_message(request: Request, body: dict[str, Any]) -> 
                         result=_mcp_call_tool_result(
                             content=[{"type": "text", "text": "Invalid target chatKey"}],
                             structured={"ok": False, "error": {"code": "INVALID_ARGUMENT", "field": "target"}},
-                            is_error=True,
-                        ),
-                    ),
-                    {"MCP-Protocol-Version": sess.protocol_version},
-                )
-
-            automation: Optional[AutomationManager] = getattr(app.state, "automation", None)
-            if automation is None:
-                return (
-                    _jsonrpc_result(
-                        request_id=request_id,
-                        result=_mcp_call_tool_result(
-                            content=[{"type": "text", "text": "Automation is not initialized; cannot validate target"}],
-                            structured={"ok": False, "error": {"code": "NOT_READY", "message": "automation is not initialized"}},
                             is_error=True,
                         ),
                     ),
@@ -22999,6 +23136,33 @@ async def admin_gateway_api_access_set(request: Request):
     else:
         raise HTTPException(status_code=400, detail="Invalid 'enabled'")
     return await automation.set_gateway_openai_default_enabled(enabled=enabled)
+
+
+@app.get("/admin/settings/telegram-bot-token")
+async def admin_telegram_bot_token_get(request: Request, includeToken: bool = False):
+    _http_require_token(request)
+    automation = _get_automation_or_500()
+    return automation.get_telegram_bot_token_settings(include_token=includeToken)
+
+
+@app.put("/admin/settings/telegram-bot-token")
+async def admin_telegram_bot_token_set(request: Request):
+    _http_require_token(request)
+    automation = _get_automation_or_500()
+    try:
+        body = await request.json()
+    except Exception as e:
+        raise HTTPException(status_code=400, detail="Invalid JSON body") from e
+    if not isinstance(body, dict):
+        raise HTTPException(status_code=400, detail="Invalid JSON body")
+    raw_token = body.get("token")
+    token = None if raw_token is None else str(raw_token).strip()
+    try:
+        return await automation.set_telegram_bot_token(token=token)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    except RuntimeError as e:
+        raise HTTPException(status_code=500, detail=str(e)) from e
 
 
 @app.get("/admin/users")

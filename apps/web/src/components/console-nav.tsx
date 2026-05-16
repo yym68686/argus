@@ -2,7 +2,7 @@
 
 import Link from "next/link";
 import { usePathname } from "next/navigation";
-import { type LucideIcon, Gauge, KeyRound, Laptop, MessagesSquare, Server, Settings2, Users2 } from "lucide-react";
+import { type LucideIcon, Gauge, KeyRound, Laptop, LayoutDashboard, Server, Settings2, Users2 } from "lucide-react";
 
 import { useAuth } from "@/components/admin-gate";
 import { cn } from "@/lib/utils";
@@ -22,7 +22,7 @@ type NavSection = {
 };
 
 const NAV_ITEMS: NavItem[] = [
-  { href: "/", label: "Workbench", icon: MessagesSquare, adminOnly: false },
+  { href: "/dashboard", label: "Dashboard", icon: LayoutDashboard, adminOnly: false },
   { href: "/api-keys", label: "API Keys", icon: KeyRound, adminOnly: false },
   { href: "/devices", label: "Devices", icon: Laptop, adminOnly: false },
   { href: "/usage", label: "Usage", icon: Gauge, adminOnly: true },
@@ -74,8 +74,7 @@ export function ConsoleNav({ compact = false }: { compact?: boolean }) {
             <div className="mt-2 flex flex-col gap-1">
               {section.items.map((item) => {
                 const Icon = item.icon;
-                const active =
-                  item.href === "/" ? pathname === "/" : pathname === item.href || pathname.startsWith(`${item.href}/`);
+                const active = pathname === item.href || pathname.startsWith(`${item.href}/`);
 
                 return (
                   <Link
