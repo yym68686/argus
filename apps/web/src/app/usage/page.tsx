@@ -20,6 +20,30 @@ import { formatCompact, formatInt, formatRelative, formatUsd, formatWhen } from 
 import { useGatewayWsUrlState } from "@/lib/gateway";
 import { cn } from "@/lib/utils";
 
+function formatTelegramIdentity(profile: AdminUserSummary["telegramProfile"] | null | undefined): string | null {
+  if (!profile) return null;
+  const parts: string[] = [];
+  if (typeof profile.userId === "number" && Number.isFinite(profile.userId) && profile.userId > 0) {
+    parts.push(`TG ${profile.userId}`);
+  }
+  if (profile.username) {
+    parts.push(`@${profile.username}`);
+  } else if (profile.displayName) {
+    parts.push(profile.displayName);
+  }
+  return parts.length ? parts.join(" · ") : null;
+}
+
+function usageUserLabel(user: Pick<AdminUserSummary, "userId" | "email" | "telegramProfile" | "privateChatKey">): string {
+  const email = user.email?.trim();
+  if (email) return email;
+  const telegramIdentity = formatTelegramIdentity(user.telegramProfile);
+  if (telegramIdentity) return telegramIdentity;
+  const privateChatKey = String(user.privateChatKey || "").trim();
+  if (privateChatKey) return `Private chat ${privateChatKey}`;
+  return `ID ${user.userId}`;
+}
+
 export default function UsagePage() {
   const { user } = useAuth();
 
@@ -103,6 +127,16 @@ function AdminUsagePage() {
     if (!Number.isFinite(userId) || userId <= 0) return null;
     return users.find((item) => item.userId === userId) ?? null;
   }, [selectedUserId, users]);
+  const usersById = React.useMemo(() => new Map(users.map((item) => [item.userId, item])), [users]);
+  const selectedUserLabel = selectedUser ? usageUserLabel(selectedUser) : null;
+  const labelForUserId = React.useCallback(
+    (userId: number | null | undefined) => {
+      if (!userId) return "—";
+      const matchedUser = usersById.get(userId);
+      return matchedUser ? usageUserLabel(matchedUser) : `ID ${userId}`;
+    },
+    [usersById],
+  );
 
   const filteredSummary = usage?.summary;
   const showUsersSkeleton = loading && !users.length && !usersError;
@@ -114,7 +148,7 @@ function AdminUsagePage() {
     <ConsoleShell title="Usage">
       <div className="grid gap-4">
         <PanelCard
-          title={selectedUser ? `User ${selectedUser.userId}` : "Global"}
+          title={selectedUserLabel || "Global"}
           action={
             <div className="grid gap-2 md:grid-cols-[minmax(0,1.3fr)_110px_110px]">
               <select
@@ -132,7 +166,7 @@ function AdminUsagePage() {
                 <option value="">All users</option>
                 {users.map((currentUser) => (
                   <option key={currentUser.userId} value={String(currentUser.userId)}>
-                    User {currentUser.userId}
+                    {usageUserLabel(currentUser)}
                   </option>
                 ))}
               </select>
@@ -143,7 +177,7 @@ function AdminUsagePage() {
           className="argus-data-grid"
         >
           <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-4">
-            <Fact label="Selected user" value={selectedUser ? `User ${selectedUser.userId}` : "All users"} />
+            <Fact label="Selected user" value={selectedUserLabel || "All users"} />
             <Fact label="Window" value={hours.trim() ? `${hours.trim()}h` : "all"} />
             <Fact label="Rows" value={usageUnavailable ? "unavailable" : formatInt(usage?.events.length)} />
             <Fact label="Last" value={usageUnavailable ? "unavailable" : formatWhen(filteredSummary?.lastAtMs)} />
@@ -216,7 +250,7 @@ function AdminUsagePage() {
                       >
                         <div className="flex items-start justify-between gap-3">
                           <div className="min-w-0">
-                            <div className="font-medium text-foreground">User {currentUser.userId}</div>
+                            <div className="truncate font-medium text-foreground">{usageUserLabel(currentUser)}</div>
                             <div className="mt-1 text-xs leading-5 text-muted-foreground">
                               {currentUser.currentChannel?.name || currentUser.currentChannelId || "gateway"} · {currentUser.currentModel || "model pending"}
                             </div>
@@ -242,7 +276,7 @@ function AdminUsagePage() {
             <section className="space-y-4">
               <PanelCard title="Recent calls" contentClassName="space-y-3">
                 <div className="flex flex-wrap items-center gap-2 text-xs text-muted-foreground">
-                  <Badge tone="default">{selectedUser ? `user ${selectedUser.userId}` : "all users"}</Badge>
+                  <Badge tone="default">{selectedUserLabel || "all users"}</Badge>
                   <Badge tone="default">{hours.trim() ? `${hours.trim()}h` : "all time"}</Badge>
                   <Badge tone="default">{formatInt(usage?.events.length)} rows</Badge>
                   {overview ? <Badge tone="default">v{overview.version}</Badge> : null}
@@ -285,7 +319,7 @@ function AdminUsagePage() {
                             className="border-t border-border/60"
                           >
                             <td className="px-4 py-3 text-muted-foreground">{formatWhen(event.createdAtMs)}</td>
-                            <td className="px-4 py-3">{event.ownerUserId || "—"}</td>
+                            <td className="px-4 py-3">{labelForUserId(event.ownerUserId)}</td>
                             <td className="px-4 py-3 font-mono text-[12.5px]">{event.agentId || "—"}</td>
                             <td className="px-4 py-3">{event.channelName || event.channelId || "—"}</td>
                             <td className="px-4 py-3 font-mono text-[12.5px]">{event.model || event.requestedModel || "—"}</td>
