@@ -7542,6 +7542,7 @@ class AutomationManager:
 
     async def start(self) -> None:
         await self._store.load()
+        await self._migrate_linked_telegram_user_profiles()
         await self._migrate_agent_models()
         await self._ensure_agent_model_files()
         await self._gc_orphan_runtime_containers()
@@ -7550,6 +7551,44 @@ class AutomationManager:
         self._tasks.append(asyncio.create_task(self._cron_loop()))
         self._tasks.append(asyncio.create_task(self._heartbeat_loop()))
         self._tasks.append(asyncio.create_task(self._lane_watchdog_loop()))
+
+    async def _migrate_linked_telegram_user_profiles(self) -> None:
+        removed = 0
+        moved = 0
+
+        def _write(st: PersistedGatewayAutomationState) -> None:
+            nonlocal removed, moved
+            if not isinstance(getattr(st, "telegram_user_profiles", None), dict):
+                return
+            if not isinstance(getattr(st, "telegram_console_links", None), dict):
+                return
+            if not isinstance(getattr(st, "console_users", None), dict):
+                return
+            for raw_user_id, profile in list(st.telegram_user_profiles.items()):
+                try:
+                    telegram_user_id = int(raw_user_id)
+                except Exception:
+                    continue
+                if telegram_user_id <= 0:
+                    continue
+                link = st.telegram_console_links.get(str(telegram_user_id))
+                if not isinstance(link, PersistedTelegramConsoleLink):
+                    continue
+                console_key = str(link.console_user_id)
+                if console_key == str(raw_user_id) or console_key not in st.console_users:
+                    continue
+                if (
+                    console_key not in st.telegram_user_profiles
+                    and isinstance(profile, PersistedTelegramUserProfile)
+                ):
+                    st.telegram_user_profiles[console_key] = profile
+                    moved += 1
+                st.telegram_user_profiles.pop(str(raw_user_id), None)
+                removed += 1
+
+        await self._store.update(_write)
+        if removed:
+            log.info("Migrated linked Telegram profiles: removed=%s moved=%s", removed, moved)
 
     def get_host_enrollment(self, host_id: str) -> Optional[PersistedHostEnrollment]:
         hid = _normalize_runtime_host_id(host_id)
@@ -8433,6 +8472,9 @@ class AutomationManager:
                 updated_at_ms=now_ms,
             )
             st.telegram_user_profiles[str(owner_user_id)] = profile
+            stale_key = str(telegram_user_id)
+            if stale_key != str(owner_user_id) and stale_key not in (st.console_users or {}):
+                st.telegram_user_profiles.pop(stale_key, None)
             stored = profile
 
         await self._store.update(_write)
@@ -8542,6 +8584,9 @@ class AutomationManager:
                 updated_at_ms=now_ms,
             )
             st.telegram_user_profiles[str(console_user_id)] = profile
+            stale_key = str(telegram_user_id)
+            if stale_key != str(console_user_id) and stale_key not in (st.console_users or {}):
+                st.telegram_user_profiles.pop(stale_key, None)
 
             console_chat_key = str(console_user_id)
             current_agent_id = st.chat_bindings.get(console_chat_key) if isinstance(st.chat_bindings, dict) else None
@@ -22714,40 +22759,49 @@ async def _self_agent_connection_payload(
 def _admin_collect_user_ids(automation: AutomationManager) -> list[int]:
     st = automation._store.state
     ids: set[int] = set()
+
+    def _canonical_user_id(raw_user_id: Any) -> Optional[int]:
+        try:
+            user_id = int(raw_user_id)
+        except Exception:
+            return None
+        if user_id <= 0:
+            return None
+        if automation.get_console_user(user_id) is not None:
+            return user_id
+        linked_user_id = automation.resolve_console_user_id_for_telegram_user_id(user_id)
+        if isinstance(linked_user_id, int) and linked_user_id > 0:
+            return linked_user_id
+        return user_id
+
     if isinstance(getattr(st, "user_channels", None), dict):
         for raw_user_id in st.user_channels.keys():
-            try:
-                user_id = int(raw_user_id)
-            except Exception:
-                continue
-            if user_id > 0:
+            user_id = _canonical_user_id(raw_user_id)
+            if user_id is not None:
                 ids.add(user_id)
     if isinstance(getattr(st, "console_users", None), dict):
         for raw_user_id in st.console_users.keys():
-            try:
-                user_id = int(raw_user_id)
-            except Exception:
-                continue
-            if user_id > 0:
+            user_id = _canonical_user_id(raw_user_id)
+            if user_id is not None:
                 ids.add(user_id)
     if isinstance(getattr(st, "telegram_user_profiles", None), dict):
         for raw_user_id in st.telegram_user_profiles.keys():
-            try:
-                user_id = int(raw_user_id)
-            except Exception:
-                continue
-            if user_id > 0:
+            user_id = _canonical_user_id(raw_user_id)
+            if user_id is not None:
                 ids.add(user_id)
     for agent in (st.agents or {}).values():
         if not isinstance(agent, PersistedAgentRuntime):
             continue
         owner_user_id = getattr(agent, "owner_user_id", None)
-        if isinstance(owner_user_id, int) and owner_user_id > 0:
-            ids.add(owner_user_id)
+        user_id = _canonical_user_id(owner_user_id)
+        if user_id is not None:
+            ids.add(user_id)
     if isinstance(getattr(st, "telegram_console_links", None), dict):
         for link in st.telegram_console_links.values():
             if isinstance(link, PersistedTelegramConsoleLink) and link.console_user_id > 0:
-                ids.add(link.console_user_id)
+                user_id = _canonical_user_id(link.console_user_id)
+                if user_id is not None:
+                    ids.add(user_id)
     if isinstance(getattr(st, "chat_bindings", None), dict):
         for chat_key in st.chat_bindings.keys():
             user_id = automation.resolve_owner_user_id_for_private_chat_key(chat_key)

@@ -1646,6 +1646,7 @@ function detectLocaleFromLanguageCode(languageCode) {
 
 const DEFAULT_AGENT_MODEL = "gpt-5.5";
 const AGENT_MODEL_RE = /^[A-Za-z0-9][A-Za-z0-9._:/+-]{0,127}$/;
+const ZERO_ZERO_PRO_CHANNEL_ID = "0-0.pro";
 
 function normalizeAgentModel(model) {
   const raw = isNonEmptyString(model) ? String(model).trim() : "";
@@ -1825,6 +1826,7 @@ function normalizeAvailableModels(models, currentModel) {
     notice_channel_renamed: "Channel renamed: {old} -> {name}",
     notice_channel_deleted: "Channel deleted: {name}",
     notice_channel_key_saved: "API key saved: {name}",
+    notice_channel_key_saved_and_switched: "API key saved and channel switched: {name}. Send your message again.",
     notice_channel_key_cleared: "API key cleared: {name}",
 
     label_channel: "channel",
@@ -1838,7 +1840,8 @@ function normalizeAvailableModels(models, currentModel) {
 
     channel_scope_all_agents: "Switching here affects all your agents/containers.",
     channel_gateway_hint: "Uses the gateway's shared OPENAI-compatible upstream.",
-    channel_promo_hint: "Set your own 0-0.pro API key, then switch to it.",
+    channel_promo_hint: "Open 0-0.pro to register/get an API key, then send it here.",
+    channel_not_ready_prompt: "Current API channel is not ready: {reason}. Open /menu to choose or configure a channel.",
     channel_delete_warning: "This deletes the saved channel. If it is current, all your agents switch to the fallback channel.",
     channel_create_name_prompt: "Send the new channel name (a-z0-9._-), e.g.",
     channel_create_name_missing: "Missing channel name.",
@@ -2007,6 +2010,7 @@ function normalizeAvailableModels(models, currentModel) {
     notice_channel_renamed: "已重命名渠道：{old} -> {name}",
     notice_channel_deleted: "已删除渠道：{name}",
     notice_channel_key_saved: "已保存 API Key：{name}",
+    notice_channel_key_saved_and_switched: "已保存 API Key 并切换到：{name}。请再发送刚才的消息。",
     notice_channel_key_cleared: "已清空 API Key：{name}",
 
     label_channel: "渠道",
@@ -2020,7 +2024,8 @@ function normalizeAvailableModels(models, currentModel) {
 
     channel_scope_all_agents: "这里的切换会影响你的所有 agent / 容器。",
     channel_gateway_hint: "使用 gateway 自己配置的 OpenAI-compatible 上游。",
-    channel_promo_hint: "先设置你自己的 0-0.pro API Key，再切换到它。",
+    channel_promo_hint: "打开 0-0.pro 注册并获取 API Key，然后直接发给我。",
+    channel_not_ready_prompt: "当前 API 渠道未就绪：{reason}。请打开 /menu 选择或配置一个渠道。",
     channel_delete_warning: "这会删除已保存的渠道；如果它当前正在使用，你的所有 agent 会切回回退渠道。",
     channel_create_name_prompt: "发送新渠道名称（a-z0-9._-），例如",
     channel_create_name_missing: "缺少渠道名称。",
@@ -2955,13 +2960,14 @@ async function main() {
     }, actorUserId);
   }
 
-  function setPendingChannelKey(chatKey, panelChatId, panelMessageId, channelId, page = 0, actorUserId) {
+  function setPendingChannelKey(chatKey, panelChatId, panelMessageId, channelId, page = 0, actorUserId, opts = {}) {
     setPendingInput(chatKey, {
       kind: "channel_key",
       panelChatId,
       panelMessageId,
       channelId,
-      page
+      page,
+      selectAfterSave: Boolean(opts?.selectAfterSave)
     }, actorUserId);
   }
 
@@ -2995,6 +3001,33 @@ async function main() {
     const S = uiStrings(locale);
     if (isNonEmptyString(channel?.apiKeyMasked)) return channel.apiKeyMasked;
     return channel?.hasApiKey ? S.value_set : S.value_unset;
+  }
+
+  function channelNeedsApiKeyPrompt(channel) {
+    const c = channel && typeof channel === "object" ? channel : null;
+    if (!c || c.ready || !c.canSetKey) return false;
+    if (c.disabledByAdmin || c.enabledForUser === false) return false;
+    const reason = isNonEmptyString(c.reason) ? String(c.reason).trim() : "";
+    return !c.hasApiKey || /api[_\s-]*key|apikey/i.test(reason);
+  }
+
+  function resolveChannelKeyPromptTarget(channelState) {
+    const state = channelState && typeof channelState === "object" ? channelState : null;
+    if (!state) return null;
+    const currentChannel = state.currentChannel && typeof state.currentChannel === "object" ? state.currentChannel : null;
+    if (currentChannel?.ready) return null;
+    if (channelNeedsApiKeyPrompt(currentChannel)) return currentChannel;
+
+    const channels = Array.isArray(state.channels) ? state.channels : [];
+    const candidates = channels.filter((channel) => channelNeedsApiKeyPrompt(channel));
+    return candidates.find((channel) => channel?.channelId === ZERO_ZERO_PRO_CHANNEL_ID) || candidates[0] || null;
+  }
+
+  function channelReadinessReason(channel, { locale } = {}) {
+    const S = uiStrings(locale);
+    const reason = isNonEmptyString(channel?.reason) ? String(channel.reason).trim() : "";
+    if (channelNeedsApiKeyPrompt(channel) || /api[_\s-]*key|apikey/i.test(reason)) return S.channel_key_missing;
+    return reason || channelDisplayName(channel);
   }
 
   function formatChannelLabel(channel, { currentChannelId } = {}) {
@@ -3577,21 +3610,30 @@ async function main() {
     const S = uiStrings(locale);
     const page = normalizePage(pageRaw);
     const lines = [];
+    let websiteUrl = null;
     lines.push(`<b>${escapeHtml(S.title_set_channel_key)}</b>`);
     try {
       const { channels } = await resolveChannelStateForChatKey(chatKey);
       const channel = findChannelById(channels, channelId);
-      if (channel) lines.push(`${escapeHtml(S.label_channel)}: ${htmlCode(channelDisplayName(channel))}`);
+      if (channel) {
+        lines.push(`${escapeHtml(S.label_channel)}: ${htmlCode(channelDisplayName(channel))}`);
+        if (isNonEmptyString(channel.websiteUrl)) websiteUrl = channel.websiteUrl;
+        if (channel.channelId === ZERO_ZERO_PRO_CHANNEL_ID) lines.push(escapeHtml(S.channel_promo_hint));
+      }
       lines.push(escapeHtml(formatTemplate(S.channel_key_prompt_prefix, { name: channelDisplayName(channel) })));
     } catch {
       if (isNonEmptyString(channelId)) lines.push(`${escapeHtml(S.label_channel)}: ${htmlCode(channelId)}`);
+      if (channelId === ZERO_ZERO_PRO_CHANNEL_ID) lines.push(escapeHtml(S.channel_promo_hint));
       lines.push(escapeHtml(formatTemplate(S.channel_key_prompt_prefix, { name: channelId || "channel" })));
     }
     if (isNonEmptyString(error)) {
       lines.push("");
       lines.push(`<b>${escapeHtml(S.label_error)}:</b> ${escapeHtml(error)}`);
     }
-    return { text: lines.join("\n"), replyMarkup: kb([[cbButton(S.btn_cancel, { action: "p:channel_key_cancel", chatKey, channelId, page })]]) };
+    const rows = [];
+    if (isNonEmptyString(websiteUrl)) rows.push([urlButton(S.btn_open_00pro, websiteUrl)]);
+    rows.push([cbButton(S.btn_cancel, { action: "p:channel_key_cancel", chatKey, channelId, page })]);
+    return { text: lines.join("\n"), replyMarkup: kb(rows) };
   }
 
   async function renderPrivateStatusMenu(chatKey, { notice, error, locale } = {}) {
@@ -5856,9 +5898,14 @@ async function main() {
                 return;
               }
               const updated = await argusHttp.automationChannelKeySet(owned.mutationChatKey, pending.channelId, apiKey);
-              const channel = updated?.channel && typeof updated.channel === "object" ? updated.channel : { channelId: pending.channelId };
+              let channel = updated?.channel && typeof updated.channel === "object" ? updated.channel : { channelId: pending.channelId };
+              let notice = formatTemplate(S.notice_channel_key_saved, { name: channelDisplayName(channel) });
+              if (pending.selectAfterSave) {
+                const selected = await argusHttp.automationChannelSelect(owned.mutationChatKey, pending.channelId);
+                channel = selected?.currentChannel && typeof selected.currentChannel === "object" ? selected.currentChannel : channel;
+                notice = formatTemplate(S.notice_channel_key_saved_and_switched, { name: channelDisplayName(channel) });
+              }
               clearPendingForActor();
-              const notice = formatTemplate(S.notice_channel_key_saved, { name: channelDisplayName(channel) });
               const view = await renderChannelDetailMenuForActor(pending.channelId, pending.page, { notice, locale });
               await editMenuMessage({ chatId: pending.panelChatId, messageId: pending.panelMessageId, view });
             } catch (e) {
@@ -5893,6 +5940,43 @@ async function main() {
             }
             await safeSendMessage({ ...target, text: msg2 });
             return;
+          }
+
+          try {
+            const channelState = await resolveChannelStateForChatKey(chatKey);
+            const currentChannel = channelState?.currentChannel && typeof channelState.currentChannel === "object" ? channelState.currentChannel : null;
+            if (currentChannel && currentChannel.ready !== true) {
+              const promptChannel = resolveChannelKeyPromptTarget(channelState);
+              if (isPrivateChatType(chatType) && promptChannel && isNonEmptyString(promptChannel.channelId)) {
+                const view = await renderChannelKeyMenuForActor(promptChannel.channelId, 0, {
+                  error: channelReadinessReason(promptChannel, { locale }),
+                  locale
+                });
+                const sent = await safeSendMessage({
+                  ...target,
+                  text: view.text,
+                  parse_mode: "HTML",
+                  disable_web_page_preview: true,
+                  reply_markup: view.replyMarkup
+                });
+                const panelChatId = Number(sent?.chat?.id ?? target.chat_id);
+                const panelMessageId = Number(sent?.message_id);
+                if (Number.isFinite(panelChatId) && Number.isFinite(panelMessageId)) {
+                  setPendingChannelKey(chatKey, Math.trunc(panelChatId), Math.trunc(panelMessageId), promptChannel.channelId, 0, undefined, { selectAfterSave: true });
+                }
+                return;
+              }
+
+              await safeSendMessage({
+                ...target,
+                text: formatTemplate(S.channel_not_ready_prompt, {
+                  reason: channelReadinessReason(currentChannel, { locale })
+                })
+              });
+              return;
+            }
+          } catch (e) {
+            log("channel preflight failed:", e instanceof Error ? e.message : String(e));
           }
 
           const sessionId = route.sessionId;
