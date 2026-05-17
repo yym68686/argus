@@ -3209,19 +3209,29 @@ const markdownComponents = {
   td: ({ children }: any) => <td className="border-b border-border/60 px-3 py-2 align-top">{children}</td>
 };
 
-	function TurnProgress({
-	  summary,
-	  tools
-	}: {
-	  summary: string;
-	  tools: Array<Extract<ChatMessage, { role: "tool" }>>;
-	}) {
-	  const hasSummary = summary.trim().length > 0;
-	  const hasTools = tools.length > 0;
-  const toolById = new Map<string, Extract<ChatMessage, { role: "tool" }>>();
-  for (const t of tools) toolById.set(t.id, t);
-  const segments = parseMarkdownToolSegments(summary);
-  const referencedToolIds = new Set<string>();
+function TurnProgress({
+  summary,
+  tools
+}: {
+  summary: string;
+  tools: Array<Extract<ChatMessage, { role: "tool" }>>;
+}) {
+  const hasSummary = summary.trim().length > 0;
+  const hasTools = tools.length > 0;
+  const { toolById, segments, remainingTools } = React.useMemo(() => {
+    const nextToolById = new Map<string, Extract<ChatMessage, { role: "tool" }>>();
+    for (const t of tools) nextToolById.set(t.id, t);
+    const nextSegments = parseMarkdownToolSegments(summary);
+    const nextReferencedToolIds = new Set<string>();
+    for (const seg of nextSegments) {
+      if (seg.kind === "tool") nextReferencedToolIds.add(seg.toolId);
+    }
+    return {
+      toolById: nextToolById,
+      segments: nextSegments,
+      remainingTools: tools.filter((t) => !nextReferencedToolIds.has(t.id)),
+    };
+  }, [summary, tools]);
   return (
     <div className="w-full">
       <div className="max-w-[78ch]">
@@ -3251,7 +3261,6 @@ const markdownComponents = {
                     </div>
                   );
                 }
-                referencedToolIds.add(seg.toolId);
                 const msg = toolById.get(seg.toolId);
                 if (!msg) return null;
                 return <ToolBubble key={msg.id} message={msg} />;
@@ -3267,9 +3276,7 @@ const markdownComponents = {
                 tools.map((t) => <ToolBubble key={t.id} message={t} />)
               ) : null}
               {segments.length && hasTools
-                ? tools
-                    .filter((t) => !referencedToolIds.has(t.id))
-                    .map((t) => <ToolBubble key={t.id} message={t} />)
+                ? remainingTools.map((t) => <ToolBubble key={t.id} message={t} />)
                 : null}
             </div>
           </details>
@@ -3303,7 +3310,11 @@ function ToolStatusBadge({ status }: { status: ToolMessageStatus }) {
   );
 }
 
-function ToolBubble({ message }: { message: Extract<ChatMessage, { role: "tool" }> }) {
+const ToolBubble = React.memo(function ToolBubble({
+  message
+}: {
+  message: Extract<ChatMessage, { role: "tool" }>;
+}) {
   const meta = message.meta;
   const label =
     meta.kind === "commandExecution"
@@ -3379,15 +3390,31 @@ function ToolBubble({ message }: { message: Extract<ChatMessage, { role: "tool" 
       </div>
     </div>
   );
-}
+});
 
-function Bubble({
+const Bubble = React.memo(function Bubble({
   message,
   turnTools
 }: {
   message: ChatMessage;
   turnTools?: Array<Extract<ChatMessage, { role: "tool" }>>;
 }) {
+  const reasoningData = React.useMemo(() => {
+    if (message.role !== "reasoning") return null;
+    const toolById = new Map<string, Extract<ChatMessage, { role: "tool" }>>();
+    for (const t of turnTools ?? []) toolById.set(t.id, t);
+    const segments = parseMarkdownToolSegments(message.text);
+    const referencedToolIds = new Set<string>();
+    for (const seg of segments) {
+      if (seg.kind === "tool") referencedToolIds.add(seg.toolId);
+    }
+    return {
+      toolById,
+      segments,
+      remainingTools: (turnTools ?? []).filter((t) => !referencedToolIds.has(t.id)),
+    };
+  }, [message.role, message.text, turnTools]);
+
   if (message.role === "user") {
     return (
       <div className="flex w-full justify-end">
@@ -3416,10 +3443,8 @@ function Bubble({
   }
 
   if (message.role === "reasoning") {
-    const toolById = new Map<string, Extract<ChatMessage, { role: "tool" }>>();
-    for (const t of turnTools ?? []) toolById.set(t.id, t);
-    const segments = parseMarkdownToolSegments(message.text);
-    const referencedToolIds = new Set<string>();
+    if (!reasoningData) return null;
+    const { toolById, segments, remainingTools } = reasoningData;
     return (
       <div className="w-full">
         <details className="group max-w-[78ch] rounded-[18px] border border-border/70 bg-background/24 px-4 py-3 shadow-[inset_0_1px_0_0_oklch(var(--foreground)/0.04)]">
@@ -3444,7 +3469,6 @@ function Bubble({
                       </div>
                     );
                   }
-                  referencedToolIds.add(seg.toolId);
                   const msg = toolById.get(seg.toolId);
                   if (!msg) return null;
                   return <ToolBubble key={msg.id} message={msg} />;
@@ -3457,9 +3481,7 @@ function Bubble({
                   </div>
                 )}
             {turnTools && turnTools.length
-              ? turnTools
-                  .filter((t) => !referencedToolIds.has(t.id))
-                  .map((t) => <ToolBubble key={t.id} message={t} />)
+              ? remainingTools.map((t) => <ToolBubble key={t.id} message={t} />)
               : null}
           </div>
         </details>
@@ -3472,4 +3494,22 @@ function Bubble({
   }
 
   return null;
+}, areChatMessagePropsEqual);
+
+function areChatMessagePropsEqual(
+  prev: Readonly<{ message: ChatMessage; turnTools?: Array<Extract<ChatMessage, { role: "tool" }>> }>,
+  next: Readonly<{ message: ChatMessage; turnTools?: Array<Extract<ChatMessage, { role: "tool" }>> }>
+) {
+  if (prev.message === next.message && prev.turnTools === next.turnTools) return true;
+  if (prev.message.role !== next.message.role) return false;
+  if (prev.message.id !== next.message.id) return false;
+  if (prev.message.text !== next.message.text) return false;
+  if (prev.message.role === "tool" && next.message.role === "tool" && prev.message.meta !== next.message.meta) return false;
+  if ((prev.message as any).turnId !== (next.message as any).turnId) return false;
+  if (prev.turnTools === next.turnTools) return true;
+  if (!prev.turnTools || !next.turnTools || prev.turnTools.length !== next.turnTools.length) return false;
+  for (let i = 0; i < prev.turnTools.length; i++) {
+    if (prev.turnTools[i] !== next.turnTools[i]) return false;
+  }
+  return true;
 }

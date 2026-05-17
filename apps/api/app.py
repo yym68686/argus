@@ -1642,6 +1642,9 @@ def _markdown_to_telegram_html(markdown: str) -> str:
     if not inp.strip():
         return ""
     normalized = inp.replace("\r\n", "\n").replace("\r", "\n")
+    heading_re = re.compile(r"^\s{0,3}#{1,6}\s+(.+?)\s*$")
+    quote_re = re.compile(r"^\s{0,3}>\s?(.*)$")
+    list_re = re.compile(r"^\s{0,3}[-*+]\s+(.+?)\s*$")
 
     def render_code_block(raw: str) -> str:
         safe = _telegram_escape_html(str(raw or "").rstrip("\n"))
@@ -1688,8 +1691,8 @@ def _markdown_to_telegram_html(markdown: str) -> str:
         text = re.sub(r"(^|[^\w*])\*([^*\n]+?)\*(?!\*)", r"\1<i>\2</i>", text)
         text = re.sub(r"(^|[^\w_])_([^_\n]+?)_(?!_)", r"\1<i>\2</i>", text)
 
-        for key, html in placeholders.items():
-            text = text.replace(key, html)
+        if placeholders:
+            text = re.sub(r"\x00\d+\x00", lambda m: placeholders.get(m.group(0), m.group(0)), text)
         return text
 
     def render_inline_block(block: str) -> str:
@@ -1699,33 +1702,33 @@ def _markdown_to_telegram_html(markdown: str) -> str:
             if not (line or "").strip():
                 out_lines.append("")
                 continue
-            m = re.match(r"^\s{0,3}#{1,6}\s+(.+?)\s*$", line)
+            m = heading_re.match(line)
             if m:
                 out_lines.append(f"<b>{render_inline_spans(m.group(1))}</b>")
                 continue
-            m = re.match(r"^\s{0,3}>\s?(.*)$", line)
+            m = quote_re.match(line)
             if m:
                 out_lines.append(f"│ {render_inline_spans(m.group(1))}")
                 continue
-            m = re.match(r"^\s{0,3}[-*+]\s+(.+?)\s*$", line)
+            m = list_re.match(line)
             if m:
                 out_lines.append(f"• {render_inline_spans(m.group(1))}")
                 continue
             out_lines.append(render_inline_spans(line))
         return "\n".join(out_lines)
 
-    out = ""
+    out_parts: list[str] = []
     i = 0
     while i < len(normalized):
         start = normalized.find("```", i)
         if start == -1:
-            out += render_inline_block(normalized[i:])
+            out_parts.append(render_inline_block(normalized[i:]))
             break
 
-        out += render_inline_block(normalized[i:start])
+        out_parts.append(render_inline_block(normalized[i:start]))
         end = normalized.find("```", start + 3)
         if end == -1:
-            out += render_inline_block(normalized[start:])
+            out_parts.append(render_inline_block(normalized[start:]))
             break
 
         code_start = start + 3
@@ -1737,15 +1740,16 @@ def _markdown_to_telegram_html(markdown: str) -> str:
                 code_start = nl + 1
         code = normalized[code_start:end]
 
-        if out and not out.endswith("\n"):
-            out += "\n"
-        out += render_code_block(code)
+        if out_parts and not out_parts[-1].endswith("\n"):
+            out_parts.append("\n")
+        out_parts.append(render_code_block(code))
 
         i = end + 3
         if i < len(normalized) and normalized[i] == "\n":
-            out += "\n"
+            out_parts.append("\n")
             i += 1
 
+    out = "".join(out_parts)
     return str(out or "").strip()
 
 
@@ -5314,54 +5318,55 @@ class _SQLiteAutomationStateStore:
         self._initialized = True
 
     def _db_has_state(self, conn: sqlite3.Connection) -> bool:
-        for table_name in (
-            "automation_state_meta",
-            "automation_sessions",
-            "automation_agents",
-            "automation_chat_bindings",
-            "automation_user_channels",
-            "automation_console_users",
-            "automation_telegram_user_profiles",
-            "automation_telegram_console_links",
-            "automation_telegram_link_tokens",
-            "automation_console_sessions",
-            "automation_host_enrollments",
-            "automation_host_bindings",
-            "automation_host_enroll_tokens",
-        ):
-            row = conn.execute(f"SELECT 1 FROM {table_name} LIMIT 1").fetchone()
-            if row is not None:
-                return True
-        return False
+        row = conn.execute(
+            """
+            SELECT
+                EXISTS(SELECT 1 FROM automation_state_meta)
+                OR EXISTS(SELECT 1 FROM automation_sessions)
+                OR EXISTS(SELECT 1 FROM automation_agents)
+                OR EXISTS(SELECT 1 FROM automation_chat_bindings)
+                OR EXISTS(SELECT 1 FROM automation_user_channels)
+                OR EXISTS(SELECT 1 FROM automation_console_users)
+                OR EXISTS(SELECT 1 FROM automation_telegram_user_profiles)
+                OR EXISTS(SELECT 1 FROM automation_telegram_console_links)
+                OR EXISTS(SELECT 1 FROM automation_telegram_link_tokens)
+                OR EXISTS(SELECT 1 FROM automation_console_sessions)
+                OR EXISTS(SELECT 1 FROM automation_host_enrollments)
+                OR EXISTS(SELECT 1 FROM automation_host_bindings)
+                OR EXISTS(SELECT 1 FROM automation_host_enroll_tokens)
+                AS has_state
+            """
+        ).fetchone()
+        return bool(row["has_state"]) if row is not None else False
 
     def _read_state(self, conn: sqlite3.Connection) -> PersistedGatewayAutomationState:
         version = AUTOMATION_STATE_VERSION
-        meta_row = conn.execute(
-            "SELECT value_text FROM automation_state_meta WHERE key = ? LIMIT 1",
-            ("version",),
-        ).fetchone()
-        if meta_row is not None:
+        meta_rows = conn.execute(
+            """
+            SELECT key, value_text
+            FROM automation_state_meta
+            WHERE key IN (?, ?, ?)
+            """,
+            ("version", "gateway_openai_default_enabled", "telegram_bot_token"),
+        )
+        meta_by_key = {str(row["key"]): row["value_text"] for row in meta_rows}
+        meta_version = meta_by_key.get("version")
+        if meta_version is not None:
             try:
-                version = max(int(meta_row["value_text"] or AUTOMATION_STATE_VERSION), 1)
+                version = max(int(meta_version or AUTOMATION_STATE_VERSION), 1)
             except Exception:
                 version = AUTOMATION_STATE_VERSION
         gateway_openai_default_enabled = True
-        gateway_default_row = conn.execute(
-            "SELECT value_text FROM automation_state_meta WHERE key = ? LIMIT 1",
-            ("gateway_openai_default_enabled",),
-        ).fetchone()
-        if gateway_default_row is not None:
+        gateway_default_raw = meta_by_key.get("gateway_openai_default_enabled")
+        if gateway_default_raw is not None:
             gateway_openai_default_enabled = _normalize_bool_flag(
-                gateway_default_row["value_text"],
+                gateway_default_raw,
                 default=True,
             )
         telegram_bot_token = None
-        telegram_bot_token_row = conn.execute(
-            "SELECT value_text FROM automation_state_meta WHERE key = ? LIMIT 1",
-            ("telegram_bot_token",),
-        ).fetchone()
-        if telegram_bot_token_row is not None:
-            raw_telegram_bot_token = str(telegram_bot_token_row["value_text"] or "").strip()
+        telegram_bot_token_raw = meta_by_key.get("telegram_bot_token")
+        if telegram_bot_token_raw is not None:
+            raw_telegram_bot_token = str(telegram_bot_token_raw or "").strip()
             telegram_bot_token = (
                 raw_telegram_bot_token
                 if _secret_storage_is_sealed(raw_telegram_bot_token)
@@ -6626,54 +6631,55 @@ class _PostgresAutomationStateStore:
         self._initialized = True
 
     def _db_has_state(self, conn) -> bool:
-        for table_name in (
-            "automation_state_meta",
-            "automation_sessions",
-            "automation_agents",
-            "automation_chat_bindings",
-            "automation_user_channels",
-            "automation_console_users",
-            "automation_telegram_user_profiles",
-            "automation_telegram_console_links",
-            "automation_telegram_link_tokens",
-            "automation_console_sessions",
-            "automation_host_enrollments",
-            "automation_host_bindings",
-            "automation_host_enroll_tokens",
-        ):
-            row = conn.execute(f"SELECT 1 FROM {table_name} LIMIT 1").fetchone()
-            if row is not None:
-                return True
-        return False
+        row = conn.execute(
+            """
+            SELECT
+                EXISTS(SELECT 1 FROM automation_state_meta)
+                OR EXISTS(SELECT 1 FROM automation_sessions)
+                OR EXISTS(SELECT 1 FROM automation_agents)
+                OR EXISTS(SELECT 1 FROM automation_chat_bindings)
+                OR EXISTS(SELECT 1 FROM automation_user_channels)
+                OR EXISTS(SELECT 1 FROM automation_console_users)
+                OR EXISTS(SELECT 1 FROM automation_telegram_user_profiles)
+                OR EXISTS(SELECT 1 FROM automation_telegram_console_links)
+                OR EXISTS(SELECT 1 FROM automation_telegram_link_tokens)
+                OR EXISTS(SELECT 1 FROM automation_console_sessions)
+                OR EXISTS(SELECT 1 FROM automation_host_enrollments)
+                OR EXISTS(SELECT 1 FROM automation_host_bindings)
+                OR EXISTS(SELECT 1 FROM automation_host_enroll_tokens)
+                AS has_state
+            """
+        ).fetchone()
+        return bool(row["has_state"]) if row is not None else False
 
     def _read_state(self, conn) -> PersistedGatewayAutomationState:
         version = AUTOMATION_STATE_VERSION
-        meta_row = conn.execute(
-            "SELECT value_text FROM automation_state_meta WHERE key = %s LIMIT 1",
-            ("version",),
-        ).fetchone()
-        if meta_row is not None:
+        meta_rows = conn.execute(
+            """
+            SELECT key, value_text
+            FROM automation_state_meta
+            WHERE key IN (%s, %s, %s)
+            """,
+            ("version", "gateway_openai_default_enabled", "telegram_bot_token"),
+        )
+        meta_by_key = {str(row["key"]): row["value_text"] for row in meta_rows}
+        meta_version = meta_by_key.get("version")
+        if meta_version is not None:
             try:
-                version = max(int(meta_row["value_text"] or AUTOMATION_STATE_VERSION), 1)
+                version = max(int(meta_version or AUTOMATION_STATE_VERSION), 1)
             except Exception:
                 version = AUTOMATION_STATE_VERSION
         gateway_openai_default_enabled = True
-        gateway_default_row = conn.execute(
-            "SELECT value_text FROM automation_state_meta WHERE key = %s LIMIT 1",
-            ("gateway_openai_default_enabled",),
-        ).fetchone()
-        if gateway_default_row is not None:
+        gateway_default_raw = meta_by_key.get("gateway_openai_default_enabled")
+        if gateway_default_raw is not None:
             gateway_openai_default_enabled = _normalize_bool_flag(
-                gateway_default_row["value_text"],
+                gateway_default_raw,
                 default=True,
             )
         telegram_bot_token = None
-        telegram_bot_token_row = conn.execute(
-            "SELECT value_text FROM automation_state_meta WHERE key = %s LIMIT 1",
-            ("telegram_bot_token",),
-        ).fetchone()
-        if telegram_bot_token_row is not None:
-            raw_telegram_bot_token = str(telegram_bot_token_row["value_text"] or "").strip()
+        telegram_bot_token_raw = meta_by_key.get("telegram_bot_token")
+        if telegram_bot_token_raw is not None:
+            raw_telegram_bot_token = str(telegram_bot_token_raw or "").strip()
             telegram_bot_token = (
                 raw_telegram_bot_token
                 if _secret_storage_is_sealed(raw_telegram_bot_token)
@@ -11028,13 +11034,16 @@ class AutomationManager:
                 st.console_sessions.pop(console_session_id, None)
                 deleted_console_session_ids.append(console_session_id)
 
+            referenced_session_ids: set[str] = set()
+            for current in (st.agents or {}).values():
+                if not isinstance(current, PersistedAgentRuntime):
+                    continue
+                sid = str(current.session_id or "").strip()
+                if sid:
+                    referenced_session_ids.add(sid)
+
             for sid in sorted(candidate_session_ids):
-                referenced_elsewhere = False
-                for current in (st.agents or {}).values():
-                    if isinstance(current, PersistedAgentRuntime) and str(current.session_id or "").strip() == sid:
-                        referenced_elsewhere = True
-                        break
-                if referenced_elsewhere:
+                if sid in referenced_session_ids:
                     continue
                 if sid in st.sessions:
                     st.sessions.pop(sid, None)
