@@ -431,6 +431,55 @@ class UserAgentProvisioningTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(summary["currentAgentId"], "u1-live")
         self.assertEqual(summary["currentSessionId"], live_session_id)
 
+    async def test_admin_user_summary_counts_live_generic_owned_sessions(self) -> None:
+        now_ms = 1778906342029
+        agent_session_id = "bbbbbbbbbbbb"
+        generic_session_id = "dddddddddddd"
+
+        await self.manager._store.update(
+            lambda st: (
+                st.agents.__setitem__(
+                    "u1-main",
+                    argus_app.PersistedAgentRuntime(
+                        agent_id="u1-main",
+                        session_id=agent_session_id,
+                        workspace_host_path=str(pathlib.Path(self.tmpdir.name) / "main"),
+                        created_at_ms=now_ms,
+                        owner_user_id=1,
+                        short_name="main",
+                        allowed_user_ids=[],
+                        model=argus_app.ARGUS_AGENT_MODEL_DEFAULT,
+                        provisioning_state=argus_app.AGENT_PROVISIONING_STATE_READY,
+                        provisioning_updated_at_ms=now_ms,
+                        last_ready_at_ms=now_ms,
+                    ),
+                ),
+                st.sessions.__setitem__(
+                    generic_session_id,
+                    argus_app.PersistedSessionAutomation(owner_user_id=1),
+                ),
+                st.chat_bindings.__setitem__("1", "u1-main"),
+            )
+        )
+
+        raw_agents = self.manager.list_agents_for_user(user_id=1)
+        filtered_agents = argus_app._admin_filter_agents_by_live_session_ids(
+            raw_agents,
+            {agent_session_id, generic_session_id},
+        )
+        summary = argus_app._admin_user_summary_payload(
+            self.manager,
+            usage_store=object(),
+            user_id=1,
+            agents=filtered_agents,
+            live_session_ids={agent_session_id, generic_session_id},
+            usage_24h={},
+            usage_total={},
+        )
+
+        self.assertEqual(summary["agentCount"], 1)
+        self.assertEqual(summary["sessionCount"], 2)
+
     async def test_connection_payload_caps_wait_timeout(self) -> None:
         gate = asyncio.Event()
 

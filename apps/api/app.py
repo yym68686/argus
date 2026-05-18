@@ -22987,6 +22987,34 @@ def _admin_filter_agents_by_live_session_ids(
     return out
 
 
+def _admin_session_count_for_user(
+    automation: AutomationManager,
+    user_id: int,
+    *,
+    agents: Optional[list[dict[str, Any]]] = None,
+    live_session_ids: Optional[set[str]] = None,
+) -> int:
+    if not isinstance(user_id, int) or user_id <= 0:
+        return 0
+    session_ids: set[str] = set()
+    if agents is not None:
+        for agent in agents:
+            if not isinstance(agent, dict):
+                continue
+            session_id = str(agent.get("sessionId") or "").strip()
+            if session_id:
+                session_ids.add(session_id)
+    else:
+        session_ids.update(automation.list_session_ids_for_user(user_id=user_id))
+
+    if live_session_ids is not None:
+        # Include live generic /ws sessions that have an owner but no persisted agent row.
+        for session_id in automation.list_session_ids_for_user(user_id=user_id):
+            if session_id in live_session_ids:
+                session_ids.add(session_id)
+    return len(session_ids)
+
+
 async def _admin_live_managed_session_ids_or_none() -> Optional[set[str]]:
     if not _provisioner_manages_runtime_sessions():
         return None
@@ -23033,6 +23061,7 @@ def _admin_user_summary_payload(
     user_id: int,
     *,
     agents: Optional[list[dict[str, Any]]] = None,
+    live_session_ids: Optional[set[str]] = None,
     usage_24h: Optional[dict[str, Any]] = None,
     usage_total: Optional[dict[str, Any]] = None,
 ) -> dict[str, Any]:
@@ -23062,7 +23091,12 @@ def _admin_user_summary_payload(
         "telegramProfile": telegram_profile.to_public_json() if isinstance(telegram_profile, PersistedTelegramUserProfile) else None,
         "privateChatKey": automation.primary_private_chat_key_for_user(user_id=user_id),
         "agentCount": len(agents),
-        "sessionCount": sum(1 for item in agents if isinstance(item, dict) and str(item.get("sessionId") or "").strip()),
+        "sessionCount": _admin_session_count_for_user(
+            automation,
+            user_id,
+            agents=agents,
+            live_session_ids=live_session_ids,
+        ),
         "defaultAgentId": _user_agent_id(user_id=user_id, short_name="main"),
         "currentAgentId": current_agent_id,
         "currentSessionId": current_session_id,
@@ -24026,6 +24060,7 @@ async def admin_users(request: Request):
                 usage_store,
                 user_id,
                 agents=agents,
+                live_session_ids=live_session_ids,
                 usage_24h=usage_24h_by_user.get(user_id),
                 usage_total=usage_total_by_user.get(user_id),
             )
@@ -24095,6 +24130,7 @@ async def admin_user_detail(user_id: int, request: Request):
         usage_store,
         user_id,
         agents=agents,
+        live_session_ids=live_session_ids,
         usage_total=usage_total,
     )
     recent_usage = await asyncio.to_thread(usage_store.list_events, owner_user_id=user_id, limit=100)
