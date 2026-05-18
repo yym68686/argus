@@ -87,6 +87,66 @@ class GatewayProxyRouteTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertIn("gpt-5.5", catalog["availableModels"])
 
+    async def test_agent_resolve_payload_can_skip_model_catalog(self) -> None:
+        automation = mock.Mock()
+        automation.resolve_owner_user_id_for_private_chat_key.return_value = 1
+        automation._store = mock.Mock(state=mock.Mock(chat_bindings={"1": "u1-main"}))
+        automation.can_user_access_agent_id.return_value = True
+        automation.resolve_agent_session_id.return_value = "sess_1"
+        automation._get_agent.return_value = mock.Mock(owner_user_id=1, model="gpt-5.5")
+        automation.list_channels_for_user.return_value = {
+            "currentChannelId": "0-0.pro",
+            "currentChannel": {"channelId": "0-0.pro", "name": "0-0.pro"},
+        }
+        automation._channel_adjusted_agent_model.return_value = "gpt-5.5"
+
+        model_payload = mock.AsyncMock(side_effect=AssertionError("model catalog should not be fetched"))
+        with mock.patch.object(argus_app, "_automation_model_payload", model_payload):
+            payload = await argus_app._automation_agent_resolve_payload(
+                automation,
+                chat_key="1",
+                include_models=False,
+            )
+
+        self.assertEqual(payload["model"], "gpt-5.5")
+        self.assertEqual(payload["availableModels"], ["gpt-5.5"])
+        self.assertEqual(payload["modelSource"], "fallback")
+        self.assertEqual(payload["currentChannelId"], "0-0.pro")
+        model_payload.assert_not_called()
+
+    async def test_agent_resolve_payload_includes_model_catalog_when_requested(self) -> None:
+        automation = mock.Mock()
+        automation.resolve_owner_user_id_for_private_chat_key.return_value = 1
+        automation._store = mock.Mock(state=mock.Mock(chat_bindings={"1": "u1-main"}))
+        automation.can_user_access_agent_id.return_value = True
+        automation.resolve_agent_session_id.return_value = "sess_1"
+        automation._get_agent.return_value = mock.Mock(owner_user_id=1, model="gpt-5.5")
+        automation.list_channels_for_user.return_value = {
+            "currentChannelId": "gateway",
+            "currentChannel": {"channelId": "gateway", "name": "gateway"},
+        }
+        automation._channel_adjusted_agent_model.return_value = "gpt-5.5"
+
+        model_payload = mock.AsyncMock(
+            return_value={
+                "availableModels": ["gpt-5.2", "gpt-5.5"],
+                "models": [{"id": "gpt-5.2"}, {"id": "gpt-5.5"}],
+                "source": "upstream",
+                "error": None,
+            }
+        )
+        with mock.patch.object(argus_app, "_automation_model_payload", model_payload):
+            payload = await argus_app._automation_agent_resolve_payload(
+                automation,
+                chat_key="1",
+                include_models=True,
+            )
+
+        model_payload.assert_awaited_once()
+        self.assertEqual(payload["availableModels"], ["gpt-5.2", "gpt-5.5"])
+        self.assertEqual(payload["modelSource"], "upstream")
+        self.assertEqual(payload["currentChannelId"], "gateway")
+
     async def test_mcp_get_returns_streaming_response_instead_of_405(self) -> None:
         request = self.make_request("/mcp", method="GET")
         session = mock.Mock(protocol_version="2025-11-25")

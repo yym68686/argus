@@ -22535,6 +22535,77 @@ async def _automation_model_payload(
     return _fallback_model_catalog(current_model=current_model, error=None)
 
 
+async def _automation_agent_resolve_payload(
+    automation: AutomationManager,
+    *,
+    chat_key: str,
+    include_models: bool = True,
+) -> dict[str, Any]:
+    user_id = automation.resolve_owner_user_id_for_private_chat_key(chat_key)
+    if user_id is None:
+        agent_id = automation.resolve_agent_for_chat_key(chat_key)
+        if not agent_id:
+            raise HTTPException(status_code=404, detail="No agent bound for chatKey")
+        agent = automation._get_agent(agent_id)
+        sess_id = automation.resolve_agent_session_id(agent_id)
+        if not sess_id:
+            raise HTTPException(status_code=404, detail="Unknown agent")
+        current_model = automation._channel_adjusted_agent_model(agent)
+        model_info = (
+            await _automation_model_payload(automation, agent=agent)
+            if include_models
+            else _fallback_model_catalog(current_model=current_model, error=None)
+        )
+        return {
+            "ok": True,
+            "chatKey": chat_key,
+            "agentId": agent_id,
+            "sessionId": sess_id,
+            "model": current_model,
+            "availableModels": model_info.get("availableModels"),
+            "models": model_info.get("models"),
+            "modelSource": model_info.get("source"),
+            "modelError": model_info.get("error"),
+        }
+
+    st = automation._store.state
+    bound = st.chat_bindings.get(chat_key) if isinstance(getattr(st, "chat_bindings", None), dict) else None
+    bound_id = bound.strip() if isinstance(bound, str) and bound.strip() else None
+    if bound_id and automation.can_user_access_agent_id(user_id=user_id, agent_id=bound_id):
+        agent_id = bound_id
+    else:
+        main_id = _user_agent_id(user_id=user_id, short_name="main")
+        if automation.can_user_access_agent_id(user_id=user_id, agent_id=main_id):
+            agent_id = main_id
+        else:
+            raise HTTPException(status_code=400, detail="Not initialized (run /start)")
+    sess_id = automation.resolve_agent_session_id(agent_id)
+    if not sess_id:
+        raise HTTPException(status_code=500, detail="Agent has no sessionId")
+    agent = automation._get_agent(agent_id)
+    channel_info = automation.list_channels_for_user(user_id=user_id)
+    current_model = automation._channel_adjusted_agent_model(agent)
+    model_info = (
+        await _automation_model_payload(automation, agent=agent, user_id=user_id)
+        if include_models
+        else _fallback_model_catalog(current_model=current_model, error=None)
+    )
+    return {
+        "ok": True,
+        "chatKey": chat_key,
+        "userId": user_id,
+        "agentId": agent_id,
+        "sessionId": sess_id,
+        "model": current_model,
+        "availableModels": model_info.get("availableModels"),
+        "models": model_info.get("models"),
+        "modelSource": model_info.get("source"),
+        "modelError": model_info.get("error"),
+        "currentChannelId": channel_info.get("currentChannelId"),
+        "currentChannel": channel_info.get("currentChannel"),
+    }
+
+
 def _automation_require_chat_key(body: Any) -> str:
     if not isinstance(body, dict):
         raise HTTPException(status_code=400, detail="Invalid JSON body")
@@ -23278,60 +23349,8 @@ async def automation_agent_resolve(request: Request):
     if not isinstance(raw_chat_key, str) or not raw_chat_key.strip():
         raise HTTPException(status_code=400, detail="Missing 'chatKey'")
     chat_key = raw_chat_key.strip()
-
-    user_id = automation.resolve_owner_user_id_for_private_chat_key(chat_key)
-    if user_id is None:
-        agent_id = automation.resolve_agent_for_chat_key(chat_key)
-        if not agent_id:
-            raise HTTPException(status_code=404, detail="No agent bound for chatKey")
-        agent = automation._get_agent(agent_id)
-        sess_id = automation.resolve_agent_session_id(agent_id)
-        if not sess_id:
-            raise HTTPException(status_code=404, detail="Unknown agent")
-        model_info = await _automation_model_payload(automation, agent=agent)
-        return {
-            "ok": True,
-            "chatKey": chat_key,
-            "agentId": agent_id,
-            "sessionId": sess_id,
-            "model": automation._channel_adjusted_agent_model(agent),
-            "availableModels": model_info.get("availableModels"),
-            "models": model_info.get("models"),
-            "modelSource": model_info.get("source"),
-            "modelError": model_info.get("error"),
-        }
-
-    st = automation._store.state
-    bound = st.chat_bindings.get(chat_key) if isinstance(getattr(st, "chat_bindings", None), dict) else None
-    bound_id = bound.strip() if isinstance(bound, str) and bound.strip() else None
-    if bound_id and automation.can_user_access_agent_id(user_id=user_id, agent_id=bound_id):
-        agent_id = bound_id
-    else:
-        main_id = _user_agent_id(user_id=user_id, short_name="main")
-        if automation.can_user_access_agent_id(user_id=user_id, agent_id=main_id):
-            agent_id = main_id
-        else:
-            raise HTTPException(status_code=400, detail="Not initialized (run /start)")
-    sess_id = automation.resolve_agent_session_id(agent_id)
-    if not sess_id:
-        raise HTTPException(status_code=500, detail="Agent has no sessionId")
-    agent = automation._get_agent(agent_id)
-    channel_info = automation.list_channels_for_user(user_id=user_id)
-    model_info = await _automation_model_payload(automation, agent=agent, user_id=user_id)
-    return {
-        "ok": True,
-        "chatKey": chat_key,
-        "userId": user_id,
-        "agentId": agent_id,
-        "sessionId": sess_id,
-        "model": automation._channel_adjusted_agent_model(agent),
-        "availableModels": model_info.get("availableModels"),
-        "models": model_info.get("models"),
-        "modelSource": model_info.get("source"),
-        "modelError": model_info.get("error"),
-        "currentChannelId": channel_info.get("currentChannelId"),
-        "currentChannel": channel_info.get("currentChannel"),
-    }
+    include_models = _normalize_bool_flag(body.get("includeModels"), default=True)
+    return await _automation_agent_resolve_payload(automation, chat_key=chat_key, include_models=include_models)
 
 
 @app.post("/automation/agent/create")

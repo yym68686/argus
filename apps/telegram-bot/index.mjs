@@ -920,9 +920,9 @@ class ArgusClient {
     return await this._httpJson("POST", "/automation/agent/list", { chatKey });
   }
 
-  async automationAgentResolve(chatKey) {
+  async automationAgentResolve(chatKey, { includeModels = false } = {}) {
     if (!isNonEmptyString(chatKey)) throw new Error("Missing chatKey");
-    return await this._httpJson("POST", "/automation/agent/resolve", { chatKey });
+    return await this._httpJson("POST", "/automation/agent/resolve", { chatKey, includeModels });
   }
 
   async automationAgentCreate(chatKey, agentId) {
@@ -2673,8 +2673,8 @@ async function main() {
     return Number.isFinite(parsed) && parsed > 0 ? Math.trunc(parsed) : null;
   }
 
-  async function resolveRouteForChatKey(chatKey) {
-    const res = await argusHttp.automationAgentResolve(chatKey);
+  async function resolveRouteForChatKey(chatKey, { includeModels = false } = {}) {
+    const res = await argusHttp.automationAgentResolve(chatKey, { includeModels });
     const sessionId = isNonEmptyString(res?.sessionId) ? res.sessionId : null;
     const agentId = isNonEmptyString(res?.agentId) ? res.agentId : "main";
     const model = normalizeAgentModel(res?.model);
