@@ -107,6 +107,7 @@ export interface AdminOverviewResponse {
 export interface GatewayApiAccessSettingsResponse {
   ok: true;
   gatewayOpenaiDefaultEnabled: boolean;
+  gatewayOpenaiDefaultSource?: "admin" | "env" | "stored" | "default" | string;
   allowOverrideCount?: number;
   denyOverrideCount?: number;
 }

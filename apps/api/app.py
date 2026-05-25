@@ -2703,7 +2703,7 @@ CONSOLE_USERNAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 CONSOLE_SESSION_ID_RE = re.compile(r"^[a-f0-9]{24}$")
 DEVELOPER_API_KEY_ID_RE = re.compile(r"^[a-f0-9]{16}$")
 TELEGRAM_LINK_TOKEN_ID_RE = re.compile(r"^[a-f0-9]{12}$")
-AUTOMATION_STATE_VERSION = 13
+AUTOMATION_STATE_VERSION = 14
 ARGUS_AGENT_MODEL_DEFAULT = "gpt-5.5"
 ARGUS_GATEWAY_AGENT_MODELS = ("gpt-5.2", "gpt-5.4", "gpt-5.5")
 ARGUS_GATEWAY_AGENT_MODELS_SET = frozenset(ARGUS_GATEWAY_AGENT_MODELS)
@@ -2723,6 +2723,18 @@ BUILTIN_ACCESS_MODES = frozenset(
         BUILTIN_ACCESS_MODE_INHERIT,
         BUILTIN_ACCESS_MODE_ALLOW,
         BUILTIN_ACCESS_MODE_DENY,
+    )
+)
+GATEWAY_OPENAI_DEFAULT_SOURCE_ADMIN = "admin"
+GATEWAY_OPENAI_DEFAULT_SOURCE_ENV = "env"
+GATEWAY_OPENAI_DEFAULT_SOURCE_STORED = "stored"
+GATEWAY_OPENAI_DEFAULT_SOURCE_DEFAULT = "default"
+GATEWAY_OPENAI_DEFAULT_SOURCES = frozenset(
+    (
+        GATEWAY_OPENAI_DEFAULT_SOURCE_ADMIN,
+        GATEWAY_OPENAI_DEFAULT_SOURCE_ENV,
+        GATEWAY_OPENAI_DEFAULT_SOURCE_STORED,
+        GATEWAY_OPENAI_DEFAULT_SOURCE_DEFAULT,
     )
 )
 CONSOLE_SESSION_TOKEN_PREFIX = "argus-console-v1"
@@ -2757,8 +2769,56 @@ def _env_bool(name: str, default: bool) -> bool:
     return _normalize_bool_flag(os.getenv(name), default=default)
 
 
+def _env_bool_value(name: str) -> Optional[bool]:
+    raw = os.getenv(name)
+    if raw is None or not str(raw).strip():
+        return None
+    return _normalize_bool_flag(raw, default=True)
+
+
+def _gateway_openai_default_enabled_env_value() -> Optional[bool]:
+    return _env_bool_value("ARGUS_GATEWAY_OPENAI_DEFAULT_ENABLED")
+
+
 def _gateway_openai_default_enabled_env() -> bool:
-    return _env_bool("ARGUS_GATEWAY_OPENAI_DEFAULT_ENABLED", default=True)
+    value = _gateway_openai_default_enabled_env_value()
+    return True if value is None else bool(value)
+
+
+def _gateway_openai_default_source_env() -> str:
+    return (
+        GATEWAY_OPENAI_DEFAULT_SOURCE_ENV
+        if _gateway_openai_default_enabled_env_value() is not None
+        else GATEWAY_OPENAI_DEFAULT_SOURCE_DEFAULT
+    )
+
+
+def _normalize_gateway_openai_default_source(raw: Any) -> str:
+    value = str(raw or "").strip().lower()
+    return value if value in GATEWAY_OPENAI_DEFAULT_SOURCES else ""
+
+
+def _resolve_gateway_openai_default_enabled(
+    raw_enabled: Any,
+    raw_source: Any = None,
+) -> tuple[bool, str]:
+    source = _normalize_gateway_openai_default_source(raw_source)
+    env_value = _gateway_openai_default_enabled_env_value()
+    if source == GATEWAY_OPENAI_DEFAULT_SOURCE_ADMIN and raw_enabled is not None:
+        return (
+            _normalize_bool_flag(raw_enabled, default=_gateway_openai_default_enabled_env()),
+            GATEWAY_OPENAI_DEFAULT_SOURCE_ADMIN,
+        )
+    if env_value is not None and source in {"", GATEWAY_OPENAI_DEFAULT_SOURCE_ENV}:
+        return bool(env_value), GATEWAY_OPENAI_DEFAULT_SOURCE_ENV
+    if raw_enabled is not None:
+        return (
+            _normalize_bool_flag(raw_enabled, default=_gateway_openai_default_enabled_env()),
+            source or GATEWAY_OPENAI_DEFAULT_SOURCE_STORED,
+        )
+    if env_value is not None:
+        return bool(env_value), GATEWAY_OPENAI_DEFAULT_SOURCE_ENV
+    return True, GATEWAY_OPENAI_DEFAULT_SOURCE_DEFAULT
 
 
 def _normalize_builtin_access_mode(raw: Any, *, allow_inherit: bool = False) -> Optional[str]:
@@ -4663,6 +4723,7 @@ class PersistedGatewayAutomationState:
     chat_bindings: dict[str, str] = field(default_factory=dict)
     user_channels: dict[str, PersistedUserChannelState] = field(default_factory=dict)
     gateway_openai_default_enabled: bool = field(default_factory=_gateway_openai_default_enabled_env)
+    gateway_openai_default_source: str = field(default_factory=_gateway_openai_default_source_env)
     telegram_bot_token: Optional[str] = None
     telegram_user_profiles: dict[str, PersistedTelegramUserProfile] = field(default_factory=dict)
     telegram_console_links: dict[str, PersistedTelegramConsoleLink] = field(default_factory=dict)
@@ -4685,6 +4746,10 @@ class PersistedGatewayAutomationState:
                 if isinstance(user_id, str) and user_id.strip() and isinstance(channel_state, PersistedUserChannelState)
             },
             "gatewayOpenaiDefaultEnabled": bool(self.gateway_openai_default_enabled),
+            "gatewayOpenaiDefaultSource": _normalize_gateway_openai_default_source(
+                self.gateway_openai_default_source
+            )
+            or _gateway_openai_default_source_env(),
             "telegramBotToken": (
                 _mask_secret(_secret_storage_resolve(self.telegram_bot_token)[0])
                 if redact_secrets
@@ -4786,9 +4851,9 @@ class PersistedGatewayAutomationState:
                 if user_id_int <= 0:
                     continue
                 user_channels[str(user_id_int)] = PersistedUserChannelState.from_json(raw_state)
-        gateway_openai_default_enabled = _normalize_bool_flag(
+        gateway_openai_default_enabled, gateway_openai_default_source = _resolve_gateway_openai_default_enabled(
             obj.get("gatewayOpenaiDefaultEnabled"),
-            default=_gateway_openai_default_enabled_env(),
+            obj.get("gatewayOpenaiDefaultSource"),
         )
         raw_telegram_bot_token = obj.get("telegramBotToken")
         telegram_bot_token = (
@@ -4912,6 +4977,7 @@ class PersistedGatewayAutomationState:
             chat_bindings=chat_bindings,
             user_channels=user_channels,
             gateway_openai_default_enabled=gateway_openai_default_enabled,
+            gateway_openai_default_source=gateway_openai_default_source,
             telegram_bot_token=telegram_bot_token,
             telegram_user_profiles=telegram_user_profiles,
             telegram_console_links=telegram_console_links,
@@ -5035,6 +5101,23 @@ class _SQLiteAutomationStateStore:
                             default=_gateway_openai_default_enabled_env(),
                         )
                         else "false",
+                        now_ms,
+                    ),
+                )
+                conn.execute(
+                    """
+                    INSERT INTO automation_state_meta (key, value_text, updated_at_ms)
+                    VALUES (?, ?, ?)
+                    ON CONFLICT(key) DO UPDATE SET
+                        value_text = excluded.value_text,
+                        updated_at_ms = excluded.updated_at_ms
+                    """,
+                    (
+                        "gateway_openai_default_source",
+                        _normalize_gateway_openai_default_source(
+                            getattr(state, "gateway_openai_default_source", None)
+                        )
+                        or _gateway_openai_default_source_env(),
                         now_ms,
                     ),
                 )
@@ -5393,9 +5476,9 @@ class _SQLiteAutomationStateStore:
             """
             SELECT key, value_text
             FROM automation_state_meta
-            WHERE key IN (?, ?, ?)
+            WHERE key IN (?, ?, ?, ?)
             """,
-            ("version", "gateway_openai_default_enabled", "telegram_bot_token"),
+            ("version", "gateway_openai_default_enabled", "gateway_openai_default_source", "telegram_bot_token"),
         )
         meta_by_key = {str(row["key"]): row["value_text"] for row in meta_rows}
         meta_version = meta_by_key.get("version")
@@ -5404,13 +5487,10 @@ class _SQLiteAutomationStateStore:
                 version = max(int(meta_version or AUTOMATION_STATE_VERSION), 1)
             except Exception:
                 version = AUTOMATION_STATE_VERSION
-        gateway_openai_default_enabled = _gateway_openai_default_enabled_env()
-        gateway_default_raw = meta_by_key.get("gateway_openai_default_enabled")
-        if gateway_default_raw is not None:
-            gateway_openai_default_enabled = _normalize_bool_flag(
-                gateway_default_raw,
-                default=_gateway_openai_default_enabled_env(),
-            )
+        gateway_openai_default_enabled, gateway_openai_default_source = _resolve_gateway_openai_default_enabled(
+            meta_by_key.get("gateway_openai_default_enabled"),
+            meta_by_key.get("gateway_openai_default_source"),
+        )
         telegram_bot_token = None
         telegram_bot_token_raw = meta_by_key.get("telegram_bot_token")
         if telegram_bot_token_raw is not None:
@@ -5602,6 +5682,7 @@ class _SQLiteAutomationStateStore:
             chat_bindings=chat_bindings,
             user_channels=user_channels,
             gateway_openai_default_enabled=gateway_openai_default_enabled,
+            gateway_openai_default_source=gateway_openai_default_source,
             telegram_bot_token=telegram_bot_token,
             telegram_user_profiles=telegram_user_profiles,
             telegram_console_links=telegram_console_links,
@@ -6340,6 +6421,23 @@ class _PostgresAutomationStateStore:
                         updated_at_ms = EXCLUDED.updated_at_ms
                     """,
                     (
+                        "gateway_openai_default_source",
+                        _normalize_gateway_openai_default_source(
+                            getattr(state, "gateway_openai_default_source", None)
+                        )
+                        or _gateway_openai_default_source_env(),
+                        now_ms,
+                    ),
+                )
+                conn.execute(
+                    """
+                    INSERT INTO automation_state_meta (key, value_text, updated_at_ms)
+                    VALUES (%s, %s, %s)
+                    ON CONFLICT(key) DO UPDATE SET
+                        value_text = EXCLUDED.value_text,
+                        updated_at_ms = EXCLUDED.updated_at_ms
+                    """,
+                    (
                         "telegram_bot_token",
                         _secret_storage_prepare(getattr(state, "telegram_bot_token", None)) or "",
                         now_ms,
@@ -6711,9 +6809,9 @@ class _PostgresAutomationStateStore:
             """
             SELECT key, value_text
             FROM automation_state_meta
-            WHERE key IN (%s, %s, %s)
+            WHERE key IN (%s, %s, %s, %s)
             """,
-            ("version", "gateway_openai_default_enabled", "telegram_bot_token"),
+            ("version", "gateway_openai_default_enabled", "gateway_openai_default_source", "telegram_bot_token"),
         )
         meta_by_key = {str(row["key"]): row["value_text"] for row in meta_rows}
         meta_version = meta_by_key.get("version")
@@ -6722,13 +6820,10 @@ class _PostgresAutomationStateStore:
                 version = max(int(meta_version or AUTOMATION_STATE_VERSION), 1)
             except Exception:
                 version = AUTOMATION_STATE_VERSION
-        gateway_openai_default_enabled = _gateway_openai_default_enabled_env()
-        gateway_default_raw = meta_by_key.get("gateway_openai_default_enabled")
-        if gateway_default_raw is not None:
-            gateway_openai_default_enabled = _normalize_bool_flag(
-                gateway_default_raw,
-                default=_gateway_openai_default_enabled_env(),
-            )
+        gateway_openai_default_enabled, gateway_openai_default_source = _resolve_gateway_openai_default_enabled(
+            meta_by_key.get("gateway_openai_default_enabled"),
+            meta_by_key.get("gateway_openai_default_source"),
+        )
         telegram_bot_token = None
         telegram_bot_token_raw = meta_by_key.get("telegram_bot_token")
         if telegram_bot_token_raw is not None:
@@ -6920,6 +7015,7 @@ class _PostgresAutomationStateStore:
             chat_bindings=chat_bindings,
             user_channels=user_channels,
             gateway_openai_default_enabled=gateway_openai_default_enabled,
+            gateway_openai_default_source=gateway_openai_default_source,
             telegram_bot_token=telegram_bot_token,
             telegram_user_profiles=telegram_user_profiles,
             telegram_console_links=telegram_console_links,
@@ -9448,6 +9544,13 @@ class AutomationManager:
             default=_gateway_openai_default_enabled_env(),
         )
 
+    def _gateway_openai_default_source(self) -> str:
+        st = self._store.state
+        return (
+            _normalize_gateway_openai_default_source(getattr(st, "gateway_openai_default_source", None))
+            or _gateway_openai_default_source_env()
+        )
+
     def _builtin_channel_access_override_for_user_state(
         self,
         *,
@@ -9904,6 +10007,8 @@ class AutomationManager:
             raise ValueError("Missing sessionId")
         owner_user_id = self.get_owner_user_id_for_session(sid)
         if owner_user_id is None:
+            if not self._gateway_openai_default_enabled():
+                raise RuntimeError("Gateway channel is disabled by default")
             api_key = _gateway_openai_api_key()
             if not api_key:
                 raise RuntimeError("Gateway channel is not configured (missing OPENAI_API_KEY)")
@@ -10205,6 +10310,7 @@ class AutomationManager:
         return {
             "ok": True,
             "gatewayOpenaiDefaultEnabled": default_enabled,
+            "gatewayOpenaiDefaultSource": self._gateway_openai_default_source(),
             "allowOverrideCount": allow_override_count,
             "denyOverrideCount": deny_override_count,
         }
@@ -10215,6 +10321,7 @@ class AutomationManager:
         def _write(st: PersistedGatewayAutomationState) -> None:
             st.version = max(int(getattr(st, "version", 1) or 1), AUTOMATION_STATE_VERSION)
             st.gateway_openai_default_enabled = enabled_flag
+            st.gateway_openai_default_source = GATEWAY_OPENAI_DEFAULT_SOURCE_ADMIN
 
         await self._store.update(_write)
         self._invalidate_model_catalog_cache()

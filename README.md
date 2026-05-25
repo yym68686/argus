@@ -196,12 +196,12 @@ How changes take effect:
 | `ARGUS_OPENAI_API_KEY` | Optional | unset | Compatibility alias for `OPENAI_API_KEY`. The built-in `gateway` channel checks `OPENAI_API_KEY` first, then this alias. |
 | `ARGUS_OPENAI_RESPONSES_UPSTREAM_URL` | Optional | `https://api.openai.com/v1/responses` | Upstream Responses API URL used by the built-in `gateway` channel. Point this at any OpenAI-compatible `/v1/responses` endpoint if you want the shared gateway channel to target your own provider or company proxy. |
 | `ARGUS_OPENAI_TOKEN` | Optional | falls back to `ARGUS_TOKEN` | Master secret used by the gateway to derive per-session bearer tokens for `/openai/v1/responses`. On the gateway this is the master secret; inside each runtime container the gateway injects a **derived session token** with the same env name. This controls access to the proxy; the actual upstream is chosen from the selected channel. |
-| `ARGUS_GATEWAY_OPENAI_DEFAULT_ENABLED` | Optional | `true` | Whether the built-in `gateway` channel is enabled for users on first boot. Leave it `false` if users should add their own provider key first. The bundled Docker Compose file sets it to `false` so Docker deployments start with the shared channel off. |
+| `ARGUS_GATEWAY_OPENAI_DEFAULT_ENABLED` | Optional | `true` | Whether the built-in `gateway` channel is enabled for users by default. Leave it `false` if users should add their own provider key first. The bundled Docker Compose file sets it to `false`; on upgrade, an explicit env value also replaces older stored defaults that predate this setting. Admin UI/API changes are then stored as the explicit admin setting. |
 | `ARGUS_GATEWAY_INTERNAL_HOST` | Required in `fugue` mode; optional in `docker` mode | Docker mode auto-detects current gateway container name, then falls back to `gateway` | Hostname that spawned runtimes should use when calling back into the gateway (`/mcp`, `/nodes/ws`, `/openai/v1`). Runtime sessions keep this fixed gateway URL even when users switch channels. In Fugue mode this should be the cluster-internal address of the gateway service. |
 
 Channel behavior:
 
-- Built-in `gateway`: enabled by default; the bundled Docker Compose file turns it off on first boot so users can bring their own provider key first. When enabled it uses `OPENAI_API_KEY` + `ARGUS_OPENAI_RESPONSES_UPSTREAM_URL`.
+- Built-in `gateway`: enabled by default; the bundled Docker Compose file turns it off so users can bring their own provider key first. When enabled it uses `OPENAI_API_KEY` + `ARGUS_OPENAI_RESPONSES_UPSTREAM_URL`.
 - Built-in `0-0.pro`: fixed base URL `https://api.0-0.pro/v1`; each user supplies their own API key from the Telegram menu.
 - Custom channels: each user can add/delete/rename their own OpenAI-compatible `baseUrl` + API key entries.
 - The built-in `gateway` channel keeps a fixed model list: `gpt-5.2` / `gpt-5.4` / `gpt-5.5`.
@@ -476,13 +476,13 @@ Notes:
 - Users can add/delete/rename extra OpenAI-compatible channels from the Telegram **API Channels** menu.
 - The channel list, selected current channel, and user-supplied API keys are stored in the configured gateway state backend (PostgreSQL via `ARGUS_DATABASE_URL`, or the local sqlite fallback when unset).
 - Switching the current channel is **user-global**: it affects that user's existing and future agents/containers.
-- Sessions without an owning Telegram user still resolve through the built-in `gateway` channel when it is enabled and configured.
+- Sessions without an owning Telegram user resolve through the built-in `gateway` channel only when the gateway channel is enabled and configured.
 - The proxy requires a per-session derived bearer token (master: `ARGUS_OPENAI_TOKEN`, fallback: `ARGUS_TOKEN`).
 - The runtime writes a generated `CODEX_HOME/config.toml` (no provider secrets) to point Codex at the gateway MCP server and proxy.
   - Default `CODEX_HOME`: `/workspace/.codex` (workspace-scoped)
   - Default model: `gpt-5.5` (`gateway` is fixed to `gpt-5.2` / `gpt-5.4` / `gpt-5.5`; other OpenAI-compatible channels can expose their own model ids, and the selection is persisted per agent).
   - The generated provider block is labeled as `OpenAI` so Codex keeps the official compression behavior, while the actual traffic still goes through the Argus gateway proxy URL.
-- If you want the shared `gateway` channel enabled on first boot, set `ARGUS_GATEWAY_OPENAI_DEFAULT_ENABLED=true` and provide `OPENAI_API_KEY` on the gateway. Otherwise users must select a ready personal channel first.
+- If you want the shared `gateway` channel enabled, set `ARGUS_GATEWAY_OPENAI_DEFAULT_ENABLED=true` and provide `OPENAI_API_KEY` on the gateway. Otherwise users must select a ready personal channel first.
 
 To swap runtimes, set these before `docker compose up --build`.
 

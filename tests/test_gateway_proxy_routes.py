@@ -87,6 +87,22 @@ class GatewayProxyRouteTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertIn("gpt-5.5", catalog["availableModels"])
 
+    async def test_ownerless_openai_proxy_respects_disabled_gateway_default(self) -> None:
+        store = InMemoryStateStore()
+        store.state.gateway_openai_default_enabled = False
+        store.state.gateway_openai_default_source = "env"
+        manager = argus_app.AutomationManager(
+            state_store=store,
+            home_host_path="/tmp",
+            workspace_host_path="/tmp",
+        )
+        try:
+            with mock.patch.dict(argus_app.os.environ, {"OPENAI_API_KEY": "sk-test"}, clear=False):
+                with self.assertRaisesRegex(RuntimeError, "disabled by default"):
+                    manager.resolve_openai_proxy_target_for_session("sess_ownerless")
+        finally:
+            await manager.stop()
+
     async def test_agent_resolve_payload_can_skip_model_catalog(self) -> None:
         automation = mock.Mock()
         automation.resolve_owner_user_id_for_private_chat_key.return_value = 1

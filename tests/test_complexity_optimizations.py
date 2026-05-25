@@ -81,11 +81,52 @@ class GatewayOpenAIDefaultTests(unittest.TestCase):
         with mock.patch.dict(os.environ, {}, clear=True):
             state = argus_app.PersistedGatewayAutomationState()
         self.assertTrue(state.gateway_openai_default_enabled)
+        self.assertEqual(state.gateway_openai_default_source, "default")
 
     def test_env_can_disable_the_default(self) -> None:
         with mock.patch.dict(os.environ, {"ARGUS_GATEWAY_OPENAI_DEFAULT_ENABLED": "false"}, clear=True):
             state = argus_app.PersistedGatewayAutomationState()
         self.assertFalse(state.gateway_openai_default_enabled)
+        self.assertEqual(state.gateway_openai_default_source, "env")
+
+    def test_env_false_migrates_legacy_stored_gateway_default(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = argus_app._SQLiteAutomationStateStore(pathlib.Path(tmpdir) / "state.db", legacy_state_path=None)
+            with contextlib.closing(store._connect()) as conn:
+                store._initialize_schema(conn)
+                with conn:
+                    conn.executemany(
+                        "INSERT INTO automation_state_meta(key, value_text, updated_at_ms) VALUES (?, ?, ?)",
+                        [
+                            ("version", "13", 1),
+                            ("gateway_openai_default_enabled", "true", 1),
+                        ],
+                    )
+                with mock.patch.dict(os.environ, {"ARGUS_GATEWAY_OPENAI_DEFAULT_ENABLED": "false"}, clear=True):
+                    state = store._read_state(conn)
+
+        self.assertFalse(state.gateway_openai_default_enabled)
+        self.assertEqual(state.gateway_openai_default_source, "env")
+
+    def test_admin_gateway_default_survives_env_false(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = argus_app._SQLiteAutomationStateStore(pathlib.Path(tmpdir) / "state.db", legacy_state_path=None)
+            with contextlib.closing(store._connect()) as conn:
+                store._initialize_schema(conn)
+                with conn:
+                    conn.executemany(
+                        "INSERT INTO automation_state_meta(key, value_text, updated_at_ms) VALUES (?, ?, ?)",
+                        [
+                            ("version", "14", 1),
+                            ("gateway_openai_default_enabled", "true", 1),
+                            ("gateway_openai_default_source", "admin", 1),
+                        ],
+                    )
+                with mock.patch.dict(os.environ, {"ARGUS_GATEWAY_OPENAI_DEFAULT_ENABLED": "false"}, clear=True):
+                    state = store._read_state(conn)
+
+        self.assertTrue(state.gateway_openai_default_enabled)
+        self.assertEqual(state.gateway_openai_default_source, "admin")
 
 
 class UserDeletionComplexityTests(unittest.IsolatedAsyncioTestCase):

@@ -191,12 +191,12 @@ cp .env.example .env
 | `ARGUS_OPENAI_API_KEY` | 可选 | 未设置 | `OPENAI_API_KEY` 的兼容别名。内置 `gateway` 渠道会先读 `OPENAI_API_KEY`，再回退到这个名字。 |
 | `ARGUS_OPENAI_RESPONSES_UPSTREAM_URL` | 可选 | `https://api.openai.com/v1/responses` | 内置 `gateway` 渠道真正转发到的 Responses API 地址。若你想改成自己的 OpenAI-compatible 提供方、公司内网代理或自建网关，就改这里。 |
 | `ARGUS_OPENAI_TOKEN` | 可选 | 回退到 `ARGUS_TOKEN` | gateway 用来派生 `/openai/v1/responses` session 级 Bearer token 的 master secret。注意：在 gateway 进程里它表示 master secret；在 runtime 容器里同名变量表示**派生后的 session token**。它只控制代理访问权限，真正走哪个上游由当前渠道决定。 |
-| `ARGUS_GATEWAY_OPENAI_DEFAULT_ENABLED` | 可选 | `true` | 控制内置 `gateway` 渠道在首次启动时是否默认可用。设成 `false` 就会要求用户先填自己的第三方 API Key。仓库自带的 Docker Compose 会把它设成 `false`，让 Docker 部署默认关闭共享渠道。 |
+| `ARGUS_GATEWAY_OPENAI_DEFAULT_ENABLED` | 可选 | `true` | 控制内置 `gateway` 渠道是否默认可用。设成 `false` 就会要求用户先填自己的第三方 API Key。仓库自带的 Docker Compose 会把它设成 `false`；升级时，如果旧库里只有早期默认值且没有显式来源，也会按当前 env 覆盖。之后管理员在 UI/API 里手动修改会作为显式管理员设置保存。 |
 | `ARGUS_GATEWAY_INTERNAL_HOST` | `fugue` 模式下必需；`docker` 模式下可选 | `docker` 模式下自动探测当前 gateway 容器名，失败后回退到 `gateway` | runtime 回连 gateway（`/mcp`、`/nodes/ws`、`/openai/v1`）时使用的主机名。即使用户切换渠道，runtime 里仍保持这个固定的 gateway 地址。在 Fugue 模式下，这应该是 gateway service 的集群内地址。 |
 
 渠道行为：
 
-- 内置 `gateway`：gateway 代码默认启用；仓库自带的 Docker Compose 会在首次启动时把它关掉，方便用户先填写自己的 API Key。启用后使用 `OPENAI_API_KEY` + `ARGUS_OPENAI_RESPONSES_UPSTREAM_URL`。
+- 内置 `gateway`：gateway 代码默认启用；仓库自带的 Docker Compose 会把它关掉，方便用户先填写自己的 API Key。启用后使用 `OPENAI_API_KEY` + `ARGUS_OPENAI_RESPONSES_UPSTREAM_URL`。
 - 内置 `0-0.pro`：固定 Base URL 为 `https://api.0-0.pro/v1`；每个用户自己在 Telegram 菜单里填 API Key。
 - 自定义渠道：每个用户都可以增删改自己的 OpenAI-compatible `baseUrl` + API Key。
 - 渠道列表和用户 API Key 都保存在 gateway 状态库中。设置了 `ARGUS_DATABASE_URL` 时，主存储是 PostgreSQL；否则回退到 `${ARGUS_HOME_HOST_PATH}/gateway/state.db`。无论哪种后端，都请按带 secrets 的持久化存储保护。旧的 `${ARGUS_HOME_HOST_PATH}/gateway/state.json` / `state.db` 会在切到 PostgreSQL 后首次启动且目标表为空时自动导入。
@@ -440,13 +440,13 @@ Argus 会让 runtime 容器始终使用固定的 gateway 代理地址（`/openai
 - 用户可以在 Telegram 的 **API Channels** 菜单里增删改其他 OpenAI-compatible 渠道。
 - 渠道列表、当前选中的渠道、以及用户填写的 API Key 都存放在当前配置的 gateway 状态后端中（`ARGUS_DATABASE_URL` 指向的 PostgreSQL，或未设置时的本地 sqlite 回退）。
 - “当前渠道”是**用户级全局状态**：会影响该用户现有和未来的所有 agent / 容器。
-- 没有归属 Telegram 用户的通用 session，仍然会走内置 `gateway` 渠道，但前提是这个渠道已经启用并配置好 API Key。
+- 没有归属 Telegram 用户的通用 session，只有在内置 `gateway` 渠道已启用且配置好 API Key 时才会走共享 gateway。
 - 代理要求每个 session 的派生 Bearer token（master：`ARGUS_OPENAI_TOKEN`；未设置则回退到 `ARGUS_TOKEN`）。
 - runtime 会写入一个生成的 `CODEX_HOME/config.toml`（不包含 provider secrets），用于把 Codex 指向 gateway 的 MCP 和代理。
   - 默认 `CODEX_HOME`：`/workspace/.codex`（按 workspace 隔离）
   - 默认模型：`gpt-5.5`（Telegram agent 可在 `/menu` 中切换 `gpt-5.2` / `gpt-5.4` / `gpt-5.5`，并按 agent 持久化）
   - 生成的 provider block 会标记成 `OpenAI`，这样 Codex 可以继续使用官方压缩能力，但实际流量仍然走 Argus 的 gateway 代理地址。
-- 如果你希望共享的 `gateway` 渠道在首次启动时就可用，就把 `ARGUS_GATEWAY_OPENAI_DEFAULT_ENABLED=true`，同时在 gateway 上配置 `OPENAI_API_KEY`；否则用户需要先选中一个“已就绪”的个人渠道。
+- 如果你希望共享的 `gateway` 渠道可用，就把 `ARGUS_GATEWAY_OPENAI_DEFAULT_ENABLED=true`，同时在 gateway 上配置 `OPENAI_API_KEY`；否则用户需要先选中一个“已就绪”的个人渠道。
 
 要替换 runtime，在 `docker compose up --build` 之前设置这两个环境变量即可。
 
