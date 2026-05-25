@@ -885,9 +885,15 @@ class ArgusClient {
     return await this._httpJson("GET", `/admin/settings/telegram-bot-token${suffix}`);
   }
 
-  async automationUserBootstrap(chatKey) {
+  async automationUserBootstrap(chatKey, profile) {
     if (!isNonEmptyString(chatKey)) throw new Error("Missing chatKey");
-    return await this._httpJson("POST", "/automation/user/bootstrap", { chatKey });
+    return await this._httpJson("POST", "/automation/user/bootstrap", {
+      chatKey,
+      telegramUserId: Number.isFinite(Number(profile?.userId)) ? Math.trunc(Number(profile.userId)) : undefined,
+      username: isNonEmptyString(profile?.username) ? String(profile.username).trim() : undefined,
+      firstName: isNonEmptyString(profile?.firstName) ? String(profile.firstName).trim() : undefined,
+      lastName: isNonEmptyString(profile?.lastName) ? String(profile.lastName).trim() : undefined
+    });
   }
 
   async automationTelegramProfileUpsert(profile) {
@@ -1697,6 +1703,8 @@ function normalizeAvailableModels(models, currentModel) {
     btn_copy_node_reconnect: "Copy Reconnect",
     btn_copy_node_disconnect: "Copy Disconnect",
     btn_copy_argus_install: "Copy Install",
+    btn_copy_account_username: "Copy Login",
+    btn_copy_account_password: "Copy Password",
     btn_status: "Status",
     btn_help: "Help",
     btn_close: "Close",
@@ -1760,6 +1768,8 @@ function normalizeAvailableModels(models, currentModel) {
     label_version: "version",
     label_error: "error",
     label_node: "node",
+    label_username: "login",
+    label_password: "password",
 
     create_prompt_prefix: "Send the new agent name (a-z0-9_-), e.g.",
     create_missing: "Missing agent name.",
@@ -1881,6 +1891,8 @@ function normalizeAvailableModels(models, currentModel) {
     btn_copy_node_reconnect: "复制重连命令",
     btn_copy_node_disconnect: "复制断开命令",
     btn_copy_argus_install: "复制安装命令",
+    btn_copy_account_username: "复制登录名",
+    btn_copy_account_password: "复制密码",
     btn_status: "状态",
     btn_help: "帮助",
     btn_close: "关闭",
@@ -1944,6 +1956,8 @@ function normalizeAvailableModels(models, currentModel) {
     label_version: "版本",
     label_error: "错误",
     label_node: "节点",
+    label_username: "登录名",
+    label_password: "密码",
 
     create_prompt_prefix: "发送新 agent 名称（a-z0-9_-），例如",
     create_missing: "缺少 agent 名称。",
@@ -2680,8 +2694,9 @@ async function main() {
     const model = normalizeAgentModel(res?.model);
     const availableModels = normalizeAvailableModels(res?.availableModels, model);
     const userId = Number(res?.userId);
+    const account = res?.account && typeof res.account === "object" ? res.account : null;
     if (!sessionId) throw new Error("Missing sessionId");
-    return { agentId, sessionId, model, availableModels, userId: Number.isFinite(userId) && userId > 0 ? Math.trunc(userId) : null };
+    return { agentId, sessionId, model, availableModels, userId: Number.isFinite(userId) && userId > 0 ? Math.trunc(userId) : null, account };
   }
 
   async function resolveChannelStateForChatKey(chatKey) {
@@ -3221,6 +3236,22 @@ async function main() {
       const lines = [];
       lines.push(`<b>${escapeHtml(S.menu_title)}</b>`);
       if (isNonEmptyString(notice)) lines.push(`<i>${escapeHtml(notice)}</i>`);
+      const account = route.account && typeof route.account === "object" ? route.account : null;
+      const loginName = isNonEmptyString(account?.username)
+        ? String(account.username).trim()
+        : isNonEmptyString(account?.email)
+          ? String(account.email).trim()
+          : Number.isFinite(route?.userId)
+            ? String(Math.trunc(route.userId))
+            : chatKey;
+      if (isNonEmptyString(loginName)) {
+        lines.push(`${escapeHtml(S.label_username)}: ${htmlCode(loginName)}`);
+      }
+      const accountPassword = isNonEmptyString(account?.password) ? String(account.password).trim() : null;
+      if (accountPassword) {
+        lines.push(`${escapeHtml(S.label_password)}:
+<pre><code>${escapeHtml(accountPassword)}</code></pre>`);
+      }
       lines.push(`agent: ${htmlCode(route.agentId)}`);
       lines.push(`${escapeHtml(S.label_model)}: ${htmlCode(route.model)}`);
       if (currentChannel) lines.push(`${escapeHtml(S.label_channel)}: ${htmlCode(channelDisplayName(currentChannel))}`);
@@ -3245,16 +3276,22 @@ async function main() {
         agentButtons.push(cbButton(S.btn_delete_agent, { action: "p:delete_begin", chatKey }));
       }
 
+      const accountButtons = [
+        copyTextButton(S.btn_copy_account_username, loginName),
+        accountPassword ? copyTextButton(S.btn_copy_account_password, accountPassword) : null
+      ].filter(Boolean);
+      const secondaryButtons = [
+        ...accountButtons,
+        cbButton(S.btn_api_channels, { action: "p:channels", chatKey, page: 0 }),
+        cbButton(S.btn_switch_model, { action: "p:model", chatKey }),
+        cbButton(S.btn_new_main_thread, { action: "p:newmain", chatKey }),
+        cbButton(S.btn_node_token, { action: "p:node", chatKey }),
+        cbButton(statusButtonText(S), { action: "p:status", chatKey }),
+        cbButton(S.btn_help, { action: "help", chatKey })
+      ];
       const rows = buildTwoColumnMenuRows(
         agentButtons,
-        [
-          cbButton(S.btn_api_channels, { action: "p:channels", chatKey, page: 0 }),
-          cbButton(S.btn_switch_model, { action: "p:model", chatKey }),
-          cbButton(S.btn_new_main_thread, { action: "p:newmain", chatKey }),
-          cbButton(S.btn_node_token, { action: "p:node", chatKey }),
-          cbButton(statusButtonText(S), { action: "p:status", chatKey }),
-          cbButton(S.btn_help, { action: "help", chatKey })
-        ],
+        secondaryButtons,
         cbButton(S.btn_close, { action: "close", chatKey })
       );
       const replyMarkup = kb(rows);
@@ -4558,7 +4595,7 @@ async function main() {
             return;
           }
           try {
-            const boot = await argusHttp.automationUserBootstrap(chatKey);
+            const boot = await argusHttp.automationUserBootstrap(chatKey, telegramProfileFromUser(callbackQuery?.from));
             const currentSessionId = isNonEmptyString(boot?.currentSessionId) ? boot.currentSessionId : null;
             if (currentSessionId) await getClient(currentSessionId);
             const notice = Boolean(boot?.createdMain) ? S.notice_initialized_created : S.notice_initialized_exists;
@@ -4770,7 +4807,7 @@ async function main() {
           return;
         }
         try {
-          const boot = await argusHttp.automationUserBootstrap(actorPrivateChatKey);
+          const boot = await argusHttp.automationUserBootstrap(actorPrivateChatKey, telegramProfileFromUser(callbackQuery?.from));
           const currentSessionId = isNonEmptyString(boot?.currentSessionId) ? boot.currentSessionId : null;
           if (currentSessionId) await getClient(currentSessionId);
         } catch (e) {
@@ -5492,9 +5529,9 @@ async function main() {
               }
               let linkNotice = null;
               const startPayload = isNonEmptyString(slash.args) ? slash.args.trim() : "";
+              const profile = telegramProfileFromUser(message?.from);
               if (startPayload.startsWith("tgl_")) {
                 try {
-                  const profile = telegramProfileFromUser(message?.from);
                   await argusHttp.automationTelegramLinkClaim(startPayload, profile, chatKey);
                   linkNotice = S.notice_telegram_linked;
                   syncedTelegramProfileKeysByUserId.delete(profile?.userId);
@@ -5503,7 +5540,7 @@ async function main() {
                   linkNotice = formatTemplate(S.notice_telegram_link_failed, { error: formatGatewayErrorForUser(e, { locale }) });
                 }
               }
-              const boot = await argusHttp.automationUserBootstrap(chatKey);
+              const boot = await argusHttp.automationUserBootstrap(chatKey, profile);
               const currentSessionId = isNonEmptyString(boot?.currentSessionId) ? boot.currentSessionId : null;
               if (currentSessionId) await getClient(currentSessionId);
               await sendMenuMessage({

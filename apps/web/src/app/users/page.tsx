@@ -64,9 +64,11 @@ function formatTelegramIdentity(profile: AdminUserSummary["telegramProfile"] | n
   return parts.length ? parts.join(" · ") : null;
 }
 
-function userPrimaryLabel(user: Pick<AdminUserSummary, "userId" | "email" | "telegramProfile" | "privateChatKey">): string {
+function userPrimaryLabel(user: Pick<AdminUserSummary, "userId" | "email" | "username" | "telegramProfile" | "privateChatKey">): string {
   const email = user.email?.trim();
   if (email) return email;
+  const username = user.username?.trim();
+  if (username) return username;
   const telegramIdentity = formatTelegramIdentity(user.telegramProfile);
   if (telegramIdentity) return telegramIdentity;
   const privateChatKey = String(user.privateChatKey || "").trim();
@@ -74,18 +76,20 @@ function userPrimaryLabel(user: Pick<AdminUserSummary, "userId" | "email" | "tel
   return `ID ${user.userId}`;
 }
 
-function userSecondaryLabels(user: Pick<AdminUserSummary, "email" | "telegramProfile" | "privateChatKey">): string[] {
+function userSecondaryLabels(user: Pick<AdminUserSummary, "email" | "username" | "telegramProfile" | "privateChatKey">): string[] {
   const labels: string[] = [];
   const telegramIdentity = formatTelegramIdentity(user.telegramProfile);
   if (user.email && telegramIdentity) labels.push(telegramIdentity);
+  if (user.username && user.username !== user.email) labels.push(user.username);
   if (!user.email && telegramIdentity && user.privateChatKey) labels.push(`Private chat ${user.privateChatKey}`);
   return labels;
 }
 
-function userIdentitySubtitle(user: Pick<AdminUserSummary, "userId" | "email" | "telegramProfile" | "privateChatKey" | "currentChannel" | "currentChannelId">): string {
+function userIdentitySubtitle(user: Pick<AdminUserSummary, "userId" | "email" | "username" | "telegramProfile" | "privateChatKey" | "currentChannel" | "currentChannelId">): string {
   const primaryLabel = userPrimaryLabel(user);
   const parts: string[] = [];
   if (user.email && user.email !== primaryLabel) parts.push(user.email);
+  if (user.username && user.username !== primaryLabel) parts.push(user.username);
   const telegramIdentity = formatTelegramIdentity(user.telegramProfile);
   if (telegramIdentity && telegramIdentity !== primaryLabel) parts.push(telegramIdentity);
   const privateChatLabel = `Private chat ${user.privateChatKey}`;

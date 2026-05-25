@@ -71,6 +71,7 @@ export interface AdminTelegramProfile {
 export interface AdminUserSummary {
   userId: number;
   email?: string | null;
+  username?: string | null;
   telegramProfile?: AdminTelegramProfile | null;
   privateChatKey: string;
   agentCount: number;

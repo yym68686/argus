@@ -2699,6 +2699,7 @@ CHANNEL_ID_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,63}$")
 TELEGRAM_PRIVATE_CHAT_ID_RE = re.compile(r"^[1-9]\d{0,19}$")
 TELEGRAM_BOT_TOKEN_MAX_LEN = 512
 CONSOLE_EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+CONSOLE_USERNAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 CONSOLE_SESSION_ID_RE = re.compile(r"^[a-f0-9]{24}$")
 DEVELOPER_API_KEY_ID_RE = re.compile(r"^[a-f0-9]{16}$")
 TELEGRAM_LINK_TOKEN_ID_RE = re.compile(r"^[a-f0-9]{12}$")
@@ -2754,6 +2755,10 @@ def _normalize_bool_flag(raw: Any, *, default: bool = False) -> bool:
 
 def _env_bool(name: str, default: bool) -> bool:
     return _normalize_bool_flag(os.getenv(name), default=default)
+
+
+def _gateway_openai_default_enabled_env() -> bool:
+    return _env_bool("ARGUS_GATEWAY_OPENAI_DEFAULT_ENABLED", default=True)
 
 
 def _normalize_builtin_access_mode(raw: Any, *, allow_inherit: bool = False) -> Optional[str]:
@@ -2938,6 +2943,17 @@ def _normalize_console_email(raw: Any) -> str:
     return email
 
 
+def _normalize_console_username(raw: Any) -> str:
+    if not isinstance(raw, str):
+        return ""
+    username = raw.strip()
+    if not username or len(username) > 128:
+        return ""
+    if not CONSOLE_USERNAME_RE.match(username):
+        return ""
+    return username
+
+
 def _normalize_telegram_profile_text(raw: Any, *, max_len: int = 256) -> Optional[str]:
     if not isinstance(raw, str):
         return None
@@ -3040,6 +3056,10 @@ def _issue_console_session_token() -> tuple[str, str, int]:
     token = f"{CONSOLE_SESSION_TOKEN_PREFIX}.{session_id}.{secret}"
     expires_at_ms = _now_ms() + CONSOLE_SESSION_TTL_MS
     return session_id, token, expires_at_ms
+
+
+def _issue_console_bootstrap_password() -> str:
+    return _b64url_no_pad(secrets.token_bytes(18))
 
 
 def _hash_developer_api_key_token(token: Any) -> str:
@@ -4461,23 +4481,32 @@ class PersistedTelegramLinkToken:
 @dataclass
 class PersistedConsoleUser:
     user_id: int
-    email: str
+    email: Optional[str]
     password_hash: str
+    username: Optional[str] = None
     is_admin: bool = False
     created_at_ms: int = field(default_factory=_now_ms)
     updated_at_ms: int = field(default_factory=_now_ms)
     last_login_at_ms: Optional[int] = None
+    telegram_bootstrap_password: Optional[str] = None
     developer_api_keys: dict[str, PersistedDeveloperApiKey] = field(default_factory=dict)
 
     def to_json(self, *, redact_secrets: bool = False) -> dict[str, Any]:
+        bootstrap_password = _secret_storage_resolve(self.telegram_bootstrap_password)[0] if self.telegram_bootstrap_password else None
         return {
             "userId": int(self.user_id),
             "email": self.email,
+            "username": self.username,
             "passwordHash": None if redact_secrets else str(self.password_hash or "").strip(),
             "isAdmin": bool(self.is_admin),
             "createdAtMs": int(self.created_at_ms),
             "updatedAtMs": int(self.updated_at_ms),
             "lastLoginAtMs": int(self.last_login_at_ms) if isinstance(self.last_login_at_ms, int) and self.last_login_at_ms > 0 else None,
+            "telegramBootstrapPassword": (
+                _mask_secret(bootstrap_password)
+                if redact_secrets
+                else _secret_storage_prepare(self.telegram_bootstrap_password)
+            ),
             "developerApiKeys": {
                 key_id: api_key.to_json(redact_secrets=redact_secrets)
                 for key_id, api_key in (self.developer_api_keys or {}).items()
@@ -4489,10 +4518,12 @@ class PersistedConsoleUser:
         return {
             "userId": int(self.user_id),
             "email": self.email,
+            "username": self.username,
             "isAdmin": bool(self.is_admin),
             "createdAtMs": int(self.created_at_ms),
             "updatedAtMs": int(self.updated_at_ms),
             "lastLoginAtMs": int(self.last_login_at_ms) if isinstance(self.last_login_at_ms, int) and self.last_login_at_ms > 0 else None,
+            "hasTelegramBootstrapPassword": bool(self.telegram_bootstrap_password),
             "developerApiKeyCount": sum(
                 1 for api_key in (self.developer_api_keys or {}).values() if isinstance(api_key, PersistedDeveloperApiKey) and api_key.is_active()
             ),
@@ -4508,10 +4539,17 @@ class PersistedConsoleUser:
             return None
         if user_id <= 0:
             return None
-        email = _normalize_console_email(obj.get("email"))
+        email = _normalize_console_email(obj.get("email")) or None
+        username = _normalize_console_username(obj.get("username")) or None
         password_hash = str(obj.get("passwordHash") or "").strip()
-        if not email or not password_hash:
+        if not (email or username) or not password_hash:
             return None
+        telegram_bootstrap_password_raw = obj.get("telegramBootstrapPassword")
+        telegram_bootstrap_password = (
+            str(telegram_bootstrap_password_raw).strip()
+            if _secret_storage_is_sealed(telegram_bootstrap_password_raw)
+            else _normalize_console_password(telegram_bootstrap_password_raw)
+        ) or None
         try:
             created_at_ms = int(obj.get("createdAtMs")) if obj.get("createdAtMs") is not None else _now_ms()
         except Exception:
@@ -4537,10 +4575,12 @@ class PersistedConsoleUser:
             user_id=user_id,
             email=email,
             password_hash=password_hash,
+            username=username,
             is_admin=bool(obj.get("isAdmin")),
             created_at_ms=created_at_ms,
             updated_at_ms=updated_at_ms,
             last_login_at_ms=last_login_at_ms,
+            telegram_bootstrap_password=telegram_bootstrap_password,
             developer_api_keys=developer_api_keys,
         )
 
@@ -4622,7 +4662,7 @@ class PersistedGatewayAutomationState:
     agents: dict[str, PersistedAgentRuntime] = field(default_factory=dict)
     chat_bindings: dict[str, str] = field(default_factory=dict)
     user_channels: dict[str, PersistedUserChannelState] = field(default_factory=dict)
-    gateway_openai_default_enabled: bool = True
+    gateway_openai_default_enabled: bool = field(default_factory=_gateway_openai_default_enabled_env)
     telegram_bot_token: Optional[str] = None
     telegram_user_profiles: dict[str, PersistedTelegramUserProfile] = field(default_factory=dict)
     telegram_console_links: dict[str, PersistedTelegramConsoleLink] = field(default_factory=dict)
@@ -4746,7 +4786,10 @@ class PersistedGatewayAutomationState:
                 if user_id_int <= 0:
                     continue
                 user_channels[str(user_id_int)] = PersistedUserChannelState.from_json(raw_state)
-        gateway_openai_default_enabled = _normalize_bool_flag(obj.get("gatewayOpenaiDefaultEnabled"), default=True)
+        gateway_openai_default_enabled = _normalize_bool_flag(
+            obj.get("gatewayOpenaiDefaultEnabled"),
+            default=_gateway_openai_default_enabled_env(),
+        )
         raw_telegram_bot_token = obj.get("telegramBotToken")
         telegram_bot_token = (
             str(raw_telegram_bot_token).strip()
@@ -4986,7 +5029,12 @@ class _SQLiteAutomationStateStore:
                     """,
                     (
                         "gateway_openai_default_enabled",
-                        "true" if _normalize_bool_flag(getattr(state, "gateway_openai_default_enabled", True), default=True) else "false",
+                        "true"
+                        if _normalize_bool_flag(
+                            getattr(state, "gateway_openai_default_enabled", _gateway_openai_default_enabled_env()),
+                            default=_gateway_openai_default_enabled_env(),
+                        )
+                        else "false",
                         now_ms,
                     ),
                 )
@@ -5356,12 +5404,12 @@ class _SQLiteAutomationStateStore:
                 version = max(int(meta_version or AUTOMATION_STATE_VERSION), 1)
             except Exception:
                 version = AUTOMATION_STATE_VERSION
-        gateway_openai_default_enabled = True
+        gateway_openai_default_enabled = _gateway_openai_default_enabled_env()
         gateway_default_raw = meta_by_key.get("gateway_openai_default_enabled")
         if gateway_default_raw is not None:
             gateway_openai_default_enabled = _normalize_bool_flag(
                 gateway_default_raw,
-                default=True,
+                default=_gateway_openai_default_enabled_env(),
             )
         telegram_bot_token = None
         telegram_bot_token_raw = meta_by_key.get("telegram_bot_token")
@@ -6274,7 +6322,12 @@ class _PostgresAutomationStateStore:
                     """,
                     (
                         "gateway_openai_default_enabled",
-                        "true" if _normalize_bool_flag(getattr(state, "gateway_openai_default_enabled", True), default=True) else "false",
+                        "true"
+                        if _normalize_bool_flag(
+                            getattr(state, "gateway_openai_default_enabled", _gateway_openai_default_enabled_env()),
+                            default=_gateway_openai_default_enabled_env(),
+                        )
+                        else "false",
                         now_ms,
                     ),
                 )
@@ -6669,12 +6722,12 @@ class _PostgresAutomationStateStore:
                 version = max(int(meta_version or AUTOMATION_STATE_VERSION), 1)
             except Exception:
                 version = AUTOMATION_STATE_VERSION
-        gateway_openai_default_enabled = True
+        gateway_openai_default_enabled = _gateway_openai_default_enabled_env()
         gateway_default_raw = meta_by_key.get("gateway_openai_default_enabled")
         if gateway_default_raw is not None:
             gateway_openai_default_enabled = _normalize_bool_flag(
                 gateway_default_raw,
-                default=True,
+                default=_gateway_openai_default_enabled_env(),
             )
         telegram_bot_token = None
         telegram_bot_token_raw = meta_by_key.get("telegram_bot_token")
@@ -8404,9 +8457,42 @@ class AutomationManager:
                 return user
         return None
 
+    def get_console_user_by_username(self, username: str) -> Optional[PersistedConsoleUser]:
+        normalized_username = _normalize_console_username(username)
+        if not normalized_username:
+            return None
+        for user in (self._store.state.console_users or {}).values():
+            if not isinstance(user, PersistedConsoleUser):
+                continue
+            if user.username == normalized_username:
+                return user
+        return None
+
+    def _resolve_console_bootstrap_password(self, user: PersistedConsoleUser) -> Optional[str]:
+        if not isinstance(user, PersistedConsoleUser):
+            return None
+        raw = user.telegram_bootstrap_password
+        if not raw:
+            return None
+        password, _err = _secret_storage_resolve(raw)
+        return _normalize_console_password(password) or None
+
+    def console_account_login_payload(self, user: Optional[PersistedConsoleUser]) -> Optional[dict[str, Any]]:
+        if not isinstance(user, PersistedConsoleUser):
+            return None
+        password = self._resolve_console_bootstrap_password(user)
+        return {
+            "userId": int(user.user_id),
+            "email": user.email,
+            "username": user.username,
+            "password": password,
+            "passwordMasked": _mask_secret(password),
+            "hasPassword": bool(password),
+        }
+
     def list_console_users(self) -> list[dict[str, Any]]:
         out = [user.to_public_json() for user in (self._store.state.console_users or {}).values() if isinstance(user, PersistedConsoleUser)]
-        out.sort(key=lambda item: (str(item.get("email") or ""), int(item.get("userId") or 0)))
+        out.sort(key=lambda item: (str(item.get("email") or item.get("username") or ""), int(item.get("userId") or 0)))
         return out
 
     async def upsert_telegram_user_profile(
@@ -8610,6 +8696,114 @@ class AutomationManager:
             raise RuntimeError("Failed to claim Telegram link")
         return link_out, profile_out
 
+    async def ensure_telegram_console_user(
+        self,
+        *,
+        telegram_user_id: int,
+        chat_key: Optional[str] = None,
+        username: Optional[str] = None,
+        first_name: Optional[str] = None,
+        last_name: Optional[str] = None,
+    ) -> tuple[PersistedConsoleUser, PersistedTelegramConsoleLink, PersistedTelegramUserProfile, Optional[str], bool]:
+        if not isinstance(telegram_user_id, int) or telegram_user_id <= 0:
+            raise ValueError("Invalid Telegram userId")
+        chat_key_norm = str(chat_key or telegram_user_id).strip() or str(telegram_user_id)
+        private_id = _parse_telegram_private_user_id(chat_key_norm)
+        if private_id is not None and private_id != telegram_user_id:
+            raise ValueError("chatKey does not match Telegram user")
+
+        console_user_id = int(telegram_user_id)
+        login_username = str(telegram_user_id)
+        username_norm = _normalize_telegram_username(username)
+        first_name_norm = _normalize_telegram_profile_text(first_name)
+        last_name_norm = _normalize_telegram_profile_text(last_name)
+        now_ms = _now_ms()
+
+        user_out: Optional[PersistedConsoleUser] = None
+        link_out: Optional[PersistedTelegramConsoleLink] = None
+        profile_out: Optional[PersistedTelegramUserProfile] = None
+        password_out: Optional[str] = None
+        created_user = False
+
+        def _write(st: PersistedGatewayAutomationState) -> None:
+            nonlocal user_out, link_out, profile_out, password_out, created_user
+            st.version = max(int(getattr(st, "version", 1) or 1), AUTOMATION_STATE_VERSION)
+
+            existing_link = st.telegram_console_links.get(str(telegram_user_id)) if isinstance(st.telegram_console_links, dict) else None
+            if isinstance(existing_link, PersistedTelegramConsoleLink) and existing_link.console_user_id > 0:
+                linked_user = st.console_users.get(str(existing_link.console_user_id))
+                if isinstance(linked_user, PersistedConsoleUser):
+                    console_user_id_local = int(existing_link.console_user_id)
+                    existing_user = linked_user
+                else:
+                    console_user_id_local = console_user_id
+                    existing_user = st.console_users.get(str(console_user_id_local))
+            else:
+                console_user_id_local = console_user_id
+                existing_user = st.console_users.get(str(console_user_id_local))
+
+            if isinstance(existing_user, PersistedConsoleUser):
+                user = existing_user
+                stored_password = self._resolve_console_bootstrap_password(existing_user)
+                if not user.username:
+                    user = replace(user, username=login_username, updated_at_ms=now_ms)
+                    st.console_users[str(console_user_id_local)] = user
+                password_out = stored_password
+            else:
+                password_out = _issue_console_bootstrap_password()
+                user = PersistedConsoleUser(
+                    user_id=console_user_id_local,
+                    email=None,
+                    username=login_username,
+                    password_hash=_hash_console_password(password_out),
+                    is_admin=not any(isinstance(existing, PersistedConsoleUser) for existing in (st.console_users or {}).values()),
+                    created_at_ms=now_ms,
+                    updated_at_ms=now_ms,
+                    last_login_at_ms=None,
+                    telegram_bootstrap_password=_secret_storage_prepare(password_out),
+                )
+                st.console_users[str(console_user_id_local)] = user
+                created_user = True
+
+            existing_link2 = st.telegram_console_links.get(str(telegram_user_id))
+            link_created_at_ms = existing_link2.created_at_ms if isinstance(existing_link2, PersistedTelegramConsoleLink) else now_ms
+            link = PersistedTelegramConsoleLink(
+                telegram_user_id=telegram_user_id,
+                console_user_id=console_user_id_local,
+                chat_key=chat_key_norm,
+                created_at_ms=link_created_at_ms,
+                updated_at_ms=now_ms,
+            )
+            st.telegram_console_links[str(telegram_user_id)] = link
+
+            existing_profile = st.telegram_user_profiles.get(str(console_user_id_local))
+            profile_created_at_ms = existing_profile.created_at_ms if isinstance(existing_profile, PersistedTelegramUserProfile) else now_ms
+            profile = PersistedTelegramUserProfile(
+                user_id=telegram_user_id,
+                username=username_norm,
+                first_name=first_name_norm,
+                last_name=last_name_norm,
+                created_at_ms=profile_created_at_ms,
+                updated_at_ms=now_ms,
+            )
+            st.telegram_user_profiles[str(console_user_id_local)] = profile
+            stale_key = str(telegram_user_id)
+            if stale_key != str(console_user_id_local) and stale_key not in (st.console_users or {}):
+                st.telegram_user_profiles.pop(stale_key, None)
+
+            current_agent_id = st.chat_bindings.get(str(console_user_id_local)) if isinstance(st.chat_bindings, dict) else None
+            if isinstance(current_agent_id, str) and current_agent_id.strip():
+                st.chat_bindings[chat_key_norm] = current_agent_id.strip()
+
+            user_out = user
+            link_out = link
+            profile_out = profile
+
+        await self._store.update(_write)
+        if user_out is None or link_out is None or profile_out is None:
+            raise RuntimeError("Failed to bootstrap Telegram console user")
+        return user_out, link_out, profile_out, password_out, created_user
+
     def developer_limits_for_user(self, *, user_id: int) -> dict[str, Any]:
         return {
             "maxApiKeys": _developer_max_api_keys(),
@@ -8810,6 +9004,7 @@ class AutomationManager:
             created = PersistedConsoleUser(
                 user_id=user_id,
                 email=normalized_email,
+                username=None,
                 password_hash=_hash_console_password(normalized_password),
                 is_admin=not any(isinstance(user, PersistedConsoleUser) for user in (st.console_users or {}).values()),
                 created_at_ms=now_ms,
@@ -8823,12 +9018,45 @@ class AutomationManager:
             raise RuntimeError("Failed to create user")
         return created
 
-    def authenticate_console_user(self, *, email: str, password: str) -> PersistedConsoleUser:
+    async def set_console_user_email(self, *, user_id: int, email: str) -> PersistedConsoleUser:
+        if not isinstance(user_id, int) or user_id <= 0:
+            raise ValueError("Invalid userId")
         normalized_email = _normalize_console_email(email)
+        if not normalized_email:
+            raise ValueError("Invalid email")
+
+        updated: Optional[PersistedConsoleUser] = None
+        now_ms = _now_ms()
+
+        def _write(st: PersistedGatewayAutomationState) -> None:
+            nonlocal updated
+            st.version = max(int(getattr(st, "version", 1) or 1), AUTOMATION_STATE_VERSION)
+            current = st.console_users.get(str(user_id))
+            if not isinstance(current, PersistedConsoleUser):
+                raise ValueError("Unknown user")
+            for raw_id, existing in (st.console_users or {}).items():
+                if raw_id == str(user_id) or not isinstance(existing, PersistedConsoleUser):
+                    continue
+                if existing.email == normalized_email:
+                    raise ValueError("Email already registered")
+            updated = replace(current, email=normalized_email, updated_at_ms=now_ms)
+            st.console_users[str(user_id)] = updated
+
+        await self._store.update(_write)
+        if updated is None:
+            raise RuntimeError("Failed to update email")
+        return updated
+
+    def authenticate_console_user(self, *, email: str, password: str) -> PersistedConsoleUser:
+        identity = str(email or "").strip()
+        normalized_email = _normalize_console_email(identity)
+        normalized_username = _normalize_console_username(identity)
         normalized_password = _normalize_console_password(password)
-        if not normalized_email or not normalized_password:
+        if not (normalized_email or normalized_username) or not normalized_password:
             raise PermissionError("Invalid email or password")
-        user = self.get_console_user_by_email(normalized_email)
+        user = self.get_console_user_by_email(normalized_email) if normalized_email else None
+        if user is None and normalized_username:
+            user = self.get_console_user_by_username(normalized_username)
         if user is None or not _verify_console_password(user.password_hash, normalized_password):
             raise PermissionError("Invalid email or password")
         return user
@@ -9215,7 +9443,10 @@ class AutomationManager:
 
     def _gateway_openai_default_enabled(self) -> bool:
         st = self._store.state
-        return _normalize_bool_flag(getattr(st, "gateway_openai_default_enabled", True), default=True)
+        return _normalize_bool_flag(
+            getattr(st, "gateway_openai_default_enabled", _gateway_openai_default_enabled_env()),
+            default=_gateway_openai_default_enabled_env(),
+        )
 
     def _builtin_channel_access_override_for_user_state(
         self,
@@ -16957,7 +17188,7 @@ async def auth_login(request: Request):
     if not isinstance(body, dict):
         raise HTTPException(status_code=400, detail="Invalid JSON body")
 
-    email = str(body.get("email") or "")
+    email = str(body.get("identity") or body.get("username") or body.get("email") or "")
     password = body.get("password")
     try:
         user = automation.authenticate_console_user(email=email, password=password)
@@ -16978,6 +17209,27 @@ async def auth_logout(request: Request):
     token = _extract_token_http(request)
     await _get_automation_or_500().revoke_console_session(token=token)
     return {"ok": True}
+
+
+@app.put("/me/email")
+async def me_email_update(request: Request):
+    principal = _http_require_auth(request)
+    if principal.session is None or principal.user_id is None:
+        raise HTTPException(status_code=403, detail="Console session required")
+    automation = _get_automation_or_500()
+    try:
+        body = await request.json()
+    except Exception as e:
+        raise HTTPException(status_code=400, detail="Invalid JSON body") from e
+    if not isinstance(body, dict):
+        raise HTTPException(status_code=400, detail="Invalid JSON body")
+    try:
+        user = await automation.set_console_user_email(user_id=principal.user_id, email=str(body.get("email") or ""))
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    except RuntimeError as e:
+        raise HTTPException(status_code=500, detail=str(e)) from e
+    return {"ok": True, "user": user.to_public_json()}
 
 
 @app.get("/me/developer-keys")
@@ -22594,6 +22846,7 @@ async def _automation_agent_resolve_payload(
         "ok": True,
         "chatKey": chat_key,
         "userId": user_id,
+        "account": automation.console_account_login_payload(automation.get_console_user(user_id)),
         "agentId": agent_id,
         "sessionId": sess_id,
         "model": current_model,
@@ -23088,6 +23341,7 @@ def _admin_user_summary_payload(
     return {
         "userId": user_id,
         "email": console_user.email if isinstance(console_user, PersistedConsoleUser) else None,
+        "username": console_user.username if isinstance(console_user, PersistedConsoleUser) else None,
         "telegramProfile": telegram_profile.to_public_json() if isinstance(telegram_profile, PersistedTelegramUserProfile) else None,
         "privateChatKey": automation.primary_private_chat_key_for_user(user_id=user_id),
         "agentCount": len(agents),
@@ -23197,9 +23451,31 @@ async def automation_user_bootstrap(request: Request):
         raise HTTPException(status_code=400, detail="Missing 'chatKey'")
     chat_key = raw_chat_key.strip()
 
-    user_id = _automation_owner_user_id_for_chat_key_or_400(automation, chat_key)
-    if user_id is None:
+    telegram_user_id = _parse_telegram_private_user_id(chat_key)
+    if telegram_user_id is None:
         raise HTTPException(status_code=400, detail="Invalid 'chatKey' (expected a Telegram private chat id)")
+    raw_telegram_user_id = body.get("telegramUserId") or body.get("userId")
+    if raw_telegram_user_id is not None:
+        try:
+            provided_telegram_user_id = int(raw_telegram_user_id)
+        except Exception as e:
+            raise HTTPException(status_code=400, detail="Invalid 'telegramUserId'") from e
+        if provided_telegram_user_id != telegram_user_id:
+            raise HTTPException(status_code=400, detail="telegramUserId does not match chatKey")
+
+    try:
+        console_user, _link, _profile, bootstrap_password, created_console_user = await automation.ensure_telegram_console_user(
+            telegram_user_id=telegram_user_id,
+            chat_key=chat_key,
+            username=body.get("username"),
+            first_name=body.get("firstName"),
+            last_name=body.get("lastName"),
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    except RuntimeError as e:
+        raise HTTPException(status_code=500, detail=str(e)) from e
+    user_id = console_user.user_id
 
     agent, created_main = await automation.ensure_user_main_agent(user_id=user_id)
 
@@ -23221,6 +23497,12 @@ async def automation_user_bootstrap(request: Request):
         "ok": True,
         "userId": user_id,
         "chatKey": chat_key,
+        "createdConsoleUser": created_console_user,
+        "account": {
+            **(automation.console_account_login_payload(console_user) or {}),
+            "password": bootstrap_password or (automation.console_account_login_payload(console_user) or {}).get("password"),
+            "hasPassword": bool(bootstrap_password or (automation.console_account_login_payload(console_user) or {}).get("password")),
+        },
         "createdMain": created_main,
         "currentAgentId": current_agent_id,
         "currentSessionId": current_session_id,
@@ -23355,6 +23637,7 @@ async def automation_agent_list(request: Request):
     return {
         "ok": True,
         "userId": user_id,
+        "account": automation.console_account_login_payload(automation.get_console_user(user_id)),
         "agents": automation.list_agents_for_user(user_id=user_id),
         "currentAgentId": current_agent_id,
         "currentSessionId": current_session_id,

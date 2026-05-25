@@ -138,6 +138,11 @@ export interface SelfTelegramLinkIssueResponse extends SelfTelegramLinkStatusRes
   expiresAtMs?: number | null;
 }
 
+export interface SelfEmailUpdateResponse {
+  ok: true;
+  user: ConsoleUser;
+}
+
 export interface SelfUsageResponse {
   ok: true;
   user: ConsoleUser;
@@ -164,6 +169,13 @@ export function fetchMyTelegramLinkStatus(wsUrl: string): Promise<SelfTelegramLi
 export function createMyTelegramLink(wsUrl: string): Promise<SelfTelegramLinkIssueResponse> {
   return gatewayFetchJson<SelfTelegramLinkIssueResponse>(wsUrl, "/me/telegram-link", {
     method: "POST",
+  });
+}
+
+export function updateMyEmail(wsUrl: string, body: { email: string }): Promise<SelfEmailUpdateResponse> {
+  return gatewayFetchJson<SelfEmailUpdateResponse>(wsUrl, "/me/email", {
+    method: "PUT",
+    body: JSON.stringify(body),
   });
 }
 

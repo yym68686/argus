@@ -326,7 +326,7 @@ export default function AgentsPage() {
       {error ? <InlineError message={error} /> : null}
 
       <div className="grid gap-4">
-        <PanelCard title={user.email} className="argus-data-grid">
+        <PanelCard title={user.email || user.username || `User ${user.userId}`} className="argus-data-grid">
           <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-5">
             <Fact label="Current" value={agentsState?.currentAgent?.shortName || agentsState?.currentAgentId || "—"} />
             <Fact label="Session" value={agentsState?.currentSessionId || "—"} mono />

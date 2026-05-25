@@ -1,5 +1,6 @@
 import contextlib
 import importlib.util
+import os
 import pathlib
 import sys
 import tempfile
@@ -73,6 +74,18 @@ class SQLiteStateStoreComplexityTests(unittest.TestCase):
             self.assertEqual(state.version, 7)
             self.assertFalse(state.gateway_openai_default_enabled)
             self.assertEqual(state.telegram_bot_token, "123:abc")
+
+
+class GatewayOpenAIDefaultTests(unittest.TestCase):
+    def test_default_is_enabled_when_env_is_unset(self) -> None:
+        with mock.patch.dict(os.environ, {}, clear=True):
+            state = argus_app.PersistedGatewayAutomationState()
+        self.assertTrue(state.gateway_openai_default_enabled)
+
+    def test_env_can_disable_the_default(self) -> None:
+        with mock.patch.dict(os.environ, {"ARGUS_GATEWAY_OPENAI_DEFAULT_ENABLED": "false"}, clear=True):
+            state = argus_app.PersistedGatewayAutomationState()
+        self.assertFalse(state.gateway_openai_default_enabled)
 
 
 class UserDeletionComplexityTests(unittest.IsolatedAsyncioTestCase):

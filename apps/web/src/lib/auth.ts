@@ -4,11 +4,13 @@ import { httpBaseFromWsUrl, loadGatewayAuthToken, summarizeHttpFailure } from "@
 
 export interface ConsoleUser {
   userId: number;
-  email: string;
+  email?: string | null;
+  username?: string | null;
   isAdmin: boolean;
   createdAtMs: number;
   updatedAtMs: number;
   lastLoginAtMs?: number | null;
+  hasTelegramBootstrapPassword?: boolean;
   developerApiKeyCount?: number;
 }
 
@@ -92,7 +94,7 @@ export function fetchAuthMe(wsUrl: string, token?: string | null): Promise<AuthM
 
 export function loginWithPassword(
   wsUrl: string,
-  body: { email: string; password: string }
+  body: { identity: string; password: string }
 ): Promise<AuthSessionResponse> {
   return fetchJson<AuthSessionResponse>(
     wsUrl,

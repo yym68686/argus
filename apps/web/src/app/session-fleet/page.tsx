@@ -40,8 +40,10 @@ function ownerDisplayValue(session: AdminSessionRow, usersById: Map<number, Admi
   if (typeof ownerUserId !== "number" || !Number.isFinite(ownerUserId) || ownerUserId <= 0) {
     return "—";
   }
-  const email = usersById.get(ownerUserId)?.email?.trim();
-  return email || String(ownerUserId);
+  const user = usersById.get(ownerUserId);
+  const email = user?.email?.trim();
+  const username = user?.username?.trim();
+  return email || username || String(ownerUserId);
 }
 
 export default function SessionFleetPage() {

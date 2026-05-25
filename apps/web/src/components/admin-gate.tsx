@@ -27,6 +27,7 @@ interface AuthContextValue {
   hasUsers: boolean;
   allowRegistration: boolean;
   loading: boolean;
+  refresh: () => Promise<void>;
   logout: () => Promise<void>;
 }
 
@@ -140,11 +141,10 @@ export function AdminGate({ children }: AdminGateProps) {
         if (mode === "register" && !allowRegistration) {
           throw new Error("Registration is currently disabled");
         }
-        const body = mode === "register" ? { email: email.trim(), password, inviteCode: inviteCode.trim() } : { email: email.trim(), password };
         const result =
           mode === "register"
-            ? await registerWithPassword(wsUrl, body)
-            : await loginWithPassword(wsUrl, body);
+            ? await registerWithPassword(wsUrl, { email: email.trim(), password, inviteCode: inviteCode.trim() })
+            : await loginWithPassword(wsUrl, { identity: email.trim(), password });
         storeGatewayAuthToken(result.sessionToken);
         setUser(result.user);
         setHasUsers(true);
@@ -179,6 +179,10 @@ export function AdminGate({ children }: AdminGateProps) {
     }
   }, [allowRegistration, hasUsers, router, storedToken, wsUrl]);
 
+  const refresh = React.useCallback(async () => {
+    await refreshSession(storedToken);
+  }, [refreshSession, storedToken]);
+
   const contextValue = React.useMemo<AuthContextValue>(
     () => ({
       user,
@@ -186,9 +190,10 @@ export function AdminGate({ children }: AdminGateProps) {
       hasUsers,
       allowRegistration,
       loading: loading || !hydrated,
+      refresh,
       logout,
     }),
-    [allowRegistration, hasUsers, hydrated, loading, logout, storedToken, user]
+    [allowRegistration, hasUsers, hydrated, loading, logout, refresh, storedToken, user]
   );
 
   if (!hydrated || loading) {
@@ -259,15 +264,15 @@ export function AdminGate({ children }: AdminGateProps) {
               <form className="mt-6 space-y-4" onSubmit={handleSubmit}>
                 <div className="grid gap-1.5">
                   <label className="argus-surface-label" htmlFor="argus-email">
-                    Email
+                    {mode === "login" ? "Email or Telegram ID" : "Email"}
                   </label>
                   <Input
                     id="argus-email"
-                    type="email"
+                    type={mode === "login" ? "text" : "email"}
                     autoComplete={mode === "login" ? "username" : "email"}
                     value={email}
                     onChange={(event) => setEmail(event.target.value)}
-                    placeholder="name@company.com"
+                    placeholder={mode === "login" ? "name@company.com or 123456789" : "name@company.com"}
                     spellCheck={false}
                   />
                 </div>

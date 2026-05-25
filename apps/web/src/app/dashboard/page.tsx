@@ -1,7 +1,7 @@
 "use client";
 
 import * as React from "react";
-import { Bot, KeyRound, RefreshCw, Send, Server, WalletCards } from "lucide-react";
+import { AtSign, Bot, KeyRound, RefreshCw, Send, Server, WalletCards } from "lucide-react";
 import { toast } from "sonner";
 
 import { useAuth } from "@/components/admin-gate";
@@ -9,6 +9,7 @@ import { Badge, EmptyState, Fact, InlineError, PanelCard, Skeleton, StatCard } f
 import { ConsoleShell } from "@/components/console-shell";
 import { PanelReveal } from "@/components/transitions";
 import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
 import type { AdminAgentEntry, UsageEventEntry, UsageSummary } from "@/lib/admin";
 import { formatCompact, formatInt, formatRelative, formatUsd, formatWhen } from "@/lib/format";
 import { useGatewayWsUrlState } from "@/lib/gateway";
@@ -18,6 +19,7 @@ import {
   fetchMyTelegramLinkStatus,
   fetchMyUsage,
   createMyTelegramLink,
+  updateMyEmail,
   type SelfAgentsResponse,
   type SelfDeveloperKeysResponse,
   type SelfTelegramLinkIssueResponse,
@@ -94,12 +96,14 @@ function telegramLinkLabel(state: SelfTelegramLinkStatusResponse | null): string
 }
 
 export default function DashboardPage() {
-  const { user } = useAuth();
+  const { user, refresh: refreshAuth } = useAuth();
   const [wsUrl] = useGatewayWsUrlState();
   const [agentsState, setAgentsState] = React.useState<SelfAgentsResponse | null>(null);
   const [keysState, setKeysState] = React.useState<SelfDeveloperKeysResponse | null>(null);
   const [telegramLinkState, setTelegramLinkState] = React.useState<SelfTelegramLinkStatusResponse | null>(null);
   const [telegramLinkBusy, setTelegramLinkBusy] = React.useState(false);
+  const [emailDraft, setEmailDraft] = React.useState("");
+  const [emailBusy, setEmailBusy] = React.useState(false);
   const [usage24h, setUsage24h] = React.useState<SelfUsageResponse | null>(null);
   const [usageTotal, setUsageTotal] = React.useState<SelfUsageResponse | null>(null);
   const [loading, setLoading] = React.useState(false);
@@ -173,6 +177,10 @@ export default function DashboardPage() {
     void run();
   }, [refresh, wsUrl]);
 
+  React.useEffect(() => {
+    setEmailDraft(user?.email || "");
+  }, [user?.email]);
+
   const handleTelegramLink = React.useCallback(async () => {
     if (!wsUrl.trim()) return;
     setTelegramLinkBusy(true);
@@ -197,6 +205,28 @@ export default function DashboardPage() {
     }
   }, [wsUrl]);
 
+  const handleEmailBind = React.useCallback(
+    async (event: React.FormEvent<HTMLFormElement>) => {
+      event.preventDefault();
+      const nextEmail = emailDraft.trim();
+      if (!nextEmail) {
+        toast.error("Enter an email address");
+        return;
+      }
+      setEmailBusy(true);
+      try {
+        await updateMyEmail(wsUrl, { email: nextEmail });
+        await refreshAuth();
+        toast.success("Email bound");
+      } catch (nextError) {
+        toast.error((nextError as Error)?.message || String(nextError));
+      } finally {
+        setEmailBusy(false);
+      }
+    },
+    [emailDraft, refreshAuth, wsUrl]
+  );
+
   const agents = agentsState?.agents ?? [];
   const agentCount = agentsState?.counts.agents ?? agents.length;
   const sessionCount = agentsState?.counts.sessions ?? 0;
@@ -204,6 +234,7 @@ export default function DashboardPage() {
   const activeKeys = activeKeyCount(keysState);
   const readyAgents = agents.filter((agent) => agentProvisioningState(agent) === "ready").length;
   const currentAgent = agentsState?.currentAgent ?? agents.find((agent) => agent.agentId === agentsState?.currentAgentId) ?? null;
+  const accountLabel = user?.email || user?.username || `User ${user?.userId ?? "—"}`;
   const totalSummary = usageTotal?.summary;
   const recentSummary = usage24h?.summary;
   const recentEvents = usageTotal?.events?.length ? usageTotal.events : usage24h?.events ?? [];
@@ -251,7 +282,9 @@ export default function DashboardPage() {
           <section className="space-y-4">
             <PanelCard title="Account">
               <div className="grid gap-3 sm:grid-cols-2">
-                <Fact label="User" value={user?.email || `User ${user?.userId ?? "—"}`} />
+                <Fact label="User" value={accountLabel} />
+                <Fact label="Login" value={user?.username || String(user?.userId || "—")} mono />
+                <Fact label="Email" value={user?.email || "—"} />
                 <Fact label="Role" value={user?.isAdmin ? "Admin" : "User"} />
                 <Fact label="Telegram" value={telegramLinkLabel(telegramLinkState)} />
                 <Fact label="Current agent" value={currentAgent?.shortName || currentAgent?.agentId || "—"} mono />
@@ -259,6 +292,20 @@ export default function DashboardPage() {
                 <Fact label="Sessions" value={formatInt(sessionCount)} />
                 <Fact label="API keys" value={`${formatInt(activeKeys)} active / ${formatInt(keyCount)} total`} />
               </div>
+              {!user?.email ? (
+                <form className="mt-4 flex flex-col gap-2 sm:flex-row" onSubmit={handleEmailBind}>
+                  <Input
+                    type="email"
+                    value={emailDraft}
+                    onChange={(event) => setEmailDraft(event.target.value)}
+                    placeholder="Bind an email"
+                  />
+                  <Button type="submit" disabled={emailBusy}>
+                    <AtSign className="h-4 w-4" />
+                    {emailBusy ? "Saving…" : "Bind email"}
+                  </Button>
+                </form>
+              ) : null}
             </PanelCard>
 
             <PanelCard title="Capacity">

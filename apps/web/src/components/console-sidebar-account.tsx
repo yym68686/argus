@@ -9,12 +9,13 @@ export function ConsoleSidebarAccount() {
   const { user, logout } = useAuth();
 
   if (!user) return null;
+  const label = user.email || user.username || `User ${user.userId}`;
 
   return (
     <div className="border-t border-border/68 px-3 py-3">
       <div className="flex items-center justify-between gap-3 rounded-lg border border-border/65 bg-background/18 px-3 py-2.5">
         <div className="min-w-0">
-          <div className="truncate text-sm font-medium text-foreground">{user.email}</div>
+          <div className="truncate text-sm font-medium text-foreground">{label}</div>
           <div className="text-[11px] uppercase tracking-[0.12em] text-muted-foreground">
             {user.isAdmin ? "Admin" : "User"}
           </div>
