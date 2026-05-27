@@ -10,7 +10,10 @@ import {
   derivePublicNodeWsUrl,
   deriveTelegramWebhookSecret,
   isTelegramGetUpdatesWebhookConflict,
+  resolveTelegramBotTokenConfig,
   resolveTelegramWebhookConfig,
+  telegramTokenHash,
+  telegramTokenRefreshIntervalMs,
   telegramWebhookInfoLogFields
 } from "./index.mjs";
 
@@ -62,6 +65,55 @@ test("isTelegramGetUpdatesWebhookConflict only matches Telegram webhook conflict
     ),
     false
   );
+});
+
+test("resolveTelegramBotTokenConfig gives stored gateway token precedence over env token", () => {
+  const config = resolveTelegramBotTokenConfig({
+    envToken: "111:env-token",
+    settings: { source: "stored", token: "222:stored-token" }
+  });
+
+  assert.equal(config.token, "222:stored-token");
+  assert.equal(config.source, "gateway-stored");
+  assert.equal(config.tokenHash, telegramTokenHash("222:stored-token"));
+});
+
+test("resolveTelegramBotTokenConfig falls back to env unless gateway is authoritative", () => {
+  assert.deepEqual(resolveTelegramBotTokenConfig({ envToken: "111:env-token", settings: null }), {
+    token: "111:env-token",
+    source: "env",
+    tokenHash: telegramTokenHash("111:env-token")
+  });
+
+  assert.deepEqual(
+    resolveTelegramBotTokenConfig({
+      envToken: "111:env-token",
+      settings: { source: "env", token: "333:gateway-env-token" }
+    }),
+    {
+      token: "111:env-token",
+      source: "env",
+      tokenHash: telegramTokenHash("111:env-token")
+    }
+  );
+
+  assert.deepEqual(
+    resolveTelegramBotTokenConfig({
+      envToken: null,
+      settings: { source: "env", token: "333:gateway-env-token" }
+    }),
+    {
+      token: "333:gateway-env-token",
+      source: "gateway",
+      tokenHash: telegramTokenHash("333:gateway-env-token")
+    }
+  );
+});
+
+test("telegramTokenRefreshIntervalMs clamps unsafe refresh intervals", () => {
+  assert.equal(telegramTokenRefreshIntervalMs("500"), 15_000);
+  assert.equal(telegramTokenRefreshIntervalMs("2500"), 2500);
+  assert.equal(telegramTokenRefreshIntervalMs("bad"), 15_000);
 });
 
 test("telegramWebhookInfoLogFields redacts webhook URLs and preserves diagnostics", () => {

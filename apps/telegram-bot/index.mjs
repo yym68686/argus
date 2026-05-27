@@ -135,6 +135,32 @@ function deriveTelegramWebhookSecret(explicitSecret, telegramToken, appId) {
   return crypto.createHash("sha256").update(`${telegramToken}:${salt}`, "utf8").digest("base64url").slice(0, 48);
 }
 
+function telegramTokenHash(token) {
+  const normalized = stripOuterQuotes(token);
+  if (!isNonEmptyString(normalized)) return null;
+  return crypto.createHash("sha256").update(normalized, "utf8").digest("hex");
+}
+
+function resolveTelegramBotTokenConfig({ envToken, settings } = {}) {
+  const env = stripOuterQuotes(envToken);
+  let token = isNonEmptyString(env) ? env : null;
+  let source = token ? "env" : "unset";
+  if (settings && typeof settings === "object" && !Array.isArray(settings)) {
+    const configuredToken = stripOuterQuotes(settings.token);
+    if (isNonEmptyString(configuredToken) && (settings.source === "stored" || !token)) {
+      token = configuredToken;
+      source = settings.source === "stored" ? "gateway-stored" : "gateway";
+    }
+  }
+  return { token, source, tokenHash: telegramTokenHash(token) };
+}
+
+function telegramTokenRefreshIntervalMs(value) {
+  const n = Number(value);
+  if (Number.isFinite(n) && n >= 1000) return Math.trunc(n);
+  return 15_000;
+}
+
 function resolveTelegramWebhookConfig({ deliveryMode, explicitUrl, appUrl, explicitSecret, telegramToken, appId }) {
   const normalizedMode = normalizeTelegramDeliveryMode(deliveryMode);
   const webhookUrl = deriveTelegramWebhookUrl(explicitUrl, appUrl);
@@ -162,7 +188,7 @@ function resolveTelegramWebhookConfig({ deliveryMode, explicitUrl, appUrl, expli
   };
 }
 
-async function startTelegramWebhookServer({ port, path: pathName, secretToken, onUpdate }) {
+async function startTelegramWebhookServer({ port, path: pathName, secretToken, getSecretToken, onUpdate }) {
   const expectedPath = isNonEmptyString(pathName) ? pathName : TELEGRAM_WEBHOOK_PATH;
   return await new Promise((resolve, reject) => {
     const server = http.createServer((req, res) => {
@@ -189,10 +215,11 @@ async function startTelegramWebhookServer({ port, path: pathName, secretToken, o
         res.end("method not allowed");
         return;
       }
-      if (isNonEmptyString(secretToken)) {
+      const expectedSecret = typeof getSecretToken === "function" ? getSecretToken() : secretToken;
+      if (isNonEmptyString(expectedSecret)) {
         const header = req.headers["x-telegram-bot-api-secret-token"];
         const received = Array.isArray(header) ? header[0] : header;
-        if (received !== secretToken) {
+        if (received !== expectedSecret) {
           res.writeHead(403, { "content-type": "text/plain; charset=utf-8" });
           res.end("forbidden");
           return;
@@ -294,8 +321,9 @@ class StateStore {
   constructor(statePath) {
     this.path = statePath;
     this.state = {
-      version: 3,
+      version: 4,
       lastUpdateId: null,
+      telegramTokenHash: null,
       threadsBySession: {}
     };
     this._writeChain = Promise.resolve();
@@ -323,8 +351,9 @@ class StateStore {
       }
 
       this.state = {
-        version: 3,
+        version: 4,
         lastUpdateId: Number.isFinite(parsed.lastUpdateId) ? parsed.lastUpdateId : null,
+        telegramTokenHash: isNonEmptyString(parsed.telegramTokenHash) ? parsed.telegramTokenHash : null,
         threadsBySession
       };
     } catch (e) {
@@ -373,6 +402,14 @@ class StateStore {
 
   setLastUpdateId(updateId) {
     this.state.lastUpdateId = updateId;
+    return this.save();
+  }
+
+  setTelegramTokenHash(tokenHash) {
+    const normalized = isNonEmptyString(tokenHash) ? tokenHash : null;
+    if (this.state.telegramTokenHash === normalized) return Promise.resolve();
+    this.state.telegramTokenHash = normalized;
+    this.state.lastUpdateId = null;
     return this.save();
   }
 }
@@ -2343,20 +2380,19 @@ async function main() {
   const cwd = process.env.ARGUS_CWD || "/workspace";
   const argusHttp = new ArgusClient({ gatewayHttpUrl, gatewayWsUrl, token: argusToken, cwd });
 
-  let telegramToken = stripOuterQuotes(process.env.TELEGRAM_BOT_TOKEN);
-  let telegramTokenSource = isNonEmptyString(telegramToken) ? "env" : "unset";
+  const envTelegramToken = stripOuterQuotes(process.env.TELEGRAM_BOT_TOKEN);
+  let telegramTokenConfig = resolveTelegramBotTokenConfig({ envToken: envTelegramToken });
   try {
     const settings = await argusHttp.adminTelegramBotTokenSettings({ includeToken: true });
-    const configuredToken = stripOuterQuotes(settings?.token);
-    if (isNonEmptyString(configuredToken) && (settings?.source === "stored" || !isNonEmptyString(telegramToken))) {
-      telegramToken = configuredToken;
-      telegramTokenSource = settings?.source === "stored" ? "gateway-stored" : "gateway";
-    }
+    telegramTokenConfig = resolveTelegramBotTokenConfig({ envToken: envTelegramToken, settings });
   } catch (e) {
-    if (!isNonEmptyString(telegramToken)) {
+    if (!isNonEmptyString(telegramTokenConfig.token)) {
       log("Failed to load Telegram bot token from gateway:", e instanceof Error ? e.message : String(e));
     }
   }
+  let telegramToken = telegramTokenConfig.token;
+  let telegramTokenSource = telegramTokenConfig.source;
+  let activeTelegramTokenHash = telegramTokenConfig.tokenHash;
   if (!isNonEmptyString(telegramToken)) {
     // eslint-disable-next-line no-console
     console.error("Missing TELEGRAM_BOT_TOKEN");
@@ -2375,8 +2411,8 @@ async function main() {
 
   log("Argus Telegram bot starting:", `version=${BOT_VERSION}`);
   log("Telegram bot token source:", telegramTokenSource);
-  const tg = new TelegramApi(telegramToken);
-  const typing = new TypingController(tg);
+  let tg = new TelegramApi(telegramToken);
+  let typing = new TypingController(tg);
   let botUsername = await refreshTelegramBotIdentity(tg);
 
   const defaultCommands = [
@@ -2401,30 +2437,36 @@ async function main() {
     { command: "cancel", description: "停止当前任务" },
     { command: "help", description: "帮助" }
   ];
-  try {
+
+  async function installTelegramCommandMenu(targetTg) {
     try {
-      await tg.deleteMyCommands({ scope: { type: "default" } });
-      await tg.deleteMyCommands({ scope: { type: "all_private_chats" } });
-      await tg.deleteMyCommands({ scope: { type: "default" }, language_code: "zh" });
-      await tg.deleteMyCommands({ scope: { type: "all_private_chats" }, language_code: "zh" });
-    } catch {
-      // ignore; older bots may not support deleteMyCommands
-    }
-    await tg.setMyCommands(defaultCommands, { scope: { type: "default" } });
-    await tg.setMyCommands(privateCommands, { scope: { type: "all_private_chats" } });
-    try {
-      await tg.setMyCommands(defaultCommandsZh, { scope: { type: "default" }, language_code: "zh" });
-      await tg.setMyCommands(privateCommandsZh, { scope: { type: "all_private_chats" }, language_code: "zh" });
+      try {
+        await targetTg.deleteMyCommands({ scope: { type: "default" } });
+        await targetTg.deleteMyCommands({ scope: { type: "all_private_chats" } });
+        await targetTg.deleteMyCommands({ scope: { type: "default" }, language_code: "zh" });
+        await targetTg.deleteMyCommands({ scope: { type: "all_private_chats" }, language_code: "zh" });
+      } catch {
+        // ignore; older bots may not support deleteMyCommands
+      }
+      await targetTg.setMyCommands(defaultCommands, { scope: { type: "default" } });
+      await targetTg.setMyCommands(privateCommands, { scope: { type: "all_private_chats" } });
+      try {
+        await targetTg.setMyCommands(defaultCommandsZh, { scope: { type: "default" }, language_code: "zh" });
+        await targetTg.setMyCommands(privateCommandsZh, { scope: { type: "all_private_chats" }, language_code: "zh" });
+      } catch (e) {
+        log("setMyCommands zh failed (continuing):", e instanceof Error ? e.message : String(e));
+      }
+      log(
+        "Telegram command menu installed:",
+        `default=[${defaultCommands.map((c) => `/${c.command}`).join(", ")}] private=[${privateCommands.map((c) => `/${c.command}`).join(", ")}]`
+      );
     } catch (e) {
-      log("setMyCommands zh failed (continuing):", e instanceof Error ? e.message : String(e));
+      log("setMyCommands failed (continuing):", e instanceof Error ? e.message : String(e));
     }
-    log(
-      "Telegram command menu installed:",
-      `default=[${defaultCommands.map((c) => `/${c.command}`).join(", ")}] private=[${privateCommands.map((c) => `/${c.command}`).join(", ")}]`
-    );
-  } catch (e) {
-    log("setMyCommands failed (continuing):", e instanceof Error ? e.message : String(e));
   }
+
+  await installTelegramCommandMenu(tg);
+
   if (!botUsername) {
     const identityRetryTimer = setInterval(async () => {
       const username = await refreshTelegramBotIdentity(tg);
@@ -2438,17 +2480,20 @@ async function main() {
 
   const state = new StateStore(statePath);
   await state.load();
+  await state.setTelegramTokenHash(activeTelegramTokenHash);
   log("State path:", statePath);
-  const telegramDelivery = resolveTelegramWebhookConfig({
+  const makeTelegramDelivery = (token) => resolveTelegramWebhookConfig({
     deliveryMode: process.env.TELEGRAM_DELIVERY_MODE,
     explicitUrl: process.env.TELEGRAM_WEBHOOK_URL,
     appUrl: process.env.FUGUE_APP_URL,
     explicitSecret: process.env.TELEGRAM_WEBHOOK_SECRET,
-    telegramToken,
+    telegramToken: token,
     appId: process.env.FUGUE_APP_ID
   });
+  let telegramDelivery = makeTelegramDelivery(telegramToken);
   const webhookListenPort = Math.max(1, clampNumber(process.env.PORT, 8080));
   let webhookServer = null;
+  let webhookRetryTimer = null;
 
   // Keep one WS per gateway sessionId to avoid reconnect churn when routing between agents.
   const clients = new Map(); // sessionId -> ArgusClient
@@ -2664,6 +2709,168 @@ async function main() {
     return await new Promise((resolve) => {
       webhookWaiters.push(resolve);
     });
+  }
+
+  let offset = 0;
+  let tokenRefreshInFlight = false;
+  const pendingRetiredTelegramTokens = new Map();
+
+  function rememberRetiredTelegramToken(token, reason) {
+    const tokenHash = telegramTokenHash(token);
+    if (!isNonEmptyString(token) || !tokenHash || tokenHash === activeTelegramTokenHash) return;
+    pendingRetiredTelegramTokens.set(tokenHash, { token, reason });
+  }
+
+  async function clearRetiredTelegramWebhook(retiredToken, reason) {
+    const retiredHash = telegramTokenHash(retiredToken);
+    if (!isNonEmptyString(retiredToken) || !retiredHash || retiredHash === activeTelegramTokenHash) return false;
+    const retiredTg = new TelegramApi(retiredToken);
+    const before = await retiredTg.getWebhookInfo().catch(() => null);
+    try {
+      await retiredTg.deleteWebhook({ drop_pending_updates: false });
+      logEvent("INFO", "tg.webhook.retired_token_cleared", {
+        reason,
+        ...telegramWebhookInfoLogFields(before || {})
+      });
+      return true;
+    } catch (e) {
+      logEvent("WARNING", "tg.webhook.retired_token_clear_failed", {
+        reason,
+        error: e instanceof Error ? e.message : String(e),
+        ...telegramWebhookInfoLogFields(before || {})
+      });
+      return false;
+    }
+  }
+
+  async function clearPendingRetiredTelegramWebhooks(reason) {
+    const entries = [...pendingRetiredTelegramTokens.entries()];
+    for (const [tokenHash, item] of entries) {
+      if (!item || !isNonEmptyString(item.token) || tokenHash === activeTelegramTokenHash) {
+        pendingRetiredTelegramTokens.delete(tokenHash);
+        continue;
+      }
+      if (await clearRetiredTelegramWebhook(item.token, `${reason}:${item.reason}`)) {
+        pendingRetiredTelegramTokens.delete(tokenHash);
+      }
+    }
+  }
+
+  async function configureTelegramWebhook(reason, targetTg = tg, delivery = telegramDelivery) {
+    if (!delivery || delivery.mode !== "webhook") return false;
+    try {
+      await targetTg.setWebhook({
+        url: delivery.url,
+        secret_token: delivery.secretToken,
+        allowed_updates: ["message", "callback_query"],
+        drop_pending_updates: false
+      });
+      log("Telegram webhook enabled:", redactUrlSecrets(delivery.url));
+      const info = await targetTg.getWebhookInfo().catch(() => null);
+      if (isObjectRecord(info)) {
+        logEvent("INFO", "tg.webhook.enabled", {
+          reason,
+          url: redactUrlSecrets(info.url || delivery.url),
+          pending_update_count: Number.isFinite(info.pending_update_count) ? info.pending_update_count : undefined,
+          has_custom_certificate: info.has_custom_certificate === true
+        });
+      }
+      return true;
+    } catch (e) {
+      log(`setWebhook failed (${reason}; continuing):`, formatErrorMessage(e));
+      return false;
+    }
+  }
+
+  function scheduleTelegramWebhookRetry(reason) {
+    if (webhookRetryTimer) return;
+    webhookRetryTimer = setInterval(async () => {
+      if (await configureTelegramWebhook(`retry:${reason}`)) {
+        clearInterval(webhookRetryTimer);
+        webhookRetryTimer = null;
+        await clearPendingRetiredTelegramWebhooks(`retry:${reason}`);
+      }
+    }, 30_000);
+    webhookRetryTimer.unref?.();
+  }
+
+  async function switchTelegramBotToken(nextConfig, reason) {
+    const nextToken = stripOuterQuotes(nextConfig?.token);
+    const nextHash = nextConfig?.tokenHash || telegramTokenHash(nextToken);
+    if (!isNonEmptyString(nextToken) || !isNonEmptyString(nextHash)) {
+      logEvent("WARNING", "tg.token.refresh_missing", {
+        reason,
+        source: nextConfig?.source || "unset"
+      });
+      return false;
+    }
+    if (nextHash === activeTelegramTokenHash) {
+      telegramTokenSource = nextConfig?.source || telegramTokenSource;
+      return false;
+    }
+
+    const previousToken = telegramToken;
+    const previousSource = telegramTokenSource;
+    const previousBotUsername = botUsername;
+    const nextTg = new TelegramApi(nextToken);
+    const nextBotUsername = await refreshTelegramBotIdentity(nextTg);
+    await installTelegramCommandMenu(nextTg);
+    const nextDelivery = makeTelegramDelivery(nextToken);
+
+    typing.stopAll();
+    telegramToken = nextToken;
+    telegramTokenSource = nextConfig?.source || "gateway";
+    activeTelegramTokenHash = nextHash;
+    tg = nextTg;
+    typing = new TypingController(tg);
+    botUsername = nextBotUsername;
+    telegramDelivery = nextDelivery;
+    webhookPendingUpdates.splice(0, webhookPendingUpdates.length);
+    offset = 0;
+    await state.setTelegramTokenHash(activeTelegramTokenHash);
+
+    let deliveryReady = true;
+    if (telegramDelivery.mode === "webhook") {
+      deliveryReady = await configureTelegramWebhook(`token_change:${reason}`);
+      if (!deliveryReady) scheduleTelegramWebhookRetry(`token_change:${reason}`);
+    } else {
+      const sync = await clearTelegramWebhookForPolling({ tg, reason: `token_change:${reason}` });
+      deliveryReady = !sync.deleteError;
+    }
+    if (deliveryReady) {
+      await clearRetiredTelegramWebhook(previousToken, `token_change:${reason}`);
+      await clearPendingRetiredTelegramWebhooks(`token_change:${reason}`);
+    } else {
+      rememberRetiredTelegramToken(previousToken, `token_change:${reason}`);
+    }
+
+    logEvent("INFO", "tg.token.switched", {
+      reason,
+      previous_source: previousSource,
+      source: telegramTokenSource,
+      previous_bot_username: previousBotUsername || undefined,
+      bot_username: botUsername || undefined,
+      delivery_mode: telegramDelivery.mode,
+      delivery_ready: deliveryReady
+    });
+    return true;
+  }
+
+  async function refreshTelegramBotTokenFromGateway(reason) {
+    if (tokenRefreshInFlight) return;
+    tokenRefreshInFlight = true;
+    try {
+      const settings = await argusHttp.adminTelegramBotTokenSettings({ includeToken: true });
+      const nextConfig = resolveTelegramBotTokenConfig({ envToken: envTelegramToken, settings });
+      await switchTelegramBotToken(nextConfig, reason);
+    } catch (e) {
+      logEvent("WARNING", "tg.token.refresh_failed", {
+        reason,
+        error: e instanceof Error ? e.message : String(e)
+      });
+    } finally {
+      tokenRefreshInFlight = false;
+    }
   }
 
   function chatIdFromChatKey(chatKey) {
@@ -5294,45 +5501,20 @@ async function main() {
     await answerOnce(S.msg_unsupported_cb);
   }
 
-  let offset = 0;
   if (telegramDelivery.mode === "webhook") {
     webhookServer = await startTelegramWebhookServer({
       port: webhookListenPort,
       path: telegramDelivery.path,
       secretToken: telegramDelivery.secretToken,
+      getSecretToken: () => telegramDelivery.secretToken,
       onUpdate: enqueueWebhookUpdate
     });
-    const configureTelegramWebhook = async (reason) => {
-      try {
-        await tg.setWebhook({
-          url: telegramDelivery.url,
-          secret_token: telegramDelivery.secretToken,
-          allowed_updates: ["message", "callback_query"],
-          drop_pending_updates: false
-        });
-        log("Telegram webhook enabled:", redactUrlSecrets(telegramDelivery.url));
-        const info = await tg.getWebhookInfo().catch(() => null);
-        if (isObjectRecord(info)) {
-          logEvent("INFO", "tg.webhook.enabled", {
-            url: redactUrlSecrets(info.url || telegramDelivery.url),
-            pending_update_count: Number.isFinite(info.pending_update_count) ? info.pending_update_count : undefined,
-            has_custom_certificate: info.has_custom_certificate === true
-          });
-        }
-        return true;
-      } catch (e) {
-        log(`setWebhook failed (${reason}; continuing):`, formatErrorMessage(e));
-        return false;
-      }
-    };
     const webhookConfigured = await configureTelegramWebhook("startup");
     if (!webhookConfigured) {
-      const webhookRetryTimer = setInterval(async () => {
-        if (await configureTelegramWebhook("retry")) {
-          clearInterval(webhookRetryTimer);
-        }
-      }, 30_000);
-      webhookRetryTimer.unref?.();
+      rememberRetiredTelegramToken(envTelegramToken, "startup.env_overridden");
+      scheduleTelegramWebhookRetry("startup");
+    } else {
+      await clearRetiredTelegramWebhook(envTelegramToken, "startup.env_overridden");
     }
     log("Serving Telegram webhook…", `port=${webhookListenPort}`, `path=${telegramDelivery.path}`);
   } else {
@@ -5366,6 +5548,12 @@ async function main() {
 
     log("Polling Telegram updates…");
   }
+
+  const tokenRefreshTimer = setInterval(
+    () => void refreshTelegramBotTokenFromGateway("periodic"),
+    telegramTokenRefreshIntervalMs(process.env.TELEGRAM_BOT_TOKEN_REFRESH_INTERVAL_MS)
+  );
+  tokenRefreshTimer.unref?.();
 
   let nextPollingWebhookRecoveryAtMs = 0;
 
@@ -6111,7 +6299,10 @@ export {
   isTelegramGetUpdatesWebhookConflict,
   normalizeTelegramDeliveryMode,
   redactUrlSecrets,
+  resolveTelegramBotTokenConfig,
   resolveTelegramWebhookConfig,
+  telegramTokenHash,
+  telegramTokenRefreshIntervalMs,
   telegramWebhookInfoLogFields
 };
 
