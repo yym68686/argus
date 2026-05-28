@@ -1228,6 +1228,20 @@ def _is_expected_websocket_receive_runtime_error(exc: RuntimeError) -> bool:
     return "WebSocket is not connected" in str(exc or "")
 
 
+def _with_jsonrpc_version_for_upstream(msg: dict[str, Any]) -> dict[str, Any]:
+    if "jsonrpc" in msg:
+        return msg
+    if "method" not in msg and "id" not in msg:
+        return msg
+    out = dict(msg)
+    out["jsonrpc"] = "2.0"
+    return out
+
+
+def _jsonrpc_upstream_text(msg: dict[str, Any]) -> str:
+    return json.dumps(_with_jsonrpc_version_for_upstream(msg))
+
+
 # Backwards-compatible alias while the rest of the module migrates away from docker-specific naming.
 LiveDockerSession = LiveRuntimeSession
 
@@ -14881,7 +14895,7 @@ class AutomationManager:
         rid, fut = await live.reserve_internal_id()
         req["id"] = rid
         try:
-            await live.write_upstream(json.dumps(req))
+            await live.write_upstream(_jsonrpc_upstream_text(req))
             resp = await asyncio.wait_for(fut, timeout=30.0)
         except Exception:
             async with live.attach_lock:
@@ -14891,13 +14905,13 @@ class AutomationManager:
             live.initialized_result = resp["result"]
         # Complete handshake.
         if not live.handshake_done:
-            await live.write_upstream(json.dumps({"method": "initialized"}))
+            await live.write_upstream(_jsonrpc_upstream_text({"method": "initialized"}))
             live.handshake_done = True
 
     async def _rpc(self, live: LiveRuntimeSession, method: str, params: Any) -> Any:
         rid, fut = await live.reserve_internal_id()
         try:
-            await live.write_upstream(json.dumps({"method": method, "id": rid, "params": params}))
+            await live.write_upstream(_jsonrpc_upstream_text({"method": method, "id": rid, "params": params}))
             resp = await asyncio.wait_for(fut, timeout=120.0)
         except Exception:
             async with live.attach_lock:
@@ -26607,7 +26621,7 @@ async def ws_proxy(ws: WebSocket):
                 if isinstance(msg, dict) and msg.get("method") == "initialize":
                     req_id = msg.get("id")
                     if req_id is None:
-                        await live.write_upstream(text)
+                        await live.write_upstream(_jsonrpc_upstream_text(msg))
                         continue
                     cached_result: Optional[dict[str, Any]] = None
                     forward: Optional[str] = None
@@ -26623,7 +26637,7 @@ async def ws_proxy(ws: WebSocket):
                             live.pending_initialize_ids.add(str(upstream_id))
                             rewritten = dict(msg)
                             rewritten["id"] = upstream_id
-                            forward = json.dumps(rewritten)
+                            forward = _jsonrpc_upstream_text(rewritten)
                     if cached_result is not None:
                         try:
                             await ws.send_text(json.dumps({"id": req_id, "result": cached_result}))
@@ -26638,7 +26652,7 @@ async def ws_proxy(ws: WebSocket):
                 if isinstance(msg, dict) and msg.get("method") == "initialized":
                     if live.handshake_done:
                         continue
-                    await live.write_upstream(text)
+                    await live.write_upstream(_jsonrpc_upstream_text(msg))
                     live.handshake_done = True
                     continue
 
@@ -26646,7 +26660,7 @@ async def ws_proxy(ws: WebSocket):
                     rid = str(msg.get("id"))
                     if rid in live.pending_server_requests:
                         live.pending_server_requests.pop(rid, None)
-                    await live.write_upstream(text)
+                    await live.write_upstream(_jsonrpc_upstream_text(msg))
                     continue
 
                 if isinstance(msg, dict) and "id" in msg and "method" in msg:
@@ -26669,9 +26683,12 @@ async def ws_proxy(ws: WebSocket):
                                         log.exception("Automation client turn-start request handler failed")
                                 async with live.attach_lock:
                                     live.pending_client_turn_starts[str(upstream_id)] = tid_norm
-                    await live.write_upstream(json.dumps(rewritten))
+                    await live.write_upstream(_jsonrpc_upstream_text(rewritten))
                     continue
 
+                if isinstance(msg, dict):
+                    await live.write_upstream(_jsonrpc_upstream_text(msg))
+                    continue
                 await live.write_upstream(text)
         except UpstreamSessionClosedError:
             log.info("Session %s upstream closed while proxying websocket traffic", session_id)

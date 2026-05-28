@@ -183,7 +183,7 @@ curl -sS -X DELETE -H "Authorization: Bearer $ARGUS_TOKEN" "http://$HOST:8080/se
 
 1) `initialize`（request，有 `id`）
 ```json
-{"method":"initialize","id":0,"params":{"clientInfo":{"name":"my_client","title":"My Client","version":"0.0.1"}}}
+{"jsonrpc":"2.0","method":"initialize","id":0,"params":{"clientInfo":{"name":"my_client","title":"My Client","version":"0.0.1"}}}
 ```
 
 2) 等待响应（response，有同一个 `id`）
@@ -193,7 +193,7 @@ curl -sS -X DELETE -H "Authorization: Bearer $ARGUS_TOKEN" "http://$HOST:8080/se
 
 3) `initialized`（notification，无 `id`）
 ```json
-{"method":"initialized","params":{}}
+{"jsonrpc":"2.0","method":"initialized","params":{}}
 ```
 
 ### 4.3 Thread（对话会话）与 Turn（一次提问）
@@ -206,7 +206,7 @@ curl -sS -X DELETE -H "Authorization: Bearer $ARGUS_TOKEN" "http://$HOST:8080/se
 
 #### 新开 thread
 ```json
-{"method":"thread/start","id":1,"params":{"cwd":"/workspace","approvalPolicy":"never","sandbox":"workspace-write"}}
+{"jsonrpc":"2.0","method":"thread/start","id":1,"params":{"cwd":"/workspace","approvalPolicy":"never","sandbox":"workspace-write"}}
 ```
 
 响应示例（拿到 `thread.id`，务必保存）：
@@ -216,17 +216,17 @@ curl -sS -X DELETE -H "Authorization: Bearer $ARGUS_TOKEN" "http://$HOST:8080/se
 
 #### 恢复 thread（断线重连继续进度）
 ```json
-{"method":"thread/resume","id":2,"params":{"threadId":"thr_123"}}
+{"jsonrpc":"2.0","method":"thread/resume","id":2,"params":{"threadId":"thr_123"}}
 ```
 
 #### 读取 thread（不恢复也可，用于回填历史消息）
 ```json
-{"method":"thread/read","id":4,"params":{"threadId":"thr_123","includeTurns":true}}
+{"jsonrpc":"2.0","method":"thread/read","id":4,"params":{"threadId":"thr_123","includeTurns":true}}
 ```
 
 #### 发起一次对话 turn（发 prompt）
 ```json
-{"method":"turn/start","id":3,"params":{"threadId":"thr_123","input":[{"type":"text","text":"say test"}],"cwd":"/workspace","approvalPolicy":"never","sandboxPolicy":{"type":"externalSandbox","networkAccess":"enabled"}}}
+{"jsonrpc":"2.0","method":"turn/start","id":3,"params":{"threadId":"thr_123","input":[{"type":"text","text":"say test"}],"cwd":"/workspace","approvalPolicy":"never","sandboxPolicy":{"type":"externalSandbox","networkAccess":"enabled"}}}
 ```
 
 之后你会收到大量 `notification`（`method` 字段存在、没有 `id`），典型包括：
@@ -240,7 +240,7 @@ curl -sS -X DELETE -H "Authorization: Bearer $ARGUS_TOKEN" "http://$HOST:8080/se
 如果你的 UI/客户端希望支持“同一 thread 忙时不打断、而是排队为下一次 turn（follow-up）”，建议不要直接调用 `turn/start`，而是调用网关内置 helper：
 
 ```json
-{"method":"argus/input/enqueue","id":3,"params":{"threadId":"thr_123","text":"say test"}}
+{"jsonrpc":"2.0","method":"argus/input/enqueue","id":3,"params":{"threadId":"thr_123","text":"say test"}}
 ```
 
 响应示例（立即开始 turn）：
@@ -262,13 +262,13 @@ curl -sS -X DELETE -H "Authorization: Bearer $ARGUS_TOKEN" "http://$HOST:8080/se
 如果你的客户端需要“立刻打断当前用户正在执行的 turn”，可以调用网关 helper：
 
 ```json
-{"method":"argus/turn/cancel","id":4,"params":{"threadId":"thr_123"}}
+{"jsonrpc":"2.0","method":"argus/turn/cancel","id":4,"params":{"threadId":"thr_123"}}
 ```
 
 私聊 / main thread 也可以直接写：
 
 ```json
-{"method":"argus/turn/cancel","id":4,"params":{"target":"main"}}
+{"jsonrpc":"2.0","method":"argus/turn/cancel","id":4,"params":{"target":"main"}}
 ```
 
 响应示例（已接受取消请求）：
@@ -342,13 +342,13 @@ function send(obj) {
 
 function rpc(method, params) {
   const id = nextId++;
-  send({ method, id, params });
+  send({ jsonrpc: "2.0", method, id, params });
   return new Promise((resolve, reject) => pending.set(id, { resolve, reject }));
 }
 
 ws.on("open", async () => {
   await rpc("initialize", { clientInfo: { name: "node_client", title: "Node Client", version: "0.0.1" } });
-  send({ method: "initialized", params: {} });
+  send({ jsonrpc: "2.0", method: "initialized", params: {} });
 
   const t = await rpc("thread/start", { cwd: "/workspace", approvalPolicy: "never", sandbox: "workspace-write" });
   const threadId = t.thread.id;

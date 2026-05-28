@@ -78,6 +78,24 @@ class GatewayProxyRouteTests(unittest.IsolatedAsyncioTestCase):
             "https://upstream.invalid/v1/responses/compact",
         )
 
+    async def test_upstream_jsonrpc_normalizer_adds_protocol_version(self) -> None:
+        raw = {"method": "initialize", "id": 1, "params": {}}
+
+        encoded = argus_app._jsonrpc_upstream_text(raw)
+
+        self.assertEqual(
+            encoded,
+            '{"method": "initialize", "id": 1, "params": {}, "jsonrpc": "2.0"}',
+        )
+        self.assertNotIn("jsonrpc", raw)
+
+    async def test_upstream_jsonrpc_normalizer_preserves_existing_version(self) -> None:
+        raw = {"jsonrpc": "2.0", "method": "initialize", "id": 1}
+
+        normalized = argus_app._with_jsonrpc_version_for_upstream(raw)
+
+        self.assertIs(normalized, raw)
+
     async def test_gateway_default_model_is_available(self) -> None:
         self.assertEqual(argus_app.ARGUS_AGENT_MODEL_DEFAULT, "gpt-5.5")
         self.assertIn("gpt-5.5", argus_app.ARGUS_GATEWAY_AGENT_MODELS)

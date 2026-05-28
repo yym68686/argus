@@ -11,6 +11,7 @@ const DEFAULT_BOT_VERSION = "0.0.0";
 const TELEGRAM_WEBHOOK_PATH = "/telegram/webhook";
 const TELEGRAM_WEBHOOK_BODY_LIMIT_BYTES = 1024 * 1024;
 const ARGUS_CLI_INSTALL_SCRIPT_URL = "https://raw.githubusercontent.com/yym68686/argus/main/scripts/install-argus.sh";
+const ARGUS_INITIALIZE_TIMEOUT_MS = 30_000;
 
 function loadBotVersion() {
   const override = typeof process.env.ARGUS_VERSION === "string" ? process.env.ARGUS_VERSION.trim() : "";
@@ -1206,7 +1207,7 @@ class ArgusClient {
 
   rpc(method, params, { timeoutMs, onSent } = {}) {
     const id = this.nextId++;
-    const req = { method, id, ...(params !== undefined ? { params } : {}) };
+    const req = { jsonrpc: "2.0", method, id, ...(params !== undefined ? { params } : {}) };
     this._send(req);
     if (typeof onSent === "function") {
       try {
@@ -1237,8 +1238,8 @@ class ArgusClient {
 
   async initialize() {
     if (this.initialized) return;
-    await this.rpc("initialize", { clientInfo: { name: "argus_tg_bot", title: "Argus Telegram Bot", version: BOT_VERSION } });
-    this._send({ method: "initialized" });
+    await this.rpc("initialize", { clientInfo: { name: "argus_tg_bot", title: "Argus Telegram Bot", version: BOT_VERSION } }, { timeoutMs: ARGUS_INITIALIZE_TIMEOUT_MS });
+    this._send({ jsonrpc: "2.0", method: "initialized" });
     this.initialized = true;
   }
 
@@ -2679,6 +2680,13 @@ async function main() {
     }
     await client.connectToSession(sid);
     return client;
+  }
+
+  function warmClient(sessionId, reason = "warmup") {
+    if (!isNonEmptyString(sessionId)) return;
+    void getClient(sessionId).catch((e) => {
+      log("Session warm-up failed:", reason, e instanceof Error ? e.message : String(e));
+    });
   }
 
   async function ensureSessionMainThread(sessionId) {
@@ -4571,7 +4579,7 @@ async function main() {
         const used = await argusHttp.automationAgentUse(chatKey, agentId);
         const sid = used?.agent?.sessionId;
         if (isNonEmptyString(sid)) {
-          await getClient(sid);
+          warmClient(sid, "private agent switch");
         }
         const notice = formatTemplate(S.notice_switched, { agentId });
         const view = await renderPrivateMainMenu(chatKey, { notice, locale });
@@ -4804,7 +4812,7 @@ async function main() {
           try {
             const boot = await argusHttp.automationUserBootstrap(chatKey, telegramProfileFromUser(callbackQuery?.from));
             const currentSessionId = isNonEmptyString(boot?.currentSessionId) ? boot.currentSessionId : null;
-            if (currentSessionId) await getClient(currentSessionId);
+            warmClient(currentSessionId, "private bootstrap");
             const notice = Boolean(boot?.createdMain) ? S.notice_initialized_created : S.notice_initialized_exists;
             const view = await renderPrivateMainMenu(chatKey, { notice, locale });
             await editMenuMessage({ chatId, messageId, view });
@@ -5016,7 +5024,7 @@ async function main() {
         try {
           const boot = await argusHttp.automationUserBootstrap(actorPrivateChatKey, telegramProfileFromUser(callbackQuery?.from));
           const currentSessionId = isNonEmptyString(boot?.currentSessionId) ? boot.currentSessionId : null;
-          if (currentSessionId) await getClient(currentSessionId);
+          warmClient(currentSessionId, "group bootstrap");
         } catch (e) {
           const view = await renderGroupMainMenu(chatKey, { notice: formatGatewayErrorForUser(e, { locale }), locale, actorUserId });
           await editMenuMessage({ chatId, messageId, view });
@@ -5482,7 +5490,7 @@ async function main() {
         const bound = await argusHttp.automationChatBind(chatKey, agentId, actorUserId);
         const sid = bound?.sessionId;
         if (isNonEmptyString(sid)) {
-          await getClient(sid);
+          warmClient(sid, "group bind");
         }
         const notice = formatTemplate(S.notice_bound, { agentId });
         const view = await renderGroupMainMenu(chatKey, { notice, locale, actorUserId });
@@ -5730,7 +5738,7 @@ async function main() {
               }
               const boot = await argusHttp.automationUserBootstrap(chatKey, profile);
               const currentSessionId = isNonEmptyString(boot?.currentSessionId) ? boot.currentSessionId : null;
-              if (currentSessionId) await getClient(currentSessionId);
+              warmClient(currentSessionId, "start bootstrap");
               await sendMenuMessage({
                 target,
                 chatKey,
@@ -5963,7 +5971,7 @@ async function main() {
                 notice = formatTemplate(S.notice_bound, { agentId: createdAgentId });
               }
               const sid = created?.agent?.sessionId;
-              if (isNonEmptyString(sid)) await getClient(sid);
+              warmClient(sid, "agent create");
               clearPendingForActor();
               const view = await renderMainMenuForActor({ notice, locale });
               await editMenuMessage({ chatId: pending.panelChatId, messageId: pending.panelMessageId, view });
