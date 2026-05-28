@@ -318,14 +318,38 @@ async function pathExists(targetPath) {
   }
 }
 
+const DEFAULT_CHAT_SETTINGS = Object.freeze({
+  replyToMessages: true,
+  sendCommentary: true,
+  sendTyping: true
+});
+
+const CHAT_SETTING_KEYS = new Set(Object.keys(DEFAULT_CHAT_SETTINGS));
+
+function normalizeChatSettings(value) {
+  const raw = value && typeof value === "object" && !Array.isArray(value) ? value : {};
+  return {
+    replyToMessages: raw.replyToMessages !== false,
+    sendCommentary: raw.sendCommentary !== false,
+    sendTyping: raw.sendTyping !== false
+  };
+}
+
+function normalizeChatSettingKey(value) {
+  const key = isNonEmptyString(value) ? value.trim() : "";
+  if (!CHAT_SETTING_KEYS.has(key)) return null;
+  return key;
+}
+
 class StateStore {
   constructor(statePath) {
     this.path = statePath;
     this.state = {
-      version: 4,
+      version: 5,
       lastUpdateId: null,
       telegramTokenHash: null,
-      threadsBySession: {}
+      threadsBySession: {},
+      chatSettingsByChatKey: {}
     };
     this._writeChain = Promise.resolve();
   }
@@ -351,11 +375,22 @@ class StateStore {
         }
       }
 
+      const chatSettingsByChatKey = {};
+      const rawChatSettings =
+        parsed.chatSettingsByChatKey && typeof parsed.chatSettingsByChatKey === "object" && !Array.isArray(parsed.chatSettingsByChatKey)
+          ? parsed.chatSettingsByChatKey
+          : {};
+      for (const [rawChatKey, rawSettings] of Object.entries(rawChatSettings)) {
+        if (!isNonEmptyString(rawChatKey)) continue;
+        chatSettingsByChatKey[rawChatKey.trim()] = normalizeChatSettings(rawSettings);
+      }
+
       this.state = {
-        version: 4,
+        version: 5,
         lastUpdateId: Number.isFinite(parsed.lastUpdateId) ? parsed.lastUpdateId : null,
         telegramTokenHash: isNonEmptyString(parsed.telegramTokenHash) ? parsed.telegramTokenHash : null,
-        threadsBySession
+        threadsBySession,
+        chatSettingsByChatKey
       };
     } catch (e) {
       if (e && typeof e === "object" && "code" in e && e.code === "ENOENT") return;
@@ -399,6 +434,46 @@ class StateStore {
     const bucket = this._threadsForSession(sessionId);
     bucket[chatKey] = { threadId };
     return this.save();
+  }
+
+  _chatSettingsMap() {
+    if (
+      !this.state.chatSettingsByChatKey ||
+      typeof this.state.chatSettingsByChatKey !== "object" ||
+      Array.isArray(this.state.chatSettingsByChatKey)
+    ) {
+      this.state.chatSettingsByChatKey = {};
+    }
+    return this.state.chatSettingsByChatKey;
+  }
+
+  getChatSettings(chatKey) {
+    const key = isNonEmptyString(chatKey) ? chatKey.trim() : "";
+    if (!key) return normalizeChatSettings(null);
+    const map = this._chatSettingsMap();
+    const settings = normalizeChatSettings(map[key]);
+    map[key] = settings;
+    return { ...settings };
+  }
+
+  setChatSetting(chatKey, settingKey, enabled) {
+    const key = isNonEmptyString(chatKey) ? chatKey.trim() : "";
+    const normalizedSettingKey = normalizeChatSettingKey(settingKey);
+    if (!key || !normalizedSettingKey) return Promise.resolve(this.getChatSettings(key));
+    const map = this._chatSettingsMap();
+    const next = normalizeChatSettings(map[key]);
+    const boolValue = Boolean(enabled);
+    if (next[normalizedSettingKey] === boolValue) return Promise.resolve({ ...next });
+    next[normalizedSettingKey] = boolValue;
+    map[key] = next;
+    return this.save().then(() => ({ ...next }));
+  }
+
+  toggleChatSetting(chatKey, settingKey) {
+    const current = this.getChatSettings(chatKey);
+    const normalizedSettingKey = normalizeChatSettingKey(settingKey);
+    if (!normalizedSettingKey) return Promise.resolve(current);
+    return this.setChatSetting(chatKey, normalizedSettingKey, !current[normalizedSettingKey]);
   }
 
   setLastUpdateId(updateId) {
@@ -1747,6 +1822,7 @@ function normalizeAvailableModels(models, currentModel) {
     title_rename_agent: "Rename Agent",
     title_delete_agent: "Delete Agent",
     title_status: "Status",
+    title_settings: "Settings",
     title_node_token: "Node Management",
     title_help: "Help",
 
@@ -1769,6 +1845,7 @@ function normalizeAvailableModels(models, currentModel) {
     btn_copy_account_username: "Copy Login",
     btn_copy_account_password: "Copy Password",
     btn_status: "Status",
+    btn_settings: "Settings",
     btn_help: "Help",
     btn_close: "Close",
     btn_refresh: "Refresh",
@@ -1821,6 +1898,7 @@ function normalizeAvailableModels(models, currentModel) {
     notice_bound: "Bound: {agentId}",
     notice_node_paused: "Paused: {nodeId}",
     notice_node_resumed: "Resumed: {nodeId}",
+    notice_setting_updated: "Updated: {name} {value}",
     notice_attachments_staged: "Saved {stagedCount} attachment(s) to the workspace. Pending for your next message: {pendingCount}.",
     notice_attachments_staged_more: "... and {count} more.",
 
@@ -1833,6 +1911,13 @@ function normalizeAvailableModels(models, currentModel) {
     label_node: "node",
     label_username: "login",
     label_password: "password",
+
+    setting_reply_to_messages: "Reply to messages",
+    setting_send_commentary: "Send commentary",
+    setting_send_typing: "Typing indicator",
+    settings_hint: "These settings apply to this Telegram chat.",
+    value_on: "on",
+    value_off: "off",
 
     create_prompt_prefix: "Send the new agent name (a-z0-9_-), e.g.",
     create_missing: "Missing agent name.",
@@ -1935,6 +2020,7 @@ function normalizeAvailableModels(models, currentModel) {
     title_rename_agent: "重命名 Agent",
     title_delete_agent: "删除 Agent",
     title_status: "状态",
+    title_settings: "设置",
     title_node_token: "节点管理",
     title_help: "帮助",
 
@@ -1957,6 +2043,7 @@ function normalizeAvailableModels(models, currentModel) {
     btn_copy_account_username: "复制登录名",
     btn_copy_account_password: "复制密码",
     btn_status: "状态",
+    btn_settings: "设置",
     btn_help: "帮助",
     btn_close: "关闭",
     btn_refresh: "刷新",
@@ -2009,6 +2096,7 @@ function normalizeAvailableModels(models, currentModel) {
     notice_bound: "已绑定：{agentId}",
     notice_node_paused: "已暂停：{nodeId}",
     notice_node_resumed: "已恢复：{nodeId}",
+    notice_setting_updated: "已更新：{name} {value}",
     notice_attachments_staged: "已将 {stagedCount} 个附件保存到工作区；下条消息会自动带上当前待处理的 {pendingCount} 个附件。",
     notice_attachments_staged_more: "……其余 {count} 个未展开。",
 
@@ -2021,6 +2109,13 @@ function normalizeAvailableModels(models, currentModel) {
     label_node: "节点",
     label_username: "登录名",
     label_password: "密码",
+
+    setting_reply_to_messages: "回复用户消息",
+    setting_send_commentary: "发送中间结果",
+    setting_send_typing: "发送 typing 状态",
+    settings_hint: "这些设置只作用于当前 Telegram 会话。",
+    value_on: "开",
+    value_off: "关",
 
     create_prompt_prefix: "发送新 agent 名称（a-z0-9_-），例如",
     create_missing: "缺少 agent 名称。",
@@ -2646,6 +2741,8 @@ async function main() {
         rememberTurnTarget(sessionId, threadId, turnId, chatKey);
       }
       lastActiveBySessionThread.set(sessionThreadKey(sessionId, threadId), chatKey);
+      const chatSettings = state.getChatSettings(chatKey);
+      if (!chatSettings.sendTyping) return;
       const target = typingTargetFromChatKey(chatKey);
       if (!target) return;
       typing.start(chatKey, target);
@@ -2655,6 +2752,8 @@ async function main() {
       if (!isNonEmptyString(sessionId) || !isNonEmptyString(threadId) || !isNonEmptyString(text)) return;
       const chatKey = isNonEmptyString(sourceChatKey) ? sourceChatKey : resolveTurnChatKey(sessionId, threadId, turnId);
       if (!isNonEmptyString(chatKey)) return;
+      const chatSettings = state.getChatSettings(chatKey);
+      if (!chatSettings.sendCommentary) return;
 
       await queue.enqueue(async () => {
         const sendTarget = sendTargetFromChatKey(chatKey);
@@ -2663,7 +2762,7 @@ async function main() {
         }
 
         const typingTarget = typingTargetFromChatKey(chatKey);
-        if (typingTarget) {
+        if (typingTarget && chatSettings.sendTyping) {
           typing.start(chatKey, typingTarget);
         }
       });
@@ -3324,6 +3423,21 @@ async function main() {
     return `${S.btn_status} · ${botVersionText()}`;
   }
 
+  function chatSettingLabel(settingKey, S) {
+    if (settingKey === "replyToMessages") return S.setting_reply_to_messages;
+    if (settingKey === "sendCommentary") return S.setting_send_commentary;
+    if (settingKey === "sendTyping") return S.setting_send_typing;
+    return String(settingKey || "");
+  }
+
+  function chatSettingValueText(enabled, S) {
+    return enabled ? S.value_on : S.value_off;
+  }
+
+  function chatSettingButtonText(settingKey, enabled, S) {
+    return `${enabled ? "✅" : "☑️"} ${chatSettingLabel(settingKey, S)}: ${chatSettingValueText(enabled, S)}`;
+  }
+
   function normalizePage(pageRaw) {
     const n = Number(pageRaw);
     return Number.isFinite(n) && n >= 0 ? Math.floor(n) : 0;
@@ -3374,6 +3488,8 @@ async function main() {
     ["p:channel_key_begin", "g:channel_key_begin"],
     ["p:channel_key_cancel", "g:channel_key_cancel"],
     ["p:channel_key_clear", "g:channel_key_clear"],
+    ["p:settings", "g:settings"],
+    ["p:setting_toggle", "g:setting_toggle"],
     ["p:rename_cancel", "g:rename_cancel"],
     ["p:delete_cancel", "g:delete_cancel"],
     ["p:delete_confirm", "g:delete_confirm"],
@@ -3523,6 +3639,7 @@ async function main() {
       const secondaryButtons = [
         ...accountButtons,
         cbButton(S.btn_api_channels, { action: "p:channels", chatKey, page: 0 }),
+        cbButton(S.btn_settings, { action: "p:settings", chatKey }),
         cbButton(S.btn_switch_model, { action: "p:model", chatKey }),
         cbButton(S.btn_new_main_thread, { action: "p:newmain", chatKey }),
         cbButton(S.btn_node_token, { action: "p:node", chatKey }),
@@ -3547,7 +3664,10 @@ async function main() {
           cbButton(S.btn_create_agent, { action: "p:create_begin", chatKey }),
           cbButton(S.btn_api_channels, { action: "p:channels", chatKey, page: 0 })
         ],
-        [cbButton(S.btn_help, { action: "help", chatKey })],
+        [
+          cbButton(S.btn_settings, { action: "p:settings", chatKey }),
+          cbButton(S.btn_help, { action: "help", chatKey })
+        ],
         cbButton(S.btn_close, { action: "close", chatKey })
       ));
       return { text: lines.join("\n"), replyMarkup };
@@ -3957,6 +4077,62 @@ async function main() {
     return { text: lines.join("\n"), replyMarkup };
   }
 
+  async function renderChatSettingsMenu(chatKey, { forGroup = false, notice, error, locale } = {}) {
+    const S = uiStrings(locale);
+    const settings = state.getChatSettings(chatKey);
+    const actionPrefix = forGroup ? "g" : "p";
+    const backAction = forGroup ? "g:main" : "p:main";
+    const lines = [];
+    lines.push(`<b>${escapeHtml(S.title_settings)}</b>`);
+    if (isNonEmptyString(notice)) lines.push(`<i>${escapeHtml(notice)}</i>`);
+    lines.push(`chatKey: ${htmlCode(chatKey)}`);
+    lines.push(escapeHtml(S.settings_hint));
+    lines.push("");
+    for (const settingKey of CHAT_SETTING_KEYS) {
+      lines.push(`${escapeHtml(chatSettingLabel(settingKey, S))}: ${htmlCode(chatSettingValueText(settings[settingKey], S))}`);
+    }
+    if (isNonEmptyString(error)) {
+      lines.push("");
+      lines.push(`<b>${escapeHtml(S.label_error)}:</b> ${escapeHtml(error)}`);
+    }
+    const rows = [
+      [
+        cbButton(chatSettingButtonText("replyToMessages", settings.replyToMessages, S), {
+          action: `${actionPrefix}:setting_toggle`,
+          chatKey,
+          setting: "replyToMessages"
+        })
+      ],
+      [
+        cbButton(chatSettingButtonText("sendCommentary", settings.sendCommentary, S), {
+          action: `${actionPrefix}:setting_toggle`,
+          chatKey,
+          setting: "sendCommentary"
+        })
+      ],
+      [
+        cbButton(chatSettingButtonText("sendTyping", settings.sendTyping, S), {
+          action: `${actionPrefix}:setting_toggle`,
+          chatKey,
+          setting: "sendTyping"
+        })
+      ],
+      [
+        cbButton(S.btn_refresh, { action: `${actionPrefix}:settings`, chatKey }),
+        cbButton(S.btn_back, { action: backAction, chatKey })
+      ]
+    ];
+    return { text: lines.join("\n"), replyMarkup: kb(rows) };
+  }
+
+  async function renderPrivateSettingsMenu(chatKey, opts = {}) {
+    return await renderChatSettingsMenu(chatKey, { ...opts, forGroup: false });
+  }
+
+  async function renderGroupSettingsMenu(chatKey, opts = {}) {
+    return await renderChatSettingsMenu(chatKey, { ...opts, forGroup: true });
+  }
+
   async function renderPrivateNodeMenu(chatKey, { reveal = false, notice, error, locale } = {}) {
     const S = uiStrings(locale);
     const lines = [];
@@ -4121,7 +4297,7 @@ async function main() {
       lines.push(escapeHtml(S.group_bind_first));
       const replyMarkup = kb([
         [cbButton(S.btn_bind_this_chat, { action: "g:bind", chatKey, page: 0 })],
-        [cbButton(S.btn_help, { action: "help", chatKey })],
+        [cbButton(S.btn_settings, { action: "g:settings", chatKey }), cbButton(S.btn_help, { action: "help", chatKey })],
         [cbButton(S.btn_close, { action: "close", chatKey })]
       ]);
       return { text: lines.join("\n"), replyMarkup };
@@ -4147,6 +4323,7 @@ async function main() {
     const secondaryButtons = [];
     secondaryButtons.push(
       cbButton(S.btn_api_channels, { action: "g:channels", chatKey, page: 0 }),
+      cbButton(S.btn_settings, { action: "g:settings", chatKey }),
       cbButton(S.btn_switch_model, { action: "g:model", chatKey }),
       cbButton(S.btn_new_main_thread, { action: "g:newmain", chatKey }),
       cbButton(S.btn_node_token, { action: "g:node", chatKey }),
@@ -4629,6 +4806,36 @@ async function main() {
         return;
       }
 
+      if (action === "p:settings") {
+        await answerOnce();
+        clearPendingAgentInput(chatKey);
+        const view = await renderPrivateSettingsMenu(chatKey, { locale });
+        await editMenuMessage({ chatId, messageId, view });
+        return;
+      }
+
+      if (action === "p:setting_toggle") {
+        await answerOnce();
+        clearPendingAgentInput(chatKey);
+        const settingKey = normalizeChatSettingKey(payload.setting);
+        if (!settingKey) {
+          const view = await renderPrivateSettingsMenu(chatKey, { error: S.msg_unsupported_cb, locale });
+          await editMenuMessage({ chatId, messageId, view });
+          return;
+        }
+        const settings = await state.toggleChatSetting(chatKey, settingKey);
+        if ((settingKey === "sendTyping" || settingKey === "replyToMessages") && settings[settingKey] === false) {
+          typing.stop(chatKey);
+        }
+        const notice = formatTemplate(S.notice_setting_updated, {
+          name: chatSettingLabel(settingKey, S),
+          value: chatSettingValueText(settings[settingKey], S)
+        });
+        const view = await renderPrivateSettingsMenu(chatKey, { notice, locale });
+        await editMenuMessage({ chatId, messageId, view });
+        return;
+      }
+
       if (action === "p:channels") {
         await answerOnce();
         clearPendingAgentInput(chatKey);
@@ -5028,6 +5235,40 @@ async function main() {
       if (action === "g:status") {
         await answerOnce();
         const view = await renderGroupStatusMenu(chatKey, { locale });
+        await editMenuMessage({ chatId, messageId, view });
+        return;
+      }
+
+      if (action === "g:settings") {
+        await answerOnce();
+        const view = await renderGroupSettingsMenu(chatKey, { locale });
+        await editMenuMessage({ chatId, messageId, view });
+        return;
+      }
+
+      if (action === "g:setting_toggle") {
+        const ok = await isChatAdmin(chatId, fromId);
+        if (!ok) {
+          await answerOnce(S.msg_admins_only);
+          return;
+        }
+        await answerOnce();
+        clearPendingForActor();
+        const settingKey = normalizeChatSettingKey(payload.setting);
+        if (!settingKey) {
+          const view = await renderGroupSettingsMenu(chatKey, { error: S.msg_unsupported_cb, locale });
+          await editMenuMessage({ chatId, messageId, view });
+          return;
+        }
+        const settings = await state.toggleChatSetting(chatKey, settingKey);
+        if ((settingKey === "sendTyping" || settingKey === "replyToMessages") && settings[settingKey] === false) {
+          typing.stop(chatKey);
+        }
+        const notice = formatTemplate(S.notice_setting_updated, {
+          name: chatSettingLabel(settingKey, S),
+          value: chatSettingValueText(settings[settingKey], S)
+        });
+        const view = await renderGroupSettingsMenu(chatKey, { notice, locale });
         await editMenuMessage({ chatId, messageId, view });
         return;
       }
@@ -6173,6 +6414,17 @@ async function main() {
             return;
           }
 
+          const chatSettings = state.getChatSettings(chatKey);
+          if (!chatSettings.replyToMessages) {
+            logEvent("INFO", "tg.message.ignored_by_setting", {
+              chat_key_hash: chatKeyHash(chatKey),
+              chat_type: chatType,
+              has_text: Boolean(isNonEmptyString(text)),
+              attachment_count: messageAttachments.length + replyAttachments.length
+            });
+            return;
+          }
+
           if (!isNonEmptyString(text) && messageAttachments.length === 0 && replyAttachments.length === 0) {
             await safeSendMessage({ ...target, text: S.msg_unsupported_message });
             return;
@@ -6266,7 +6518,7 @@ async function main() {
             threadId = await ensureSessionMainThread(sessionId);
           }
 
-          if (hasUserText && !useSharedMainThread) {
+          if (hasUserText && !useSharedMainThread && chatSettings.sendTyping) {
             typing.start(chatKey, typingTarget);
           }
 
@@ -6330,6 +6582,8 @@ export {
   deriveTelegramWebhookUrl,
   derivePublicNodeWsUrl,
   isTelegramGetUpdatesWebhookConflict,
+  normalizeChatSettingKey,
+  normalizeChatSettings,
   normalizeTelegramDeliveryMode,
   redactUrlSecrets,
   resolveTelegramBotTokenConfig,

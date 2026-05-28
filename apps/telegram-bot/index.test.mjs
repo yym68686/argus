@@ -10,6 +10,8 @@ import {
   derivePublicNodeWsUrl,
   deriveTelegramWebhookSecret,
   isTelegramGetUpdatesWebhookConflict,
+  normalizeChatSettingKey,
+  normalizeChatSettings,
   resolveTelegramBotTokenConfig,
   resolveTelegramWebhookConfig,
   telegramSourceFromMessage,
@@ -17,6 +19,21 @@ import {
   telegramTokenRefreshIntervalMs,
   telegramWebhookInfoLogFields
 } from "./index.mjs";
+
+test("normalizeChatSettings defaults Telegram chat settings on", () => {
+  assert.deepEqual(normalizeChatSettings(null), {
+    replyToMessages: true,
+    sendCommentary: true,
+    sendTyping: true
+  });
+  assert.deepEqual(normalizeChatSettings({ replyToMessages: false, sendCommentary: false }), {
+    replyToMessages: false,
+    sendCommentary: false,
+    sendTyping: true
+  });
+  assert.equal(normalizeChatSettingKey("sendCommentary"), "sendCommentary");
+  assert.equal(normalizeChatSettingKey("bad"), null);
+});
 
 test("resolveTelegramWebhookConfig falls back to polling when no webhook URL is available", () => {
   const config = resolveTelegramWebhookConfig({
