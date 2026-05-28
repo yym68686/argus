@@ -634,6 +634,80 @@ class FugueApiHelperTests(unittest.TestCase):
         err = argus_app.FugueRuntimeImageMissingError("configured runtime image digest is missing")
         self.assertEqual(argus_app._runtime_provision_ws_close_reason(err), "Runtime image digest missing")
 
+    def test_fugue_workspace_tree_recursive_uses_depth_one_calls(self) -> None:
+        cfg = argus_app.FugueProvisionConfig(
+            base_url="https://fugue.invalid",
+            token="token",
+            project_id="project_123",
+            runtime_id="runtime_123",
+            gateway_internal_host="gateway.internal",
+            runtime_cmd="codex serve",
+            connect_timeout_s=1.0,
+        )
+        calls: list[tuple[str, int]] = []
+        tree_entries = {
+            "skills": [
+                {"kind": "directory", "path": "/workspace/skills/code-review"},
+                {"kind": "file", "path": "/workspace/skills/README.md"},
+            ],
+            "skills/code-review": [
+                {"kind": "file", "path": "/workspace/skills/code-review/SKILL.md"},
+                {"kind": "directory", "path": "/workspace/skills/code-review/references"},
+            ],
+            "skills/code-review/references": [
+                {"kind": "file", "path": "/workspace/skills/code-review/references/checklist.md"},
+            ],
+        }
+
+        def fake_list_workspace_tree_sync(patched_cfg, session_id, relative_path, *, depth):
+            self.assertIs(patched_cfg, cfg)
+            self.assertEqual(session_id, "3416ab8781ab")
+            calls.append((relative_path, depth))
+            return tree_entries.get(relative_path, [])
+
+        with mock.patch.object(argus_app, "_fugue_list_workspace_tree_sync", side_effect=fake_list_workspace_tree_sync):
+            entries = argus_app._fugue_list_workspace_tree_recursive_sync(
+                cfg,
+                "3416ab8781ab",
+                "skills",
+                max_depth=3,
+            )
+
+        self.assertEqual(calls, [("skills", 1), ("skills/code-review", 1), ("skills/code-review/references", 1)])
+        self.assertEqual([entry["path"] for entry in entries], [
+            "/workspace/skills/code-review",
+            "/workspace/skills/README.md",
+            "/workspace/skills/code-review/SKILL.md",
+            "/workspace/skills/code-review/references",
+            "/workspace/skills/code-review/references/checklist.md",
+        ])
+
+    def test_fugue_workspace_tree_recursive_rejects_absolute_paths_outside_workspace(self) -> None:
+        cfg = argus_app.FugueProvisionConfig(
+            base_url="https://fugue.invalid",
+            token="token",
+            project_id="project_123",
+            runtime_id="runtime_123",
+            gateway_internal_host="gateway.internal",
+            runtime_cmd="codex serve",
+            connect_timeout_s=1.0,
+        )
+
+        with mock.patch.object(
+            argus_app,
+            "_fugue_list_workspace_tree_sync",
+            return_value=[{"kind": "directory", "path": "/tmp/not-workspace"}],
+        ) as list_tree:
+            entries = argus_app._fugue_list_workspace_tree_recursive_sync(
+                cfg,
+                "3416ab8781ab",
+                "skills",
+                max_depth=3,
+            )
+
+        self.assertEqual(entries, [{"kind": "directory", "path": "/tmp/not-workspace"}])
+        list_tree.assert_called_once_with(cfg, "3416ab8781ab", "skills", depth=1)
+
 
 class RuntimeSessionProvisioningTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self) -> None:

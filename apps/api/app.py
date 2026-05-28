@@ -17090,7 +17090,7 @@ async def _sync_session_prompt_context_to_local(session_id: str, root: Path, *, 
 
     try:
         cfg = _fugue_cfg()
-        entries = await asyncio.to_thread(_fugue_list_workspace_tree_sync, cfg, session_id, SKILLS_DIRNAME, depth=3)
+        entries = await asyncio.to_thread(_fugue_list_workspace_tree_recursive_sync, cfg, session_id, SKILLS_DIRNAME, max_depth=3)
     except Exception:
         log.exception("Failed to sync skills tree for session %s", session_id)
         return
@@ -22252,6 +22252,56 @@ def _fugue_list_workspace_tree_sync(cfg: FugueProvisionConfig, session_id: str, 
         raise
     entries = payload.get("entries") if isinstance(payload, dict) else None
     return [entry for entry in entries if isinstance(entry, dict)] if isinstance(entries, list) else []
+
+
+def _fugue_tree_entry_relative_workspace_path(cfg: FugueProvisionConfig, entry: dict[str, Any]) -> Optional[str]:
+    path_val = entry.get("path")
+    if not isinstance(path_val, str):
+        return None
+    if path_val.strip().startswith("/"):
+        return _fugue_relative_workspace_path(cfg, path_val)
+    return _normalize_workspace_relative_path(path_val)
+
+
+def _fugue_tree_entry_is_directory(entry: dict[str, Any]) -> bool:
+    kind = str(entry.get("kind") or entry.get("type") or "").strip().lower()
+    return kind in {"directory", "dir", "folder"}
+
+
+def _fugue_list_workspace_tree_recursive_sync(
+    cfg: FugueProvisionConfig,
+    session_id: str,
+    relative_path: str,
+    *,
+    max_depth: int,
+) -> list[dict[str, Any]]:
+    root = _normalize_workspace_relative_path(relative_path)
+    if not root:
+        return []
+
+    limit = max(1, int(max_depth))
+    pending: list[tuple[str, int]] = [(root, 1)]
+    visited_dirs: set[str] = set()
+    out: list[dict[str, Any]] = []
+
+    while pending:
+        current, level = pending.pop(0)
+        if current in visited_dirs:
+            continue
+        visited_dirs.add(current)
+        entries = _fugue_list_workspace_tree_sync(cfg, session_id, current, depth=1)
+        out.extend(entries)
+        if level >= limit:
+            continue
+        for entry in entries:
+            if not _fugue_tree_entry_is_directory(entry):
+                continue
+            rel = _fugue_tree_entry_relative_workspace_path(cfg, entry)
+            if not rel or rel in visited_dirs:
+                continue
+            pending.append((rel, level + 1))
+
+    return out
 
 
 async def _ensure_live_fugue_session(session_id: str, *, allow_create: bool) -> tuple[LiveRuntimeSession, bool]:

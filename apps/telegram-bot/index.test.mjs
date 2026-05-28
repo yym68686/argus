@@ -10,6 +10,7 @@ import {
   derivePublicNodeWsUrl,
   deriveTelegramWebhookSecret,
   isTelegramGetUpdatesWebhookConflict,
+  isTelegramMessageDirectedAtBot,
   normalizeChatSettingKey,
   normalizeChatSettings,
   resolveTelegramBotTokenConfig,
@@ -177,6 +178,51 @@ test("telegramSourceFromMessage includes Telegram sender identity", () => {
     firstName: "Alice",
     lastName: "Ng"
   });
+});
+
+test("isTelegramMessageDirectedAtBot detects explicit group mentions", () => {
+  assert.equal(
+    isTelegramMessageDirectedAtBot(
+      {
+        chat: { id: -4633273294, type: "supergroup" },
+        text: "hey @arguschat_bot please check this",
+        entities: [{ type: "mention", offset: 4, length: 14 }]
+      },
+      "arguschat_bot"
+    ),
+    true
+  );
+  assert.equal(
+    isTelegramMessageDirectedAtBot(
+      {
+        chat: { id: -4633273294, type: "supergroup" },
+        text: "this is for everyone else"
+      },
+      "arguschat_bot"
+    ),
+    false
+  );
+});
+
+test("isTelegramMessageDirectedAtBot detects replies to the bot", () => {
+  assert.equal(
+    isTelegramMessageDirectedAtBot(
+      {
+        chat: { id: -4633273294, type: "supergroup" },
+        text: "follow up",
+        reply_to_message: {
+          from: {
+            id: 12345,
+            is_bot: true,
+            username: "ArgusChat_Bot"
+          },
+          text: "previous bot answer"
+        }
+      },
+      "@arguschat_bot"
+    ),
+    true
+  );
 });
 
 test("buildNodeConnectionCommand renders a shell-safe copyable command", () => {

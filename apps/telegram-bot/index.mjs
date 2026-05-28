@@ -1648,6 +1648,56 @@ function parseSlashCommand(text, botUsername) {
   return { cmd: known ? rawCmd : null, rawCmd, args, known, forOtherBot: false };
 }
 
+function normalizeTelegramBotUsername(value) {
+  return isNonEmptyString(value) ? String(value).trim().replace(/^@+/, "").toLowerCase() : "";
+}
+
+function escapeRegExpLiteral(value) {
+  return String(value ?? "").replace(/[\\^$.*+?()[\]{}|]/g, "\\$&");
+}
+
+function telegramEntityText(text, entity) {
+  if (!isNonEmptyString(text) || !entity || typeof entity !== "object") return "";
+  const offset = Number(entity.offset);
+  const length = Number(entity.length);
+  if (!Number.isFinite(offset) || !Number.isFinite(length) || offset < 0 || length <= 0) return "";
+  return String(text).slice(Math.trunc(offset), Math.trunc(offset + length));
+}
+
+function telegramTextMentionsBot(text, entities, botUsername) {
+  const username = normalizeTelegramBotUsername(botUsername);
+  if (!username || !isNonEmptyString(text)) return false;
+  const mention = `@${username}`;
+  const entityList = Array.isArray(entities) ? entities : [];
+  for (const entity of entityList) {
+    if (entity?.type !== "mention") continue;
+    if (telegramEntityText(text, entity).toLowerCase() === mention) return true;
+  }
+  const fallbackRe = new RegExp(`(^|[^A-Za-z0-9_])@${escapeRegExpLiteral(username)}(?=$|[^A-Za-z0-9_])`, "i");
+  return fallbackRe.test(String(text));
+}
+
+function telegramMessageMentionsBot(message, botUsername) {
+  const text = isNonEmptyString(message?.text)
+    ? message.text
+    : isNonEmptyString(message?.caption)
+      ? message.caption
+      : "";
+  const entities = isNonEmptyString(message?.text) ? message?.entities : message?.caption_entities;
+  return telegramTextMentionsBot(text, entities, botUsername);
+}
+
+function telegramMessageRepliesToBot(message, botUsername) {
+  const username = normalizeTelegramBotUsername(botUsername);
+  if (!username) return false;
+  const replyUsername = normalizeTelegramBotUsername(message?.reply_to_message?.from?.username);
+  return Boolean(replyUsername && replyUsername === username);
+}
+
+function isTelegramMessageDirectedAtBot(message, botUsername) {
+  return telegramMessageMentionsBot(message, botUsername) || telegramMessageRepliesToBot(message, botUsername);
+}
+
 function extractReplyText(message) {
   const reply = message?.reply_to_message;
   if (!reply || typeof reply !== "object") return null;
@@ -6425,6 +6475,17 @@ async function main() {
             return;
           }
 
+          if (isGroupChatType(chatType) && !isTelegramMessageDirectedAtBot(message, botUsername)) {
+            logEvent("INFO", "tg.message.ignored_not_directed", {
+              chat_key_hash: chatKeyHash(chatKey),
+              chat_type: chatType,
+              has_text: Boolean(isNonEmptyString(text)),
+              attachment_count: messageAttachments.length + replyAttachments.length,
+              bot_username_known: Boolean(normalizeTelegramBotUsername(botUsername))
+            });
+            return;
+          }
+
           if (!isNonEmptyString(text) && messageAttachments.length === 0 && replyAttachments.length === 0) {
             await safeSendMessage({ ...target, text: S.msg_unsupported_message });
             return;
@@ -6582,6 +6643,7 @@ export {
   deriveTelegramWebhookUrl,
   derivePublicNodeWsUrl,
   isTelegramGetUpdatesWebhookConflict,
+  isTelegramMessageDirectedAtBot,
   normalizeChatSettingKey,
   normalizeChatSettings,
   normalizeTelegramDeliveryMode,
