@@ -12,6 +12,7 @@ import {
   isTelegramGetUpdatesWebhookConflict,
   resolveTelegramBotTokenConfig,
   resolveTelegramWebhookConfig,
+  telegramSourceFromMessage,
   telegramTokenHash,
   telegramTokenRefreshIntervalMs,
   telegramWebhookInfoLogFields
@@ -134,6 +135,30 @@ test("telegramWebhookInfoLogFields redacts webhook URLs and preserves diagnostic
     webhook_last_error_message: "Wrong response from the webhook: 403 Forbidden",
     webhook_ip_address: "188.114.96.0",
     webhook_allowed_updates: ["message", "callback_query"]
+  });
+});
+
+test("telegramSourceFromMessage includes Telegram sender identity", () => {
+  const source = telegramSourceFromMessage(
+    {
+      chat: { id: -4633273294, type: "supergroup" },
+      from: {
+        id: 917527833,
+        username: "@alice_dev",
+        first_name: "Alice",
+        last_name: "Ng"
+      }
+    },
+    "-4633273294"
+  );
+
+  assert.deepEqual(source, {
+    channel: "telegram",
+    chatKey: "-4633273294",
+    telegramUserId: 917527833,
+    username: "alice_dev",
+    firstName: "Alice",
+    lastName: "Ng"
   });
 });
 

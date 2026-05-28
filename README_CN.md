@@ -315,6 +315,8 @@ runtime 会管理这些 workspace 文件：
 
 这些文件会组成“项目上下文”。每一轮 turn 都会注入 `AGENTS.md` / `SOUL.md` / `USER.md`；**只有 heartbeat turn 才会注入 `HEARTBEAT.md`**。
 
+静默回复标记按 turn 类型区分：heartbeat turn 使用 `HEARTBEAT_OK`；普通 user turn 可以只输出 `NO_TEXT`，表示本轮有意不产生用户可见文本。
+
 ### Telegram 多用户 Agent（私聊隔离）
 
 如果你使用 `apps/telegram-bot` 接入 Telegram，则网关支持按 Telegram 用户隔离 runtime 容器（agent）：

@@ -345,6 +345,8 @@ If you want a durable change to the managed agent instructions, edit `docs/templ
 
 These files are used to build the assistant’s “project context”. Every turn injects `AGENTS.md` / `SOUL.md` / `USER.md`; **`HEARTBEAT.md` is injected only for heartbeat turns**.
 
+Silent reply markers are turn-specific: heartbeat turns use `HEARTBEAT_OK`; normal user turns can output exactly `NO_TEXT` to intentionally produce no user-visible text.
+
 ### Telegram multi-user agents (DM isolation)
 
 When using `apps/telegram-bot`, the gateway can isolate runtime containers (agents) per Telegram private user:

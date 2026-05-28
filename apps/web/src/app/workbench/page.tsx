@@ -32,6 +32,7 @@ import { AnimatedDropdown, AnimatedNumber, PageSideBySide, PanelReveal, TextSwap
 import { buildGatewayHeaders, useGatewayWsUrlState, withGatewayAdminToken } from "@/lib/gateway";
 
 const ARGUS_WEB_VERSION = process.env.NEXT_PUBLIC_ARGUS_VERSION || "0.0.0";
+const USER_NO_TEXT_TOKEN = "NO_TEXT";
 
 type JsonValue =
   | null
@@ -595,6 +596,21 @@ function userMessageToUiText(rawText: string): string {
   return prefix + (extracted || trimmed);
 }
 
+function stripAckTokenMarkup(rawText: string): string {
+  return rawText
+    .trim()
+    .replace(/<[^>]*>/g, " ")
+    .replace(/&nbsp;/gi, " ")
+    .replace(/^[*`~_]+/, "")
+    .replace(/[*`~_]+$/, "")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function isUserNoTextToken(rawText: string): boolean {
+  return stripAckTokenMarkup(rawText) === USER_NO_TEXT_TOKEN;
+}
+
 function turnsToChatMessages(turns: unknown): ChatMessage[] {
   if (!Array.isArray(turns)) return [];
   const messages: ChatMessage[] = [];
@@ -657,6 +673,7 @@ function turnsToChatMessages(turns: unknown): ChatMessage[] {
         flushReasoning();
         const text = getString(rawItem["text"]) ?? "";
         if (!text.trim()) continue;
+        if (isUserNoTextToken(text)) continue;
         messages.push({ id, role: "assistant", text, turnId });
         continue;
       }
@@ -1169,9 +1186,10 @@ export default function Page() {
 	        }
 	      };
 	    });
-	  }
+  }
 
   function appendAssistantDelta(sessionId: string, incomingThreadId: string, incomingTurnId: string | null, delta: string): void {
+    if (isUserNoTextToken(delta)) return;
     const key = threadKey(sessionId, incomingThreadId);
     setChatByThreadKey((prev) => {
       const current = prev[key] ?? emptyThreadChatState();
@@ -1287,6 +1305,23 @@ export default function Page() {
       })();
 
       let nextMessages = msgs;
+      if (isUserNoTextToken(fullText)) {
+        nextMessages =
+          idx >= 0 && msgs[idx]?.role === "assistant"
+            ? [...msgs.slice(0, idx), ...msgs.slice(idx + 1)]
+            : msgs;
+        return {
+          ...prev,
+          [key]: {
+            ...current,
+            messages: nextMessages,
+            turnId: nextTurnId ?? null,
+            upstreamTurnId: nextUpstreamTurnId ?? null,
+            hydrated: true
+          }
+        };
+      }
+
       if (idx >= 0 && msgs[idx]?.role === "assistant") {
         const existing = msgs[idx] as Extract<ChatMessage, { role: "assistant" }>;
         nextMessages = [

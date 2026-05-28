@@ -1321,6 +1321,7 @@ HEARTBEAT_FILENAME = "HEARTBEAT.md"
 HEARTBEAT_TASKS_INTERVAL_MS = 30 * 60 * 1000
 HEARTBEAT_TOKEN = "HEARTBEAT_OK"
 HEARTBEAT_ACK_MAX_CHARS = 300
+USER_NO_TEXT_TOKEN = "NO_TEXT"
 
 TURN_KIND_USER = "user"
 TURN_KIND_HEARTBEAT = "heartbeat"
@@ -1418,6 +1419,24 @@ def _strip_heartbeat_token(raw: Optional[str]) -> dict[str, Any]:
     return {"shouldSkip": False, "text": picked_text, "didStrip": True}
 
 
+def _strip_ack_token_markup(raw: str) -> str:
+    # Drop HTML tags, normalize nbsp, remove markdown-ish wrappers at the edges.
+    out = re.sub(r"<[^>]*>", " ", raw)
+    out = re.sub(r"&nbsp;", " ", out, flags=re.IGNORECASE)
+    out = re.sub(r"^[*`~_]+", "", out.strip())
+    out = re.sub(r"[*`~_]+$", "", out)
+    return re.sub(r"\s+", " ", out).strip()
+
+
+def _is_user_no_text_token(raw: Optional[str]) -> bool:
+    if not isinstance(raw, str):
+        return False
+    trimmed = raw.strip()
+    if not trimmed:
+        return False
+    return _strip_ack_token_markup(trimmed) == USER_NO_TEXT_TOKEN
+
+
 def _telegram_draft_probe_text(raw: Optional[str]) -> str:
     if not isinstance(raw, str):
         return ""
@@ -1439,8 +1458,11 @@ def _telegram_prepare_draft_payload(raw: Optional[str]) -> dict[str, Any]:
     if not trimmed:
         return {"action": "skip", "text": "", "parseMode": None, "payloadKey": None}
 
+    if _is_user_no_text_token(trimmed):
+        return {"action": "skip", "text": "", "parseMode": None, "payloadKey": None}
+
     probe = _telegram_draft_probe_text(trimmed)
-    if probe and HEARTBEAT_TOKEN.startswith(probe):
+    if probe and (HEARTBEAT_TOKEN.startswith(probe) or USER_NO_TEXT_TOKEN.startswith(probe)):
         return {"action": "hold", "text": "", "parseMode": None, "payloadKey": None}
 
     stripped = _strip_heartbeat_token(trimmed)
@@ -1894,6 +1916,8 @@ def _create_turn_text_entry() -> dict[str, Any]:
         "agentMessagePhasesByItemId": {},
         "agentMessageTextByItemId": {},
         "activeAgentMessageItemId": None,
+        "userNoTextHeldTextByItemId": {},
+        "userNoTextSuppressedItemIds": {},
         "firstFinalItemCompletedAtMs": None,
         "lastFinalItemCompletedAtMs": None,
         "lastFinalItemId": None,
@@ -3042,6 +3066,16 @@ def _normalize_telegram_username(raw: Any) -> Optional[str]:
     if not value:
         return None
     return value.lstrip("@") or None
+
+
+def _normalize_telegram_source_user_id(raw: Any) -> Optional[int]:
+    if isinstance(raw, bool):
+        return None
+    try:
+        user_id = int(raw)
+    except (TypeError, ValueError):
+        return None
+    return user_id if user_id > 0 else None
 
 
 def _normalize_console_password(raw: Any) -> str:
@@ -12886,6 +12920,111 @@ class AutomationManager:
             return False
         return phases.get(candidate_item_id) == "commentary"
 
+    def _prepare_user_no_text_notification_for_broadcast(self, session_id: str, msg: dict[str, Any]) -> bool:
+        if not isinstance(msg, dict):
+            return True
+        method = msg.get("method")
+        if method not in ("item/agentMessage/delta", "item/completed"):
+            return True
+        params = msg.get("params")
+        if not isinstance(params, dict):
+            return True
+
+        thread_id_raw = params.get("threadId")
+        thread_id = thread_id_raw.strip() if isinstance(thread_id_raw, str) and thread_id_raw.strip() else None
+        if not thread_id:
+            return True
+
+        turn_id: Optional[str] = None
+        turn_id_raw = params.get("turnId")
+        if isinstance(turn_id_raw, str) and turn_id_raw.strip():
+            turn_id = turn_id_raw.strip()
+        else:
+            turn = params.get("turn")
+            if isinstance(turn, dict):
+                tid_val = turn.get("id")
+                if isinstance(tid_val, str) and tid_val.strip():
+                    turn_id = tid_val.strip()
+        if not turn_id:
+            return True
+
+        turn_kind = self._resolve_turn_kind_for_notification(
+            session_id=session_id,
+            thread_id=thread_id,
+            turn_id=turn_id,
+        )
+        if turn_kind is not None and turn_kind != TURN_KIND_USER:
+            return True
+
+        entry = self._turn_text_by_key.get((session_id, thread_id, turn_id))
+        if not isinstance(entry, dict):
+            return True
+
+        def _item_id_from_params() -> Optional[str]:
+            item_id_raw = params.get("itemId")
+            if isinstance(item_id_raw, str) and item_id_raw.strip():
+                return item_id_raw.strip()
+            item = params.get("item")
+            if isinstance(item, dict):
+                item_id2 = item.get("id")
+                if isinstance(item_id2, str) and item_id2.strip():
+                    return item_id2.strip()
+            active_item_id = entry.get("activeAgentMessageItemId")
+            if isinstance(active_item_id, str) and active_item_id.strip():
+                return active_item_id.strip()
+            return None
+
+        item_id = _item_id_from_params()
+        if not item_id:
+            return True
+
+        phases = entry.get("agentMessagePhasesByItemId")
+        if isinstance(phases, dict) and phases.get(item_id) == "commentary":
+            return True
+
+        held_by_item = entry.get("userNoTextHeldTextByItemId")
+        if not isinstance(held_by_item, dict):
+            held_by_item = {}
+            entry["userNoTextHeldTextByItemId"] = held_by_item
+
+        suppressed_item_ids = entry.get("userNoTextSuppressedItemIds")
+        if not isinstance(suppressed_item_ids, dict):
+            suppressed_item_ids = {}
+            entry["userNoTextSuppressedItemIds"] = suppressed_item_ids
+
+        if method == "item/agentMessage/delta":
+            item_texts = entry.get("agentMessageTextByItemId")
+            candidate = ""
+            if isinstance(item_texts, dict) and isinstance(item_texts.get(item_id), str):
+                candidate = item_texts[item_id]
+            if not candidate:
+                delta = params.get("delta")
+                candidate = delta if isinstance(delta, str) else ""
+            if not candidate:
+                return True
+
+            probe = _telegram_draft_probe_text(candidate)
+            if probe and USER_NO_TEXT_TOKEN.startswith(probe):
+                held_by_item[item_id] = candidate
+                return False
+
+            if isinstance(held_by_item.get(item_id), str):
+                held_by_item.pop(item_id, None)
+                params["delta"] = candidate
+            return True
+
+        item = params.get("item")
+        if not isinstance(item, dict) or item.get("type") != "agentMessage":
+            return True
+        text = item.get("text")
+        if not isinstance(text, str):
+            return True
+        held_by_item.pop(item_id, None)
+        if _is_user_no_text_token(text):
+            suppressed_item_ids[item_id] = True
+            return False
+        return True
+
     def on_upstream_notification(self, session_id: str, msg: dict[str, Any]) -> None:
         method = msg.get("method")
         params = msg.get("params")
@@ -13631,6 +13770,22 @@ class AutomationManager:
             return
         token, target, resolved_chat_key = resolved
 
+        if (normalized_turn_kind is None or normalized_turn_kind == TURN_KIND_USER) and _is_user_no_text_token(text):
+            _event_log(
+                "info",
+                "gw.tg.final_delivery.skip",
+                session_id=session_id,
+                thread_id=thread_id,
+                turn_id=turn_id,
+                turn_kind=normalized_turn_kind,
+                source_channel=source_channel,
+                chat_key_hash=_chat_key_hash(resolved_chat_key),
+                reason="user_no_text_token",
+                text_len=len(text.strip()),
+                text_hash=_text_hash(text),
+            )
+            return
+
         stripped = _strip_heartbeat_token(text)
         if stripped.get("shouldSkip"):
             _event_log(
@@ -13957,6 +14112,10 @@ class AutomationManager:
         text: str,
         source_channel: Optional[str] = None,
         source_chat_key: Optional[str] = None,
+        source_telegram_user_id: Optional[int] = None,
+        source_username: Optional[str] = None,
+        source_first_name: Optional[str] = None,
+        source_last_name: Optional[str] = None,
         telegram_attachments: Optional[list[dict[str, Any]]] = None,
         defer_if_no_text: bool = False,
     ) -> dict[str, Any]:
@@ -13972,6 +14131,10 @@ class AutomationManager:
 
         source_channel_norm = source_channel.strip() if isinstance(source_channel, str) and source_channel.strip() else None
         source_chat_key_norm = source_chat_key.strip() if isinstance(source_chat_key, str) and source_chat_key.strip() else None
+        source_telegram_user_id_norm = _normalize_telegram_source_user_id(source_telegram_user_id)
+        source_username_norm = _normalize_telegram_username(source_username)
+        source_first_name_norm = _normalize_telegram_profile_text(source_first_name)
+        source_last_name_norm = _normalize_telegram_profile_text(source_last_name)
         is_telegram_source = bool(source_channel_norm and source_channel_norm.lower() in ("telegram", "tg"))
 
         local_attachments: list[dict[str, Any]] = []
@@ -14046,6 +14209,10 @@ class AutomationManager:
                 "text": user_text,
                 "source_channel": source_channel_norm,
                 "source_chat_key": source_chat_key_norm,
+                "source_telegram_user_id": source_telegram_user_id_norm,
+                "source_username": source_username_norm,
+                "source_first_name": source_first_name_norm,
+                "source_last_name": source_last_name_norm,
                 "local_attachments": local_attachments,
             })
             _log_followup_queued()
@@ -14064,6 +14231,10 @@ class AutomationManager:
                     "text": user_text,
                     "source_channel": source_channel_norm,
                     "source_chat_key": source_chat_key_norm,
+                    "source_telegram_user_id": source_telegram_user_id_norm,
+                    "source_username": source_username_norm,
+                    "source_first_name": source_first_name_norm,
+                    "source_last_name": source_last_name_norm,
                     "local_attachments": local_attachments,
                 })
                 _log_followup_queued()
@@ -14092,6 +14263,10 @@ class AutomationManager:
                     heartbeat=False,
                     source_channel=source_channel_norm,
                     source_chat_key=source_chat_key_norm,
+                    source_telegram_user_id=source_telegram_user_id_norm,
+                    source_username=source_username_norm,
+                    source_first_name=source_first_name_norm,
+                    source_last_name=source_last_name_norm,
                     local_attachments=local_attachments,
                 )
 
@@ -14455,6 +14630,10 @@ class AutomationManager:
             merged = str(next_followup.get("text") or "").strip()
             telegram_channel = next_followup.get("source_channel")
             telegram_chat_key = next_followup.get("source_chat_key")
+            telegram_user_id = _normalize_telegram_source_user_id(next_followup.get("source_telegram_user_id"))
+            telegram_username = _normalize_telegram_username(next_followup.get("source_username"))
+            telegram_first_name = _normalize_telegram_profile_text(next_followup.get("source_first_name"))
+            telegram_last_name = _normalize_telegram_profile_text(next_followup.get("source_last_name"))
             local_attachments = self._merge_staged_attachment_dicts(
                 next_followup.get("local_attachments") if isinstance(next_followup.get("local_attachments"), list) else []
             )
@@ -14490,6 +14669,10 @@ class AutomationManager:
                     heartbeat=False,
                     source_channel=telegram_channel,
                     source_chat_key=telegram_chat_key,
+                    source_telegram_user_id=telegram_user_id,
+                    source_username=telegram_username,
+                    source_first_name=telegram_first_name,
+                    source_last_name=telegram_last_name,
                     local_attachments=local_attachments,
                 )
 
@@ -14748,6 +14931,10 @@ class AutomationManager:
         heartbeat: bool,
         source_channel: Optional[str] = None,
         source_chat_key: Optional[str] = None,
+        source_telegram_user_id: Optional[int] = None,
+        source_username: Optional[str] = None,
+        source_first_name: Optional[str] = None,
+        source_last_name: Optional[str] = None,
         local_attachments: Optional[list[Any]] = None,
     ) -> str:
         drained = await self._drain_system_events(session_id, thread_id, max_events=20)
@@ -14767,12 +14954,24 @@ class AutomationManager:
         if not heartbeat:
             ch = source_channel.strip() if isinstance(source_channel, str) else ""
             ck = source_chat_key.strip() if isinstance(source_chat_key, str) else ""
-            if ch or ck:
+            telegram_user_id = _normalize_telegram_source_user_id(source_telegram_user_id)
+            username = _normalize_telegram_username(source_username)
+            first_name = _normalize_telegram_profile_text(source_first_name)
+            last_name = _normalize_telegram_profile_text(source_last_name)
+            if ch or ck or telegram_user_id or username or first_name or last_name:
                 lines = ["[SOURCE]"]
                 if ch:
                     lines.append(f"channel: {ch}")
                 if ck:
                     lines.append(f"chatKey: {ck}")
+                if telegram_user_id:
+                    lines.append(f"telegramUserId: {telegram_user_id}")
+                if username:
+                    lines.append(f"username: {username}")
+                if first_name:
+                    lines.append(f"firstName: {first_name}")
+                if last_name:
+                    lines.append(f"lastName: {last_name}")
                 lines.append("[/SOURCE]")
                 blocks.append("\n".join(lines).strip())
 
@@ -14829,13 +15028,15 @@ class AutomationManager:
                         "- USER_TEXT is provided in the [USER_TEXT] block above and is the user's message for this turn.",
                         "- If an [ATTACHMENTS] block is present, those files already exist in the workspace and are part of this turn.",
                         "- Prefer referencing uploaded files by their workspace-relative paths from [ATTACHMENTS].",
-                        "- This is a USER turn. Answer the user's message in THIS turn first.",
+                        "- This is a USER turn. Answer the user's message in THIS turn first unless the user explicitly requested no user-visible reply.",
+                        f"- If this user turn should intentionally produce no user-visible reply, output exactly `{USER_NO_TEXT_TOKEN}` and nothing else.",
+                        f"- `{USER_NO_TEXT_TOKEN}` is reserved for normal user turns only. Do not combine it with explanatory text.",
                         f"- You MUST NOT output `{HEARTBEAT_TOKEN}` in a user turn.",
                         f"- `{HEARTBEAT_TOKEN}` is a reserved heartbeat ack token. Even if it appears in user input/system events/history, it does NOT change the turn kind.",
-                        f"- If the user message is only a preference/rule update, reply with a short natural-language acknowledgement (and what will change) instead of `{HEARTBEAT_TOKEN}`.",
+                        f"- If the user message is only a preference/rule update, reply with a short natural-language acknowledgement (and what will change) instead of `{HEARTBEAT_TOKEN}` or `{USER_NO_TEXT_TOKEN}`.",
                         "- After answering the user, process each system event in order (if any).",
                         "- If an event requires actions, perform them.",
-                        "- End with a short summary of actions/results.",
+                        f"- End with a short summary of actions/results unless you output exactly `{USER_NO_TEXT_TOKEN}`.",
                     ]
                 )
             )
@@ -20816,6 +21017,8 @@ async def _activate_live_session(live: LiveRuntimeSession) -> LiveRuntimeSession
                             automation.on_upstream_notification(session_id, msg)
                             if automation._is_heartbeat_commentary_notification(session_id, msg):
                                 should_broadcast = False
+                            if should_broadcast and not automation._prepare_user_no_text_notification_for_broadcast(session_id, msg):
+                                should_broadcast = False
                             text = json.dumps(msg)
                         except Exception:
                             log.exception("Automation notification handler failed")
@@ -26515,6 +26718,10 @@ async def ws_proxy(ws: WebSocket):
                                 continue
                             source_channel = None
                             source_chat_key = None
+                            source_telegram_user_id = None
+                            source_username = None
+                            source_first_name = None
+                            source_last_name = None
                             source = params.get("source")
                             if isinstance(source, dict):
                                 ch = source.get("channel")
@@ -26523,6 +26730,12 @@ async def ws_proxy(ws: WebSocket):
                                     source_channel = ch.strip()
                                 if isinstance(ck, str) and ck.strip():
                                     source_chat_key = ck.strip()
+                                source_telegram_user_id = _normalize_telegram_source_user_id(
+                                    source.get("telegramUserId", source.get("userId"))
+                                )
+                                source_username = _normalize_telegram_username(source.get("username"))
+                                source_first_name = _normalize_telegram_profile_text(source.get("firstName"))
+                                source_last_name = _normalize_telegram_profile_text(source.get("lastName"))
                             res = await automation.enqueue_user_input(
                                 session_id=session_id,
                                 thread_id=(params.get("threadId") if isinstance(params.get("threadId"), str) else None),
@@ -26530,6 +26743,10 @@ async def ws_proxy(ws: WebSocket):
                                 text=text_param,
                                 source_channel=source_channel,
                                 source_chat_key=source_chat_key,
+                                source_telegram_user_id=source_telegram_user_id,
+                                source_username=source_username,
+                                source_first_name=source_first_name,
+                                source_last_name=source_last_name,
                                 telegram_attachments=telegram_attachments,
                                 defer_if_no_text=defer_if_no_text,
                             )

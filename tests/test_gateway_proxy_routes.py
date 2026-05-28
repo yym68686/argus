@@ -105,6 +105,41 @@ class GatewayProxyRouteTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertIn("gpt-5.5", catalog["availableModels"])
 
+    async def test_assemble_turn_input_includes_telegram_sender_identity(self) -> None:
+        manager = argus_app.AutomationManager(
+            state_store=InMemoryStateStore(),
+            home_host_path="/tmp",
+            workspace_host_path="/tmp",
+        )
+        try:
+            with (
+                mock.patch.object(manager, "_read_project_context_block", new=mock.AsyncMock(return_value="")),
+                mock.patch.object(manager, "_read_skills_prompt_block", new=mock.AsyncMock(return_value="")),
+                mock.patch.object(manager, "_drain_system_events", new=mock.AsyncMock(return_value=[])),
+            ):
+                assembled = await manager._assemble_turn_input(
+                    "sess_1",
+                    "thread_1",
+                    user_text="你知道我的 tg id 吗？",
+                    heartbeat=False,
+                    source_channel="telegram",
+                    source_chat_key="-4633273294",
+                    source_telegram_user_id=917527833,
+                    source_username="@alice_dev",
+                    source_first_name="Alice",
+                    source_last_name="Ng",
+                )
+        finally:
+            await manager.stop()
+
+        self.assertIn("[SOURCE]", assembled)
+        self.assertIn("channel: telegram", assembled)
+        self.assertIn("chatKey: -4633273294", assembled)
+        self.assertIn("telegramUserId: 917527833", assembled)
+        self.assertIn("username: alice_dev", assembled)
+        self.assertIn("firstName: Alice", assembled)
+        self.assertIn("lastName: Ng", assembled)
+
     async def test_ownerless_openai_proxy_respects_disabled_gateway_default(self) -> None:
         store = InMemoryStateStore()
         store.state.gateway_openai_default_enabled = False
@@ -245,6 +280,174 @@ class GatewayProxyRouteTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(events), 1)
         self.assertEqual(events[0][0], "info")
         self.assertEqual(events[0][2]["reason"], "missing_target")
+
+    async def test_user_no_text_token_skips_telegram_delivery(self) -> None:
+        manager = argus_app.AutomationManager(
+            state_store=InMemoryStateStore(),
+            home_host_path="/tmp",
+            workspace_host_path="/tmp",
+        )
+        target = {"chat_id": 123}
+        events: list[tuple[str, str, dict[str, object]]] = []
+
+        def fake_event_log(level: str, event: str, **fields):
+            events.append((level, event, fields))
+
+        with (
+            mock.patch.object(argus_app, "_event_log", side_effect=fake_event_log),
+            mock.patch.object(
+                manager,
+                "_resolve_telegram_target_for_source",
+                return_value=("tg-token", target, "telegram:123"),
+            ),
+            mock.patch.object(manager, "_resolve_telegram_target_for_turn", return_value=None),
+            mock.patch.object(argus_app, "_telegram_send_markdown_message_parts", new=mock.AsyncMock()) as send_text,
+        ):
+            await manager._deliver_turn_text(
+                "sess_1",
+                "thread_1",
+                "`NO_TEXT`",
+                turn_id="turn_1",
+                turn_kind=argus_app.TURN_KIND_USER,
+                source_channel="telegram",
+                source_chat_key="telegram:123",
+            )
+
+        send_text.assert_not_awaited()
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0][0], "info")
+        self.assertEqual(events[0][1], "gw.tg.final_delivery.skip")
+        self.assertEqual(events[0][2]["reason"], "user_no_text_token")
+
+    async def test_user_no_text_token_does_not_skip_regular_content(self) -> None:
+        manager = argus_app.AutomationManager(
+            state_store=InMemoryStateStore(),
+            home_host_path="/tmp",
+            workspace_host_path="/tmp",
+        )
+        target = {"chat_id": 123}
+
+        with (
+            mock.patch.object(
+                manager,
+                "_resolve_telegram_target_for_source",
+                return_value=("tg-token", target, "telegram:123"),
+            ),
+            mock.patch.object(manager, "_resolve_telegram_target_for_turn", return_value=None),
+            mock.patch.object(argus_app, "_telegram_send_markdown_message_parts", new=mock.AsyncMock(return_value=[{"ok": True}])) as send_text,
+            mock.patch.object(argus_app, "_event_log"),
+        ):
+            await manager._deliver_turn_text(
+                "sess_1",
+                "thread_1",
+                "Mentioning NO_TEXT in a normal sentence.",
+                turn_id="turn_1",
+                turn_kind=argus_app.TURN_KIND_USER,
+                source_channel="telegram",
+                source_chat_key="telegram:123",
+            )
+
+        send_text.assert_awaited_once()
+
+    def test_telegram_draft_payload_skips_user_no_text_token(self) -> None:
+        self.assertEqual(
+            argus_app._telegram_prepare_draft_payload("NO").get("action"),
+            "hold",
+        )
+        self.assertEqual(
+            argus_app._telegram_prepare_draft_payload("`NO_TEXT`").get("action"),
+            "skip",
+        )
+        self.assertEqual(
+            argus_app._telegram_prepare_draft_payload("Use NO_TEXT only when needed.").get("action"),
+            "send",
+        )
+
+    def test_user_no_text_notification_filter_holds_and_skips_token(self) -> None:
+        manager = argus_app.AutomationManager(
+            state_store=InMemoryStateStore(),
+            home_host_path="/tmp",
+            workspace_host_path="/tmp",
+        )
+        manager._remember_turn_kind(
+            session_id="sess_1",
+            thread_id="thread_1",
+            turn_id="turn_1",
+            kind=argus_app.TURN_KIND_USER,
+        )
+
+        first = {
+            "method": "item/agentMessage/delta",
+            "params": {
+                "threadId": "thread_1",
+                "turnId": "turn_1",
+                "itemId": "item_1",
+                "delta": "NO",
+            },
+        }
+        manager.on_upstream_notification("sess_1", first)
+        self.assertFalse(manager._prepare_user_no_text_notification_for_broadcast("sess_1", first))
+
+        second = {
+            "method": "item/agentMessage/delta",
+            "params": {
+                "threadId": "thread_1",
+                "turnId": "turn_1",
+                "itemId": "item_1",
+                "delta": "_TEXT",
+            },
+        }
+        manager.on_upstream_notification("sess_1", second)
+        self.assertFalse(manager._prepare_user_no_text_notification_for_broadcast("sess_1", second))
+
+        completed = {
+            "method": "item/completed",
+            "params": {
+                "threadId": "thread_1",
+                "turnId": "turn_1",
+                "item": {"id": "item_1", "type": "agentMessage", "text": "NO_TEXT"},
+            },
+        }
+        manager.on_upstream_notification("sess_1", completed)
+        self.assertFalse(manager._prepare_user_no_text_notification_for_broadcast("sess_1", completed))
+
+    def test_user_no_text_notification_filter_replays_held_prefix_when_content_diverges(self) -> None:
+        manager = argus_app.AutomationManager(
+            state_store=InMemoryStateStore(),
+            home_host_path="/tmp",
+            workspace_host_path="/tmp",
+        )
+        manager._remember_turn_kind(
+            session_id="sess_1",
+            thread_id="thread_1",
+            turn_id="turn_1",
+            kind=argus_app.TURN_KIND_USER,
+        )
+
+        first = {
+            "method": "item/agentMessage/delta",
+            "params": {
+                "threadId": "thread_1",
+                "turnId": "turn_1",
+                "itemId": "item_1",
+                "delta": "NO",
+            },
+        }
+        manager.on_upstream_notification("sess_1", first)
+        self.assertFalse(manager._prepare_user_no_text_notification_for_broadcast("sess_1", first))
+
+        second = {
+            "method": "item/agentMessage/delta",
+            "params": {
+                "threadId": "thread_1",
+                "turnId": "turn_1",
+                "itemId": "item_1",
+                "delta": " WAY",
+            },
+        }
+        manager.on_upstream_notification("sess_1", second)
+        self.assertTrue(manager._prepare_user_no_text_notification_for_broadcast("sess_1", second))
+        self.assertEqual(second["params"]["delta"], "NO WAY")
 
     async def test_telegram_media_delivery_uses_resolved_session_workspace(self) -> None:
         manager = argus_app.AutomationManager(

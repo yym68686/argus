@@ -235,6 +235,11 @@ curl -sS -X DELETE -H "Authorization: Bearer $ARGUS_TOKEN" "http://$HOST:8080/se
 - `item/completed`：某个 item 完成
 - `turn/completed`：本次 turn 完成（UI/客户端应在这里“解锁下一次发送”；如果是取消，`turn.status` 会是 `interrupted`）
 
+特殊静默标记：
+
+- 普通用户 turn 中，如果 agent 最终只输出 `NO_TEXT`，表示“本轮故意不产生用户可见文本”。网关会尽量过滤对应的 agentMessage 流和 Telegram 投递；客户端即使在历史 `thread/read` 中看到整条 agent message 为 `NO_TEXT`，也应把它当作空回复跳过。
+- heartbeat turn 的静默 ACK 仍然是 `HEARTBEAT_OK`；不要在普通用户 turn 中复用它。
+
 #### 推荐：用网关的 `argus/input/enqueue`（支持 followup queue + 自动合并 systemEvent）
 
 如果你的 UI/客户端希望支持“同一 thread 忙时不打断、而是排队为下一次 turn（follow-up）”，建议不要直接调用 `turn/start`，而是调用网关内置 helper：

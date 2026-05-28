@@ -1268,7 +1268,20 @@ class ArgusClient {
       const channel = source.channel;
       const chatKey = source.chatKey;
       if (isNonEmptyString(channel) && isNonEmptyString(chatKey)) {
-        params.source = { channel: String(channel), chatKey: String(chatKey) };
+        const sourceOut = { channel: String(channel), chatKey: String(chatKey) };
+        const userId = Number(source.telegramUserId ?? source.userId);
+        if (Number.isFinite(userId) && userId > 0) {
+          sourceOut.telegramUserId = Math.trunc(userId);
+        }
+        const username = isNonEmptyString(source.username)
+          ? String(source.username).trim().replace(/^@+/, "")
+          : null;
+        if (username) sourceOut.username = username;
+        const firstName = isNonEmptyString(source.firstName) ? String(source.firstName).trim() : null;
+        if (firstName) sourceOut.firstName = firstName;
+        const lastName = isNonEmptyString(source.lastName) ? String(source.lastName).trim() : null;
+        if (lastName) sourceOut.lastName = lastName;
+        params.source = sourceOut;
       }
     }
     return await this.rpc("argus/input/enqueue", params, { timeoutMs: 120000 });
@@ -1453,6 +1466,18 @@ function telegramProfileFromUser(user) {
     firstName,
     lastName
   };
+}
+
+function telegramSourceFromMessage(message, chatKey) {
+  if (!isNonEmptyString(chatKey)) return null;
+  const source = { channel: "telegram", chatKey: String(chatKey).trim() };
+  const profile = telegramProfileFromUser(message?.from);
+  if (!profile) return source;
+  source.telegramUserId = profile.userId;
+  if (profile.username) source.username = profile.username;
+  if (profile.firstName) source.firstName = profile.firstName;
+  if (profile.lastName) source.lastName = profile.lastName;
+  return source;
 }
 
 function sendTargetFromMessage(message) {
@@ -6254,7 +6279,7 @@ async function main() {
               text: hasUserText ? userText : "",
               threadId,
               target: enqueueTarget,
-              source: { channel: "telegram", chatKey },
+              source: telegramSourceFromMessage(message, chatKey),
               telegramAttachments: [...replyAttachments, ...messageAttachments],
             });
           } catch (e) {
@@ -6309,6 +6334,8 @@ export {
   redactUrlSecrets,
   resolveTelegramBotTokenConfig,
   resolveTelegramWebhookConfig,
+  telegramProfileFromUser,
+  telegramSourceFromMessage,
   telegramTokenHash,
   telegramTokenRefreshIntervalMs,
   telegramWebhookInfoLogFields
