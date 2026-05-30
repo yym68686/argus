@@ -24,7 +24,7 @@ type NavSection = {
 const NAV_ITEMS: NavItem[] = [
   { href: "/dashboard", label: "Dashboard", icon: LayoutDashboard, adminOnly: false },
   { href: "/api-keys", label: "API Keys", icon: KeyRound, adminOnly: false },
-  { href: "/sessions", label: "Sessions", icon: Server, adminOnly: false },
+  { href: "/my-sessions", label: "Sessions", icon: Server, adminOnly: false },
   { href: "/devices", label: "Devices", icon: Laptop, adminOnly: false },
   { href: "/usage", label: "Usage", icon: Gauge, adminOnly: true },
   { href: "/session-fleet", label: "All Sessions", icon: Server, adminOnly: true },
