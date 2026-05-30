@@ -1,7 +1,7 @@
 "use client";
 
 import * as React from "react";
-import { RefreshCw, Trash2 } from "lucide-react";
+import { RefreshCw, Trash2, UserPlus, Users, X } from "lucide-react";
 import { toast } from "sonner";
 
 import { useAuth } from "@/components/admin-gate";
@@ -9,10 +9,19 @@ import { useConfirmDialog } from "@/components/confirm-dialog";
 import { Badge, EmptyState, InlineError, PanelCard, Skeleton, StatCard } from "@/components/console-primitives";
 import { ConsoleShell } from "@/components/console-shell";
 import { Button } from "@/components/ui/button";
-import type { AdminSessionRow } from "@/lib/admin";
+import { Input } from "@/components/ui/input";
+import type { AdminAgentEntry, AdminSessionRow } from "@/lib/admin";
 import { formatInt } from "@/lib/format";
 import { useGatewayWsUrlState } from "@/lib/gateway";
-import { deleteMySession, fetchMySessions } from "@/lib/self";
+import {
+  deleteMySession,
+  fetchMyAgents,
+  fetchMySessions,
+  shareMyAgent,
+  type SelfAgentsResponse,
+  type SelfSharedUser,
+  unshareMyAgent,
+} from "@/lib/self";
 
 function normalizedSessionStatus(status?: string | null): string {
   const value = String(status || "").trim().toLowerCase();
@@ -36,13 +45,36 @@ function sessionValue(value?: string | number | null): string {
   return "-";
 }
 
+function sharedUserLabel(user?: SelfSharedUser | null, fallbackUserId?: number): string {
+  const email = String(user?.email || "").trim();
+  if (email) return email;
+  const username = String(user?.username || "").trim();
+  if (username) return username.startsWith("@") ? username : `@${username}`;
+  return typeof fallbackUserId === "number" && Number.isFinite(fallbackUserId) ? `User ${fallbackUserId}` : "User";
+}
+
+function agentShareUserIds(agent?: AdminAgentEntry | null): number[] {
+  if (!agent || !Array.isArray(agent.allowedUserIds)) return [];
+  const seen = new Set<number>();
+  for (const rawUserId of agent.allowedUserIds) {
+    const userId = Number(rawUserId);
+    if (!Number.isFinite(userId) || userId <= 0 || seen.has(userId)) continue;
+    seen.add(userId);
+  }
+  return Array.from(seen).sort((a, b) => a - b);
+}
+
 export default function SessionsPage() {
   const { user } = useAuth();
   const { confirm, confirmDialog } = useConfirmDialog();
   const [wsUrl] = useGatewayWsUrlState();
   const [sessions, setSessions] = React.useState<AdminSessionRow[]>([]);
+  const [agentsState, setAgentsState] = React.useState<SelfAgentsResponse | null>(null);
+  const [shareDraftByAgentId, setShareDraftByAgentId] = React.useState<Record<string, string>>({});
   const [loading, setLoading] = React.useState(false);
   const [deletingId, setDeletingId] = React.useState<string | null>(null);
+  const [sharingAgentId, setSharingAgentId] = React.useState<string | null>(null);
+  const [unsharingKey, setUnsharingKey] = React.useState<string | null>(null);
   const [error, setError] = React.useState<string | null>(null);
 
   const refresh = React.useCallback(
@@ -51,14 +83,33 @@ export default function SessionsPage() {
       setLoading(true);
       setError(null);
       try {
-        const result = await fetchMySessions(wsUrl);
-        setSessions(Array.isArray(result.sessions) ? result.sessions : []);
-        if (opts?.notify) {
+        const [sessionsResult, agentsResult] = await Promise.allSettled([
+          fetchMySessions(wsUrl),
+          fetchMyAgents(wsUrl, { bootstrap: false }),
+        ]);
+        if (sessionsResult.status === "rejected") {
+          throw sessionsResult.reason;
+        }
+        setSessions(Array.isArray(sessionsResult.value.sessions) ? sessionsResult.value.sessions : []);
+        let shareLoadFailed = false;
+        if (agentsResult.status === "fulfilled") {
+          setAgentsState(agentsResult.value);
+        } else {
+          shareLoadFailed = true;
+          const shareMessage = (agentsResult.reason as Error)?.message || String(agentsResult.reason);
+          setAgentsState(null);
+          setError(`Sharing data unavailable: ${shareMessage}`);
+          if (opts?.notify) {
+            toast.error(shareMessage);
+          }
+        }
+        if (opts?.notify && !shareLoadFailed) {
           toast.success("Refreshed");
         }
       } catch (nextError) {
         const message = (nextError as Error)?.message || String(nextError);
         setSessions([]);
+        setAgentsState(null);
         setError(message);
         if (opts?.notify) {
           toast.error(message);
@@ -108,6 +159,75 @@ export default function SessionsPage() {
     },
     [confirm, refresh, wsUrl],
   );
+
+  const handleShare = React.useCallback(
+    async (agentId: string) => {
+      const account = String(shareDraftByAgentId[agentId] || "").trim();
+      if (!agentId || !wsUrl.trim()) return;
+      if (!account) {
+        toast.error("Account is required");
+        return;
+      }
+      setSharingAgentId(agentId);
+      setError(null);
+      try {
+        const result = await shareMyAgent(wsUrl, agentId, { account });
+        setAgentsState(result);
+        setShareDraftByAgentId((current) => {
+          const next = { ...current };
+          delete next[agentId];
+          return next;
+        });
+        toast.success(`Shared with ${sharedUserLabel(result.sharedUser)}`);
+      } catch (nextError) {
+        const message = (nextError as Error)?.message || String(nextError);
+        setError(message);
+        toast.error(message);
+      } finally {
+        setSharingAgentId(null);
+      }
+    },
+    [shareDraftByAgentId, wsUrl],
+  );
+
+  const handleUnshare = React.useCallback(
+    async (agent: AdminAgentEntry, targetUserId: number) => {
+      if (!agent.agentId || !wsUrl.trim()) return;
+      const sharedUser = agentsState?.sharedUsersById?.[String(targetUserId)] ?? null;
+      const confirmed = await confirm({
+        title: "Remove share?",
+        body: `Stop sharing ${agent.shortName || agent.agentId} with ${sharedUserLabel(sharedUser, targetUserId)}?`,
+        confirmLabel: "Remove share",
+        tone: "destructive",
+      });
+      if (!confirmed) return;
+      const key = `${agent.agentId}:${targetUserId}`;
+      setUnsharingKey(key);
+      setError(null);
+      try {
+        const result = await unshareMyAgent(wsUrl, agent.agentId, targetUserId);
+        setAgentsState(result);
+        toast.success("Share removed");
+      } catch (nextError) {
+        const message = (nextError as Error)?.message || String(nextError);
+        setError(message);
+        toast.error(message);
+      } finally {
+        setUnsharingKey(null);
+      }
+    },
+    [agentsState?.sharedUsersById, confirm, wsUrl],
+  );
+
+  const agentsById = React.useMemo(() => {
+    const next = new Map<string, AdminAgentEntry>();
+    for (const agent of agentsState?.agents ?? []) {
+      if (agent.agentId) next.set(agent.agentId, agent);
+    }
+    return next;
+  }, [agentsState?.agents]);
+
+  const sharedUsersById = agentsState?.sharedUsersById ?? {};
 
   const runningCount = React.useMemo(
     () => sessions.filter((session) => normalizedSessionStatus(session.status) === "running").length,
@@ -162,9 +282,9 @@ export default function SessionsPage() {
               {Array.from({ length: 5 }).map((_, index) => (
                 <div
                   key={index}
-                  className="grid gap-3 border-t border-border/54 px-4 py-3 first:border-t-0 md:grid-cols-[1.5fr_1fr_1fr_0.8fr_0.7fr]"
+                  className="grid gap-3 border-t border-border/54 px-4 py-3 first:border-t-0 md:grid-cols-[1.4fr_1fr_1.35fr_1fr_0.8fr_0.7fr]"
                 >
-                  {Array.from({ length: 5 }).map((__, cellIndex) => (
+                  {Array.from({ length: 6 }).map((__, cellIndex) => (
                     <Skeleton key={cellIndex} className="h-4 w-full" />
                   ))}
                 </div>
@@ -177,6 +297,7 @@ export default function SessionsPage() {
                   <tr>
                     <th className="px-4 py-3">Session</th>
                     <th className="px-4 py-3">Agent</th>
+                    <th className="px-4 py-3">Sharing</th>
                     <th className="px-4 py-3">Container</th>
                     <th className="px-4 py-3">Status</th>
                     <th className="px-4 py-3 text-right">Action</th>
@@ -187,6 +308,10 @@ export default function SessionsPage() {
                     const sessionId = String(session.sessionId || "").trim();
                     const label = sessionDisplayName(session);
                     const deleting = deletingId === sessionId;
+                    const agentId = String(session.agentId || "").trim();
+                    const agent = agentId ? agentsById.get(agentId) ?? null : null;
+                    const shareUserIds = agentShareUserIds(agent);
+                    const canShare = Boolean(agent?.isOwner && agent.agentId);
                     return (
                       <tr key={sessionId || `${label}:${session.containerId || ""}:${index}`} className="border-t border-border/60">
                         <td className="px-4 py-3">
@@ -204,7 +329,82 @@ export default function SessionsPage() {
                             ) : null}
                           </div>
                         </td>
-                        <td className="px-4 py-3 font-mono text-[12.5px]">{sessionValue(session.agentId)}</td>
+                        <td className="px-4 py-3">
+                          <div className="min-w-0">
+                            <div className="truncate font-medium text-foreground">{agent?.shortName || sessionValue(session.agentId)}</div>
+                            {agentId ? (
+                              <div className="mt-1 truncate font-mono text-[12.5px] text-muted-foreground">{agentId}</div>
+                            ) : null}
+                          </div>
+                        </td>
+                        <td className="px-4 py-3">
+                          {canShare && agent ? (
+                            <div className="grid min-w-[260px] gap-2">
+                              <div className="flex flex-wrap gap-1.5">
+                                {shareUserIds.length ? (
+                                  shareUserIds.map((targetUserId) => {
+                                    const sharedUser = sharedUsersById[String(targetUserId)] ?? null;
+                                    const key = `${agent.agentId}:${targetUserId}`;
+                                    const removing = unsharingKey === key;
+                                    return (
+                                      <span
+                                        key={targetUserId}
+                                        className="inline-flex max-w-full items-center gap-1 rounded-[999px] border border-border/70 bg-background/30 px-2 py-1 text-xs text-foreground"
+                                      >
+                                        <Users className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
+                                        <span className="max-w-[11rem] truncate">{sharedUserLabel(sharedUser, targetUserId)}</span>
+                                        <button
+                                          type="button"
+                                          className="rounded-full p-0.5 text-muted-foreground transition hover:bg-destructive/12 hover:text-destructive"
+                                          disabled={removing || loading || sharingAgentId === agent.agentId}
+                                          onClick={() => void handleUnshare(agent, targetUserId)}
+                                          aria-label={`Remove ${sharedUserLabel(sharedUser, targetUserId)}`}
+                                        >
+                                          <X className="h-3.5 w-3.5" />
+                                        </button>
+                                      </span>
+                                    );
+                                  })
+                                ) : (
+                                  <span className="text-xs text-muted-foreground">No shares</span>
+                                )}
+                              </div>
+                              <div className="flex gap-2">
+                                <Input
+                                  className="h-8 text-xs"
+                                  value={shareDraftByAgentId[agent.agentId] ?? ""}
+                                  onChange={(event) =>
+                                    setShareDraftByAgentId((current) => ({
+                                      ...current,
+                                      [agent.agentId]: event.target.value,
+                                    }))
+                                  }
+                                  onKeyDown={(event) => {
+                                    if (event.key === "Enter") {
+                                      event.preventDefault();
+                                      void handleShare(agent.agentId);
+                                    }
+                                  }}
+                                  placeholder="email or username"
+                                />
+                                <Button
+                                  type="button"
+                                  size="sm"
+                                  variant="secondary"
+                                  disabled={loading || sharingAgentId === agent.agentId || !String(shareDraftByAgentId[agent.agentId] || "").trim()}
+                                  onClick={() => void handleShare(agent.agentId)}
+                                >
+                                  <UserPlus className="h-4 w-4" />
+                                  Share
+                                </Button>
+                              </div>
+                            </div>
+                          ) : agent ? (
+                            <Badge tone="default">{agent.isOwner ? "not owned" : "shared"}</Badge>
+                          ) : (
+                            <span className="text-xs text-muted-foreground">-</span>
+                          )}
+                        </td>
                         <td className="px-4 py-3 font-mono text-[12.5px]">{sessionValue(session.containerId)}</td>
                         <td className="px-4 py-3">
                           <Badge tone={sessionStatusTone(session.status)}>{normalizedSessionStatus(session.status)}</Badge>

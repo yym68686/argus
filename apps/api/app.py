@@ -8612,6 +8612,52 @@ class AutomationManager:
                 return user
         return None
 
+    def resolve_console_user_by_account(self, account: Any) -> Optional[PersistedConsoleUser]:
+        if isinstance(account, bool):
+            return None
+        if isinstance(account, int):
+            return self.get_console_user(account)
+        raw = str(account or "").strip()
+        if not raw:
+            return None
+        if raw.lower().startswith("user:"):
+            raw = raw[5:].strip()
+        if raw.isdigit():
+            user = self.get_console_user(int(raw))
+            if user is not None:
+                return user
+
+        normalized_email = _normalize_console_email(raw)
+        if normalized_email:
+            user = self.get_console_user_by_email(normalized_email)
+            if user is not None:
+                return user
+
+        for username_candidate in (raw, raw.lstrip("@")):
+            normalized_username = _normalize_console_username(username_candidate)
+            if not normalized_username:
+                continue
+            user = self.get_console_user_by_username(normalized_username)
+            if user is not None:
+                return user
+
+        telegram_username = _normalize_telegram_username(raw)
+        if telegram_username:
+            for profile in (self._store.state.telegram_user_profiles or {}).values():
+                if not isinstance(profile, PersistedTelegramUserProfile):
+                    continue
+                profile_username = str(profile.username or "").strip()
+                if not profile_username or profile_username.lower() != telegram_username.lower():
+                    continue
+                console_user_id = self.resolve_console_user_id_for_telegram_user_id(profile.user_id)
+                if console_user_id is None and self.get_console_user(profile.user_id) is not None:
+                    console_user_id = profile.user_id
+                if isinstance(console_user_id, int) and console_user_id > 0:
+                    user = self.get_console_user(console_user_id)
+                    if user is not None:
+                        return user
+        return None
+
     def _resolve_console_bootstrap_password(self, user: PersistedConsoleUser) -> Optional[str]:
         if not isinstance(user, PersistedConsoleUser):
             return None
@@ -11461,6 +11507,125 @@ class AutomationManager:
         if agent is None:
             return False
         return self._can_user_access_agent(user_id=user_id, agent=agent)
+
+    async def share_user_agent(self, *, user_id: int, agent_id: str, target_user_id: int) -> PersistedAgentRuntime:
+        _require_user_agent_support()
+        if not isinstance(user_id, int) or user_id <= 0:
+            raise ValueError("Invalid userId")
+        if not isinstance(target_user_id, int) or target_user_id <= 0:
+            raise ValueError("Invalid targetUserId")
+        if target_user_id == user_id:
+            raise ValueError("Cannot share an agent with yourself")
+
+        aid = _normalize_agent_id(agent_id)
+        if not aid:
+            raise ValueError("Invalid agentId")
+        current = self._get_agent(aid)
+        if current is None:
+            raise ValueError(f"Unknown agent: {aid}")
+        if not (isinstance(current.owner_user_id, int) and current.owner_user_id == user_id):
+            raise PermissionError("Forbidden")
+        if self.get_console_user(target_user_id) is None:
+            raise ValueError("Unknown target user")
+
+        updated: Optional[PersistedAgentRuntime] = None
+
+        def _write(st: PersistedGatewayAutomationState) -> None:
+            nonlocal updated
+            st.version = max(int(getattr(st, "version", 1) or 1), AUTOMATION_STATE_VERSION)
+            agent = st.agents.get(aid)
+            if not isinstance(agent, PersistedAgentRuntime):
+                raise ValueError(f"Unknown agent: {aid}")
+            if not (isinstance(agent.owner_user_id, int) and agent.owner_user_id == user_id):
+                raise PermissionError("Forbidden")
+            target = st.console_users.get(str(target_user_id))
+            if not isinstance(target, PersistedConsoleUser):
+                raise ValueError("Unknown target user")
+            allowed: set[int] = set()
+            for raw_allowed in agent.allowed_user_ids or []:
+                try:
+                    allowed_user_id = int(raw_allowed)
+                except Exception:
+                    continue
+                if allowed_user_id <= 0 or allowed_user_id == user_id:
+                    continue
+                allowed.add(allowed_user_id)
+            allowed.add(target_user_id)
+            updated = replace(agent, allowed_user_ids=sorted(allowed))
+            st.agents[aid] = updated
+
+        await self._store.update(_write)
+        if updated is None:
+            raise RuntimeError("Agent not found after share update")
+        return updated
+
+    async def unshare_user_agent(self, *, user_id: int, agent_id: str, target_user_id: int) -> PersistedAgentRuntime:
+        _require_user_agent_support()
+        if not isinstance(user_id, int) or user_id <= 0:
+            raise ValueError("Invalid userId")
+        if not isinstance(target_user_id, int) or target_user_id <= 0:
+            raise ValueError("Invalid targetUserId")
+
+        aid = _normalize_agent_id(agent_id)
+        if not aid:
+            raise ValueError("Invalid agentId")
+        current = self._get_agent(aid)
+        if current is None:
+            raise ValueError(f"Unknown agent: {aid}")
+        if not (isinstance(current.owner_user_id, int) and current.owner_user_id == user_id):
+            raise PermissionError("Forbidden")
+
+        target_binding_keys = {str(int(target_user_id))}
+        for link in (self._store.state.telegram_console_links or {}).values():
+            if not isinstance(link, PersistedTelegramConsoleLink):
+                continue
+            if link.console_user_id != target_user_id:
+                continue
+            if isinstance(link.chat_key, str) and link.chat_key.strip():
+                target_binding_keys.add(link.chat_key.strip())
+            if isinstance(link.telegram_user_id, int) and link.telegram_user_id > 0:
+                target_binding_keys.add(str(link.telegram_user_id))
+
+        updated: Optional[PersistedAgentRuntime] = None
+        target_main_id = _user_agent_id(user_id=target_user_id, short_name="main")
+
+        def _write(st: PersistedGatewayAutomationState) -> None:
+            nonlocal updated
+            st.version = max(int(getattr(st, "version", 1) or 1), AUTOMATION_STATE_VERSION)
+            agent = st.agents.get(aid)
+            if not isinstance(agent, PersistedAgentRuntime):
+                raise ValueError(f"Unknown agent: {aid}")
+            if not (isinstance(agent.owner_user_id, int) and agent.owner_user_id == user_id):
+                raise PermissionError("Forbidden")
+            allowed: list[int] = []
+            seen: set[int] = set()
+            for raw_allowed in agent.allowed_user_ids or []:
+                try:
+                    allowed_user_id = int(raw_allowed)
+                except Exception:
+                    continue
+                if allowed_user_id <= 0 or allowed_user_id in seen or allowed_user_id == target_user_id or allowed_user_id == user_id:
+                    continue
+                seen.add(allowed_user_id)
+                allowed.append(allowed_user_id)
+            updated = replace(agent, allowed_user_ids=allowed)
+            st.agents[aid] = updated
+
+            for bound_ck, bound_aid in list(st.chat_bindings.items()):
+                if bound_aid != aid:
+                    continue
+                binding_key = str(bound_ck or "").strip()
+                if binding_key not in target_binding_keys:
+                    continue
+                if target_main_id in st.agents and target_main_id != aid:
+                    st.chat_bindings[bound_ck] = target_main_id
+                else:
+                    st.chat_bindings.pop(bound_ck, None)
+
+        await self._store.update(_write)
+        if updated is None:
+            raise RuntimeError("Agent not found after share update")
+        return updated
 
     async def set_user_agent_model(self, *, user_id: int, agent_id: str, model: str) -> tuple[PersistedAgentRuntime, bool]:
         _require_user_agent_support()
@@ -17663,8 +17828,12 @@ async def me_agents(request: Request):
     if principal.user_id is None:
         raise HTTPException(status_code=403, detail="Console session or developer API key required")
     automation = _get_automation_or_500()
+    bootstrap = _normalize_bool_flag(request.query_params.get("bootstrap"), default=True)
     try:
-        context = await _self_bootstrap_user_agent_context(automation, user_id=principal.user_id)
+        if bootstrap:
+            context = await _self_bootstrap_user_agent_context(automation, user_id=principal.user_id)
+        else:
+            context = await _self_existing_user_agent_context(automation, user_id=principal.user_id)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e)) from e
     except RuntimeError as e:
@@ -17672,7 +17841,7 @@ async def me_agents(request: Request):
     return {
         "ok": True,
         "userId": principal.user_id,
-        "agents": automation.list_agents_for_user(user_id=principal.user_id),
+        **_self_agents_list_payload(automation, user_id=principal.user_id),
         **context,
         **_developer_limits_and_counts_payload(automation, user_id=principal.user_id),
     }
@@ -17705,7 +17874,7 @@ async def me_agent_create(request: Request):
         "userId": principal.user_id,
         "agent": agent.to_json(),
         "created": created,
-        "agents": automation.list_agents_for_user(user_id=principal.user_id),
+        **_self_agents_list_payload(automation, user_id=principal.user_id),
         "availableModels": model_info.get("availableModels"),
         "models": model_info.get("models"),
         "modelSource": model_info.get("source"),
@@ -17713,6 +17882,77 @@ async def me_agent_create(request: Request):
         **_developer_limits_and_counts_payload(automation, user_id=principal.user_id),
     }
     return JSONResponse(status_code=_agent_create_response_status(agent), content=payload)
+
+
+@app.post("/me/agents/{agent_id}/shares")
+async def me_agent_share(agent_id: str, request: Request):
+    principal = _http_require_auth(request)
+    if principal.user_id is None:
+        raise HTTPException(status_code=403, detail="Console session or developer API key required")
+    automation = _get_automation_or_500()
+    try:
+        body = await request.json()
+    except Exception as e:
+        raise HTTPException(status_code=400, detail="Invalid JSON body") from e
+    if not isinstance(body, dict):
+        raise HTTPException(status_code=400, detail="Invalid JSON body")
+    target_account = body.get("account")
+    if target_account is None:
+        for key in ("email", "username", "userId", "targetUserId"):
+            if key in body:
+                target_account = body.get(key)
+                break
+    if target_account is None or (isinstance(target_account, str) and not target_account.strip()):
+        raise HTTPException(status_code=400, detail="Missing target account")
+    target_user = automation.resolve_console_user_by_account(target_account)
+    if not isinstance(target_user, PersistedConsoleUser):
+        raise HTTPException(status_code=404, detail="Target user not found")
+    normalized_agent_id = _self_normalize_agent_id_for_user(principal.user_id, agent_id)
+    try:
+        agent = await automation.share_user_agent(
+            user_id=principal.user_id,
+            agent_id=normalized_agent_id,
+            target_user_id=target_user.user_id,
+        )
+    except PermissionError as e:
+        raise HTTPException(status_code=403, detail=str(e)) from e
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    return {
+        "ok": True,
+        "userId": principal.user_id,
+        "agent": agent.to_json(),
+        "sharedUser": _self_public_console_user_payload(target_user),
+        **_self_agents_list_payload(automation, user_id=principal.user_id),
+        **_developer_limits_and_counts_payload(automation, user_id=principal.user_id),
+    }
+
+
+@app.delete("/me/agents/{agent_id}/shares/{target_user_id}")
+async def me_agent_unshare(agent_id: str, target_user_id: int, request: Request):
+    principal = _http_require_auth(request)
+    if principal.user_id is None:
+        raise HTTPException(status_code=403, detail="Console session or developer API key required")
+    automation = _get_automation_or_500()
+    normalized_agent_id = _self_normalize_agent_id_for_user(principal.user_id, agent_id)
+    try:
+        agent = await automation.unshare_user_agent(
+            user_id=principal.user_id,
+            agent_id=normalized_agent_id,
+            target_user_id=int(target_user_id),
+        )
+    except PermissionError as e:
+        raise HTTPException(status_code=403, detail=str(e)) from e
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    return {
+        "ok": True,
+        "userId": principal.user_id,
+        "agent": agent.to_json(),
+        "unsharedUserId": int(target_user_id),
+        **_self_agents_list_payload(automation, user_id=principal.user_id),
+        **_developer_limits_and_counts_payload(automation, user_id=principal.user_id),
+    }
 
 
 @app.post("/me/agents/{agent_id}/use")
@@ -17737,7 +17977,7 @@ async def me_agent_use(agent_id: str, request: Request):
         "ok": True,
         "userId": principal.user_id,
         "agent": agent.to_json(),
-        "agents": automation.list_agents_for_user(user_id=principal.user_id),
+        **_self_agents_list_payload(automation, user_id=principal.user_id),
         **context,
         **_developer_limits_and_counts_payload(automation, user_id=principal.user_id),
     }
@@ -17772,7 +18012,7 @@ async def me_agent_model_set(agent_id: str, request: Request):
         "userId": principal.user_id,
         "agent": agent.to_json(),
         "liveModelSynced": synced,
-        "agents": automation.list_agents_for_user(user_id=principal.user_id),
+        **_self_agents_list_payload(automation, user_id=principal.user_id),
         "availableModels": model_info.get("availableModels"),
         "models": model_info.get("models"),
         "modelSource": model_info.get("source"),
@@ -17800,7 +18040,7 @@ async def me_agent_retry(agent_id: str, request: Request):
             "ok": True,
             "userId": principal.user_id,
             "agent": agent.to_json(),
-            "agents": automation.list_agents_for_user(user_id=principal.user_id),
+            **_self_agents_list_payload(automation, user_id=principal.user_id),
             **_developer_limits_and_counts_payload(automation, user_id=principal.user_id),
         },
     )
@@ -17833,7 +18073,7 @@ async def me_agent_rename(agent_id: str, request: Request):
         "ok": True,
         "userId": principal.user_id,
         "agent": agent.to_json(),
-        "agents": automation.list_agents_for_user(user_id=principal.user_id),
+        **_self_agents_list_payload(automation, user_id=principal.user_id),
         **_developer_limits_and_counts_payload(automation, user_id=principal.user_id),
     }
 
@@ -17859,7 +18099,7 @@ async def me_agent_delete(agent_id: str, request: Request):
         "ok": True,
         "userId": principal.user_id,
         **(result or {}),
-        "agents": automation.list_agents_for_user(user_id=principal.user_id),
+        **_self_agents_list_payload(automation, user_id=principal.user_id),
         **_developer_limits_and_counts_payload(automation, user_id=principal.user_id),
     }
 
@@ -23277,6 +23517,47 @@ def _developer_limits_and_counts_payload(automation: AutomationManager, *, user_
     }
 
 
+def _self_public_console_user_payload(user: PersistedConsoleUser) -> dict[str, Any]:
+    return user.to_public_json()
+
+
+def _self_shared_users_by_id_payload(
+    automation: AutomationManager,
+    *,
+    user_id: int,
+    agents: Optional[list[dict[str, Any]]] = None,
+) -> dict[str, dict[str, Any]]:
+    entries = agents if isinstance(agents, list) else automation.list_agents_for_user(user_id=user_id)
+    shared_user_ids: set[int] = set()
+    for entry in entries:
+        if not isinstance(entry, dict) or not bool(entry.get("isOwner")):
+            continue
+        allowed_raw = entry.get("allowedUserIds")
+        if not isinstance(allowed_raw, list):
+            continue
+        for raw_user_id in allowed_raw:
+            try:
+                shared_user_id = int(raw_user_id)
+            except Exception:
+                continue
+            if shared_user_id > 0 and shared_user_id != user_id:
+                shared_user_ids.add(shared_user_id)
+    out: dict[str, dict[str, Any]] = {}
+    for shared_user_id in sorted(shared_user_ids):
+        shared_user = automation.get_console_user(shared_user_id)
+        if isinstance(shared_user, PersistedConsoleUser):
+            out[str(shared_user_id)] = _self_public_console_user_payload(shared_user)
+    return out
+
+
+def _self_agents_list_payload(automation: AutomationManager, *, user_id: int) -> dict[str, Any]:
+    agents = automation.list_agents_for_user(user_id=user_id)
+    return {
+        "agents": agents,
+        "sharedUsersById": _self_shared_users_by_id_payload(automation, user_id=user_id, agents=agents),
+    }
+
+
 def _agent_create_response_status(agent: Optional[PersistedAgentRuntime]) -> int:
     if isinstance(agent, PersistedAgentRuntime) and _normalize_agent_provisioning_state(agent.provisioning_state) == AGENT_PROVISIONING_STATE_PENDING:
         return 202
@@ -23328,6 +23609,35 @@ def _self_normalize_agent_id_for_user(user_id: int, raw_agent_id: Any) -> str:
     if re.match(r"^u\d+-", aid_raw):
         return aid_raw
     return _user_agent_id(user_id=user_id, short_name=aid_raw)
+
+
+async def _self_existing_user_agent_context(automation: AutomationManager, *, user_id: int) -> dict[str, Any]:
+    chat_key = automation.primary_private_chat_key_for_user(user_id=user_id)
+    st = automation._store.state
+    bound = st.chat_bindings.get(chat_key) if isinstance(getattr(st, "chat_bindings", None), dict) else None
+    current_agent_id = bound if isinstance(bound, str) and bound.strip() else None
+    if current_agent_id and not automation.can_user_access_agent_id(user_id=user_id, agent_id=current_agent_id):
+        current_agent_id = None
+    current_session_id = automation.resolve_agent_session_id(current_agent_id) if current_agent_id else None
+    current_agent = automation._get_agent(current_agent_id) if current_agent_id else None
+    current_channel = automation.get_current_channel_for_user(user_id=user_id)
+    model_info = (
+        await _automation_model_payload(automation, agent=current_agent, user_id=user_id)
+        if isinstance(current_agent, PersistedAgentRuntime)
+        else {}
+    )
+    return {
+        "createdMain": False,
+        "currentAgentId": current_agent_id,
+        "currentSessionId": current_session_id,
+        "currentAgent": current_agent.to_json() if isinstance(current_agent, PersistedAgentRuntime) else None,
+        "currentChannelId": current_channel.get("channelId") if isinstance(current_channel, dict) else None,
+        "currentChannel": current_channel,
+        "availableModels": model_info.get("availableModels"),
+        "models": model_info.get("models"),
+        "modelSource": model_info.get("source"),
+        "modelError": model_info.get("error"),
+    }
 
 
 async def _self_bootstrap_user_agent_context(automation: AutomationManager, *, user_id: int) -> dict[str, Any]:

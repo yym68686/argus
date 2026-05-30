@@ -34,6 +34,16 @@ export interface DeveloperKeyEntry {
   active?: boolean;
 }
 
+export interface SelfSharedUser {
+  userId: number;
+  email?: string | null;
+  username?: string | null;
+  isAdmin?: boolean;
+  createdAtMs?: number | null;
+  updatedAtMs?: number | null;
+  lastLoginAtMs?: number | null;
+}
+
 export interface SelfDeveloperKeysResponse {
   ok: true;
   userId: number;
@@ -47,7 +57,10 @@ export interface SelfAgentsResponse {
   ok: true;
   userId: number;
   agents: AdminAgentEntry[];
+  sharedUsersById?: Record<string, SelfSharedUser>;
   agent?: AdminAgentEntry | null;
+  sharedUser?: SelfSharedUser | null;
+  unsharedUserId?: number | null;
   created?: boolean;
   currentAgentId?: string | null;
   currentSessionId?: string | null;
@@ -104,6 +117,10 @@ export interface SelfAgentConnectionResponse {
 export interface SelfAgentConnectionOptions {
   wait?: boolean;
   timeoutMs?: number;
+}
+
+export interface SelfAgentsOptions {
+  bootstrap?: boolean;
 }
 
 export interface SelfChannelsResponse {
@@ -210,8 +227,13 @@ export function revokeMyDeveloperKey(wsUrl: string, keyId: string): Promise<Self
   });
 }
 
-export function fetchMyAgents(wsUrl: string): Promise<SelfAgentsResponse> {
-  return gatewayFetchJson<SelfAgentsResponse>(wsUrl, "/me/agents");
+export function fetchMyAgents(wsUrl: string, options?: SelfAgentsOptions): Promise<SelfAgentsResponse> {
+  const query = new URLSearchParams();
+  if (options?.bootstrap === false) {
+    query.set("bootstrap", "false");
+  }
+  const suffix = query.toString() ? `?${query.toString()}` : "";
+  return gatewayFetchJson<SelfAgentsResponse>(wsUrl, `/me/agents${suffix}`);
 }
 
 export function fetchMySessions(wsUrl: string): Promise<SelfSessionsResponse> {
@@ -255,6 +277,31 @@ export function deleteMyAgent(wsUrl: string, agentId: string): Promise<SelfAgent
   return gatewayFetchJson<SelfAgentsResponse>(wsUrl, `/me/agents/${encodeURIComponent(agentId)}`, {
     method: "DELETE",
   });
+}
+
+export function shareMyAgent(
+  wsUrl: string,
+  agentId: string,
+  body: { account: string }
+): Promise<SelfAgentsResponse> {
+  return gatewayFetchJson<SelfAgentsResponse>(wsUrl, `/me/agents/${encodeURIComponent(agentId)}/shares`, {
+    method: "POST",
+    body: JSON.stringify(body),
+  });
+}
+
+export function unshareMyAgent(
+  wsUrl: string,
+  agentId: string,
+  targetUserId: number
+): Promise<SelfAgentsResponse> {
+  return gatewayFetchJson<SelfAgentsResponse>(
+    wsUrl,
+    `/me/agents/${encodeURIComponent(agentId)}/shares/${encodeURIComponent(String(targetUserId))}`,
+    {
+      method: "DELETE",
+    }
+  );
 }
 
 export function setMyAgentModel(

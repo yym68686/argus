@@ -93,6 +93,7 @@ export default function AgentsPage() {
     }
     return agents[0] ?? null;
   })();
+  const selectedAgentIsOwner = Boolean(selectedAgent?.isOwner);
 
   const applyAgents = React.useCallback((nextState: SelfAgentsResponse, preferredAgentId?: string | null) => {
     const candidates = [
@@ -188,6 +189,7 @@ export default function AgentsPage() {
 
   const retryAgent = React.useCallback(async () => {
     if (!selectedAgent || !wsUrl.trim()) return;
+    if (!selectedAgent.isOwner) return;
     setSaving(true);
     setError(null);
     try {
@@ -224,6 +226,7 @@ export default function AgentsPage() {
 
   const saveRename = React.useCallback(async () => {
     if (!selectedAgent || !wsUrl.trim()) return;
+    if (!selectedAgent.isOwner) return;
     if (!renameName.trim()) {
       toast.error("Agent name is required");
       return;
@@ -245,6 +248,7 @@ export default function AgentsPage() {
 
   const saveModel = React.useCallback(async () => {
     if (!selectedAgent || !wsUrl.trim()) return;
+    if (!selectedAgent.isOwner) return;
     if (!modelDraft.trim()) {
       toast.error("Model is required");
       return;
@@ -266,6 +270,7 @@ export default function AgentsPage() {
 
   const removeAgent = React.useCallback(async () => {
     if (!selectedAgent || !wsUrl.trim()) return;
+    if (!selectedAgent.isOwner) return;
     const label = selectedAgent.shortName || selectedAgent.agentId;
     const confirmed = await confirm({
       title: "Delete agent?",
@@ -330,7 +335,7 @@ export default function AgentsPage() {
           <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-5">
             <Fact label="Current" value={agentsState?.currentAgent?.shortName || agentsState?.currentAgentId || "—"} />
             <Fact label="Session" value={agentsState?.currentSessionId || "—"} mono />
-            <Fact label="Agents" value={String(agentsState?.counts.agents ?? agents.length)} />
+            <Fact label="Agents" value={String(agents.length)} />
             <Fact label="Sessions" value={String(agentsState?.counts.sessions ?? 0)} />
             <Fact label="Limit" value={String(agentsState?.limits.maxAgents ?? "—")} />
           </div>
@@ -365,6 +370,7 @@ export default function AgentsPage() {
                           </div>
                           <div className="flex flex-wrap justify-end gap-2">
                             <Badge tone={agentBadgeTone(agent, agentsState?.currentAgentId)}>{current ? "current" : agent.isDefault ? "main" : "agent"}</Badge>
+                            {!agent.isOwner ? <Badge tone="default">shared</Badge> : null}
                             <Badge tone={agentProvisioningTone(agent)}>{agentProvisioningLabel(agent)}</Badge>
                           </div>
                         </div>
@@ -410,7 +416,7 @@ export default function AgentsPage() {
                         Use
                       </Button>
                     ) : null}
-                    {agentProvisioningState(selectedAgent) === "failed" ? (
+                    {selectedAgentIsOwner && agentProvisioningState(selectedAgent) === "failed" ? (
                       <Button type="button" size="sm" disabled={loading || saving} onClick={() => void retryAgent()}>
                         <RefreshCw className="h-4 w-4" />
                         Retry
@@ -420,7 +426,7 @@ export default function AgentsPage() {
                       <Link2 className="h-4 w-4" />
                       <TextSwap value={agentProvisioningState(selectedAgent) === "pending" ? "Wait for ready" : "Connection"} />
                     </Button>
-                    {!selectedAgent.isDefault ? (
+                    {selectedAgentIsOwner && !selectedAgent.isDefault ? (
                       <Button type="button" size="sm" variant="destructive" disabled={loading || saving} onClick={() => void removeAgent()}>
                         <Trash2 className="h-4 w-4" />
                         Delete
@@ -436,6 +442,7 @@ export default function AgentsPage() {
                     <Badge tone={agentProvisioningTone(selectedAgent)}>
                       <TextSwap value={agentProvisioningLabel(selectedAgent)} />
                     </Badge>
+                    {!selectedAgent.isOwner ? <Badge tone="default">shared</Badge> : null}
                     {selectedAgent.isDefault ? <Badge tone="success">main</Badge> : null}
                     {selectedAgent.agentId === agentsState?.currentAgentId ? <Badge tone="primary">current</Badge> : null}
                   </div>
@@ -450,7 +457,7 @@ export default function AgentsPage() {
                     <InlineError message={selectedAgent.provisioningError || "Provisioning failed"} />
                   ) : null}
 
-                  {!selectedAgent.isDefault ? (
+                  {selectedAgentIsOwner && !selectedAgent.isDefault ? (
                     <div className="grid gap-2 md:grid-cols-[minmax(0,1fr)_auto]">
                       <Input value={renameName} onChange={(event) => setRenameName(event.target.value)} placeholder="agent name" />
                       <Button
@@ -465,12 +472,16 @@ export default function AgentsPage() {
                     </div>
                   ) : null}
 
-                  <div className="grid gap-2 md:grid-cols-[minmax(0,1fr)_auto]">
-                    <Input value={modelDraft} onChange={(event) => setModelDraft(event.target.value)} placeholder="model" />
-                    <Button type="button" variant="secondary" disabled={loading || saving || !modelDraft.trim()} onClick={() => void saveModel()}>
-                      Save model
-                    </Button>
-                  </div>
+                  {selectedAgentIsOwner ? (
+                    <div className="grid gap-2 md:grid-cols-[minmax(0,1fr)_auto]">
+                      <Input value={modelDraft} onChange={(event) => setModelDraft(event.target.value)} placeholder="model" />
+                      <Button type="button" variant="secondary" disabled={loading || saving || !modelDraft.trim()} onClick={() => void saveModel()}>
+                        Save model
+                      </Button>
+                    </div>
+                  ) : (
+                    <Fact label="Model" value={selectedAgent.model || "—"} mono />
+                  )}
 
                   {agentsState?.availableModels?.length ? (
                     <div className="flex flex-wrap gap-2">
