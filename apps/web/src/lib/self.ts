@@ -1,4 +1,10 @@
-import { type AdminAgentEntry, type AdminChannelEntry, type UsageEventEntry, type UsageSummary } from "@/lib/admin";
+import {
+  type AdminAgentEntry,
+  type AdminChannelEntry,
+  type AdminSessionRow,
+  type UsageEventEntry,
+  type UsageSummary,
+} from "@/lib/admin";
 import type { ConsoleUser } from "@/lib/auth";
 import { gatewayFetchJson } from "@/lib/gateway";
 
@@ -158,6 +164,11 @@ export interface SelfUsageResponse {
   events: UsageEventEntry[];
 }
 
+export interface SelfSessionsResponse {
+  ok?: true;
+  sessions: AdminSessionRow[];
+}
+
 export function fetchMyChannels(wsUrl: string): Promise<SelfChannelsResponse> {
   return gatewayFetchJson<SelfChannelsResponse>(wsUrl, "/me/channels");
 }
@@ -201,6 +212,16 @@ export function revokeMyDeveloperKey(wsUrl: string, keyId: string): Promise<Self
 
 export function fetchMyAgents(wsUrl: string): Promise<SelfAgentsResponse> {
   return gatewayFetchJson<SelfAgentsResponse>(wsUrl, "/me/agents");
+}
+
+export function fetchMySessions(wsUrl: string): Promise<SelfSessionsResponse> {
+  return gatewayFetchJson<SelfSessionsResponse>(wsUrl, "/sessions");
+}
+
+export function deleteMySession(wsUrl: string, sessionId: string): Promise<{ ok: true; sessionId: string }> {
+  return gatewayFetchJson<{ ok: true; sessionId: string }>(wsUrl, `/sessions/${encodeURIComponent(sessionId)}`, {
+    method: "DELETE",
+  });
 }
 
 export function createMyAgent(
