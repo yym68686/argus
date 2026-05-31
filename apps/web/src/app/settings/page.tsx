@@ -1,9 +1,10 @@
 "use client";
 
 import React from "react";
-import { Bot, CheckCircle2, RefreshCw, Save, Trash2, XCircle } from "lucide-react";
+import { Bot, CheckCircle2, KeyRound, RefreshCw, Save, Trash2, XCircle } from "lucide-react";
 import { toast } from "sonner";
 
+import { useAuth } from "@/components/admin-gate";
 import { EmptyState, Fact, InlineError, PanelCard, Skeleton, StatCard } from "@/components/console-primitives";
 import { ConsoleShell } from "@/components/console-shell";
 import { Button } from "@/components/ui/button";
@@ -16,6 +17,7 @@ import {
   fetchGatewayApiAccessSettings,
   fetchTelegramBotTokenSettings,
   updateGatewayApiAccessSettings,
+  updateGatewayApiSettings,
   updateTelegramBotTokenSettings,
 } from "@/lib/admin";
 import { formatInt } from "@/lib/format";
@@ -27,14 +29,24 @@ interface GatewayHealth {
 }
 
 export default function SettingsPage() {
+  const { user } = useAuth();
+
+  if (!user?.isAdmin) return null;
+  return <AdminSettingsPage />;
+}
+
+function AdminSettingsPage() {
   const [wsUrl, setWsUrl] = useGatewayWsUrlState();
   const [overview, setOverview] = React.useState<AdminOverviewResponse | null>(null);
   const [gatewayAccess, setGatewayAccess] = React.useState<GatewayApiAccessSettingsResponse | null>(null);
+  const [gatewayBaseUrlDraft, setGatewayBaseUrlDraft] = React.useState("");
+  const [gatewayApiKeyDraft, setGatewayApiKeyDraft] = React.useState("");
   const [telegramBotToken, setTelegramBotToken] = React.useState<TelegramBotTokenSettingsResponse | null>(null);
   const [telegramTokenDraft, setTelegramTokenDraft] = React.useState("");
   const [health, setHealth] = React.useState<GatewayHealth | null>(null);
   const [loading, setLoading] = React.useState(false);
   const [gatewayAccessBusy, setGatewayAccessBusy] = React.useState(false);
+  const [gatewayApiBusy, setGatewayApiBusy] = React.useState(false);
   const [telegramTokenBusy, setTelegramTokenBusy] = React.useState(false);
   const [error, setError] = React.useState<string | null>(null);
   const showSkeleton = loading && !overview && !health && !gatewayAccess && !telegramBotToken;
@@ -53,6 +65,8 @@ export default function SettingsPage() {
       setOverview(nextOverview);
       setHealth(nextHealth);
       setGatewayAccess(nextGatewayAccess);
+      setGatewayBaseUrlDraft(nextGatewayAccess.gatewayOpenaiBaseUrl || "");
+      setGatewayApiKeyDraft("");
       setTelegramBotToken(nextTelegramBotToken);
     } catch (err) {
       const message = (err as Error)?.message || String(err);
@@ -92,6 +106,62 @@ export default function SettingsPage() {
       setGatewayAccessBusy(false);
     }
   }, [gatewayAccess, wsUrl]);
+
+  const saveGatewayApi = React.useCallback(async () => {
+    if (!wsUrl.trim()) return;
+    const nextBaseUrl = gatewayBaseUrlDraft.trim();
+    const nextApiKey = gatewayApiKeyDraft.trim();
+    if (!nextBaseUrl) {
+      toast.error("Enter a gateway base URL");
+      return;
+    }
+    setGatewayApiBusy(true);
+    try {
+      const next = await updateGatewayApiSettings(wsUrl, {
+        baseUrl: nextBaseUrl,
+        ...(nextApiKey ? { apiKey: nextApiKey } : {}),
+      });
+      setGatewayAccess(next);
+      setGatewayBaseUrlDraft(next.gatewayOpenaiBaseUrl || "");
+      setGatewayApiKeyDraft("");
+      toast.success("Gateway LLM API saved");
+    } catch (err) {
+      toast.error((err as Error)?.message || String(err));
+    } finally {
+      setGatewayApiBusy(false);
+    }
+  }, [gatewayApiKeyDraft, gatewayBaseUrlDraft, wsUrl]);
+
+  const clearGatewayApiKey = React.useCallback(async () => {
+    if (!wsUrl.trim()) return;
+    setGatewayApiBusy(true);
+    try {
+      const next = await updateGatewayApiSettings(wsUrl, { apiKey: null });
+      setGatewayAccess(next);
+      setGatewayBaseUrlDraft(next.gatewayOpenaiBaseUrl || "");
+      setGatewayApiKeyDraft("");
+      toast.success("Gateway API key override cleared");
+    } catch (err) {
+      toast.error((err as Error)?.message || String(err));
+    } finally {
+      setGatewayApiBusy(false);
+    }
+  }, [wsUrl]);
+
+  const clearGatewayBaseUrl = React.useCallback(async () => {
+    if (!wsUrl.trim()) return;
+    setGatewayApiBusy(true);
+    try {
+      const next = await updateGatewayApiSettings(wsUrl, { baseUrl: null });
+      setGatewayAccess(next);
+      setGatewayBaseUrlDraft(next.gatewayOpenaiBaseUrl || "");
+      toast.success("Gateway base URL override cleared");
+    } catch (err) {
+      toast.error((err as Error)?.message || String(err));
+    } finally {
+      setGatewayApiBusy(false);
+    }
+  }, [wsUrl]);
 
   const saveTelegramToken = React.useCallback(async () => {
     if (!wsUrl.trim()) return;
@@ -176,7 +246,7 @@ export default function SettingsPage() {
         <div className="grid gap-4 xl:grid-cols-[minmax(0,1fr)_380px]">
           <section className="space-y-4">
             <PanelCard
-              title="Gateway API"
+              title="Gateway LLM API"
               action={
                 <Button
                   type="button"
@@ -193,8 +263,8 @@ export default function SettingsPage() {
               }
             >
               {showSkeleton ? (
-                <div className="grid gap-3 lg:grid-cols-2">
-                  {Array.from({ length: 2 }).map((_, index) => (
+                <div className="grid gap-3 lg:grid-cols-4">
+                  {Array.from({ length: 4 }).map((_, index) => (
                     <div
                       key={index}
                       className="min-w-0 border-l border-border/58 py-1.5 pl-3"
@@ -205,25 +275,96 @@ export default function SettingsPage() {
                   ))}
                 </div>
               ) : (
-                <div className="grid gap-3 lg:grid-cols-2">
-                  <Fact
-                    label="Telegram default"
-                    value={
-                      gatewayAccess
-                        ? gatewayAccess.gatewayOpenaiDefaultEnabled
-                          ? "on"
-                          : "off"
-                        : "unknown"
-                    }
-                  />
-                  <Fact
-                    label="Overrides"
-                    value={
-                      gatewayAccess
-                        ? `${formatInt(gatewayAccess.allowOverrideCount)} allow · ${formatInt(gatewayAccess.denyOverrideCount)} deny`
-                        : "unknown"
-                    }
-                  />
+                <div className="grid gap-4">
+                  <div className="grid gap-3 lg:grid-cols-4">
+                    <Fact
+                      label="Default access"
+                      value={
+                        gatewayAccess
+                          ? gatewayAccess.gatewayOpenaiDefaultEnabled
+                            ? "on"
+                            : "off"
+                          : "unknown"
+                      }
+                    />
+                    <Fact label="API key" value={gatewayAccess?.gatewayOpenaiApiKeyMasked || "missing"} mono />
+                    <Fact label="Base source" value={gatewayAccess?.gatewayOpenaiBaseUrlSource || "unknown"} />
+                    <Fact
+                      label="Overrides"
+                      value={
+                        gatewayAccess
+                          ? `${formatInt(gatewayAccess.allowOverrideCount)} allow · ${formatInt(gatewayAccess.denyOverrideCount)} deny`
+                          : "unknown"
+                      }
+                    />
+                  </div>
+                  {gatewayAccess?.gatewayOpenaiApiKeyError ? <InlineError message={gatewayAccess.gatewayOpenaiApiKeyError} /> : null}
+                  <form
+                    className="grid gap-3"
+                    onSubmit={(event) => {
+                      event.preventDefault();
+                      void saveGatewayApi();
+                    }}
+                  >
+                    <div className="grid gap-3 lg:grid-cols-[minmax(0,1.2fr)_minmax(13rem,0.8fr)]">
+                      <div className="grid gap-1.5">
+                        <label htmlFor="gateway-openai-base-url" className="text-xs font-medium text-muted-foreground">
+                          Base URL
+                        </label>
+                        <Input
+                          id="gateway-openai-base-url"
+                          type="url"
+                          value={gatewayBaseUrlDraft}
+                          onChange={(event) => setGatewayBaseUrlDraft(event.target.value)}
+                          placeholder="https://api.openai.com/v1"
+                          autoComplete="off"
+                          spellCheck={false}
+                        />
+                      </div>
+                      <div className="grid gap-1.5">
+                        <label htmlFor="gateway-openai-api-key" className="text-xs font-medium text-muted-foreground">
+                          API key
+                        </label>
+                        <Input
+                          id="gateway-openai-api-key"
+                          type="password"
+                          value={gatewayApiKeyDraft}
+                          onChange={(event) => setGatewayApiKeyDraft(event.target.value)}
+                          placeholder={gatewayAccess?.hasStoredGatewayOpenaiApiKey ? "Replace stored key" : "Set API key"}
+                          autoComplete="off"
+                          spellCheck={false}
+                        />
+                      </div>
+                    </div>
+                    <div className="flex flex-wrap items-center gap-2">
+                      <Button type="submit" disabled={gatewayApiBusy || !gatewayBaseUrlDraft.trim()}>
+                        <Save className="h-4 w-4" />
+                        {gatewayApiBusy ? "Saving…" : "Save API"}
+                      </Button>
+                      <Button
+                        type="button"
+                        variant="secondary"
+                        disabled={gatewayApiBusy || !gatewayAccess?.hasStoredGatewayOpenaiApiKey}
+                        onClick={() => void clearGatewayApiKey()}
+                      >
+                        <KeyRound className="h-4 w-4" />
+                        Clear key
+                      </Button>
+                      <Button
+                        type="button"
+                        variant="secondary"
+                        disabled={gatewayApiBusy || !gatewayAccess?.hasStoredGatewayOpenaiBaseUrl}
+                        onClick={() => void clearGatewayBaseUrl()}
+                      >
+                        <Trash2 className="h-4 w-4" />
+                        Clear URL
+                      </Button>
+                    </div>
+                  </form>
+                  <div className="grid gap-3 lg:grid-cols-2">
+                    <Fact label="Responses URL" value={gatewayAccess?.gatewayOpenaiResponsesUrl || "—"} mono />
+                    <Fact label="Models URL" value={gatewayAccess?.gatewayOpenaiModelsUrl || "—"} mono />
+                  </div>
                 </div>
               )}
             </PanelCard>

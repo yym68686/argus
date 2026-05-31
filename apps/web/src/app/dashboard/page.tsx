@@ -177,10 +177,6 @@ export default function DashboardPage() {
     void run();
   }, [refresh, wsUrl]);
 
-  React.useEffect(() => {
-    setEmailDraft(user?.email || "");
-  }, [user?.email]);
-
   const handleTelegramLink = React.useCallback(async () => {
     if (!wsUrl.trim()) return;
     setTelegramLinkBusy(true);

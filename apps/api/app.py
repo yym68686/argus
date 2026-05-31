@@ -2741,7 +2741,7 @@ CONSOLE_USERNAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 CONSOLE_SESSION_ID_RE = re.compile(r"^[a-f0-9]{24}$")
 DEVELOPER_API_KEY_ID_RE = re.compile(r"^[a-f0-9]{16}$")
 TELEGRAM_LINK_TOKEN_ID_RE = re.compile(r"^[a-f0-9]{12}$")
-AUTOMATION_STATE_VERSION = 14
+AUTOMATION_STATE_VERSION = 15
 ARGUS_AGENT_MODEL_DEFAULT = "gpt-5.5"
 ARGUS_GATEWAY_AGENT_MODELS = ("gpt-5.2", "gpt-5.4", "gpt-5.5")
 ARGUS_GATEWAY_AGENT_MODELS_SET = frozenset(ARGUS_GATEWAY_AGENT_MODELS)
@@ -2753,6 +2753,7 @@ CHANNEL_ID_ZERO_ZERO_PRO = "0-0.pro"
 CHANNEL_IDS_BUILTIN = frozenset((CHANNEL_ID_GATEWAY, CHANNEL_ID_ZERO_ZERO_PRO))
 CHANNEL_ZERO_ZERO_PRO_BASE_URL = "https://api.0-0.pro/v1"
 CHANNEL_ZERO_ZERO_PRO_PROMO_URL = "https://0-0.pro"
+GATEWAY_OPENAI_DEFAULT_RESPONSES_UPSTREAM_URL = "https://api.openai.com/v1/responses"
 BUILTIN_ACCESS_MODE_INHERIT = "inherit"
 BUILTIN_ACCESS_MODE_ALLOW = "allow"
 BUILTIN_ACCESS_MODE_DENY = "deny"
@@ -3371,12 +3372,24 @@ def _base_url_from_responses_url(raw: Any) -> str:
     return value.rstrip("/")
 
 
-def _gateway_openai_api_key() -> Optional[str]:
+def _gateway_openai_env_api_key() -> Optional[str]:
     return _normalize_channel_api_key(os.getenv("OPENAI_API_KEY") or os.getenv("ARGUS_OPENAI_API_KEY"))
 
 
-def _gateway_openai_responses_upstream_url() -> str:
-    return (os.getenv("ARGUS_OPENAI_RESPONSES_UPSTREAM_URL") or "https://api.openai.com/v1/responses").strip()
+def _gateway_openai_env_responses_upstream_url() -> str:
+    return (os.getenv("ARGUS_OPENAI_RESPONSES_UPSTREAM_URL") or GATEWAY_OPENAI_DEFAULT_RESPONSES_UPSTREAM_URL).strip()
+
+
+def _gateway_openai_env_base_url() -> str:
+    raw = _gateway_openai_env_responses_upstream_url()
+    normalized = _normalize_openai_base_url(raw)
+    if normalized:
+        return normalized
+    return _base_url_from_responses_url(raw)
+
+
+def _gateway_openai_env_base_url_source() -> str:
+    return "env" if str(os.getenv("ARGUS_OPENAI_RESPONSES_UPSTREAM_URL") or "").strip() else "default"
 
 
 def _mask_secret(raw: Any) -> Optional[str]:
@@ -4772,6 +4785,8 @@ class PersistedGatewayAutomationState:
     user_channels: dict[str, PersistedUserChannelState] = field(default_factory=dict)
     gateway_openai_default_enabled: bool = field(default_factory=_gateway_openai_default_enabled_env)
     gateway_openai_default_source: str = field(default_factory=_gateway_openai_default_source_env)
+    gateway_openai_api_key: Optional[str] = None
+    gateway_openai_base_url: Optional[str] = None
     telegram_bot_token: Optional[str] = None
     telegram_user_profiles: dict[str, PersistedTelegramUserProfile] = field(default_factory=dict)
     telegram_console_links: dict[str, PersistedTelegramConsoleLink] = field(default_factory=dict)
@@ -4798,6 +4813,12 @@ class PersistedGatewayAutomationState:
                 self.gateway_openai_default_source
             )
             or _gateway_openai_default_source_env(),
+            "gatewayOpenaiApiKey": (
+                _mask_secret(_secret_storage_resolve(self.gateway_openai_api_key)[0])
+                if redact_secrets
+                else _secret_storage_prepare(self.gateway_openai_api_key)
+            ),
+            "gatewayOpenaiBaseUrl": _normalize_openai_base_url(self.gateway_openai_base_url) or None,
             "telegramBotToken": (
                 _mask_secret(_secret_storage_resolve(self.telegram_bot_token)[0])
                 if redact_secrets
@@ -4903,6 +4924,13 @@ class PersistedGatewayAutomationState:
             obj.get("gatewayOpenaiDefaultEnabled"),
             obj.get("gatewayOpenaiDefaultSource"),
         )
+        raw_gateway_openai_api_key = obj.get("gatewayOpenaiApiKey")
+        gateway_openai_api_key = (
+            str(raw_gateway_openai_api_key).strip()
+            if _secret_storage_is_sealed(raw_gateway_openai_api_key)
+            else _normalize_channel_api_key(raw_gateway_openai_api_key)
+        )
+        gateway_openai_base_url = _normalize_openai_base_url(obj.get("gatewayOpenaiBaseUrl")) or None
         raw_telegram_bot_token = obj.get("telegramBotToken")
         telegram_bot_token = (
             str(raw_telegram_bot_token).strip()
@@ -5026,6 +5054,8 @@ class PersistedGatewayAutomationState:
             user_channels=user_channels,
             gateway_openai_default_enabled=gateway_openai_default_enabled,
             gateway_openai_default_source=gateway_openai_default_source,
+            gateway_openai_api_key=gateway_openai_api_key,
+            gateway_openai_base_url=gateway_openai_base_url,
             telegram_bot_token=telegram_bot_token,
             telegram_user_profiles=telegram_user_profiles,
             telegram_console_links=telegram_console_links,
@@ -5149,6 +5179,34 @@ class _SQLiteAutomationStateStore:
                             default=_gateway_openai_default_enabled_env(),
                         )
                         else "false",
+                        now_ms,
+                    ),
+                )
+                conn.execute(
+                    """
+                    INSERT INTO automation_state_meta (key, value_text, updated_at_ms)
+                    VALUES (?, ?, ?)
+                    ON CONFLICT(key) DO UPDATE SET
+                        value_text = excluded.value_text,
+                        updated_at_ms = excluded.updated_at_ms
+                    """,
+                    (
+                        "gateway_openai_api_key",
+                        _secret_storage_prepare(getattr(state, "gateway_openai_api_key", None)) or "",
+                        now_ms,
+                    ),
+                )
+                conn.execute(
+                    """
+                    INSERT INTO automation_state_meta (key, value_text, updated_at_ms)
+                    VALUES (?, ?, ?)
+                    ON CONFLICT(key) DO UPDATE SET
+                        value_text = excluded.value_text,
+                        updated_at_ms = excluded.updated_at_ms
+                    """,
+                    (
+                        "gateway_openai_base_url",
+                        _normalize_openai_base_url(getattr(state, "gateway_openai_base_url", None)) or "",
                         now_ms,
                     ),
                 )
@@ -5524,9 +5582,16 @@ class _SQLiteAutomationStateStore:
             """
             SELECT key, value_text
             FROM automation_state_meta
-            WHERE key IN (?, ?, ?, ?)
+            WHERE key IN (?, ?, ?, ?, ?, ?)
             """,
-            ("version", "gateway_openai_default_enabled", "gateway_openai_default_source", "telegram_bot_token"),
+            (
+                "version",
+                "gateway_openai_default_enabled",
+                "gateway_openai_default_source",
+                "gateway_openai_api_key",
+                "gateway_openai_base_url",
+                "telegram_bot_token",
+            ),
         )
         meta_by_key = {str(row["key"]): row["value_text"] for row in meta_rows}
         meta_version = meta_by_key.get("version")
@@ -5539,6 +5604,16 @@ class _SQLiteAutomationStateStore:
             meta_by_key.get("gateway_openai_default_enabled"),
             meta_by_key.get("gateway_openai_default_source"),
         )
+        gateway_openai_api_key = None
+        gateway_openai_api_key_raw = meta_by_key.get("gateway_openai_api_key")
+        if gateway_openai_api_key_raw is not None:
+            raw_gateway_openai_api_key = str(gateway_openai_api_key_raw or "").strip()
+            gateway_openai_api_key = (
+                raw_gateway_openai_api_key
+                if _secret_storage_is_sealed(raw_gateway_openai_api_key)
+                else _normalize_channel_api_key(raw_gateway_openai_api_key)
+            )
+        gateway_openai_base_url = _normalize_openai_base_url(meta_by_key.get("gateway_openai_base_url")) or None
         telegram_bot_token = None
         telegram_bot_token_raw = meta_by_key.get("telegram_bot_token")
         if telegram_bot_token_raw is not None:
@@ -5731,6 +5806,8 @@ class _SQLiteAutomationStateStore:
             user_channels=user_channels,
             gateway_openai_default_enabled=gateway_openai_default_enabled,
             gateway_openai_default_source=gateway_openai_default_source,
+            gateway_openai_api_key=gateway_openai_api_key,
+            gateway_openai_base_url=gateway_openai_base_url,
             telegram_bot_token=telegram_bot_token,
             telegram_user_profiles=telegram_user_profiles,
             telegram_console_links=telegram_console_links,
@@ -6469,6 +6546,34 @@ class _PostgresAutomationStateStore:
                         updated_at_ms = EXCLUDED.updated_at_ms
                     """,
                     (
+                        "gateway_openai_api_key",
+                        _secret_storage_prepare(getattr(state, "gateway_openai_api_key", None)) or "",
+                        now_ms,
+                    ),
+                )
+                conn.execute(
+                    """
+                    INSERT INTO automation_state_meta (key, value_text, updated_at_ms)
+                    VALUES (%s, %s, %s)
+                    ON CONFLICT(key) DO UPDATE SET
+                        value_text = EXCLUDED.value_text,
+                        updated_at_ms = EXCLUDED.updated_at_ms
+                    """,
+                    (
+                        "gateway_openai_base_url",
+                        _normalize_openai_base_url(getattr(state, "gateway_openai_base_url", None)) or "",
+                        now_ms,
+                    ),
+                )
+                conn.execute(
+                    """
+                    INSERT INTO automation_state_meta (key, value_text, updated_at_ms)
+                    VALUES (%s, %s, %s)
+                    ON CONFLICT(key) DO UPDATE SET
+                        value_text = EXCLUDED.value_text,
+                        updated_at_ms = EXCLUDED.updated_at_ms
+                    """,
+                    (
                         "gateway_openai_default_source",
                         _normalize_gateway_openai_default_source(
                             getattr(state, "gateway_openai_default_source", None)
@@ -6857,9 +6962,16 @@ class _PostgresAutomationStateStore:
             """
             SELECT key, value_text
             FROM automation_state_meta
-            WHERE key IN (%s, %s, %s, %s)
+            WHERE key IN (%s, %s, %s, %s, %s, %s)
             """,
-            ("version", "gateway_openai_default_enabled", "gateway_openai_default_source", "telegram_bot_token"),
+            (
+                "version",
+                "gateway_openai_default_enabled",
+                "gateway_openai_default_source",
+                "gateway_openai_api_key",
+                "gateway_openai_base_url",
+                "telegram_bot_token",
+            ),
         )
         meta_by_key = {str(row["key"]): row["value_text"] for row in meta_rows}
         meta_version = meta_by_key.get("version")
@@ -6872,6 +6984,16 @@ class _PostgresAutomationStateStore:
             meta_by_key.get("gateway_openai_default_enabled"),
             meta_by_key.get("gateway_openai_default_source"),
         )
+        gateway_openai_api_key = None
+        gateway_openai_api_key_raw = meta_by_key.get("gateway_openai_api_key")
+        if gateway_openai_api_key_raw is not None:
+            raw_gateway_openai_api_key = str(gateway_openai_api_key_raw or "").strip()
+            gateway_openai_api_key = (
+                raw_gateway_openai_api_key
+                if _secret_storage_is_sealed(raw_gateway_openai_api_key)
+                else _normalize_channel_api_key(raw_gateway_openai_api_key)
+            )
+        gateway_openai_base_url = _normalize_openai_base_url(meta_by_key.get("gateway_openai_base_url")) or None
         telegram_bot_token = None
         telegram_bot_token_raw = meta_by_key.get("telegram_bot_token")
         if telegram_bot_token_raw is not None:
@@ -7064,6 +7186,8 @@ class _PostgresAutomationStateStore:
             user_channels=user_channels,
             gateway_openai_default_enabled=gateway_openai_default_enabled,
             gateway_openai_default_source=gateway_openai_default_source,
+            gateway_openai_api_key=gateway_openai_api_key,
+            gateway_openai_base_url=gateway_openai_base_url,
             telegram_bot_token=telegram_bot_token,
             telegram_user_profiles=telegram_user_profiles,
             telegram_console_links=telegram_console_links,
@@ -9645,6 +9769,42 @@ class AutomationManager:
             or _gateway_openai_default_source_env()
         )
 
+    def _stored_gateway_openai_api_key(self) -> tuple[Optional[str], Optional[str]]:
+        raw = getattr(self._store.state, "gateway_openai_api_key", None)
+        api_key, err = _secret_storage_resolve(raw)
+        normalized = _normalize_channel_api_key(api_key)
+        if normalized:
+            return normalized, None
+        if err:
+            return None, err
+        if str(raw or "").strip():
+            return None, "Stored gateway API key is invalid"
+        return None, None
+
+    def _effective_gateway_openai_api_key(self) -> tuple[Optional[str], str, Optional[str]]:
+        stored_api_key, stored_error = self._stored_gateway_openai_api_key()
+        if stored_api_key:
+            return stored_api_key, "stored", stored_error
+        env_api_key = _gateway_openai_env_api_key()
+        if env_api_key:
+            return env_api_key, "env", stored_error
+        return None, "unset", stored_error
+
+    def _stored_gateway_openai_base_url(self) -> Optional[str]:
+        return _normalize_openai_base_url(getattr(self._store.state, "gateway_openai_base_url", None)) or None
+
+    def _effective_gateway_openai_base_url(self) -> tuple[str, str]:
+        stored_base_url = self._stored_gateway_openai_base_url()
+        if stored_base_url:
+            return stored_base_url, "stored"
+        return _gateway_openai_env_base_url(), _gateway_openai_env_base_url_source()
+
+    def _effective_gateway_openai_responses_upstream_url(self) -> str:
+        stored_base_url = self._stored_gateway_openai_base_url()
+        if stored_base_url:
+            return _responses_url_from_base_url(stored_base_url)
+        return _gateway_openai_env_responses_upstream_url()
+
     def _builtin_channel_access_override_for_user_state(
         self,
         *,
@@ -9755,14 +9915,15 @@ class AutomationManager:
         current_id = _normalize_channel_id(current_channel_id)
         normalized_channel_id = _normalize_channel_id(channel_id)
         if normalized_channel_id == CHANNEL_ID_GATEWAY:
-            api_key = _gateway_openai_api_key()
+            api_key, _api_key_source, api_key_error = self._effective_gateway_openai_api_key()
             policy = self._builtin_channel_access_policy_for_user_state(
                 user_state=user_state,
                 channel_id=CHANNEL_ID_GATEWAY,
             )
             enabled = bool(policy.get("enabled"))
             ready = bool(api_key) and enabled
-            base_url = _base_url_from_responses_url(_gateway_openai_responses_upstream_url())
+            base_url, _base_url_source = self._effective_gateway_openai_base_url()
+            responses_url = self._effective_gateway_openai_responses_upstream_url()
             reason: Optional[str] = None
             if not enabled:
                 reason = (
@@ -9770,8 +9931,10 @@ class AutomationManager:
                     if policy.get("accessMode") == BUILTIN_ACCESS_MODE_DENY
                     else "Blocked by default"
                 )
+            elif api_key_error:
+                reason = api_key_error
             elif not api_key:
-                reason = "Gateway OPENAI_API_KEY is not configured"
+                reason = "Gateway API key is not configured"
             return {
                 "channelId": CHANNEL_ID_GATEWAY,
                 "name": CHANNEL_ID_GATEWAY,
@@ -9780,7 +9943,7 @@ class AutomationManager:
                 "isBuiltin": True,
                 "selected": current_id == CHANNEL_ID_GATEWAY,
                 "baseUrl": base_url,
-                "responsesUrl": _gateway_openai_responses_upstream_url(),
+                "responsesUrl": responses_url,
                 "modelsUrl": _models_url_from_base_url(base_url),
                 "hasApiKey": bool(api_key),
                 "apiKeyMasked": None,
@@ -9971,9 +10134,11 @@ class AutomationManager:
             raise RuntimeError(str(channel_entry.get("reason") or f"Channel is not ready: {resolved_channel_id}"))
 
         if resolved_channel_id == CHANNEL_ID_GATEWAY:
-            api_key = _gateway_openai_api_key()
-            base_url = _base_url_from_responses_url(_gateway_openai_responses_upstream_url())
-            responses_url = _gateway_openai_responses_upstream_url()
+            api_key, _api_key_source, api_key_error = self._effective_gateway_openai_api_key()
+            base_url, _base_url_source = self._effective_gateway_openai_base_url()
+            responses_url = self._effective_gateway_openai_responses_upstream_url()
+            if api_key_error:
+                raise RuntimeError(api_key_error)
         elif resolved_channel_id == CHANNEL_ID_ZERO_ZERO_PRO:
             api_key, api_key_error = _secret_storage_resolve((user_state.builtin_api_keys or {}).get(CHANNEL_ID_ZERO_ZERO_PRO))
             base_url = CHANNEL_ZERO_ZERO_PRO_BASE_URL
@@ -10103,16 +10268,16 @@ class AutomationManager:
         if owner_user_id is None:
             if not self._gateway_openai_default_enabled():
                 raise RuntimeError("Gateway channel is disabled by default")
-            api_key = _gateway_openai_api_key()
+            api_key, _api_key_source, api_key_error = self._effective_gateway_openai_api_key()
             if not api_key:
-                raise RuntimeError("Gateway channel is not configured (missing OPENAI_API_KEY)")
-            base_url = _base_url_from_responses_url(_gateway_openai_responses_upstream_url())
+                raise RuntimeError(api_key_error or "Gateway channel is not configured (missing API key)")
+            base_url, _base_url_source = self._effective_gateway_openai_base_url()
             return {
                 "ownerUserId": None,
                 "channelId": CHANNEL_ID_GATEWAY,
                 "name": CHANNEL_ID_GATEWAY,
                 "baseUrl": base_url,
-                "upstreamUrl": _gateway_openai_responses_upstream_url(),
+                "upstreamUrl": self._effective_gateway_openai_responses_upstream_url(),
                 "modelsUrl": _models_url_from_base_url(base_url),
                 "apiKey": api_key,
             }
@@ -10388,6 +10553,14 @@ class AutomationManager:
     def get_gateway_openai_access_settings(self) -> dict[str, Any]:
         st = self._store.state
         default_enabled = self._gateway_openai_default_enabled()
+        stored_api_key_raw = getattr(st, "gateway_openai_api_key", None)
+        has_stored_api_key = bool(str(stored_api_key_raw or "").strip())
+        stored_api_key, stored_api_key_error = self._stored_gateway_openai_api_key()
+        env_api_key = _gateway_openai_env_api_key()
+        effective_api_key, api_key_source, api_key_error = self._effective_gateway_openai_api_key()
+        stored_base_url = self._stored_gateway_openai_base_url()
+        effective_base_url, base_url_source = self._effective_gateway_openai_base_url()
+        responses_url = self._effective_gateway_openai_responses_upstream_url()
         allow_override_count = 0
         deny_override_count = 0
         for user_state in (getattr(st, "user_channels", None) or {}).values():
@@ -10407,15 +10580,60 @@ class AutomationManager:
             "gatewayOpenaiDefaultSource": self._gateway_openai_default_source(),
             "allowOverrideCount": allow_override_count,
             "denyOverrideCount": deny_override_count,
+            "gatewayOpenaiConfigured": bool(effective_api_key),
+            "gatewayOpenaiApiKeySource": api_key_source,
+            "gatewayOpenaiApiKeyMasked": _mask_secret(effective_api_key),
+            "hasStoredGatewayOpenaiApiKey": has_stored_api_key,
+            "storedGatewayOpenaiApiKeyMasked": _mask_secret(stored_api_key),
+            "envGatewayOpenaiApiKeyMasked": _mask_secret(env_api_key),
+            "storedGatewayOpenaiApiKeyReadable": stored_api_key_error is None,
+            "gatewayOpenaiApiKeyError": api_key_error,
+            "gatewayOpenaiBaseUrl": effective_base_url,
+            "gatewayOpenaiBaseUrlSource": base_url_source,
+            "hasStoredGatewayOpenaiBaseUrl": bool(stored_base_url),
+            "storedGatewayOpenaiBaseUrl": stored_base_url,
+            "envGatewayOpenaiBaseUrl": _gateway_openai_env_base_url(),
+            "gatewayOpenaiResponsesUrl": responses_url,
+            "gatewayOpenaiModelsUrl": _models_url_from_base_url(effective_base_url),
         }
 
     async def set_gateway_openai_default_enabled(self, *, enabled: bool) -> dict[str, Any]:
-        enabled_flag = bool(enabled)
+        return await self.set_gateway_openai_settings(enabled=bool(enabled))
+
+    async def set_gateway_openai_settings(
+        self,
+        *,
+        enabled: Optional[bool] = None,
+        api_key: Any = None,
+        update_api_key: bool = False,
+        base_url: Any = None,
+        update_base_url: bool = False,
+    ) -> dict[str, Any]:
+        enabled_provided = enabled is not None
+        enabled_flag = bool(enabled) if enabled_provided else None
+        if update_api_key:
+            normalized_api_key = None if api_key is None else _normalize_channel_api_key(api_key)
+            if api_key is not None and not normalized_api_key:
+                raise ValueError("Invalid apiKey")
+            stored_api_key = _secret_storage_prepare(normalized_api_key) if normalized_api_key else None
+        else:
+            stored_api_key = None
+        if update_base_url:
+            normalized_base_url = None if base_url is None else _normalize_openai_base_url(base_url)
+            if base_url is not None and not normalized_base_url:
+                raise ValueError("Invalid baseUrl")
+        else:
+            normalized_base_url = None
 
         def _write(st: PersistedGatewayAutomationState) -> None:
             st.version = max(int(getattr(st, "version", 1) or 1), AUTOMATION_STATE_VERSION)
-            st.gateway_openai_default_enabled = enabled_flag
-            st.gateway_openai_default_source = GATEWAY_OPENAI_DEFAULT_SOURCE_ADMIN
+            if enabled_provided:
+                st.gateway_openai_default_enabled = bool(enabled_flag)
+                st.gateway_openai_default_source = GATEWAY_OPENAI_DEFAULT_SOURCE_ADMIN
+            if update_api_key:
+                st.gateway_openai_api_key = stored_api_key
+            if update_base_url:
+                st.gateway_openai_base_url = normalized_base_url
 
         await self._store.update(_write)
         self._invalidate_model_catalog_cache()
@@ -24958,20 +25176,37 @@ async def admin_gateway_api_access_set(request: Request):
         raise HTTPException(status_code=400, detail="Invalid JSON body") from e
     if not isinstance(body, dict):
         raise HTTPException(status_code=400, detail="Invalid JSON body")
-    raw_enabled = body.get("enabled")
-    if isinstance(raw_enabled, bool):
-        enabled = raw_enabled
-    elif isinstance(raw_enabled, str):
-        lowered = raw_enabled.strip().lower()
-        if lowered in {"true", "1", "yes", "on"}:
-            enabled = True
-        elif lowered in {"false", "0", "no", "off"}:
-            enabled = False
+    enabled: Optional[bool] = None
+    if "enabled" in body:
+        raw_enabled = body.get("enabled")
+        if isinstance(raw_enabled, bool):
+            enabled = raw_enabled
+        elif isinstance(raw_enabled, str):
+            lowered = raw_enabled.strip().lower()
+            if lowered in {"true", "1", "yes", "on"}:
+                enabled = True
+            elif lowered in {"false", "0", "no", "off"}:
+                enabled = False
+            else:
+                raise HTTPException(status_code=400, detail="Invalid 'enabled'")
         else:
             raise HTTPException(status_code=400, detail="Invalid 'enabled'")
-    else:
-        raise HTTPException(status_code=400, detail="Invalid 'enabled'")
-    return await automation.set_gateway_openai_default_enabled(enabled=enabled)
+    update_api_key = "apiKey" in body
+    update_base_url = "baseUrl" in body
+    if enabled is None and not update_api_key and not update_base_url:
+        raise HTTPException(status_code=400, detail="Missing setting update")
+    try:
+        return await automation.set_gateway_openai_settings(
+            enabled=enabled,
+            api_key=None if body.get("apiKey") is None else str(body.get("apiKey") or ""),
+            update_api_key=update_api_key,
+            base_url=None if body.get("baseUrl") is None else str(body.get("baseUrl") or ""),
+            update_base_url=update_base_url,
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    except RuntimeError as e:
+        raise HTTPException(status_code=500, detail=str(e)) from e
 
 
 @app.get("/admin/settings/telegram-bot-token")

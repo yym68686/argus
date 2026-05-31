@@ -110,6 +110,21 @@ export interface GatewayApiAccessSettingsResponse {
   gatewayOpenaiDefaultSource?: "admin" | "env" | "stored" | "default" | string;
   allowOverrideCount?: number;
   denyOverrideCount?: number;
+  gatewayOpenaiConfigured?: boolean;
+  gatewayOpenaiApiKeySource?: "stored" | "env" | "unset" | string;
+  gatewayOpenaiApiKeyMasked?: string | null;
+  hasStoredGatewayOpenaiApiKey?: boolean;
+  storedGatewayOpenaiApiKeyMasked?: string | null;
+  envGatewayOpenaiApiKeyMasked?: string | null;
+  storedGatewayOpenaiApiKeyReadable?: boolean;
+  gatewayOpenaiApiKeyError?: string | null;
+  gatewayOpenaiBaseUrl?: string | null;
+  gatewayOpenaiBaseUrlSource?: "stored" | "env" | "default" | string;
+  hasStoredGatewayOpenaiBaseUrl?: boolean;
+  storedGatewayOpenaiBaseUrl?: string | null;
+  envGatewayOpenaiBaseUrl?: string | null;
+  gatewayOpenaiResponsesUrl?: string | null;
+  gatewayOpenaiModelsUrl?: string | null;
 }
 
 export interface TelegramBotTokenSettingsResponse {
@@ -253,9 +268,16 @@ export async function updateGatewayApiAccessSettings(
   wsUrl: string,
   enabled: boolean,
 ): Promise<GatewayApiAccessSettingsResponse> {
+  return updateGatewayApiSettings(wsUrl, { enabled });
+}
+
+export async function updateGatewayApiSettings(
+  wsUrl: string,
+  body: { enabled?: boolean; apiKey?: string | null; baseUrl?: string | null },
+): Promise<GatewayApiAccessSettingsResponse> {
   return gatewayFetchJson<GatewayApiAccessSettingsResponse>(wsUrl, "/admin/settings/gateway-api-access", {
     method: "PUT",
-    body: JSON.stringify({ enabled }),
+    body: JSON.stringify(body),
   });
 }
 
