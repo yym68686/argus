@@ -1,7 +1,7 @@
 "use client";
 
 import React from "react";
-import { Bot, ChevronDown, KeyRound, Pencil, Plus, RadioTower, RefreshCw, Trash2, UserRoundCheck } from "lucide-react";
+import { Bot, ChevronDown, KeyRound, Pencil, Plus, RadioTower, RefreshCw, RotateCcw, SlidersHorizontal, Trash2, UserRoundCheck } from "lucide-react";
 import { toast } from "sonner";
 
 import { useConfirmDialog } from "@/components/confirm-dialog";
@@ -17,6 +17,7 @@ import {
   type AdminUserSummary,
   fetchAdminUserDetail,
   fetchAdminUsers,
+  updateAdminUserLimits,
 } from "@/lib/admin";
 import { formatCompact, formatInt, formatRelative, formatWhen } from "@/lib/format";
 import { cn } from "@/lib/utils";
@@ -98,6 +99,25 @@ function userIdentitySubtitle(user: Pick<AdminUserSummary, "userId" | "email" | 
   return parts.join(" · ");
 }
 
+function userAgentLimitLabel(user: Pick<AdminUserSummary, "agentCount" | "limits">): string {
+  const maxAgents = user.limits?.maxAgents;
+  if (typeof maxAgents === "number" && Number.isFinite(maxAgents) && maxAgents > 0) {
+    return `${formatInt(user.agentCount)}/${formatInt(maxAgents)}`;
+  }
+  return formatInt(user.agentCount);
+}
+
+function userAgentLimitDetail(user: Pick<AdminUserSummary, "limits">): string {
+  const maxAgents = user.limits?.maxAgents;
+  if (!(typeof maxAgents === "number" && Number.isFinite(maxAgents) && maxAgents > 0)) return "—";
+  return user.limits?.maxAgentsOverride ? `${formatInt(maxAgents)} custom` : `${formatInt(maxAgents)} default`;
+}
+
+function userAgentLimitDraft(user: Pick<AdminUserSummary, "limits"> | null | undefined): string {
+  const override = user?.limits?.maxAgentsOverride;
+  return typeof override === "number" && Number.isFinite(override) && override > 0 ? String(override) : "";
+}
+
 export default function UsersPage() {
   const { confirm, confirmDialog } = useConfirmDialog();
   const [wsUrl] = useGatewayWsUrlState();
@@ -115,6 +135,7 @@ export default function UsersPage() {
   const [newChannelName, setNewChannelName] = React.useState("");
   const [newChannelBaseUrl, setNewChannelBaseUrl] = React.useState("");
   const [newChannelApiKey, setNewChannelApiKey] = React.useState("");
+  const [agentLimitDraft, setAgentLimitDraft] = React.useState("");
   const [modelDraftByAgent, setModelDraftByAgent] = React.useState<Record<string, string>>({});
   const [agentNameDraftById, setAgentNameDraftById] = React.useState<Record<string, string>>({});
   const [channelNameDraftById, setChannelNameDraftById] = React.useState<Record<string, string>>({});
@@ -178,6 +199,7 @@ export default function UsersPage() {
       if (!userId || userId <= 0) {
         setDetail(null);
         setDetailError(null);
+        setAgentLimitDraft("");
         return;
       }
       setDetailBusy(true);
@@ -188,6 +210,7 @@ export default function UsersPage() {
       try {
         const response = await fetchAdminUserDetail(wsUrl, userId);
         setDetail(response);
+        setAgentLimitDraft(userAgentLimitDraft(response.user));
         const availableModels = response.availableModels ?? response.models?.map((item) => item.id || "").filter(Boolean) ?? [];
         const nextDrafts: Record<string, string> = {};
         const nextAgentNames: Record<string, string> = {};
@@ -335,6 +358,39 @@ export default function UsersPage() {
       toast.success(
         `Deleted ${label} (${response.deletedAgentIds?.length ?? 0} agents, ${response.deletedCustomChannelIds?.length ?? 0} custom channels)`,
       );
+    } catch (error) {
+      toast.error((error as Error)?.message || String(error));
+    } finally {
+      setPendingAction(actionKey, false);
+    }
+  }
+
+  async function saveUserAgentLimit(reset = false): Promise<void> {
+    if (!selectedUserId) return;
+    const actionKey = `user-limits:${selectedUserId}`;
+    const rawDraft = agentLimitDraft.trim();
+    let nextMaxAgents: number | null = null;
+    if (!reset) {
+      if (!rawDraft) {
+        toast.error("Enter an agent limit or reset to default");
+        return;
+      }
+      const parsed = Number(rawDraft);
+      if (!Number.isInteger(parsed) || parsed <= 0) {
+        toast.error("Agent limit must be a positive integer");
+        return;
+      }
+      nextMaxAgents = parsed;
+    }
+
+    setPendingAction(actionKey, true);
+    try {
+      const response = await updateAdminUserLimits(wsUrl, selectedUserId, { maxAgents: nextMaxAgents });
+      const updatedUser = response.user;
+      setUsers((prev) => prev.map((user) => (user.userId === selectedUserId ? updatedUser : user)));
+      updateUserDetail(selectedUserId, (current) => ({ ...current, user: updatedUser }));
+      setAgentLimitDraft(userAgentLimitDraft(updatedUser));
+      toast.success(reset ? "Agent limit reset" : "Agent limit updated");
     } catch (error) {
       toast.error((error as Error)?.message || String(error));
     } finally {
@@ -706,6 +762,7 @@ export default function UsersPage() {
       : users.find((user) => user.userId === selectedUserId) ?? null
     : null;
   const selectedUserLabel = selectedUser ? userPrimaryLabel(selectedUser) : null;
+  const savingAgentLimit = Boolean(selectedUserId && pendingActions[`user-limits:${selectedUserId}`]);
 
   return (
     <ConsoleShell title="Users">
@@ -816,7 +873,7 @@ export default function UsersPage() {
                         <td className="px-4 py-3 font-mono text-[12.5px]">
                           <div className="max-w-[8rem] truncate">{user.currentModel || "—"}</div>
                         </td>
-                        <td className="px-4 py-3 text-right font-medium tabular-nums">{formatInt(user.agentCount)}</td>
+                        <td className="px-4 py-3 text-right font-medium tabular-nums">{userAgentLimitLabel(user)}</td>
                         <td className="px-4 py-3 text-right font-medium tabular-nums">{formatInt(user.channelCount)}</td>
                         <td className="hidden px-4 py-3 text-right font-medium tabular-nums 2xl:table-cell">{formatInt(user.sessionCount)}</td>
                         <td className="hidden px-4 py-3 text-right font-medium tabular-nums 2xl:table-cell">{formatCompact(user.usage24h.totalTokens)}</td>
@@ -893,6 +950,7 @@ export default function UsersPage() {
                   <Fact label="Private chat" value={detail.user.privateChatKey} mono />
                   <Fact label="24h tokens" value={formatCompact(detail.user.usage24h.totalTokens)} mono />
                   <Fact label="Total tokens" value={formatCompact(detail.user.usageTotal.totalTokens)} mono />
+                  <Fact label="Agent limit" value={userAgentLimitDetail(detail.user)} />
                   <Fact label="Current agent" value={detail.user.currentAgentId || "—"} mono />
                   <Fact label="Current session" value={detail.user.currentSessionId || "—"} mono />
                   <Fact label="Current channel" value={detail.user.currentChannel?.name || detail.user.currentChannelId || "gateway"} />
@@ -902,14 +960,50 @@ export default function UsersPage() {
                 </div>
 
                 <ManageDetails label="Manage user">
-                  <div className="flex flex-wrap items-center justify-between gap-3">
-                    <div className="max-w-[48rem] text-sm leading-6 text-muted-foreground">
-                      Remove this user and their agents, channel settings, Telegram profile, and console sessions.
+                  <div className="grid gap-4">
+                    <form
+                      className="grid gap-2"
+                      onSubmit={(event) => {
+                        event.preventDefault();
+                        void saveUserAgentLimit(false);
+                      }}
+                    >
+                      <span className="text-sm font-medium text-foreground">Agent creation limit</span>
+                      <div className="grid gap-2 lg:grid-cols-[minmax(0,1fr)_auto_auto]">
+                        <Input
+                          value={agentLimitDraft}
+                          onChange={(event) => setAgentLimitDraft(event.target.value)}
+                          placeholder={`Default ${detail.user.limits?.defaultMaxAgents ?? detail.user.limits?.maxAgents ?? 20}`}
+                          inputMode="numeric"
+                          type="number"
+                          min={1}
+                          step={1}
+                        />
+                        <Button type="submit" variant="secondary" disabled={savingAgentLimit || !agentLimitDraft.trim()}>
+                          <SlidersHorizontal className="h-4 w-4" />
+                          {savingAgentLimit ? "Saving…" : "Save limit"}
+                        </Button>
+                        <Button
+                          type="button"
+                          variant="secondary"
+                          disabled={savingAgentLimit || !detail.user.limits?.maxAgentsOverride}
+                          onClick={() => void saveUserAgentLimit(true)}
+                        >
+                          <RotateCcw className="h-4 w-4" />
+                          Reset
+                        </Button>
+                      </div>
+                    </form>
+
+                    <div className="flex flex-wrap items-center justify-between gap-3 border-t border-border/60 pt-4">
+                      <div className="max-w-[48rem] text-sm leading-6 text-muted-foreground">
+                        Remove this user and their agents, channel settings, Telegram profile, and console sessions.
+                      </div>
+                      <Button type="button" variant="destructive" disabled={deletingSelectedUser} onClick={() => void deleteUser()}>
+                        <Trash2 className="h-4 w-4" />
+                        {deletingSelectedUser ? "Deleting…" : "Delete user"}
+                      </Button>
                     </div>
-                    <Button type="button" variant="destructive" disabled={deletingSelectedUser} onClick={() => void deleteUser()}>
-                      <Trash2 className="h-4 w-4" />
-                      {deletingSelectedUser ? "Deleting…" : "Delete user"}
-                    </Button>
                   </div>
                 </ManageDetails>
               </PanelCard>

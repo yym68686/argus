@@ -13,6 +13,22 @@ export interface UsageSummary {
   lastAtMs?: number | null;
 }
 
+export interface AdminDeveloperLimits {
+  maxApiKeys?: number | null;
+  maxAgents?: number | null;
+  defaultMaxAgents?: number | null;
+  maxAgentsOverride?: number | null;
+  maxManagedSessions?: number | null;
+  apiRequestsPerMinute?: number | null;
+  monthlyTokenQuota?: number | null;
+}
+
+export interface AdminDeveloperCounts {
+  apiKeys: number;
+  agents: number;
+  sessions: number;
+}
+
 export interface AdminChannelEntry {
   channelId: string;
   name: string;
@@ -88,6 +104,8 @@ export interface AdminUserSummary {
   lastActiveMs?: number | null;
   usage24h: UsageSummary;
   usageTotal: UsageSummary;
+  limits?: AdminDeveloperLimits | null;
+  counts?: AdminDeveloperCounts | null;
   initialized: boolean;
 }
 
@@ -297,6 +315,21 @@ export async function updateTelegramBotTokenSettings(
 
 export async function fetchAdminUserDetail(wsUrl: string, userId: number): Promise<AdminUserDetailResponse> {
   return gatewayFetchJson<AdminUserDetailResponse>(wsUrl, `/admin/users/${encodeURIComponent(String(userId))}`);
+}
+
+export async function updateAdminUserLimits(
+  wsUrl: string,
+  userId: number,
+  limits: { maxAgents: number | null },
+): Promise<{ ok: true; user: AdminUserSummary }> {
+  return gatewayFetchJson<{ ok: true; user: AdminUserSummary }>(
+    wsUrl,
+    `/admin/users/${encodeURIComponent(String(userId))}/limits`,
+    {
+      method: "PATCH",
+      body: JSON.stringify(limits),
+    },
+  );
 }
 
 export async function fetchAdminUsage(wsUrl: string, query?: URLSearchParams): Promise<AdminUsageResponse> {

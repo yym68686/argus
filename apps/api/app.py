@@ -2886,6 +2886,19 @@ def _env_optional_int(name: str, *, default: Optional[int] = None, minimum: Opti
     return value
 
 
+def _env_optional_int_any(
+    names: list[str],
+    *,
+    default: Optional[int] = None,
+    minimum: Optional[int] = None,
+) -> Optional[int]:
+    for name in names:
+        raw = os.getenv(name)
+        if raw is not None and str(raw).strip():
+            return _env_optional_int(name, default=default, minimum=minimum)
+    return default
+
+
 def _allow_registration() -> bool:
     return _env_bool("ARGUS_ALLOW_REGISTRATION", True)
 
@@ -2908,19 +2921,27 @@ def _user_api_rate_limit_per_minute() -> int:
 
 
 def _developer_max_agents() -> Optional[int]:
-    return _env_optional_int("ARGUS_USER_MAX_AGENTS", default=20, minimum=1)
+    return _env_optional_int_any(["ARGUS_USER_MAX_AGENTS", "ARGUS_DEVELOPER_MAX_AGENTS"], default=20, minimum=1)
 
 
 def _developer_max_managed_sessions() -> Optional[int]:
-    return _env_optional_int("ARGUS_USER_MAX_MANAGED_SESSIONS", default=20, minimum=1)
+    return _env_optional_int_any(
+        ["ARGUS_USER_MAX_MANAGED_SESSIONS", "ARGUS_DEVELOPER_MAX_MANAGED_SESSIONS"],
+        default=20,
+        minimum=1,
+    )
 
 
 def _developer_max_api_keys() -> Optional[int]:
-    return _env_optional_int("ARGUS_USER_MAX_API_KEYS", default=10, minimum=1)
+    return _env_optional_int_any(["ARGUS_USER_MAX_API_KEYS", "ARGUS_DEVELOPER_MAX_API_KEYS"], default=10, minimum=1)
 
 
 def _developer_monthly_token_quota() -> Optional[int]:
-    value = _env_optional_int("ARGUS_USER_MONTHLY_TOKEN_QUOTA", default=0, minimum=0)
+    value = _env_optional_int_any(
+        ["ARGUS_USER_MONTHLY_TOKEN_QUOTA", "ARGUS_DEVELOPER_MONTHLY_TOKEN_QUOTA"],
+        default=0,
+        minimum=0,
+    )
     if value is None or value <= 0:
         return None
     return value
@@ -4777,12 +4798,81 @@ class PersistedConsoleSession:
 
 
 @dataclass
+class PersistedUserLimits:
+    max_agents: Optional[int] = None
+    updated_at_ms: int = field(default_factory=_now_ms)
+
+    def to_json(self) -> dict[str, Any]:
+        return {
+            "maxAgents": int(self.max_agents) if isinstance(self.max_agents, int) and self.max_agents > 0 else None,
+            "updatedAtMs": int(self.updated_at_ms),
+        }
+
+    @staticmethod
+    def from_json(obj: Any) -> Optional["PersistedUserLimits"]:
+        if not isinstance(obj, dict):
+            return None
+        raw_max_agents = obj.get("maxAgents")
+        max_agents: Optional[int] = None
+        if raw_max_agents is not None:
+            try:
+                parsed = int(raw_max_agents)
+            except Exception:
+                parsed = 0
+            if parsed > 0:
+                max_agents = parsed
+        try:
+            updated_at_ms = int(obj.get("updatedAtMs")) if obj.get("updatedAtMs") is not None else _now_ms()
+        except Exception:
+            updated_at_ms = _now_ms()
+        if max_agents is None:
+            return None
+        return PersistedUserLimits(max_agents=max_agents, updated_at_ms=updated_at_ms)
+
+
+def _persisted_user_limits_dict_to_json(user_limits: dict[str, PersistedUserLimits]) -> dict[str, Any]:
+    return {
+        user_id: limits.to_json()
+        for user_id, limits in (user_limits or {}).items()
+        if isinstance(user_id, str) and user_id.strip() and isinstance(limits, PersistedUserLimits)
+    }
+
+
+def _persisted_user_limits_dict_from_json(obj: Any) -> dict[str, PersistedUserLimits]:
+    user_limits: dict[str, PersistedUserLimits] = {}
+    if not isinstance(obj, dict):
+        return user_limits
+    for raw_user_id, raw_limits in obj.items():
+        if not isinstance(raw_user_id, str) or not raw_user_id.strip():
+            continue
+        try:
+            user_id_int = int(raw_user_id)
+        except Exception:
+            continue
+        if user_id_int <= 0:
+            continue
+        limits = PersistedUserLimits.from_json(raw_limits)
+        if limits is not None:
+            user_limits[str(user_id_int)] = limits
+    return user_limits
+
+
+def _persisted_user_limits_dict_to_json_text(user_limits: dict[str, PersistedUserLimits]) -> str:
+    return json.dumps(
+        _persisted_user_limits_dict_to_json(user_limits),
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+
+
+@dataclass
 class PersistedGatewayAutomationState:
     version: int = AUTOMATION_STATE_VERSION
     sessions: dict[str, PersistedSessionAutomation] = field(default_factory=dict)
     agents: dict[str, PersistedAgentRuntime] = field(default_factory=dict)
     chat_bindings: dict[str, str] = field(default_factory=dict)
     user_channels: dict[str, PersistedUserChannelState] = field(default_factory=dict)
+    user_limits: dict[str, PersistedUserLimits] = field(default_factory=dict)
     gateway_openai_default_enabled: bool = field(default_factory=_gateway_openai_default_enabled_env)
     gateway_openai_default_source: str = field(default_factory=_gateway_openai_default_source_env)
     gateway_openai_api_key: Optional[str] = None
@@ -4808,6 +4898,7 @@ class PersistedGatewayAutomationState:
                 for user_id, channel_state in (self.user_channels or {}).items()
                 if isinstance(user_id, str) and user_id.strip() and isinstance(channel_state, PersistedUserChannelState)
             },
+            "userLimits": _persisted_user_limits_dict_to_json(self.user_limits),
             "gatewayOpenaiDefaultEnabled": bool(self.gateway_openai_default_enabled),
             "gatewayOpenaiDefaultSource": _normalize_gateway_openai_default_source(
                 self.gateway_openai_default_source
@@ -4920,6 +5011,9 @@ class PersistedGatewayAutomationState:
                 if user_id_int <= 0:
                     continue
                 user_channels[str(user_id_int)] = PersistedUserChannelState.from_json(raw_state)
+
+        user_limits_raw = obj.get("userLimits")
+        user_limits = _persisted_user_limits_dict_from_json(user_limits_raw)
         gateway_openai_default_enabled, gateway_openai_default_source = _resolve_gateway_openai_default_enabled(
             obj.get("gatewayOpenaiDefaultEnabled"),
             obj.get("gatewayOpenaiDefaultSource"),
@@ -5052,6 +5146,7 @@ class PersistedGatewayAutomationState:
             agents=agents,
             chat_bindings=chat_bindings,
             user_channels=user_channels,
+            user_limits=user_limits,
             gateway_openai_default_enabled=gateway_openai_default_enabled,
             gateway_openai_default_source=gateway_openai_default_source,
             gateway_openai_api_key=gateway_openai_api_key,
@@ -5238,6 +5333,20 @@ class _SQLiteAutomationStateStore:
                     (
                         "telegram_bot_token",
                         _secret_storage_prepare(getattr(state, "telegram_bot_token", None)) or "",
+                        now_ms,
+                    ),
+                )
+                conn.execute(
+                    """
+                    INSERT INTO automation_state_meta (key, value_text, updated_at_ms)
+                    VALUES (?, ?, ?)
+                    ON CONFLICT(key) DO UPDATE SET
+                        value_text = excluded.value_text,
+                        updated_at_ms = excluded.updated_at_ms
+                    """,
+                    (
+                        "user_limits_json",
+                        _persisted_user_limits_dict_to_json_text(getattr(state, "user_limits", {})),
                         now_ms,
                     ),
                 )
@@ -5582,7 +5691,7 @@ class _SQLiteAutomationStateStore:
             """
             SELECT key, value_text
             FROM automation_state_meta
-            WHERE key IN (?, ?, ?, ?, ?, ?)
+            WHERE key IN (?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 "version",
@@ -5591,6 +5700,7 @@ class _SQLiteAutomationStateStore:
                 "gateway_openai_api_key",
                 "gateway_openai_base_url",
                 "telegram_bot_token",
+                "user_limits_json",
             ),
         )
         meta_by_key = {str(row["key"]): row["value_text"] for row in meta_rows}
@@ -5623,6 +5733,13 @@ class _SQLiteAutomationStateStore:
                 if _secret_storage_is_sealed(raw_telegram_bot_token)
                 else _normalize_telegram_bot_token(raw_telegram_bot_token)
             )
+        user_limits: dict[str, PersistedUserLimits] = {}
+        user_limits_raw = meta_by_key.get("user_limits_json")
+        if user_limits_raw:
+            try:
+                user_limits = _persisted_user_limits_dict_from_json(json.loads(str(user_limits_raw or "{}")))
+            except Exception:
+                user_limits = {}
 
         sessions: dict[str, PersistedSessionAutomation] = {}
         for row in conn.execute("SELECT session_id, payload_json FROM automation_sessions"):
@@ -5804,6 +5921,7 @@ class _SQLiteAutomationStateStore:
             agents=agents,
             chat_bindings=chat_bindings,
             user_channels=user_channels,
+            user_limits=user_limits,
             gateway_openai_default_enabled=gateway_openai_default_enabled,
             gateway_openai_default_source=gateway_openai_default_source,
             gateway_openai_api_key=gateway_openai_api_key,
@@ -6596,6 +6714,20 @@ class _PostgresAutomationStateStore:
                         now_ms,
                     ),
                 )
+                conn.execute(
+                    """
+                    INSERT INTO automation_state_meta (key, value_text, updated_at_ms)
+                    VALUES (%s, %s, %s)
+                    ON CONFLICT(key) DO UPDATE SET
+                        value_text = EXCLUDED.value_text,
+                        updated_at_ms = EXCLUDED.updated_at_ms
+                    """,
+                    (
+                        "user_limits_json",
+                        _persisted_user_limits_dict_to_json_text(getattr(state, "user_limits", {})),
+                        now_ms,
+                    ),
+                )
 
                 with conn.cursor() as cur:
                     cur.execute("DELETE FROM automation_sessions")
@@ -6962,7 +7094,7 @@ class _PostgresAutomationStateStore:
             """
             SELECT key, value_text
             FROM automation_state_meta
-            WHERE key IN (%s, %s, %s, %s, %s, %s)
+            WHERE key IN (%s, %s, %s, %s, %s, %s, %s)
             """,
             (
                 "version",
@@ -6971,6 +7103,7 @@ class _PostgresAutomationStateStore:
                 "gateway_openai_api_key",
                 "gateway_openai_base_url",
                 "telegram_bot_token",
+                "user_limits_json",
             ),
         )
         meta_by_key = {str(row["key"]): row["value_text"] for row in meta_rows}
@@ -7003,6 +7136,13 @@ class _PostgresAutomationStateStore:
                 if _secret_storage_is_sealed(raw_telegram_bot_token)
                 else _normalize_telegram_bot_token(raw_telegram_bot_token)
             )
+        user_limits: dict[str, PersistedUserLimits] = {}
+        user_limits_raw = meta_by_key.get("user_limits_json")
+        if user_limits_raw:
+            try:
+                user_limits = _persisted_user_limits_dict_from_json(json.loads(str(user_limits_raw or "{}")))
+            except Exception:
+                user_limits = {}
 
         sessions: dict[str, PersistedSessionAutomation] = {}
         for row in conn.execute("SELECT session_id, payload_json FROM automation_sessions").fetchall():
@@ -7184,6 +7324,7 @@ class _PostgresAutomationStateStore:
             agents=agents,
             chat_bindings=chat_bindings,
             user_channels=user_channels,
+            user_limits=user_limits,
             gateway_openai_default_enabled=gateway_openai_default_enabled,
             gateway_openai_default_source=gateway_openai_default_source,
             gateway_openai_api_key=gateway_openai_api_key,
@@ -9118,14 +9259,60 @@ class AutomationManager:
             raise RuntimeError("Failed to bootstrap Telegram console user")
         return user_out, link_out, profile_out, password_out, created_user
 
+    def max_agents_override_for_user(self, *, user_id: int) -> Optional[int]:
+        if not isinstance(user_id, int) or user_id <= 0:
+            return None
+        limits = (self._store.state.user_limits or {}).get(str(user_id))
+        if not isinstance(limits, PersistedUserLimits):
+            return None
+        if isinstance(limits.max_agents, int) and limits.max_agents > 0:
+            return int(limits.max_agents)
+        return None
+
+    def effective_max_agents_for_user(self, *, user_id: int) -> Optional[int]:
+        override = self.max_agents_override_for_user(user_id=user_id)
+        if isinstance(override, int) and override > 0:
+            return override
+        return _developer_max_agents()
+
     def developer_limits_for_user(self, *, user_id: int) -> dict[str, Any]:
+        default_max_agents = _developer_max_agents()
+        max_agents_override = self.max_agents_override_for_user(user_id=user_id)
         return {
             "maxApiKeys": _developer_max_api_keys(),
-            "maxAgents": _developer_max_agents(),
+            "maxAgents": max_agents_override if isinstance(max_agents_override, int) and max_agents_override > 0 else default_max_agents,
+            "defaultMaxAgents": default_max_agents,
+            "maxAgentsOverride": max_agents_override,
             "maxManagedSessions": _developer_max_managed_sessions(),
             "apiRequestsPerMinute": _user_api_rate_limit_per_minute() or None,
             "monthlyTokenQuota": _developer_monthly_token_quota(),
         }
+
+    async def set_user_max_agents(self, *, user_id: int, max_agents: Optional[int]) -> Optional[int]:
+        if not isinstance(user_id, int) or user_id <= 0:
+            raise ValueError("Invalid userId")
+        next_max_agents: Optional[int] = None
+        if max_agents is not None:
+            try:
+                next_max_agents = int(max_agents)
+            except Exception as e:
+                raise ValueError("Invalid maxAgents") from e
+            if next_max_agents <= 0:
+                raise ValueError("maxAgents must be at least 1")
+        now_ms = _now_ms()
+
+        def _write(st: PersistedGatewayAutomationState) -> None:
+            st.version = max(int(getattr(st, "version", 1) or 1), AUTOMATION_STATE_VERSION)
+            if not isinstance(getattr(st, "user_limits", None), dict):
+                st.user_limits = {}
+            key = str(user_id)
+            if next_max_agents is None:
+                st.user_limits.pop(key, None)
+                return
+            st.user_limits[key] = PersistedUserLimits(max_agents=next_max_agents, updated_at_ms=now_ms)
+
+        await self._store.update(_write)
+        return next_max_agents
 
     def developer_counts_for_user(self, *, user_id: int) -> dict[str, int]:
         agent_count = 0
@@ -9289,7 +9476,7 @@ class AutomationManager:
         return revoked
 
     def _assert_user_can_create_agent(self, *, user_id: int) -> None:
-        max_agents = _developer_max_agents()
+        max_agents = self.effective_max_agents_for_user(user_id=user_id)
         counts = self.developer_counts_for_user(user_id=user_id)
         if isinstance(max_agents, int) and max_agents > 0 and counts["agents"] >= max_agents:
             raise ValueError(f"Agent quota exceeded ({max_agents})")
@@ -24014,6 +24201,11 @@ def _admin_collect_user_ids(automation: AutomationManager) -> list[int]:
             user_id = _canonical_user_id(raw_user_id)
             if user_id is not None:
                 ids.add(user_id)
+    if isinstance(getattr(st, "user_limits", None), dict):
+        for raw_user_id in st.user_limits.keys():
+            user_id = _canonical_user_id(raw_user_id)
+            if user_id is not None:
+                ids.add(user_id)
     if isinstance(getattr(st, "console_users", None), dict):
         for raw_user_id in st.console_users.keys():
             user_id = _canonical_user_id(raw_user_id)
@@ -24239,6 +24431,8 @@ def _admin_user_summary_payload(
         usage_24h = usage_store.summarize(owner_user_id=user_id, since_ms=_now_ms() - 24 * 60 * 60 * 1000)
     if usage_total is None:
         usage_total = usage_store.summarize(owner_user_id=user_id)
+    developer_limits = automation.developer_limits_for_user(user_id=user_id)
+    developer_counts = automation.developer_counts_for_user(user_id=user_id)
 
     return {
         "userId": user_id,
@@ -24265,6 +24459,8 @@ def _admin_user_summary_payload(
         "lastActiveMs": last_active_ms,
         "usage24h": dict(usage_24h or {}),
         "usageTotal": dict(usage_total or {}),
+        "limits": developer_limits,
+        "counts": developer_counts,
         "initialized": bool(agents),
     }
 
@@ -25346,6 +25542,63 @@ async def admin_user_detail(user_id: int, request: Request):
         "modelSource": model_info.get("source"),
         "modelError": model_info.get("error"),
         "recentUsage": recent_usage,
+    }
+
+
+@app.patch("/admin/users/{user_id}/limits")
+async def admin_user_limits_update(user_id: int, request: Request):
+    _http_require_admin(request)
+    automation = _get_automation_or_500()
+    usage_store = _get_usage_store_or_500()
+    if user_id <= 0:
+        raise HTTPException(status_code=400, detail="Invalid userId")
+
+    known_user_ids = set(_admin_collect_user_ids(automation))
+    usage_total = await asyncio.to_thread(usage_store.summarize, owner_user_id=user_id)
+    if user_id not in known_user_ids and int(usage_total.get("requestCount") or 0) <= 0:
+        raise HTTPException(status_code=404, detail="Unknown user")
+
+    try:
+        body = await request.json()
+    except Exception as e:
+        raise HTTPException(status_code=400, detail="Invalid JSON body") from e
+    if not isinstance(body, dict):
+        raise HTTPException(status_code=400, detail="Invalid JSON body")
+
+    if "maxAgents" not in body:
+        raise HTTPException(status_code=400, detail="Missing 'maxAgents'")
+    raw_max_agents = body.get("maxAgents")
+    max_agents: Optional[int]
+    if raw_max_agents is None or str(raw_max_agents).strip().lower() in {"", "default", "inherit", "reset", "null"}:
+        max_agents = None
+    else:
+        try:
+            max_agents = int(raw_max_agents)
+        except Exception as e:
+            raise HTTPException(status_code=400, detail="Invalid 'maxAgents'") from e
+        if max_agents <= 0:
+            raise HTTPException(status_code=400, detail="'maxAgents' must be at least 1")
+
+    try:
+        await automation.set_user_max_agents(user_id=user_id, max_agents=max_agents)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+
+    live_session_ids = await _admin_live_managed_session_ids_or_none()
+    agents = _admin_filter_agents_by_live_session_ids(
+        automation.list_agents_for_user(user_id=user_id),
+        live_session_ids,
+    )
+    return {
+        "ok": True,
+        "user": _admin_user_summary_payload(
+            automation,
+            usage_store,
+            user_id,
+            agents=agents,
+            live_session_ids=live_session_ids,
+            usage_total=usage_total,
+        ),
     }
 
 

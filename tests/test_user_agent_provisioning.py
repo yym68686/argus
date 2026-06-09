@@ -1,5 +1,6 @@
 import asyncio
 import importlib.util
+import os
 import pathlib
 import sys
 import tempfile
@@ -58,6 +59,50 @@ class UserAgentProvisioningTests(unittest.IsolatedAsyncioTestCase):
     async def asyncTearDown(self) -> None:
         await self.manager.stop()
         self.tmpdir.cleanup()
+
+    async def test_user_agent_limit_override_blocks_create_until_reset(self) -> None:
+        async def fake_ensure_live_session(session_id: str, *, allow_create: bool):
+            self.assertTrue(allow_create)
+            self.assertTrue(session_id)
+            return types.SimpleNamespace(provider="fake"), True
+
+        with (
+            mock.patch.dict(os.environ, {"ARGUS_USER_MAX_AGENTS": "2", "ARGUS_USER_MAX_MANAGED_SESSIONS": "10"}),
+            mock.patch.object(argus_app, "_require_user_agent_support", return_value=None),
+            mock.patch.object(argus_app, "_ensure_live_session", side_effect=fake_ensure_live_session),
+        ):
+            await self.manager.set_user_max_agents(user_id=1, max_agents=1)
+            limits = self.manager.developer_limits_for_user(user_id=1)
+            self.assertEqual(limits["maxAgents"], 1)
+            self.assertEqual(limits["defaultMaxAgents"], 2)
+            self.assertEqual(limits["maxAgentsOverride"], 1)
+
+            alpha, _ = await self.manager.create_user_agent(user_id=1, short_name="alpha")
+            await self.manager.wait_for_user_agent_provisioning(agent_id=alpha.agent_id, timeout_ms=2000)
+            with self.assertRaisesRegex(ValueError, r"Agent quota exceeded \(1\)"):
+                await self.manager.create_user_agent(user_id=1, short_name="beta")
+
+            await self.manager.set_user_max_agents(user_id=1, max_agents=None)
+            limits = self.manager.developer_limits_for_user(user_id=1)
+            self.assertEqual(limits["maxAgents"], 2)
+            self.assertEqual(limits["defaultMaxAgents"], 2)
+            self.assertIsNone(limits["maxAgentsOverride"])
+
+            beta, _ = await self.manager.create_user_agent(user_id=1, short_name="beta")
+            await self.manager.wait_for_user_agent_provisioning(agent_id=beta.agent_id, timeout_ms=2000)
+            with self.assertRaisesRegex(ValueError, r"Agent quota exceeded \(2\)"):
+                await self.manager.create_user_agent(user_id=1, short_name="gamma")
+
+    async def test_user_agent_limits_round_trip_in_persisted_state(self) -> None:
+        state = argus_app.PersistedGatewayAutomationState(
+            user_limits={
+                "1": argus_app.PersistedUserLimits(max_agents=7, updated_at_ms=1234),
+            }
+        )
+        restored = argus_app.PersistedGatewayAutomationState.from_json(state.to_json())
+        self.assertIn("1", restored.user_limits)
+        self.assertEqual(restored.user_limits["1"].max_agents, 7)
+        self.assertEqual(restored.user_limits["1"].updated_at_ms, 1234)
 
     async def test_create_user_agent_returns_pending_then_ready_and_is_idempotent(self) -> None:
         gate = asyncio.Event()
