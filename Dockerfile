@@ -42,8 +42,9 @@ RUN mkdir -p /root/.argus /workspace /app
 COPY VERSION /app/VERSION
 COPY docs/templates /app/docs/templates
 
+COPY app_server_tcp_bridge.py /app/app_server_tcp_bridge.py
 COPY run_app_server.sh /app/run_app_server.sh
-RUN chmod +x /app/run_app_server.sh
+RUN chmod +x /app/app_server_tcp_bridge.py /app/run_app_server.sh
 
 RUN mkdir -p /app/node-host /app/host-agent-dist
 COPY --from=node-host-builder /out/argus /app/node-host/argus
@@ -55,4 +56,4 @@ EXPOSE 7777
 
 # Expose an app-server (JSONL over stdio) as a TCP stream.
 # Also starts a long-lived node-host daemon (if configured) for background job execution.
-CMD ["sh","-lc","set -eu; NODE_PID=\"\"; if [ -n \"${ARGUS_NODE_WS_URL:-}\" ]; then /app/node-host/argus & NODE_PID=$!; fi; socat TCP-LISTEN:7777,reuseaddr,fork EXEC:'/app/run_app_server.sh',stderr & SOCAT_PID=$!; trap 'kill -TERM $SOCAT_PID 2>/dev/null || true; if [ -n \"$NODE_PID\" ]; then kill -TERM $NODE_PID 2>/dev/null || true; fi; wait' TERM INT; wait $SOCAT_PID; if [ -n \"$NODE_PID\" ]; then kill -TERM $NODE_PID 2>/dev/null || true; wait $NODE_PID 2>/dev/null || true; fi"]
+CMD ["sh","-lc","set -eu; NODE_PID=\"\"; if [ -n \"${ARGUS_NODE_WS_URL:-}\" ]; then /app/node-host/argus & NODE_PID=$!; fi; /app/app_server_tcp_bridge.py & BRIDGE_PID=$!; trap 'kill -TERM $BRIDGE_PID 2>/dev/null || true; if [ -n \"$NODE_PID\" ]; then kill -TERM $NODE_PID 2>/dev/null || true; fi; wait' TERM INT; wait $BRIDGE_PID; if [ -n \"$NODE_PID\" ]; then kill -TERM $NODE_PID 2>/dev/null || true; wait $NODE_PID 2>/dev/null || true; fi"]
