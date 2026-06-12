@@ -7,6 +7,132 @@ if [ -z "${APP_SERVER_CMD:-}" ]; then
   exit 2
 fi
 
+ARGUS_APP_SERVER_FIRST_LINE_FILE=""
+
+cleanup_first_line_file() {
+  if [ -n "${ARGUS_APP_SERVER_FIRST_LINE_FILE:-}" ]; then
+    rm -f "$ARGUS_APP_SERVER_FIRST_LINE_FILE"
+  fi
+}
+
+app_server_stdin_gate_enabled() {
+  case "${ARGUS_APP_SERVER_STDIN_GATE:-1}" in
+    0 | false | FALSE | no | NO | off | OFF)
+      return 1
+      ;;
+    *)
+      return 0
+      ;;
+  esac
+}
+
+read_first_app_server_line_with_python() {
+  py_bin=""
+  if command -v python3 >/dev/null 2>&1; then
+    py_bin="python3"
+  elif command -v python >/dev/null 2>&1; then
+    py_bin="python"
+  else
+    return 127
+  fi
+
+  "$py_bin" -c '
+import os
+import re
+import select
+import sys
+import time
+
+raw_timeout = sys.argv[1]
+out_path = sys.argv[2]
+match = re.fullmatch(r"([0-9]+(?:\.[0-9]+)?)([smhd]?)", raw_timeout)
+if not match:
+    print("ERROR: invalid ARGUS_APP_SERVER_FIRST_LINE_TIMEOUT", file=sys.stderr)
+    sys.exit(2)
+timeout_s = float(match.group(1))
+unit = match.group(2)
+if unit == "m":
+    timeout_s *= 60
+elif unit == "h":
+    timeout_s *= 3600
+elif unit == "d":
+    timeout_s *= 86400
+fd = sys.stdin.fileno()
+deadline = time.monotonic() + timeout_s
+chunks = []
+while True:
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        sys.exit(3)
+    ready, _, _ = select.select([fd], [], [], remaining)
+    if not ready:
+        sys.exit(3)
+    data = os.read(fd, 1)
+    if not data:
+        break
+    chunks.append(data)
+    if data == b"\n":
+        break
+    if len(chunks) > 1024 * 1024:
+        print("ERROR: first JSONL line exceeds 1MiB before app-server start", file=sys.stderr)
+        sys.exit(2)
+if not chunks:
+    sys.exit(3)
+with open(out_path, "wb") as f:
+    f.write(b"".join(chunks))
+' "$ARGUS_APP_SERVER_FIRST_LINE_TIMEOUT" "$ARGUS_APP_SERVER_FIRST_LINE_FILE"
+}
+
+read_first_app_server_line_with_timeout() {
+  if ! command -v timeout >/dev/null 2>&1; then
+    return 127
+  fi
+  timeout "$ARGUS_APP_SERVER_FIRST_LINE_TIMEOUT" sh -c 'IFS= read -r line || exit 3; printf "%s\n" "$line" > "$1"' sh "$ARGUS_APP_SERVER_FIRST_LINE_FILE"
+}
+
+if app_server_stdin_gate_enabled; then
+  ARGUS_APP_SERVER_FIRST_LINE_TIMEOUT="${ARGUS_APP_SERVER_FIRST_LINE_TIMEOUT:-10s}"
+  case "$ARGUS_APP_SERVER_FIRST_LINE_TIMEOUT" in
+    "" | *[!0123456789.smhd]*)
+      echo "ERROR: ARGUS_APP_SERVER_FIRST_LINE_TIMEOUT must be a timeout like 10s, 0.5s, 1m, or 1h." >&2
+      exit 2
+      ;;
+  esac
+
+  ARGUS_APP_SERVER_FIRST_LINE_FILE="$(mktemp /tmp/argus-app-server-first-line.XXXXXX)"
+  trap cleanup_first_line_file EXIT
+
+  if read_first_app_server_line_with_python; then
+    :
+  else
+    gate_rc=$?
+    if [ "$gate_rc" -eq 127 ]; then
+      if read_first_app_server_line_with_timeout; then
+        :
+      else
+        gate_rc=$?
+        if [ "$gate_rc" -eq 127 ]; then
+          echo "WARNING: python and timeout are unavailable; ARGUS_APP_SERVER_STDIN_GATE is disabled." >&2
+        elif [ "$gate_rc" -eq 2 ]; then
+          exit 2
+        else
+          exit 0
+        fi
+      fi
+    elif [ "$gate_rc" -eq 2 ]; then
+      exit 2
+    else
+      exit 0
+    fi
+  fi
+
+  if [ -n "${ARGUS_APP_SERVER_FIRST_LINE_FILE:-}" ] && [ -s "$ARGUS_APP_SERVER_FIRST_LINE_FILE" ]; then
+    if ! grep -q '^[[:space:]]*{' "$ARGUS_APP_SERVER_FIRST_LINE_FILE"; then
+      exit 0
+    fi
+  fi
+fi
+
 APP_HOME_DIR="${APP_HOME:-/root/.argus}"
 APP_WORKSPACE_DIR="${APP_WORKSPACE:-/workspace}"
 
@@ -143,6 +269,7 @@ base_url = "${ARGUS_CODEX_OPENAI_PROXY_BASE_URL}"
 wire_api = "responses"
 env_key = "ARGUS_OPENAI_TOKEN"
 requires_openai_auth = false
+supports_websockets = false
 EOF
   fi
 
@@ -150,5 +277,13 @@ EOF
 fi
 
 cd "$APP_WORKSPACE_DIR"
+
+if [ -n "${ARGUS_APP_SERVER_FIRST_LINE_FILE:-}" ]; then
+  {
+    cat "$ARGUS_APP_SERVER_FIRST_LINE_FILE"
+    cat
+  } | sh -lc "$APP_SERVER_CMD"
+  exit "$?"
+fi
 
 exec sh -lc "$APP_SERVER_CMD"
