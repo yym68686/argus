@@ -708,6 +708,50 @@ class FugueApiHelperTests(unittest.TestCase):
         self.assertEqual(entries, [{"kind": "directory", "path": "/tmp/not-workspace"}])
         list_tree.assert_called_once_with(cfg, "3416ab8781ab", "skills", depth=1)
 
+    def test_fugue_pull_workspace_snapshot_archives_root_tree(self) -> None:
+        cfg = argus_app.FugueProvisionConfig(
+            base_url="https://fugue.invalid",
+            token="token",
+            project_id="project_123",
+            runtime_id="runtime_123",
+            gateway_internal_host="gateway.internal",
+            runtime_cmd="codex serve",
+            connect_timeout_s=1.0,
+        )
+        tree_entries = {
+            "": [
+                {"kind": "directory", "path": "/workspace/memory"},
+                {"kind": "file", "path": "/workspace/AGENTS.md"},
+            ],
+            "memory": [
+                {"kind": "file", "path": "/workspace/memory/2026-06-13.md"},
+            ],
+        }
+
+        def fake_list_workspace_tree_sync(patched_cfg, session_id, relative_path, *, depth):
+            self.assertIs(patched_cfg, cfg)
+            self.assertEqual(session_id, "3416ab8781ab")
+            self.assertEqual(depth, 1)
+            return tree_entries.get(relative_path, [])
+
+        def fake_read_workspace_file_result_sync(patched_cfg, session_id, relative_path, *, max_bytes):
+            self.assertIs(patched_cfg, cfg)
+            self.assertEqual(session_id, "3416ab8781ab")
+            self.assertGreaterEqual(max_bytes, 1)
+            return f"{relative_path}\n".encode("utf-8"), False
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = pathlib.Path(tmpdir)
+            with (
+                mock.patch.object(argus_app, "_fugue_list_workspace_tree_sync", side_effect=fake_list_workspace_tree_sync),
+                mock.patch.object(argus_app, "_fugue_read_workspace_file_result_sync", side_effect=fake_read_workspace_file_result_sync),
+            ):
+                pulled = argus_app._fugue_pull_workspace_snapshot_sync(cfg, "3416ab8781ab", root)
+
+            self.assertEqual(pulled, 2)
+            self.assertEqual((root / "AGENTS.md").read_text(encoding="utf-8"), "AGENTS.md\n")
+            self.assertEqual((root / "memory" / "2026-06-13.md").read_text(encoding="utf-8"), "memory/2026-06-13.md\n")
+
 
 class RuntimeSessionProvisioningTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self) -> None:
@@ -773,6 +817,7 @@ class RuntimeSessionProvisioningTests(unittest.IsolatedAsyncioTestCase):
             mock.patch.object(argus_app, "_resolve_workspace_host_path_for_session", return_value=None),
             mock.patch.object(argus_app, "_derive_default_workspace_host_path_for_session", return_value=self.tmpdir.name),
             mock.patch.object(argus_app, "_fugue_ensure_session_app_ready_sync", side_effect=fake_ensure_session_app_ready_sync),
+            mock.patch.object(argus_app, "_fugue_push_workspace_snapshot_sync", return_value=None) as push_snapshot,
             mock.patch.object(argus_app, "_wait_for_tcp", side_effect=fake_wait_for_tcp),
             mock.patch.object(argus_app, "_activate_live_session", side_effect=fake_activate_live_session),
             mock.patch.object(argus_app, "_sync_remote_workspace_templates", new=mock.AsyncMock()),
@@ -794,6 +839,67 @@ class RuntimeSessionProvisioningTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(second_created)
         self.assertIs(first_live, second_live)
         self.assertEqual(first_live.runtime_id, "app_123")
+        push_snapshot.assert_called_once()
+
+    async def test_fugue_created_session_restores_workspace_snapshot_before_connect(self) -> None:
+        session_id = "3416ab8781ab"
+        workspace_root = pathlib.Path(self.tmpdir.name)
+        (workspace_root / "memory").mkdir()
+        (workspace_root / "memory" / "note.md").write_text("remember this\n", encoding="utf-8")
+        cfg = argus_app.FugueProvisionConfig(
+            base_url="https://fugue.invalid",
+            token="token",
+            project_id="project_123",
+            runtime_id="runtime_123",
+            gateway_internal_host="gateway.internal",
+            runtime_cmd="codex serve",
+            connect_timeout_s=1.0,
+        )
+        events: list[str] = []
+
+        def fake_push_workspace_snapshot_sync(patched_cfg, patched_session_id, patched_root):
+            self.assertIs(patched_cfg, cfg)
+            self.assertEqual(patched_session_id, session_id)
+            self.assertEqual(pathlib.Path(patched_root), workspace_root)
+            self.assertTrue((pathlib.Path(patched_root) / "memory" / "note.md").is_file())
+            events.append("push")
+
+        async def fake_wait_for_tcp(host: str, port: int, timeout_s: float):
+            self.assertEqual(host, "fugue.internal")
+            self.assertEqual(port, 7777)
+            events.append("connect")
+            return asyncio.StreamReader(), DummyWriter()
+
+        async def fake_activate_live_session(live):
+            async with argus_app.app.state.sessions_lock:
+                argus_app.app.state.sessions[live.session_id] = live
+            return live
+
+        with (
+            mock.patch.object(argus_app, "_fugue_cfg", return_value=cfg),
+            mock.patch.object(argus_app, "_resolve_workspace_host_path_for_session", return_value=str(workspace_root)),
+            mock.patch.object(
+                argus_app,
+                "_fugue_ensure_session_app_ready_sync",
+                return_value=(
+                    {
+                        "id": "app_123",
+                        "name": argus_app._fugue_app_name(cfg, session_id),
+                        "internal_service": {"host": "fugue.internal", "port": 7777},
+                    },
+                    True,
+                ),
+            ),
+            mock.patch.object(argus_app, "_fugue_push_workspace_snapshot_sync", side_effect=fake_push_workspace_snapshot_sync),
+            mock.patch.object(argus_app, "_wait_for_tcp", side_effect=fake_wait_for_tcp),
+            mock.patch.object(argus_app, "_activate_live_session", side_effect=fake_activate_live_session),
+            mock.patch.object(argus_app, "_sync_remote_workspace_templates", new=mock.AsyncMock()),
+        ):
+            live, created = await argus_app._ensure_live_fugue_session(session_id, allow_create=True)
+
+        self.assertTrue(created)
+        self.assertEqual(live.runtime_id, "app_123")
+        self.assertEqual(events, ["push", "connect"])
 
     async def test_fugue_session_discovery_handles_suffixed_app_names(self) -> None:
         cfg = argus_app.FugueProvisionConfig(
@@ -822,6 +928,7 @@ class RuntimeSessionProvisioningTests(unittest.IsolatedAsyncioTestCase):
             },
         ]
         delete_calls: list[tuple[str, str, dict[str, str] | None]] = []
+        archive_calls: list[tuple[str, pathlib.Path]] = []
 
         def fake_request_json_sync(patched_cfg, method, path, **kwargs):
             self.assertIs(patched_cfg, cfg)
@@ -832,6 +939,12 @@ class RuntimeSessionProvisioningTests(unittest.IsolatedAsyncioTestCase):
             mock.patch.object(argus_app, "_fugue_cfg", return_value=cfg),
             mock.patch.object(argus_app, "_fugue_list_apps_sync", return_value=apps),
             mock.patch.object(argus_app, "_fugue_request_json_sync", side_effect=fake_request_json_sync),
+            mock.patch.object(argus_app, "_resolve_workspace_mirror_root_for_session", return_value=pathlib.Path(self.tmpdir.name)),
+            mock.patch.object(
+                argus_app,
+                "_fugue_pull_workspace_snapshot_sync",
+                side_effect=lambda patched_cfg, patched_session_id, root: archive_calls.append((patched_session_id, pathlib.Path(root))) or 2,
+            ),
         ):
             listed = argus_app._fugue_list_argus_sessions_sync()
             found = argus_app._fugue_find_session_app_sync(cfg, "3416ab8781ab")
@@ -843,6 +956,7 @@ class RuntimeSessionProvisioningTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNotNone(found)
         self.assertEqual(found["id"], "app_123")
         self.assertTrue(deleted)
+        self.assertEqual(archive_calls, [("3416ab8781ab", pathlib.Path(self.tmpdir.name))])
         self.assertEqual(delete_calls, [("DELETE", "/v1/apps/app_123", {"force": "true"})])
 
     async def test_fugue_wait_for_app_ready_surfaces_operation_failure(self) -> None:

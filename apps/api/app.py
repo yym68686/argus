@@ -17919,6 +17919,17 @@ async def _sync_session_workspace_file(session_id: str, root: Path, path_obj: Pa
         return
 
 
+def _resolve_workspace_mirror_root_for_session(session_id: str) -> Optional[Path]:
+    workspace_host_path = _resolve_workspace_host_path_for_session(session_id) or _derive_default_workspace_host_path_for_session(
+        session_id,
+        home_host_path=_configured_home_host_path(),
+        workspace_base_host_path=_configured_workspace_host_path(),
+    )
+    if not workspace_host_path or not os.path.isabs(workspace_host_path):
+        return None
+    return Path(workspace_host_path)
+
+
 async def _pull_session_workspace_file_to_local(
     session_id: str,
     *,
@@ -23022,6 +23033,13 @@ def _fugue_delete_session_sync(session_id: str, force: bool) -> bool:
     matches = _fugue_find_session_apps_sync(cfg, session_id)
     if not matches:
         return False
+    mirror_root = _resolve_workspace_mirror_root_for_session(session_id)
+    if mirror_root is not None:
+        try:
+            mirror_root.mkdir(parents=True, exist_ok=True)
+            _fugue_pull_workspace_snapshot_sync(cfg, session_id, mirror_root)
+        except Exception as e:
+            log.warning("Failed to archive Fugue workspace before deleting session %s: %s", session_id, str(e))
     deleted = False
     for app_data in matches:
         app_id = str(app_data.get("id") or "").strip()
@@ -23135,13 +23153,19 @@ def _fugue_push_workspace_snapshot_sync(cfg: FugueProvisionConfig, session_id: s
         _fugue_put_workspace_file_for_app_sync(cfg, app_id, rel, data)
 
 
-def _fugue_read_workspace_file_bytes_sync(cfg: FugueProvisionConfig, session_id: str, relative_path: str, *, max_bytes: int) -> Optional[bytes]:
+def _fugue_read_workspace_file_result_sync(
+    cfg: FugueProvisionConfig,
+    session_id: str,
+    relative_path: str,
+    *,
+    max_bytes: int,
+) -> tuple[Optional[bytes], bool]:
     app_data = _fugue_find_session_app_sync(cfg, session_id)
     if app_data is None:
-        return None
+        return None, False
     app_id = str(app_data.get("id") or "").strip()
     if not app_id:
-        return None
+        return None, False
     try:
         payload = _fugue_request_json_sync(
             cfg,
@@ -23156,11 +23180,19 @@ def _fugue_read_workspace_file_bytes_sync(cfg: FugueProvisionConfig, session_id:
         )
     except RuntimeError as e:
         if " 404" in str(e):
-            return None
+            return None, False
         raise
     if not isinstance(payload, dict):
+        return None, False
+    return _decode_fugue_filesystem_content(payload.get("content"), payload.get("encoding")), bool(payload.get("truncated"))
+
+
+def _fugue_read_workspace_file_bytes_sync(cfg: FugueProvisionConfig, session_id: str, relative_path: str, *, max_bytes: int) -> Optional[bytes]:
+    data, truncated = _fugue_read_workspace_file_result_sync(cfg, session_id, relative_path, max_bytes=max_bytes)
+    if truncated:
+        log.warning("Skipping truncated Fugue workspace file session=%s relative_path=%s max_bytes=%d", session_id, relative_path, max_bytes)
         return None
-    return _decode_fugue_filesystem_content(payload.get("content"), payload.get("encoding"))
+    return data
 
 
 def _fugue_list_workspace_tree_sync(cfg: FugueProvisionConfig, session_id: str, relative_path: str, *, depth: int) -> list[dict[str, Any]]:
@@ -23204,6 +23236,11 @@ def _fugue_tree_entry_is_directory(entry: dict[str, Any]) -> bool:
     return kind in {"directory", "dir", "folder"}
 
 
+def _fugue_tree_entry_is_file(entry: dict[str, Any]) -> bool:
+    kind = str(entry.get("kind") or entry.get("type") or "").strip().lower()
+    return kind in {"file", "regular"}
+
+
 def _fugue_list_workspace_tree_recursive_sync(
     cfg: FugueProvisionConfig,
     session_id: str,
@@ -23211,9 +23248,7 @@ def _fugue_list_workspace_tree_recursive_sync(
     *,
     max_depth: int,
 ) -> list[dict[str, Any]]:
-    root = _normalize_workspace_relative_path(relative_path)
-    if not root:
-        return []
+    root = _normalize_workspace_relative_path(relative_path) or ""
 
     limit = max(1, int(max_depth))
     pending: list[tuple[str, int]] = [(root, 1)]
@@ -23240,6 +23275,46 @@ def _fugue_list_workspace_tree_recursive_sync(
     return out
 
 
+def _fugue_pull_workspace_snapshot_sync(
+    cfg: FugueProvisionConfig,
+    session_id: str,
+    root: Path,
+    *,
+    max_depth: int = 12,
+    max_file_bytes: int = 10 * 1024 * 1024,
+) -> int:
+    if not root.exists() or not root.is_dir():
+        return 0
+    entries = _fugue_list_workspace_tree_recursive_sync(cfg, session_id, "", max_depth=max_depth)
+    pulled = 0
+    for entry in entries:
+        rel = _fugue_tree_entry_relative_workspace_path(cfg, entry)
+        if not rel:
+            continue
+        dest = root / rel
+        if _fugue_tree_entry_is_directory(entry):
+            try:
+                dest.mkdir(parents=True, exist_ok=True)
+            except Exception:
+                pass
+            continue
+        if not _fugue_tree_entry_is_file(entry):
+            continue
+        data, truncated = _fugue_read_workspace_file_result_sync(cfg, session_id, rel, max_bytes=max_file_bytes)
+        if data is None:
+            continue
+        if truncated:
+            log.warning("Skipping oversized Fugue workspace file during archive session=%s relative_path=%s", session_id, rel)
+            continue
+        try:
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            _atomic_write_bytes(dest, data)
+            pulled += 1
+        except Exception as e:
+            log.warning("Failed to archive Fugue workspace file session=%s relative_path=%s: %s", session_id, rel, str(e))
+    return pulled
+
+
 async def _ensure_live_fugue_session(session_id: str, *, allow_create: bool) -> tuple[LiveRuntimeSession, bool]:
     return await _with_session_provision_lock(
         session_id,
@@ -23260,20 +23335,13 @@ async def _ensure_live_fugue_session_unlocked(session_id: str, *, allow_create: 
         log.info("Ignoring stale live session for %s (closed=%s, writer_closing=%s)", session_id, existing.closed, writer_closing)
 
     cfg = _fugue_cfg()
-    workspace_host_path = _resolve_workspace_host_path_for_session(session_id) or _derive_default_workspace_host_path_for_session(
-        session_id,
-        home_host_path=_configured_home_host_path(),
-        workspace_base_host_path=_configured_workspace_host_path(),
-    )
-    if not workspace_host_path:
+    workspace_root = _resolve_workspace_mirror_root_for_session(session_id)
+    if workspace_root is None:
         raise RuntimeError("workspace root is not configured (ARGUS_HOME_HOST_PATH/ARGUS_WORKSPACE_HOST_PATH)")
-    if not os.path.isabs(workspace_host_path):
-        raise RuntimeError(f"Invalid workspaceHostPath for session {session_id}: not an absolute path")
-    workspace_root = Path(workspace_host_path)
     try:
         workspace_root.mkdir(parents=True, exist_ok=True)
     except Exception as e:
-        log.warning("Failed to create local workspace mirror for session %s at %s: %s", session_id, workspace_host_path, str(e))
+        log.warning("Failed to create local workspace mirror for session %s at %s: %s", session_id, str(workspace_root), str(e))
 
     try:
         app_data, created = await asyncio.to_thread(_fugue_ensure_session_app_ready_sync, cfg, session_id, allow_create)
@@ -23300,6 +23368,14 @@ async def _ensure_live_fugue_session_unlocked(session_id: str, *, allow_create: 
         image_ref,
         created,
     )
+    if created:
+        try:
+            await asyncio.to_thread(_fugue_push_workspace_snapshot_sync, cfg, session_id, workspace_root)
+        except KeyError:
+            log.warning("New Fugue session app disappeared before workspace restore session=%s", session_id)
+        except Exception as e:
+            log.warning("Failed to restore Fugue workspace for recreated session %s from %s: %s", session_id, str(workspace_root), str(e))
+            raise
     reader, writer = await _wait_for_tcp(host, port, cfg.connect_timeout_s)
 
     live = LiveRuntimeSession(
