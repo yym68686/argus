@@ -589,6 +589,10 @@ class TelegramApi {
     return await this.call("sendMessage", params);
   }
 
+  async sendRichMessage(params) {
+    return await this.call("sendRichMessage", params);
+  }
+
   async sendChatAction(params) {
     return await this.call("sendChatAction", params);
   }
@@ -1782,6 +1786,7 @@ function formatStagedAttachmentsNotice(result, S) {
 }
 
 const TELEGRAM_MAX_MESSAGE_CHARS = 4000;
+const TELEGRAM_RICH_MESSAGE_MAX_CHARS = 32768;
 
 function findTelegramSplitBoundary(text) {
   if (!isNonEmptyString(text)) return 0;
@@ -1810,23 +1815,115 @@ function findTelegramSplitBoundary(text) {
   return 0;
 }
 
-function splitTelegramMessage(text) {
+function splitTelegramMessageWithLimit(text, maxChars) {
   const raw = String(text ?? "");
   if (!raw) return [];
-  if (raw.length <= TELEGRAM_MAX_MESSAGE_CHARS) return [raw];
+  const limit = Math.max(1, Math.trunc(Number(maxChars) || TELEGRAM_MAX_MESSAGE_CHARS));
+  if (raw.length <= limit) return [raw];
 
   const out = [];
   let start = 0;
   while (start < raw.length) {
-    let end = Math.min(start + TELEGRAM_MAX_MESSAGE_CHARS, raw.length);
+    let end = Math.min(start + limit, raw.length);
     if (end < raw.length) {
       const boundary = findTelegramSplitBoundary(raw.slice(start, end));
       if (boundary > 0) end = start + boundary;
     }
-    if (end <= start) end = Math.min(start + TELEGRAM_MAX_MESSAGE_CHARS, raw.length);
+    if (end <= start) end = Math.min(start + limit, raw.length);
     out.push(raw.slice(start, end));
     start = end;
   }
+  return out.filter((chunk) => chunk.length > 0);
+}
+
+function splitTelegramMessage(text) {
+  return splitTelegramMessageWithLimit(text, TELEGRAM_MAX_MESSAGE_CHARS);
+}
+
+function markdownBlockUnits(text) {
+  const raw = String(text ?? "").replace(/\r\n?/g, "\n");
+  if (!raw) return [];
+  const lines = raw.match(/[^\n]*\n|[^\n]+$/g) || [];
+  const units = [];
+  let buf = "";
+  let fenceMarker = null;
+  let inMathBlock = false;
+
+  const flush = () => {
+    if (!buf) return;
+    units.push(buf);
+    buf = "";
+  };
+
+  for (const line of lines) {
+    const stripped = String(line ?? "").trim();
+    const fenceMatch = /^\s*(```+|~~~+)/.exec(line);
+    if (fenceMatch) {
+      const marker = fenceMatch[1].slice(0, 3);
+      if (!fenceMarker) fenceMarker = marker;
+      else if (stripped.startsWith(fenceMarker)) fenceMarker = null;
+      buf += line;
+      if (!fenceMarker) flush();
+      continue;
+    }
+
+    if (fenceMarker) {
+      buf += line;
+      continue;
+    }
+
+    if (stripped === "$$") {
+      inMathBlock = !inMathBlock;
+      buf += line;
+      if (!inMathBlock) flush();
+      continue;
+    }
+
+    buf += line;
+    if (!inMathBlock && stripped === "") flush();
+  }
+
+  flush();
+  return units;
+}
+
+function splitTelegramRichMessage(text) {
+  const raw = String(text ?? "");
+  if (!raw) return [];
+  if (raw.length <= TELEGRAM_RICH_MESSAGE_MAX_CHARS) return [raw];
+
+  const out = [];
+  let current = "";
+  for (const unit of markdownBlockUnits(raw)) {
+    if (!unit) continue;
+    if (current && current.length + unit.length > TELEGRAM_RICH_MESSAGE_MAX_CHARS) {
+      out.push(current);
+      current = "";
+    }
+    if (unit.length <= TELEGRAM_RICH_MESSAGE_MAX_CHARS) {
+      current += unit;
+      continue;
+    }
+
+    for (const chunk of splitTelegramMessageWithLimit(unit, TELEGRAM_RICH_MESSAGE_MAX_CHARS)) {
+      if (current && current.length + chunk.length > TELEGRAM_RICH_MESSAGE_MAX_CHARS) {
+        out.push(current);
+        current = "";
+      }
+      if (chunk.length <= TELEGRAM_RICH_MESSAGE_MAX_CHARS) {
+        current += chunk;
+        continue;
+      }
+      for (let start = 0; start < chunk.length; start += TELEGRAM_RICH_MESSAGE_MAX_CHARS) {
+        if (current) {
+          out.push(current);
+          current = "";
+        }
+        out.push(chunk.slice(start, start + TELEGRAM_RICH_MESSAGE_MAX_CHARS));
+      }
+    }
+  }
+  if (current) out.push(current);
   return out.filter((chunk) => chunk.length > 0);
 }
 
@@ -2313,11 +2410,17 @@ function resolveCancelTurnResultForUser(result, { locale } = {}) {
 
 const TELEGRAM_HTML_PARSE_ERR_RE = /can't parse entities|parse entities|find end of the entity/i;
 const TELEGRAM_MESSAGE_TOO_LONG_RE = /message is too long/i;
+const TELEGRAM_RICH_MESSAGE_FALLBACK_RE = /sendRichMessage failed:.*(?:not found|method not found)|can't parse.*rich|parse rich|rich_message|rich message|unsupported/i;
 const TELEGRAM_TOPIC_UNAVAILABLE_RE = /TOPIC_CLOSED|topic is closed|message thread not found/i;
 
 function isIgnorableTelegramSendError(err) {
   const msg = err instanceof Error ? err.message : String(err);
   return TELEGRAM_TOPIC_UNAVAILABLE_RE.test(msg);
+}
+
+function shouldFallbackFromRichMessageError(err) {
+  const msg = err instanceof Error ? err.message : String(err);
+  return TELEGRAM_RICH_MESSAGE_FALLBACK_RE.test(msg) || TELEGRAM_HTML_PARSE_ERR_RE.test(msg) || TELEGRAM_MESSAGE_TOO_LONG_RE.test(msg);
 }
 
 function escapeHtml(text) {
@@ -3181,29 +3284,45 @@ async function main() {
 
   async function sendAssistantMessage(target, text) {
     if (!target || !isNonEmptyString(text)) return null;
-    const chunks = splitTelegramMessage(text.trim());
+    const chunks = splitTelegramRichMessage(text.trim());
     let lastResult = null;
+    let richSupported = true;
 
     try {
       for (const chunk of chunks) {
-        const html = markdownToTelegramHtml(chunk);
-        if (isNonEmptyString(html)) {
+        if (richSupported) {
           try {
-            lastResult = await tg.sendMessage({ ...target, text: html, parse_mode: "HTML" });
+            lastResult = await tg.sendRichMessage({ ...target, rich_message: { markdown: chunk } });
             continue;
           } catch (e) {
             if (isIgnorableTelegramSendError(e)) return lastResult;
-            const msg = e instanceof Error ? e.message : String(e);
-            if (!TELEGRAM_HTML_PARSE_ERR_RE.test(msg) && !TELEGRAM_MESSAGE_TOO_LONG_RE.test(msg)) {
+            if (!shouldFallbackFromRichMessageError(e)) {
               throw e;
             }
+            richSupported = false;
           }
         }
-        try {
-          lastResult = await tg.sendMessage({ ...target, text: chunk });
-        } catch (e) {
-          if (isIgnorableTelegramSendError(e)) return lastResult;
-          throw e;
+
+        for (const legacyChunk of splitTelegramMessage(chunk)) {
+          const html = markdownToTelegramHtml(legacyChunk);
+          if (isNonEmptyString(html)) {
+            try {
+              lastResult = await tg.sendMessage({ ...target, text: html, parse_mode: "HTML" });
+              continue;
+            } catch (e) {
+              if (isIgnorableTelegramSendError(e)) return lastResult;
+              const msg = e instanceof Error ? e.message : String(e);
+              if (!TELEGRAM_HTML_PARSE_ERR_RE.test(msg) && !TELEGRAM_MESSAGE_TOO_LONG_RE.test(msg)) {
+                throw e;
+              }
+            }
+          }
+          try {
+            lastResult = await tg.sendMessage({ ...target, text: legacyChunk });
+          } catch (e) {
+            if (isIgnorableTelegramSendError(e)) return lastResult;
+            throw e;
+          }
         }
       }
       return lastResult;

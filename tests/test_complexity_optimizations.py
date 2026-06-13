@@ -50,6 +50,69 @@ class MarkdownComplexityTests(unittest.TestCase):
             "• item",
         )
 
+    def test_rich_markdown_split_preserves_table_and_formula_blocks(self) -> None:
+        rendered = (
+            "# Report\n\n"
+            "| Metric | Value |\n"
+            "| --- | ---: |\n"
+            "| Latency | 42 ms |\n\n"
+            "$$\n"
+            "E = mc^2\n"
+            "$$\n"
+        )
+
+        self.assertEqual(argus_app._telegram_split_rich_text(rendered), [rendered])
+
+    def test_telegram_draft_payload_uses_rich_markdown(self) -> None:
+        raw = "| A | B |\n| --- | --- |\n| 1 | 2 |\n\n$$\nx^2\n$$"
+        payload = argus_app._telegram_prepare_draft_payload(raw)
+
+        self.assertEqual(payload.get("action"), "send")
+        self.assertEqual(payload.get("richMessage"), {"markdown": raw})
+        self.assertIsNone(payload.get("parseMode"))
+        self.assertEqual(payload.get("legacyParseMode"), "HTML")
+
+
+class TelegramRichMessageTests(unittest.IsolatedAsyncioTestCase):
+    async def test_markdown_delivery_uses_rich_message_api(self) -> None:
+        calls: list[tuple[str, dict[str, object]]] = []
+
+        async def fake_to_thread(_fn, _token, method, params):
+            calls.append((method, params))
+            return {"method": method}
+
+        with mock.patch.object(argus_app.asyncio, "to_thread", new=fake_to_thread):
+            results = await argus_app._telegram_send_markdown_message_parts(
+                token="123:abc",
+                target={"chat_id": 42},
+                text="| A | B |\n| --- | --- |\n| 1 | 2 |",
+            )
+
+        self.assertEqual(results, [{"method": "sendRichMessage"}])
+        self.assertEqual(calls[0][0], "sendRichMessage")
+        self.assertEqual(calls[0][1]["rich_message"], {"markdown": "| A | B |\n| --- | --- |\n| 1 | 2 |"})
+
+    async def test_markdown_delivery_falls_back_to_legacy_html(self) -> None:
+        calls: list[tuple[str, dict[str, object]]] = []
+
+        async def fake_to_thread(_fn, _token, method, params):
+            calls.append((method, params))
+            if method == "sendRichMessage":
+                raise RuntimeError("Telegram sendRichMessage failed: Not Found")
+            return {"method": method, "params": params}
+
+        with mock.patch.object(argus_app.asyncio, "to_thread", new=fake_to_thread):
+            results = await argus_app._telegram_send_markdown_message_parts(
+                token="123:abc",
+                target={"chat_id": 42},
+                text="**bold**",
+            )
+
+        self.assertEqual([method for method, _params in calls], ["sendRichMessage", "sendMessage"])
+        self.assertEqual(results[0]["method"], "sendMessage")
+        self.assertEqual(calls[1][1]["text"], "<b>bold</b>")
+        self.assertEqual(calls[1][1]["parse_mode"], "HTML")
+
 
 class SQLiteStateStoreComplexityTests(unittest.TestCase):
     def test_state_probe_and_meta_load_use_combined_queries(self) -> None:

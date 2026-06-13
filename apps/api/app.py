@@ -1338,6 +1338,7 @@ CRON_DEFAULT_WRITEBACK_PROMPT_HINT = True
 CRON_DEFAULT_RETENTION_MAX_UNARCHIVED_THREADS = 50
 
 TELEGRAM_MAX_MESSAGE_CHARS = 4000
+TELEGRAM_RICH_MESSAGE_MAX_CHARS = 32768
 TELEGRAM_MAX_UPLOAD_BYTES = 50 * 1024 * 1024
 TELEGRAM_MAX_DOWNLOAD_BYTES = 20 * 1024 * 1024
 TELEGRAM_DRAFT_FLUSH_INTERVAL_MS = 400
@@ -1470,24 +1471,31 @@ def _telegram_prepare_draft_payload(raw: Optional[str]) -> dict[str, Any]:
         return {"action": "skip", "text": "", "parseMode": None, "payloadKey": None}
 
     text = stripped.get("text") if isinstance(stripped.get("text"), str) else trimmed
-    text = _telegram_truncate(text.strip())
+    text = _telegram_rich_truncate(text.strip())
     if not text:
         return {"action": "skip", "text": "", "parseMode": None, "payloadKey": None}
 
-    html = _markdown_to_telegram_html(text)
+    legacy_text = _telegram_truncate(text)
+    html = _markdown_to_telegram_html(legacy_text)
     if html:
         return {
             "action": "send",
-            "text": html,
-            "parseMode": "HTML",
-            "payloadKey": f"HTML\0{html}",
+            "text": text,
+            "richMessage": {"markdown": text},
+            "parseMode": None,
+            "legacyText": html,
+            "legacyParseMode": "HTML",
+            "payloadKey": f"RICH_MARKDOWN\0{text}",
         }
 
     return {
         "action": "send",
         "text": text,
+        "richMessage": {"markdown": text},
         "parseMode": None,
-        "payloadKey": f"PLAIN\0{text}",
+        "legacyText": legacy_text,
+        "legacyParseMode": None,
+        "payloadKey": f"RICH_MARKDOWN\0{text}",
     }
 
 def _unwrap_media_quotes(raw: str) -> Optional[str]:
@@ -1640,28 +1648,128 @@ def _telegram_find_split_boundary(text: str) -> int:
     return 0
 
 
-def _telegram_split_text(text: str) -> list[str]:
+def _telegram_split_text_with_limit(text: str, max_chars: int) -> list[str]:
     raw = str(text or "")
     if not raw:
         return []
-    if len(raw) <= TELEGRAM_MAX_MESSAGE_CHARS:
+    limit = max(1, int(max_chars or TELEGRAM_MAX_MESSAGE_CHARS))
+    if len(raw) <= limit:
         return [raw]
 
     out: list[str] = []
     start = 0
     while start < len(raw):
-        end = min(start + TELEGRAM_MAX_MESSAGE_CHARS, len(raw))
+        end = min(start + limit, len(raw))
         if end < len(raw):
             boundary = _telegram_find_split_boundary(raw[start:end])
             if boundary > 0:
                 end = start + boundary
         if end <= start:
-            end = min(start + TELEGRAM_MAX_MESSAGE_CHARS, len(raw))
+            end = min(start + limit, len(raw))
         chunk = raw[start:end]
         if chunk:
             out.append(chunk)
         start = end
     return out
+
+
+def _telegram_split_text(text: str) -> list[str]:
+    return _telegram_split_text_with_limit(text, TELEGRAM_MAX_MESSAGE_CHARS)
+
+
+def _telegram_rich_truncate(text: str) -> str:
+    raw = str(text or "")
+    if len(raw) <= TELEGRAM_RICH_MESSAGE_MAX_CHARS:
+        return raw
+    suffix = "\n...(truncated)"
+    return raw[: max(0, TELEGRAM_RICH_MESSAGE_MAX_CHARS - len(suffix))] + suffix
+
+
+def _telegram_markdown_block_units(text: str) -> list[str]:
+    raw = str(text or "").replace("\r\n", "\n").replace("\r", "\n")
+    if not raw:
+        return []
+
+    lines = raw.splitlines(keepends=True)
+    units: list[str] = []
+    buf: list[str] = []
+    fence_marker: Optional[str] = None
+    in_math_block = False
+
+    def flush() -> None:
+        nonlocal buf
+        if buf:
+            units.append("".join(buf))
+            buf = []
+
+    for line in lines:
+        stripped = line.strip()
+        fence_match = re.match(r"^\s*(```+|~~~+)", line)
+        if fence_match:
+            marker = fence_match.group(1)[:3]
+            if fence_marker is None:
+                fence_marker = marker
+            elif stripped.startswith(fence_marker):
+                fence_marker = None
+            buf.append(line)
+            if fence_marker is None:
+                flush()
+            continue
+
+        if fence_marker is not None:
+            buf.append(line)
+            continue
+
+        if stripped == "$$":
+            in_math_block = not in_math_block
+            buf.append(line)
+            if not in_math_block:
+                flush()
+            continue
+
+        buf.append(line)
+        if not in_math_block and stripped == "":
+            flush()
+
+    flush()
+    return units
+
+
+def _telegram_split_rich_text(text: str) -> list[str]:
+    raw = str(text or "")
+    if not raw:
+        return []
+    if len(raw) <= TELEGRAM_RICH_MESSAGE_MAX_CHARS:
+        return [raw]
+
+    out: list[str] = []
+    current = ""
+    for unit in _telegram_markdown_block_units(raw):
+        if not unit:
+            continue
+        if current and len(current) + len(unit) > TELEGRAM_RICH_MESSAGE_MAX_CHARS:
+            out.append(current)
+            current = ""
+        if len(unit) <= TELEGRAM_RICH_MESSAGE_MAX_CHARS:
+            current += unit
+            continue
+
+        for chunk in _telegram_split_text_with_limit(unit, TELEGRAM_RICH_MESSAGE_MAX_CHARS):
+            if current and len(current) + len(chunk) > TELEGRAM_RICH_MESSAGE_MAX_CHARS:
+                out.append(current)
+                current = ""
+            if len(chunk) <= TELEGRAM_RICH_MESSAGE_MAX_CHARS:
+                current += chunk
+                continue
+            for start in range(0, len(chunk), TELEGRAM_RICH_MESSAGE_MAX_CHARS):
+                if current:
+                    out.append(current)
+                    current = ""
+                out.append(chunk[start : start + TELEGRAM_RICH_MESSAGE_MAX_CHARS])
+
+    if current:
+        out.append(current)
+    return [chunk for chunk in out if chunk]
 
 
 def _telegram_escape_html(text: str) -> str:
@@ -1934,6 +2042,19 @@ def _create_turn_text_entry() -> dict[str, Any]:
 
 TELEGRAM_HTML_PARSE_ERR_RE = re.compile(r"can't parse entities|parse entities|find end of the entity", re.IGNORECASE)
 TELEGRAM_MESSAGE_TOO_LONG_RE = re.compile(r"message is too long", re.IGNORECASE)
+TELEGRAM_RICH_MESSAGE_FALLBACK_RE = re.compile(
+    r"sendRichMessage(?:Draft)? failed:.*(?:not found|method not found)|can't parse.*rich|parse rich|rich_message|rich message|unsupported",
+    re.IGNORECASE,
+)
+
+
+def _telegram_should_fallback_from_rich_error(error: BaseException) -> bool:
+    msg = str(error or "")
+    return bool(
+        TELEGRAM_RICH_MESSAGE_FALLBACK_RE.search(msg)
+        or TELEGRAM_HTML_PARSE_ERR_RE.search(msg)
+        or TELEGRAM_MESSAGE_TOO_LONG_RE.search(msg)
+    )
 
 
 def _telegram_api_call_sync(token: str, method: str, params: dict[str, Any]) -> Any:
@@ -2132,6 +2253,26 @@ async def _telegram_send_message(
         raise
 
 
+async def _telegram_send_rich_message(
+    *,
+    token: str,
+    target: dict[str, Any],
+    rich_message: dict[str, Any],
+    disable_notification: Optional[bool] = None,
+) -> Any:
+    params = dict(target)
+    params["rich_message"] = rich_message
+    if disable_notification is not None:
+        params["disable_notification"] = bool(disable_notification)
+    try:
+        return await asyncio.to_thread(_telegram_api_call_sync, token, "sendRichMessage", params)
+    except Exception as e:  # noqa: BLE001
+        if "message_thread_id" in params and TELEGRAM_THREAD_NOT_FOUND_RE.search(str(e) or ""):
+            params.pop("message_thread_id", None)
+            return await asyncio.to_thread(_telegram_api_call_sync, token, "sendRichMessage", params)
+        raise
+
+
 async def _telegram_send_plain_message_parts(
     *,
     token: str,
@@ -2153,7 +2294,81 @@ async def _telegram_send_plain_message_parts(
     return results
 
 
-async def _telegram_send_markdown_message_parts(
+async def _telegram_send_legacy_html_message_parts(
+    *,
+    token: str,
+    target: dict[str, Any],
+    text: str,
+    disable_notification: Optional[bool] = None,
+) -> list[Any]:
+    results: list[Any] = []
+    for chunk in _telegram_split_text(text):
+        try:
+            results.append(
+                await _telegram_send_message(
+                    token=token,
+                    target=target,
+                    text=chunk,
+                    parse_mode="HTML",
+                    disable_notification=disable_notification,
+                )
+            )
+            continue
+        except Exception as e:  # noqa: BLE001
+            msg = str(e)
+            if not (TELEGRAM_HTML_PARSE_ERR_RE.search(msg) or TELEGRAM_MESSAGE_TOO_LONG_RE.search(msg)):
+                raise
+
+        results.append(
+            await _telegram_send_message(
+                token=token,
+                target=target,
+                text=chunk,
+                parse_mode=None,
+                disable_notification=disable_notification,
+            )
+        )
+    return results
+
+
+async def _telegram_send_rich_html_message_parts(
+    *,
+    token: str,
+    target: dict[str, Any],
+    text: str,
+    disable_notification: Optional[bool] = None,
+) -> list[Any]:
+    results: list[Any] = []
+    rich_supported = True
+    for chunk in _telegram_split_rich_text(text):
+        if rich_supported:
+            try:
+                results.append(
+                    await _telegram_send_rich_message(
+                        token=token,
+                        target=target,
+                        rich_message={"html": chunk},
+                        disable_notification=disable_notification,
+                    )
+                )
+                continue
+            except Exception as e:  # noqa: BLE001
+                if not _telegram_should_fallback_from_rich_error(e):
+                    raise
+                rich_supported = False
+
+        results.extend(
+            await _telegram_send_legacy_html_message_parts(
+                token=token,
+                target=target,
+                text=chunk,
+                disable_notification=disable_notification,
+            )
+        )
+    return results
+
+
+async def _telegram_send_legacy_markdown_message_parts(
     *,
     token: str,
     target: dict[str, Any],
@@ -2192,6 +2407,43 @@ async def _telegram_send_markdown_message_parts(
     return results
 
 
+async def _telegram_send_markdown_message_parts(
+    *,
+    token: str,
+    target: dict[str, Any],
+    text: str,
+    disable_notification: Optional[bool] = None,
+) -> list[Any]:
+    results: list[Any] = []
+    rich_supported = True
+    for chunk in _telegram_split_rich_text(text):
+        if rich_supported:
+            try:
+                results.append(
+                    await _telegram_send_rich_message(
+                        token=token,
+                        target=target,
+                        rich_message={"markdown": chunk},
+                        disable_notification=disable_notification,
+                    )
+                )
+                continue
+            except Exception as e:  # noqa: BLE001
+                if not _telegram_should_fallback_from_rich_error(e):
+                    raise
+                rich_supported = False
+
+        results.extend(
+            await _telegram_send_legacy_markdown_message_parts(
+                token=token,
+                target=target,
+                text=chunk,
+                disable_notification=disable_notification,
+            )
+        )
+    return results
+
+
 async def _telegram_send_message_draft(
     *,
     token: str,
@@ -2215,6 +2467,29 @@ async def _telegram_send_message_draft(
         if "message_thread_id" in params and TELEGRAM_THREAD_NOT_FOUND_RE.search(str(e) or ""):
             params.pop("message_thread_id", None)
             return await asyncio.to_thread(_telegram_api_call_sync, token, "sendMessageDraft", params)
+        raise
+
+
+async def _telegram_send_rich_message_draft(
+    *,
+    token: str,
+    target: dict[str, Any],
+    draft_id: int,
+    rich_message: dict[str, Any],
+) -> Any:
+    params = {
+        "chat_id": target.get("chat_id"),
+        "draft_id": int(draft_id),
+        "rich_message": rich_message,
+    }
+    if "message_thread_id" in target:
+        params["message_thread_id"] = target["message_thread_id"]
+    try:
+        return await asyncio.to_thread(_telegram_api_call_sync, token, "sendRichMessageDraft", params)
+    except Exception as e:  # noqa: BLE001
+        if "message_thread_id" in params and TELEGRAM_THREAD_NOT_FOUND_RE.search(str(e) or ""):
+            params.pop("message_thread_id", None)
+            return await asyncio.to_thread(_telegram_api_call_sync, token, "sendRichMessageDraft", params)
         raise
 
 
@@ -13170,7 +13445,12 @@ class AutomationManager:
                 return
 
             payload_text = prepared.get("text") if isinstance(prepared.get("text"), str) else ""
+            payload_rich_message = prepared.get("richMessage") if isinstance(prepared.get("richMessage"), dict) else None
             payload_parse_mode = prepared.get("parseMode") if isinstance(prepared.get("parseMode"), str) else None
+            payload_legacy_text = prepared.get("legacyText") if isinstance(prepared.get("legacyText"), str) else payload_text
+            payload_legacy_parse_mode = (
+                prepared.get("legacyParseMode") if isinstance(prepared.get("legacyParseMode"), str) else payload_parse_mode
+            )
             payload_key = prepared.get("payloadKey") if isinstance(prepared.get("payloadKey"), str) else None
             if not payload_text or not payload_key:
                 draft["flushTask"] = None
@@ -13214,21 +13494,48 @@ class AutomationManager:
             source_text = source_text.strip()
             source_text_hash = _text_hash(source_text)
             send_started_at_ms = _now_ms()
+            send_error: Optional[BaseException] = None
             try:
-                await _telegram_send_message_draft(
-                    token=token,
-                    target=target,
-                    draft_id=draft_id,
-                    text=payload_text,
-                    parse_mode=payload_parse_mode,
-                )
+                if payload_rich_message is not None:
+                    await _telegram_send_rich_message_draft(
+                        token=token,
+                        target=target,
+                        draft_id=draft_id,
+                        rich_message=payload_rich_message,
+                    )
+                else:
+                    await _telegram_send_message_draft(
+                        token=token,
+                        target=target,
+                        draft_id=draft_id,
+                        text=payload_text,
+                        parse_mode=payload_parse_mode,
+                    )
             except asyncio.CancelledError:
                 draft["flushTask"] = None
                 raise
             except Exception as e:  # noqa: BLE001
+                if payload_rich_message is not None and payload_legacy_text and _telegram_should_fallback_from_rich_error(e):
+                    try:
+                        await _telegram_send_message_draft(
+                            token=token,
+                            target=target,
+                            draft_id=draft_id,
+                            text=payload_legacy_text,
+                            parse_mode=payload_legacy_parse_mode,
+                        )
+                    except asyncio.CancelledError:
+                        draft["flushTask"] = None
+                        raise
+                    except Exception as fallback_error:  # noqa: BLE001
+                        send_error = fallback_error
+                else:
+                    send_error = e
+
+            if send_error is not None:
                 draft["disabled"] = True
                 draft["flushTask"] = None
-                log.info("Telegram draft streaming disabled for %s/%s: %s", session_id, thread_id, str(e))
+                log.info("Telegram draft streaming disabled for %s/%s: %s", session_id, thread_id, str(send_error))
                 _event_log(
                     "warning",
                     "gw.tg.draft_flush",
@@ -14399,7 +14706,7 @@ class AutomationManager:
         clean_text = clean_text.strip()
         clean_text_hash = _text_hash(clean_text)
         if clean_text:
-            text_part_count = len(_telegram_split_text(clean_text))
+            text_part_count = len(_telegram_split_rich_text(clean_text))
         _event_log(
             "info",
             "gw.tg.final_delivery.start",
@@ -19326,28 +19633,12 @@ async def _mcp_handle_single_message(request: Request, body: dict[str, Any]) -> 
             send_results: list[Any] = []
             try:
                 if fmt == "html":
-                    truncated = _telegram_truncate(raw_text)
-                    try:
-                        res = await _telegram_send_message(
-                            token=token,
-                            target=target,
-                            text=truncated,
-                            parse_mode="HTML",
-                            disable_notification=silent,
-                        )
-                    except Exception as e:  # noqa: BLE001
-                        msg = str(e)
-                        if TELEGRAM_HTML_PARSE_ERR_RE.search(msg) or TELEGRAM_MESSAGE_TOO_LONG_RE.search(msg):
-                            res = await _telegram_send_message(
-                                token=token,
-                                target=target,
-                                text=truncated,
-                                parse_mode=None,
-                                disable_notification=silent,
-                            )
-                        else:
-                            raise
-                    send_results = [res]
+                    send_results = await _telegram_send_rich_html_message_parts(
+                        token=token,
+                        target=target,
+                        text=raw_text,
+                        disable_notification=silent,
+                    )
                 elif fmt == "plain":
                     send_results = await _telegram_send_plain_message_parts(
                         token=token,
