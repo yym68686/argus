@@ -22695,12 +22695,22 @@ def _fugue_preflight_runtime_image_sync(
         raise RuntimeError("Fugue runtime image source resolved to an empty image_ref")
 
     if resolved.runtime_app_id:
+        runtime_phase = str(resolved.runtime_phase or "").strip().lower()
+        runtime_app_ready = runtime_phase in ("deployed", "scaled", "migrated", "failed-over")
         try:
             inventory = _fugue_get_app_image_inventory_sync(cfg, resolved.runtime_app_id)
         except RuntimeError as e:
             detail = str(e)
             if " failed with 403" not in detail and " failed with 404" not in detail:
                 raise
+            if runtime_app_ready:
+                log.warning(
+                    "Fugue image inventory unavailable for deployed runtime app %s; using runtime image %s: %s",
+                    resolved.runtime_app_id,
+                    image_ref,
+                    detail,
+                )
+                return resolved
             log.info(
                 "Fugue image inventory unavailable for runtime app %s; falling back to registry manifest check: %s",
                 resolved.runtime_app_id,
@@ -22711,9 +22721,17 @@ def _fugue_preflight_runtime_image_sync(
             if available is True:
                 return resolved
             if available is False:
-                _raise_runtime_image_missing(
-                    f"configured runtime image digest is missing: {image_ref}",
-                    resolution=resolved,
+                if runtime_app_ready:
+                    log.warning(
+                        "Fugue image inventory reports deployed runtime app %s image %s as missing; using deployed runtime image",
+                        resolved.runtime_app_id,
+                        image_ref,
+                    )
+                    return resolved
+                log.info(
+                    "Fugue image inventory reports runtime app %s image %s as missing; verifying registry manifest before failing",
+                    resolved.runtime_app_id,
+                    image_ref,
                 )
 
     registry_refs = [image_ref]
@@ -22736,11 +22754,6 @@ def _fugue_preflight_runtime_image_sync(
             log.info("Registry manifest check for %s failed; trying fallback if available: %s", check_ref, str(e))
             continue
         missing_seen = True
-        if check_ref == image_ref:
-            _raise_runtime_image_missing(
-                f"configured runtime image digest is missing: {image_ref}",
-                resolution=resolved,
-            )
     if missing_seen:
         _raise_runtime_image_missing(
             f"configured runtime image digest is missing: {image_ref}",

@@ -528,9 +528,55 @@ class FugueApiHelperTests(unittest.TestCase):
             mock.patch.object(argus_app, "_fugue_list_apps_sync", return_value=[app_data]),
             mock.patch.object(argus_app, "_fugue_get_app_sync", return_value=app_data),
             mock.patch.object(argus_app, "_fugue_get_app_image_inventory_sync", return_value=inventory),
+            mock.patch.object(argus_app, "_registry_manifest_exists_sync", return_value=False) as registry_check,
         ):
             with self.assertRaisesRegex(argus_app.FugueRuntimeImageMissingError, "configured runtime image digest is missing"):
                 argus_app._fugue_preflight_runtime_image_sync(cfg)
+        registry_check.assert_called_once_with("registry.invalid/runtime@sha256:missing", timeout_s=1.0)
+
+    def test_fugue_preflight_trusts_deployed_template_when_inventory_is_stale(self) -> None:
+        cfg = argus_app.FugueProvisionConfig(
+            base_url="https://fugue.invalid",
+            token="token",
+            project_id="project_123",
+            runtime_id="runtime_123",
+            gateway_internal_host="gateway.internal",
+            runtime_compose_service="runtime",
+            runtime_cmd="codex serve",
+            connect_timeout_s=1.0,
+        )
+        app_data = {
+            "id": "app_template",
+            "name": "runtime",
+            "project_id": "project_123",
+            "source": {"compose_service": "runtime"},
+            "spec": {"image": "registry.fugue.internal:5000/runtime:git-abc123"},
+            "status": {"phase": "deployed", "last_message": "deployment ready (1/1 replicas)"},
+        }
+        inventory = {
+            "app_id": "app_template",
+            "registry_configured": True,
+            "versions": [
+                {
+                    "image_ref": "registry.fugue.internal:5000/runtime:git-abc123",
+                    "runtime_image_ref": "registry.fugue.internal:5000/runtime:git-abc123",
+                    "status": "missing",
+                    "current": True,
+                }
+            ],
+        }
+
+        with (
+            mock.patch.object(argus_app, "_fugue_list_apps_sync", return_value=[app_data]),
+            mock.patch.object(argus_app, "_fugue_get_app_sync", return_value=app_data),
+            mock.patch.object(argus_app, "_fugue_get_app_image_inventory_sync", return_value=inventory),
+            mock.patch.object(argus_app, "_registry_manifest_exists_sync") as registry_check,
+        ):
+            resolution = argus_app._fugue_preflight_runtime_image_sync(cfg)
+
+        self.assertEqual(resolution.image_ref, "registry.fugue.internal:5000/runtime:git-abc123")
+        self.assertEqual(resolution.runtime_phase, "deployed")
+        registry_check.assert_not_called()
 
     def test_fugue_preflight_falls_back_to_registry_when_inventory_forbidden(self) -> None:
         cfg = argus_app.FugueProvisionConfig(
