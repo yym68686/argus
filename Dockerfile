@@ -23,6 +23,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
   ca-certificates \
   curl \
   git \
+  openssh-server \
   procps \
   python-is-python3 \
   python3 \
@@ -37,14 +38,36 @@ RUN install_cmd="${APP_SERVER_INSTALL_CMD:-npm i -g @openai/codex}" \
 ENV APP_HOME=/root/.argus \
     APP_WORKSPACE=/workspace
 
-RUN mkdir -p /root/.argus /workspace /app
+RUN useradd --create-home --home-dir /home/fugue --shell /bin/bash fugue \
+  && passwd -d fugue >/dev/null \
+  && mkdir -p /root/.argus /workspace /app /run/sshd /home/fugue/.ssh \
+  && chmod 700 /home/fugue/.ssh \
+  && chown -R fugue:fugue /home/fugue \
+  && chown fugue:fugue /workspace \
+  && printf '%s\n' \
+    'Port 22' \
+    'ListenAddress 0.0.0.0' \
+    'PasswordAuthentication no' \
+    'KbdInteractiveAuthentication no' \
+    'ChallengeResponseAuthentication no' \
+    'PermitRootLogin no' \
+    'PubkeyAuthentication yes' \
+    'AuthorizedKeysFile .ssh/authorized_keys' \
+    'AllowUsers fugue' \
+    'X11Forwarding no' \
+    'AllowTcpForwarding no' \
+    'PrintMotd no' \
+    'UsePAM no' \
+    'PidFile /run/sshd.pid' \
+    > /etc/ssh/sshd_config
 
 COPY VERSION /app/VERSION
 COPY docs/templates /app/docs/templates
 
 COPY app_server_tcp_bridge.py /app/app_server_tcp_bridge.py
 COPY run_app_server.sh /app/run_app_server.sh
-RUN chmod +x /app/app_server_tcp_bridge.py /app/run_app_server.sh
+COPY start_runtime.sh /app/start_runtime.sh
+RUN chmod +x /app/app_server_tcp_bridge.py /app/run_app_server.sh /app/start_runtime.sh
 
 RUN mkdir -p /app/node-host /app/host-agent-dist
 COPY --from=node-host-builder /out/argus /app/node-host/argus
@@ -53,7 +76,8 @@ COPY --from=node-host-builder /out/host-agent-dist/ /app/host-agent-dist/
 WORKDIR /workspace
 
 EXPOSE 7777
+EXPOSE 22
 
 # Expose an app-server (JSONL over stdio) as a TCP stream.
 # Also starts a long-lived node-host daemon (if configured) for background job execution.
-CMD ["sh","-lc","set -eu; NODE_PID=\"\"; if [ -n \"${ARGUS_NODE_WS_URL:-}\" ]; then /app/node-host/argus & NODE_PID=$!; fi; /app/app_server_tcp_bridge.py & BRIDGE_PID=$!; trap 'kill -TERM $BRIDGE_PID 2>/dev/null || true; if [ -n \"$NODE_PID\" ]; then kill -TERM $NODE_PID 2>/dev/null || true; fi; wait' TERM INT; wait $BRIDGE_PID; if [ -n \"$NODE_PID\" ]; then kill -TERM $NODE_PID 2>/dev/null || true; wait $NODE_PID 2>/dev/null || true; fi"]
+CMD ["/app/start_runtime.sh"]
