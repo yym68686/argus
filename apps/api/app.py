@@ -22582,6 +22582,14 @@ def _fugue_inventory_image_available(inventory: dict[str, Any], image_ref: str) 
     return None
 
 
+def _is_fugue_internal_registry_image_ref(image_ref: str) -> bool:
+    value = str(image_ref or "").strip().lower()
+    return (
+        value.startswith("registry.fugue.internal/")
+        or value.startswith("registry.fugue.internal:")
+    )
+
+
 def _split_registry_image_ref(image_ref: str) -> tuple[str, str, str]:
     value = str(image_ref or "").strip()
     if not value:
@@ -22717,6 +22725,14 @@ def _fugue_preflight_runtime_image_sync(
                 detail,
             )
         else:
+            if (
+                inventory.get("registry_configured") is False
+                and _is_fugue_internal_registry_image_ref(image_ref)
+            ):
+                _raise_runtime_image_missing(
+                    f"Fugue managed registry is unavailable for runtime image: {image_ref}",
+                    resolution=resolved,
+                )
             available = _fugue_inventory_image_available(inventory, image_ref)
             if available is True:
                 return resolved
