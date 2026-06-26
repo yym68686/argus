@@ -21,7 +21,7 @@ services:
       ARGUS_FUGUE_RUNTIME_NETWORK_POLICY: required
       ARGUS_FUGUE_RUNTIME_ALLOW_PUBLIC_EGRESS: "true"
       ARGUS_FUGUE_WORKSPACE_STORAGE_MODE: movable_rwo
-      ARGUS_FUGUE_WORKSPACE_STORAGE_CLASS: fugue-local-rwo
+      ARGUS_FUGUE_WORKSPACE_STORAGE_CLASS: fugue-workspace-rwo
       ARGUS_FUGUE_WORKSPACE_SHARED_SUBPATH_PREFIX: argus/sessions
       ARGUS_RUNTIME_CMD: codex app-server
     generated_env:
