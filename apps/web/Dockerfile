@@ -21,7 +21,32 @@ RUN npm run build
 
 FROM nginx:1.27-alpine
 
+RUN apk add --no-cache openssh-server \
+    && mkdir -p /run/sshd /root/.ssh \
+    && chmod 700 /root/.ssh \
+    && printf '%s\n' \
+      'Port 22' \
+      'ListenAddress 0.0.0.0' \
+      'PasswordAuthentication no' \
+      'KbdInteractiveAuthentication no' \
+      'ChallengeResponseAuthentication no' \
+      'PermitRootLogin prohibit-password' \
+      'PubkeyAuthentication yes' \
+      'AuthorizedKeysFile /root/.ssh/authorized_keys' \
+      'AllowUsers root' \
+      'X11Forwarding no' \
+      'AllowTcpForwarding no' \
+      'PrintMotd no' \
+      'UsePAM no' \
+      'PidFile /run/sshd.pid' \
+      > /etc/ssh/sshd_config
+
 COPY --from=build /app/out /usr/share/nginx/html
 COPY nginx.conf.template /etc/nginx/templates/default.conf.template
+COPY start_web.sh /app/start_web.sh
+RUN chmod +x /app/start_web.sh
 
 EXPOSE 80
+EXPOSE 22
+
+CMD ["/app/start_web.sh"]

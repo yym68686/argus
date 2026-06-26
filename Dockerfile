@@ -35,25 +35,23 @@ ARG APP_SERVER_INSTALL_CMD
 RUN install_cmd="${APP_SERVER_INSTALL_CMD:-npm i -g @openai/codex}" \
     && sh -lc "$install_cmd"
 
-ENV APP_HOME=/root/.argus \
+ENV HOME=/workspace \
+    APP_HOME=/workspace/.argus \
     APP_WORKSPACE=/workspace
 
-RUN useradd --create-home --home-dir /home/fugue --shell /bin/bash fugue \
-  && passwd -d fugue >/dev/null \
-  && mkdir -p /root/.argus /workspace /app /run/sshd /home/fugue/.ssh \
-  && chmod 700 /home/fugue/.ssh \
-  && chown -R fugue:fugue /home/fugue \
-  && chown fugue:fugue /workspace \
+RUN mkdir -p /root/.ssh /workspace/.argus /app /run/sshd \
+  && chmod 700 /root/.ssh \
+  && sed -i 's#^root:\([^:]*:[^:]*:[^:]*:[^:]*:\)[^:]*:\(.*\)$#root:\1/workspace:\2#' /etc/passwd \
   && printf '%s\n' \
     'Port 22' \
     'ListenAddress 0.0.0.0' \
     'PasswordAuthentication no' \
     'KbdInteractiveAuthentication no' \
     'ChallengeResponseAuthentication no' \
-    'PermitRootLogin no' \
+    'PermitRootLogin prohibit-password' \
     'PubkeyAuthentication yes' \
-    'AuthorizedKeysFile .ssh/authorized_keys' \
-    'AllowUsers fugue' \
+    'AuthorizedKeysFile /root/.ssh/authorized_keys' \
+    'AllowUsers root' \
     'X11Forwarding no' \
     'AllowTcpForwarding no' \
     'PrintMotd no' \
