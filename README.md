@@ -204,7 +204,7 @@ Channel behavior:
 - Built-in `gateway`: enabled by default; the bundled Docker Compose file turns it off so users can bring their own provider key first. When enabled it uses `OPENAI_API_KEY` + `ARGUS_OPENAI_RESPONSES_UPSTREAM_URL`.
 - Built-in `0-0.pro`: fixed base URL `https://api.0-0.pro/v1`; each user supplies their own API key from the Telegram menu.
 - Custom channels: each user can add/delete/rename their own OpenAI-compatible `baseUrl` + API key entries.
-- The built-in `gateway` channel keeps a fixed model list: `gpt-5.2` / `gpt-5.4` / `gpt-5.5`.
+- The built-in `gateway` channel keeps a fixed model list: `gpt-5.2` / `gpt-5.4` / `gpt-5.5` / `gpt-5.6-sol` / `gpt-5.6-terra` / `gpt-5.6-luna`.
 - The `0-0.pro` and custom channels fetch their model lists from `<baseUrl>/models` (OpenAI-compatible shape). If that request fails, Argus falls back to the agent's current model so the session still stays usable.
 - The channel list and user API keys are stored in the gateway state store. When `ARGUS_DATABASE_URL` is set this means PostgreSQL; otherwise Argus falls back to `${ARGUS_HOME_HOST_PATH}/gateway/state.db`. Protect either backend like any other secret store. Legacy `${ARGUS_HOME_HOST_PATH}/gateway/state.json` / `state.db` files are imported automatically on first PostgreSQL boot when the target tables are still empty.
 - Switching the current channel is **user-global**: one switch affects that user's existing and future agents/containers.
@@ -359,7 +359,7 @@ When using `apps/telegram-bot`, the gateway can isolate runtime containers (agen
   - If the upload has no caption, the file is still saved immediately and will be attached to the next text message from that chat.
 - Use `/menu` to open the control panel:
   - **Switch Agent**: switch the current DM agent (workspace/session).
-  - **Switch Model**: for `gateway`, switch between `gpt-5.2`, `gpt-5.4`, and `gpt-5.5`; for `0-0.pro` and custom channels, use the models exposed by the current channel's `/models` endpoint.
+  - **Switch Model**: for `gateway`, switch between `gpt-5.2`, `gpt-5.4`, `gpt-5.5`, `gpt-5.6-sol`, `gpt-5.6-terra`, and `gpt-5.6-luna`; for `0-0.pro` and custom channels, use the models exposed by the current channel's `/models` endpoint.
   - **API Channels**: manage the per-user channel list (`gateway`, `0-0.pro`, and your own custom channels) and switch the current channel for all of your agents/containers.
   - **Create Agent**: create a new agent (workspace/session) and switch to it.
   - **Rename Agent**: rename the current agent (owner-only; non-`main`).
@@ -482,7 +482,7 @@ Notes:
 - The proxy requires a per-session derived bearer token (master: `ARGUS_OPENAI_TOKEN`, fallback: `ARGUS_TOKEN`).
 - The runtime writes a generated `CODEX_HOME/config.toml` (no provider secrets) to point Codex at the gateway MCP server and proxy.
   - Default `CODEX_HOME`: `/workspace/.codex` (workspace-scoped)
-  - Default model: `gpt-5.5` (`gateway` is fixed to `gpt-5.2` / `gpt-5.4` / `gpt-5.5`; other OpenAI-compatible channels can expose their own model ids, and the selection is persisted per agent).
+  - Default model: `gpt-5.5` (`gateway` also offers `gpt-5.2`, `gpt-5.4`, `gpt-5.6-sol`, `gpt-5.6-terra`, and `gpt-5.6-luna`; other OpenAI-compatible channels can expose their own model ids, and the selection is persisted per agent).
   - The generated provider block is labeled as `OpenAI` so Codex keeps the official compression behavior, while the actual traffic still goes through the Argus gateway proxy URL.
 - If you want the shared `gateway` channel enabled, set `ARGUS_GATEWAY_OPENAI_DEFAULT_ENABLED=true` and provide `OPENAI_API_KEY` on the gateway. Otherwise users must select a ready personal channel first.
 

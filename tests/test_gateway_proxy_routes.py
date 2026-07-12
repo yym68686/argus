@@ -98,12 +98,66 @@ class GatewayProxyRouteTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_gateway_default_model_is_available(self) -> None:
         self.assertEqual(argus_app.ARGUS_AGENT_MODEL_DEFAULT, "gpt-5.5")
-        self.assertIn("gpt-5.5", argus_app.ARGUS_GATEWAY_AGENT_MODELS)
+        self.assertEqual(
+            argus_app.ARGUS_GATEWAY_AGENT_MODELS,
+            (
+                "gpt-5.2",
+                "gpt-5.4",
+                "gpt-5.5",
+                "gpt-5.6-sol",
+                "gpt-5.6-terra",
+                "gpt-5.6-luna",
+            ),
+        )
         catalog = argus_app._static_model_catalog(
             models=argus_app.ARGUS_GATEWAY_AGENT_MODELS,
             source="static",
         )
-        self.assertIn("gpt-5.5", catalog["availableModels"])
+        self.assertEqual(catalog["availableModels"], list(argus_app.ARGUS_GATEWAY_AGENT_MODELS))
+
+    async def test_gateway_new_models_can_be_selected_without_changing_default(self) -> None:
+        with tempfile.TemporaryDirectory() as workspace:
+            store = InMemoryStateStore()
+            store.state.user_channels["1"] = argus_app.PersistedUserChannelState(
+                current_channel_id=argus_app.CHANNEL_ID_GATEWAY,
+            )
+            store.state.agents["u1-main"] = argus_app.PersistedAgentRuntime(
+                agent_id="u1-main",
+                session_id="aaaaaaaaaaaa",
+                workspace_host_path=workspace,
+                created_at_ms=1,
+                owner_user_id=1,
+                short_name="main",
+                provisioning_state=argus_app.AGENT_PROVISIONING_STATE_PENDING,
+            )
+            manager = argus_app.AutomationManager(
+                state_store=store,
+                home_host_path=workspace,
+                workspace_host_path=workspace,
+            )
+            try:
+                with mock.patch.object(argus_app, "_require_user_agent_support", return_value=None):
+                    for model in ("gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"):
+                        updated, workspace_synced = await manager.set_user_agent_model(
+                            user_id=1,
+                            agent_id="u1-main",
+                            model=model,
+                        )
+                        self.assertEqual(updated.model, model)
+                        self.assertFalse(workspace_synced)
+                        self.assertEqual(
+                            pathlib.Path(workspace, ".codex", argus_app.ARGUS_AGENT_MODEL_FILE).read_text().strip(),
+                            model,
+                        )
+
+                    with self.assertRaisesRegex(ValueError, "Invalid model for gateway channel"):
+                        await manager.set_user_agent_model(
+                            user_id=1,
+                            agent_id="u1-main",
+                            model="gpt-5.6-unknown",
+                        )
+            finally:
+                await manager.stop()
 
     async def test_assemble_turn_input_includes_telegram_sender_identity(self) -> None:
         manager = argus_app.AutomationManager(

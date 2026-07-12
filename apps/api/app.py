@@ -3018,7 +3018,14 @@ DEVELOPER_API_KEY_ID_RE = re.compile(r"^[a-f0-9]{16}$")
 TELEGRAM_LINK_TOKEN_ID_RE = re.compile(r"^[a-f0-9]{12}$")
 AUTOMATION_STATE_VERSION = 15
 ARGUS_AGENT_MODEL_DEFAULT = "gpt-5.5"
-ARGUS_GATEWAY_AGENT_MODELS = ("gpt-5.2", "gpt-5.4", "gpt-5.5")
+ARGUS_GATEWAY_AGENT_MODELS = (
+    "gpt-5.2",
+    "gpt-5.4",
+    "gpt-5.5",
+    "gpt-5.6-sol",
+    "gpt-5.6-terra",
+    "gpt-5.6-luna",
+)
 ARGUS_GATEWAY_AGENT_MODELS_SET = frozenset(ARGUS_GATEWAY_AGENT_MODELS)
 ARGUS_AGENT_MODEL_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/+-]{0,127}$")
 ARGUS_MODEL_CATALOG_CACHE_TTL_MS = 60_000
