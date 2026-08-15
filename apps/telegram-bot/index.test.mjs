@@ -2,6 +2,8 @@ import test from "node:test";
 import assert from "node:assert/strict";
 
 import {
+  DEFAULT_TELEGRAM_TYPING_TTL_MS,
+  TypingController,
   buildArgusCliInstallCommand,
   buildNodeDisconnectCommand,
   buildNodeConnectionCommand,
@@ -20,6 +22,51 @@ import {
   telegramTokenRefreshIntervalMs,
   telegramWebhookInfoLogFields
 } from "./index.mjs";
+
+test("TypingController expires stale typing indicators by default", async () => {
+  const originalSetInterval = globalThis.setInterval;
+  const originalClearInterval = globalThis.clearInterval;
+  const originalDateNow = Date.now;
+  let nowMs = 1_000;
+  let tick = null;
+  let clearedTimer = null;
+  const timer = { unref() {} };
+  const actions = [];
+
+  globalThis.setInterval = (callback, intervalMs) => {
+    assert.equal(intervalMs, 4_500);
+    tick = callback;
+    return timer;
+  };
+  globalThis.clearInterval = (value) => {
+    clearedTimer = value;
+  };
+  Date.now = () => nowMs;
+
+  try {
+    const controller = new TypingController({
+      async sendChatAction(action) {
+        actions.push(action);
+      }
+    });
+
+    controller.start("123", { chat_id: 123 });
+    assert.equal(actions.length, 1);
+    assert.equal(controller.activeByChatKey.has("123"), true);
+
+    nowMs += DEFAULT_TELEGRAM_TYPING_TTL_MS;
+    tick();
+    await Promise.resolve();
+
+    assert.equal(controller.activeByChatKey.has("123"), false);
+    assert.equal(clearedTimer, timer);
+    assert.equal(actions.length, 1);
+  } finally {
+    globalThis.setInterval = originalSetInterval;
+    globalThis.clearInterval = originalClearInterval;
+    Date.now = originalDateNow;
+  }
+});
 
 test("normalizeChatSettings defaults Telegram chat settings on", () => {
   assert.deepEqual(normalizeChatSettings(null), {

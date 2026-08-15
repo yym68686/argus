@@ -2562,8 +2562,10 @@ function markdownToTelegramHtml(markdown) {
   return String(out ?? "").trim();
 }
 
+const DEFAULT_TELEGRAM_TYPING_TTL_MS = 15 * 60_000;
+
 class TypingController {
-  constructor(tg, { intervalSeconds = 4.5, ttlMs = 0 } = {}) {
+  constructor(tg, { intervalSeconds = 4.5, ttlMs = DEFAULT_TELEGRAM_TYPING_TTL_MS } = {}) {
     this.tg = tg;
     this.intervalMs = Math.max(1000, Math.floor(Number(intervalSeconds) * 1000));
     const ttlNumber = Number(ttlMs);
@@ -6721,6 +6723,7 @@ async function main() {
 
           if (res?.staged === true && res?.started !== true && res?.queued !== true) {
             if (shouldTrackTurnTarget) removePendingTurnTarget(sessionId, threadId, chatKey);
+            typing.stop(chatKey);
             await safeSendMessage({ ...target, text: formatStagedAttachmentsNotice(res, S) });
             return;
           }
@@ -6752,6 +6755,8 @@ async function main() {
 }
 
 export {
+  DEFAULT_TELEGRAM_TYPING_TTL_MS,
+  TypingController,
   buildArgusCliInstallCommand,
   buildNodeDisconnectCommand,
   buildNodeConnectionCommand,
