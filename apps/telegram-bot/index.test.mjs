@@ -17,6 +17,7 @@ import {
   normalizeChatSettings,
   resolveTelegramBotTokenConfig,
   resolveTelegramWebhookConfig,
+  shouldDeliverTelegramAgentMessage,
   telegramSourceFromMessage,
   telegramTokenHash,
   telegramTokenRefreshIntervalMs,
@@ -126,6 +127,13 @@ test("sendTelegramAssistantMessage selects rich or legacy Markdown per chat sett
       params: { chat_id: 123, text: "<b>legacy</b>", parse_mode: "HTML" }
     }
   ]);
+});
+
+test("shouldDeliverTelegramAgentMessage always delivers final answers", () => {
+  assert.equal(shouldDeliverTelegramAgentMessage({ phase: "final_answer", sendCommentary: false }), true);
+  assert.equal(shouldDeliverTelegramAgentMessage({ phase: "commentary", sendCommentary: true }), true);
+  assert.equal(shouldDeliverTelegramAgentMessage({ phase: "commentary", sendCommentary: false }), false);
+  assert.equal(shouldDeliverTelegramAgentMessage({ phase: "unknown", sendCommentary: true }), false);
 });
 
 test("resolveTelegramWebhookConfig falls back to polling when no webhook URL is available", () => {

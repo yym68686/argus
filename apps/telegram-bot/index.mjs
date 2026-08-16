@@ -90,6 +90,12 @@ function normalizeMessagePhase(value) {
   return value.trim().toLowerCase();
 }
 
+function shouldDeliverTelegramAgentMessage({ phase, sendCommentary } = {}) {
+  const normalizedPhase = normalizeMessagePhase(phase);
+  if (normalizedPhase === "final_answer") return true;
+  return normalizedPhase === "commentary" && sendCommentary === true;
+}
+
 function normalizeTurnKind(value) {
   if (!isNonEmptyString(value)) return null;
   const normalized = value.trim().toLowerCase();
@@ -2963,28 +2969,54 @@ async function main() {
       if (!target) return;
       typing.start(chatKey, target);
     };
-    client.onAgentMessageCompleted = async ({ sessionId, threadId, turnId, sourceChatKey, text, phase }) => {
-      if (phase !== "commentary") return;
+    client.onAgentMessageCompleted = async ({ sessionId, threadId, turnId, sourceChatKey, itemId, text, phase }) => {
       if (!isNonEmptyString(sessionId) || !isNonEmptyString(threadId) || !isNonEmptyString(text)) return;
       const chatKey = isNonEmptyString(sourceChatKey) ? sourceChatKey : resolveTurnChatKey(sessionId, threadId, turnId);
       if (!isNonEmptyString(chatKey)) return;
       const chatSettings = state.getChatSettings(chatKey);
-      if (!chatSettings.sendCommentary) return;
+      if (!shouldDeliverTelegramAgentMessage({ phase, sendCommentary: chatSettings.sendCommentary })) return;
 
       await queue.enqueue(async () => {
         const sendTarget = sendTargetFromChatKey(chatKey);
-        if (sendTarget) {
-          await sendTelegramAssistantMessage({
-            tg,
-            target: sendTarget,
-            text,
-            useRichMarkdown: chatSettings.useRichMarkdown
+        if (!sendTarget) {
+          logEvent("WARNING", "tg.agent_message.delivery", {
+            session_id: sessionId,
+            thread_id: threadId,
+            turn_id: turnId,
+            item_id: itemId,
+            phase,
+            chat_key_hash: chatKeyHash(chatKey),
+            outcome: "skipped",
+            reason: "invalid_send_target",
+            text_chars: text.length
           });
+          return;
         }
 
-        const typingTarget = typingTargetFromChatKey(chatKey);
-        if (typingTarget && chatSettings.sendTyping) {
-          typing.start(chatKey, typingTarget);
+        const sent = await sendTelegramAssistantMessage({
+          tg,
+          target: sendTarget,
+          text,
+          useRichMarkdown: chatSettings.useRichMarkdown
+        });
+        logEvent(sent ? "INFO" : "WARNING", "tg.agent_message.delivery", {
+          session_id: sessionId,
+          thread_id: threadId,
+          turn_id: turnId,
+          item_id: itemId,
+          phase,
+          chat_key_hash: chatKeyHash(chatKey),
+          outcome: sent ? "sent" : "send_failed_or_ignored",
+          render_mode_requested: chatSettings.useRichMarkdown ? "rich" : "legacy",
+          telegram_message_id: Number.isFinite(sent?.message_id) ? sent.message_id : null,
+          text_chars: text.length
+        });
+
+        if (phase === "commentary") {
+          const typingTarget = typingTargetFromChatKey(chatKey);
+          if (typingTarget && chatSettings.sendTyping) {
+            typing.start(chatKey, typingTarget);
+          }
         }
       });
     };
@@ -6797,6 +6829,7 @@ export {
   derivePublicNodeWsUrl,
   isTelegramGetUpdatesWebhookConflict,
   isTelegramMessageDirectedAtBot,
+  shouldDeliverTelegramAgentMessage,
   normalizeChatSettingKey,
   normalizeChatSettings,
   normalizeTelegramDeliveryMode,
