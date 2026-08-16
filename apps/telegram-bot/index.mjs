@@ -321,7 +321,8 @@ async function pathExists(targetPath) {
 const DEFAULT_CHAT_SETTINGS = Object.freeze({
   replyToMessages: true,
   sendCommentary: true,
-  sendTyping: true
+  sendTyping: true,
+  useRichMarkdown: true
 });
 
 const CHAT_SETTING_KEYS = new Set(Object.keys(DEFAULT_CHAT_SETTINGS));
@@ -331,7 +332,8 @@ function normalizeChatSettings(value) {
   return {
     replyToMessages: raw.replyToMessages !== false,
     sendCommentary: raw.sendCommentary !== false,
-    sendTyping: raw.sendTyping !== false
+    sendTyping: raw.sendTyping !== false,
+    useRichMarkdown: raw.useRichMarkdown !== false
   };
 }
 
@@ -2062,9 +2064,12 @@ function normalizeAvailableModels(models, currentModel) {
     setting_reply_to_messages: "Reply to messages",
     setting_send_commentary: "Send commentary",
     setting_send_typing: "Typing indicator",
+    setting_markdown_rendering: "Markdown rendering",
     settings_hint: "These settings apply to this Telegram chat.",
     value_on: "on",
     value_off: "off",
+    value_markdown_rich: "new",
+    value_markdown_legacy: "legacy",
 
     create_prompt_prefix: "Send the new agent name (a-z0-9_-), e.g.",
     create_missing: "Missing agent name.",
@@ -2260,9 +2265,12 @@ function normalizeAvailableModels(models, currentModel) {
     setting_reply_to_messages: "回复用户消息",
     setting_send_commentary: "发送中间结果",
     setting_send_typing: "发送 typing 状态",
+    setting_markdown_rendering: "Markdown 渲染方式",
     settings_hint: "这些设置只作用于当前 Telegram 会话。",
     value_on: "开",
     value_off: "关",
+    value_markdown_rich: "新版",
+    value_markdown_legacy: "旧版",
 
     create_prompt_prefix: "发送新 agent 名称（a-z0-9_-），例如",
     create_missing: "缺少 agent 名称。",
@@ -2560,6 +2568,59 @@ function markdownToTelegramHtml(markdown) {
   }
 
   return String(out ?? "").trim();
+}
+
+export async function sendTelegramAssistantMessage({ tg, target, text, useRichMarkdown = true } = {}) {
+  if (!tg || !target || !isNonEmptyString(text)) return null;
+  const trimmedText = text.trim();
+  const chunks = useRichMarkdown ? splitTelegramRichMessage(trimmedText) : splitTelegramMessage(trimmedText);
+  let lastResult = null;
+  let richSupported = useRichMarkdown;
+
+  try {
+    for (const chunk of chunks) {
+      if (richSupported) {
+        try {
+          lastResult = await tg.sendRichMessage({ ...target, rich_message: { markdown: chunk } });
+          continue;
+        } catch (e) {
+          if (isIgnorableTelegramSendError(e)) return lastResult;
+          if (!shouldFallbackFromRichMessageError(e)) {
+            throw e;
+          }
+          richSupported = false;
+        }
+      }
+
+      const legacyChunks = useRichMarkdown ? splitTelegramMessage(chunk) : [chunk];
+      for (const legacyChunk of legacyChunks) {
+        const html = markdownToTelegramHtml(legacyChunk);
+        if (isNonEmptyString(html)) {
+          try {
+            lastResult = await tg.sendMessage({ ...target, text: html, parse_mode: "HTML" });
+            continue;
+          } catch (e) {
+            if (isIgnorableTelegramSendError(e)) return lastResult;
+            const msg = e instanceof Error ? e.message : String(e);
+            if (!TELEGRAM_HTML_PARSE_ERR_RE.test(msg) && !TELEGRAM_MESSAGE_TOO_LONG_RE.test(msg)) {
+              throw e;
+            }
+          }
+        }
+        try {
+          lastResult = await tg.sendMessage({ ...target, text: legacyChunk });
+        } catch (e) {
+          if (isIgnorableTelegramSendError(e)) return lastResult;
+          throw e;
+        }
+      }
+    }
+    return lastResult;
+  } catch (e) {
+    if (isIgnorableTelegramSendError(e)) return lastResult;
+    log("assistant sendMessage failed:", e instanceof Error ? e.message : String(e));
+    return null;
+  }
 }
 
 const DEFAULT_TELEGRAM_TYPING_TTL_MS = 15 * 60_000;
@@ -2913,7 +2974,12 @@ async function main() {
       await queue.enqueue(async () => {
         const sendTarget = sendTargetFromChatKey(chatKey);
         if (sendTarget) {
-          await sendAssistantMessage(sendTarget, text);
+          await sendTelegramAssistantMessage({
+            tg,
+            target: sendTarget,
+            text,
+            useRichMarkdown: chatSettings.useRichMarkdown
+          });
         }
 
         const typingTarget = typingTargetFromChatKey(chatKey);
@@ -3284,57 +3350,6 @@ async function main() {
     }
   }
 
-  async function sendAssistantMessage(target, text) {
-    if (!target || !isNonEmptyString(text)) return null;
-    const chunks = splitTelegramRichMessage(text.trim());
-    let lastResult = null;
-    let richSupported = true;
-
-    try {
-      for (const chunk of chunks) {
-        if (richSupported) {
-          try {
-            lastResult = await tg.sendRichMessage({ ...target, rich_message: { markdown: chunk } });
-            continue;
-          } catch (e) {
-            if (isIgnorableTelegramSendError(e)) return lastResult;
-            if (!shouldFallbackFromRichMessageError(e)) {
-              throw e;
-            }
-            richSupported = false;
-          }
-        }
-
-        for (const legacyChunk of splitTelegramMessage(chunk)) {
-          const html = markdownToTelegramHtml(legacyChunk);
-          if (isNonEmptyString(html)) {
-            try {
-              lastResult = await tg.sendMessage({ ...target, text: html, parse_mode: "HTML" });
-              continue;
-            } catch (e) {
-              if (isIgnorableTelegramSendError(e)) return lastResult;
-              const msg = e instanceof Error ? e.message : String(e);
-              if (!TELEGRAM_HTML_PARSE_ERR_RE.test(msg) && !TELEGRAM_MESSAGE_TOO_LONG_RE.test(msg)) {
-                throw e;
-              }
-            }
-          }
-          try {
-            lastResult = await tg.sendMessage({ ...target, text: legacyChunk });
-          } catch (e) {
-            if (isIgnorableTelegramSendError(e)) return lastResult;
-            throw e;
-          }
-        }
-      }
-      return lastResult;
-    } catch (e) {
-      if (isIgnorableTelegramSendError(e)) return lastResult;
-      log("assistant sendMessage failed:", e instanceof Error ? e.message : String(e));
-      return null;
-    }
-  }
-
   async function safeEditMessageText(params) {
     try {
       return await tg.editMessageText(params);
@@ -3598,15 +3613,20 @@ async function main() {
     if (settingKey === "replyToMessages") return S.setting_reply_to_messages;
     if (settingKey === "sendCommentary") return S.setting_send_commentary;
     if (settingKey === "sendTyping") return S.setting_send_typing;
+    if (settingKey === "useRichMarkdown") return S.setting_markdown_rendering;
     return String(settingKey || "");
   }
 
-  function chatSettingValueText(enabled, S) {
+  function chatSettingValueText(settingKey, enabled, S) {
+    if (settingKey === "useRichMarkdown") {
+      return enabled ? S.value_markdown_rich : S.value_markdown_legacy;
+    }
     return enabled ? S.value_on : S.value_off;
   }
 
   function chatSettingButtonText(settingKey, enabled, S) {
-    return `${enabled ? "✅" : "☑️"} ${chatSettingLabel(settingKey, S)}: ${chatSettingValueText(enabled, S)}`;
+    const icon = settingKey === "useRichMarkdown" ? "📝" : enabled ? "✅" : "☑️";
+    return `${icon} ${chatSettingLabel(settingKey, S)}: ${chatSettingValueText(settingKey, enabled, S)}`;
   }
 
   function normalizePage(pageRaw) {
@@ -4260,7 +4280,9 @@ async function main() {
     lines.push(escapeHtml(S.settings_hint));
     lines.push("");
     for (const settingKey of CHAT_SETTING_KEYS) {
-      lines.push(`${escapeHtml(chatSettingLabel(settingKey, S))}: ${htmlCode(chatSettingValueText(settings[settingKey], S))}`);
+      lines.push(
+        `${escapeHtml(chatSettingLabel(settingKey, S))}: ${htmlCode(chatSettingValueText(settingKey, settings[settingKey], S))}`
+      );
     }
     if (isNonEmptyString(error)) {
       lines.push("");
@@ -4286,6 +4308,13 @@ async function main() {
           action: `${actionPrefix}:setting_toggle`,
           chatKey,
           setting: "sendTyping"
+        })
+      ],
+      [
+        cbButton(chatSettingButtonText("useRichMarkdown", settings.useRichMarkdown, S), {
+          action: `${actionPrefix}:setting_toggle`,
+          chatKey,
+          setting: "useRichMarkdown"
         })
       ],
       [
@@ -5000,7 +5029,7 @@ async function main() {
         }
         const notice = formatTemplate(S.notice_setting_updated, {
           name: chatSettingLabel(settingKey, S),
-          value: chatSettingValueText(settings[settingKey], S)
+          value: chatSettingValueText(settingKey, settings[settingKey], S)
         });
         const view = await renderPrivateSettingsMenu(chatKey, { notice, locale });
         await editMenuMessage({ chatId, messageId, view });
@@ -5437,7 +5466,7 @@ async function main() {
         }
         const notice = formatTemplate(S.notice_setting_updated, {
           name: chatSettingLabel(settingKey, S),
-          value: chatSettingValueText(settings[settingKey], S)
+          value: chatSettingValueText(settingKey, settings[settingKey], S)
         });
         const view = await renderGroupSettingsMenu(chatKey, { notice, locale });
         await editMenuMessage({ chatId, messageId, view });

@@ -72,15 +72,60 @@ test("normalizeChatSettings defaults Telegram chat settings on", () => {
   assert.deepEqual(normalizeChatSettings(null), {
     replyToMessages: true,
     sendCommentary: true,
-    sendTyping: true
+    sendTyping: true,
+    useRichMarkdown: true
   });
-  assert.deepEqual(normalizeChatSettings({ replyToMessages: false, sendCommentary: false }), {
+  assert.deepEqual(normalizeChatSettings({ replyToMessages: false, sendCommentary: false, useRichMarkdown: false }), {
     replyToMessages: false,
     sendCommentary: false,
-    sendTyping: true
+    sendTyping: true,
+    useRichMarkdown: false
   });
   assert.equal(normalizeChatSettingKey("sendCommentary"), "sendCommentary");
+  assert.equal(normalizeChatSettingKey("useRichMarkdown"), "useRichMarkdown");
   assert.equal(normalizeChatSettingKey("bad"), null);
+});
+
+test("sendTelegramAssistantMessage selects rich or legacy Markdown per chat setting", async () => {
+  const { sendTelegramAssistantMessage } = await import("./index.mjs");
+  const calls = [];
+  const tg = {
+    async sendRichMessage(params) {
+      calls.push({ method: "sendRichMessage", params });
+      return { message_id: 1 };
+    },
+    async sendMessage(params) {
+      calls.push({ method: "sendMessage", params });
+      return { message_id: 2 };
+    }
+  };
+
+  await sendTelegramAssistantMessage({
+    tg,
+    target: { chat_id: 123 },
+    text: "**rich**",
+    useRichMarkdown: true
+  });
+  assert.deepEqual(calls, [
+    {
+      method: "sendRichMessage",
+      params: { chat_id: 123, rich_message: { markdown: "**rich**" } }
+    }
+  ]);
+
+  calls.length = 0;
+  await sendTelegramAssistantMessage({
+    tg,
+    target: { chat_id: 123 },
+    text: "**legacy**",
+    useRichMarkdown: false
+  });
+  assert.deepEqual(calls, [
+    {
+      method: "sendMessage",
+      params: { chat_id: 123, text: "<b>legacy</b>", parse_mode: "HTML" }
+    }
+  ]);
 });
 
 test("resolveTelegramWebhookConfig falls back to polling when no webhook URL is available", () => {
