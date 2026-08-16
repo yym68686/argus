@@ -335,6 +335,59 @@ class GatewayProxyRouteTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(events[0][0], "info")
         self.assertEqual(events[0][2]["reason"], "missing_target")
 
+    async def test_bot_owned_telegram_turn_skips_gateway_delivery(self) -> None:
+        manager = argus_app.AutomationManager(
+            state_store=InMemoryStateStore(),
+            home_host_path="/tmp",
+            workspace_host_path="/tmp",
+        )
+        events: list[tuple[str, str, dict[str, object]]] = []
+
+        def fake_event_log(level: str, event: str, **fields):
+            events.append((level, event, fields))
+
+        with (
+            mock.patch.object(argus_app, "_event_log", side_effect=fake_event_log),
+            mock.patch.object(manager, "_resolve_telegram_target_for_source") as resolve_source,
+            mock.patch.object(manager, "_resolve_telegram_target_for_turn") as resolve_turn,
+            mock.patch.object(argus_app, "_telegram_send_markdown_message_parts", new=mock.AsyncMock()) as send_text,
+        ):
+            await manager._deliver_turn_text(
+                "sess_1",
+                "thread_1",
+                "final answer",
+                turn_id="turn_1",
+                turn_kind=argus_app.TURN_KIND_USER,
+                source_channel=argus_app.TELEGRAM_BOT_OWNED_SOURCE_CHANNEL,
+                source_chat_key="123",
+            )
+
+        resolve_source.assert_not_called()
+        resolve_turn.assert_not_called()
+        send_text.assert_not_awaited()
+        self.assertTrue(argus_app._is_telegram_source_channel(argus_app.TELEGRAM_BOT_OWNED_SOURCE_CHANNEL))
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0][0], "info")
+        self.assertEqual(events[0][1], "gw.tg.final_delivery.skip")
+        self.assertEqual(events[0][2]["reason"], "bot_owned_delivery")
+
+    def test_bot_owned_telegram_source_context_is_forwarded_to_bot(self) -> None:
+        manager = argus_app.AutomationManager(
+            state_store=InMemoryStateStore(),
+            home_host_path="/tmp",
+            workspace_host_path="/tmp",
+        )
+        params: dict[str, object] = {}
+
+        manager._inject_source_context_into_notification(
+            params,
+            source_channel=argus_app.TELEGRAM_BOT_OWNED_SOURCE_CHANNEL,
+            source_chat_key="123",
+        )
+
+        self.assertEqual(params["sourceChannel"], argus_app.TELEGRAM_BOT_OWNED_SOURCE_CHANNEL)
+        self.assertEqual(params["sourceChatKey"], "123")
+
     async def test_user_no_text_token_skips_telegram_delivery(self) -> None:
         manager = argus_app.AutomationManager(
             state_store=InMemoryStateStore(),

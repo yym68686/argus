@@ -3382,6 +3382,15 @@ def _normalize_telegram_source_user_id(raw: Any) -> Optional[int]:
     return user_id if user_id > 0 else None
 
 
+TELEGRAM_BOT_OWNED_SOURCE_CHANNEL = "telegram_bot"
+
+
+def _is_telegram_source_channel(raw: Any) -> bool:
+    if not isinstance(raw, str):
+        return False
+    return raw.strip().lower() in ("telegram", "tg", TELEGRAM_BOT_OWNED_SOURCE_CHANNEL)
+
+
 def _normalize_console_password(raw: Any) -> str:
     if not isinstance(raw, str):
         return ""
@@ -13264,7 +13273,7 @@ class AutomationManager:
         chat_key = source_chat_key.strip() if isinstance(source_chat_key, str) and source_chat_key.strip() else None
         if not channel or not chat_key:
             return
-        if channel.lower() not in ("telegram", "tg"):
+        if not _is_telegram_source_channel(channel):
             return
         params["sourceChannel"] = channel
         params["sourceChatKey"] = chat_key
@@ -14626,11 +14635,24 @@ class AutomationManager:
                 text_hash=_text_hash(text),
             )
             return
+        source_channel_normalized = source_channel.strip().lower() if isinstance(source_channel, str) else ""
+        if source_channel_normalized == TELEGRAM_BOT_OWNED_SOURCE_CHANNEL:
+            _event_log(
+                "info",
+                "gw.tg.final_delivery.skip",
+                session_id=session_id,
+                thread_id=thread_id,
+                turn_id=turn_id,
+                turn_kind=normalized_turn_kind,
+                source_channel=source_channel,
+                chat_key_hash=_chat_key_hash(source_chat_key),
+                reason="bot_owned_delivery",
+                text_len=len(text.strip()),
+                text_hash=_text_hash(text),
+            )
+            return
         delivery_started_at_ms = _now_ms()
-        source_is_telegram = (
-            isinstance(source_channel, str)
-            and source_channel.strip().lower() in ("telegram", "tg")
-        )
+        source_is_telegram = _is_telegram_source_channel(source_channel)
         resolved = self._resolve_telegram_target_for_source(
             source_channel=source_channel,
             source_chat_key=source_chat_key,
@@ -15019,7 +15041,7 @@ class AutomationManager:
         source_username_norm = _normalize_telegram_username(source_username)
         source_first_name_norm = _normalize_telegram_profile_text(source_first_name)
         source_last_name_norm = _normalize_telegram_profile_text(source_last_name)
-        is_telegram_source = bool(source_channel_norm and source_channel_norm.lower() in ("telegram", "tg"))
+        is_telegram_source = _is_telegram_source_channel(source_channel_norm)
 
         local_attachments: list[dict[str, Any]] = []
         if telegram_attachments and is_telegram_source:

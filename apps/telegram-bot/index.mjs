@@ -1557,7 +1557,7 @@ function telegramProfileFromUser(user) {
 
 function telegramSourceFromMessage(message, chatKey) {
   if (!isNonEmptyString(chatKey)) return null;
-  const source = { channel: "telegram", chatKey: String(chatKey).trim() };
+  const source = { channel: "telegram_bot", chatKey: String(chatKey).trim() };
   const profile = telegramProfileFromUser(message?.from);
   if (!profile) return source;
   source.telegramUserId = profile.userId;

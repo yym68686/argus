@@ -271,7 +271,7 @@ test("telegramSourceFromMessage includes Telegram sender identity", () => {
   );
 
   assert.deepEqual(source, {
-    channel: "telegram",
+    channel: "telegram_bot",
     chatKey: "-4633273294",
     telegramUserId: 917527833,
     username: "alice_dev",
