@@ -15696,6 +15696,9 @@ class AutomationManager:
 
     async def _read_project_context_block(self, *, session_id: str, include_heartbeat: bool) -> str:
         root = self._workspace_root_for_session(session_id)
+        fugue_workspace = _fugue_workspace_enabled(session_id)
+        if fugue_workspace:
+            root = Path(_fugue_cfg().workspace_mount_path)
         if root is None:
             return ""
 
@@ -15703,10 +15706,13 @@ class AutomationManager:
         # Codex session. Reading it through the control-plane filesystem API
         # forces a pod lookup and kube exec for every file, adding seconds of
         # latency. Use the live runtime path for both native and Fugue sessions.
-        if _session_uses_remote_workspace(session_id) or _fugue_workspace_enabled(session_id):
+        if _session_uses_remote_workspace(session_id) or fugue_workspace:
             try:
                 live, _ = await _ensure_live_session(session_id, allow_create=True)
-                await self._sync_workspace_agents_file_for_session(session_id, root)
+                await _live_fs_write_text(
+                    live, str(root / AGENTS_FILENAME),
+                    _render_workspace_template_content(AGENTS_TEMPLATE_FILENAME, AGENTS_FILENAME),
+                )
             except Exception:
                 log.exception("Failed to prepare remote project context for session %s", session_id)
                 return ""
@@ -15803,10 +15809,13 @@ class AutomationManager:
 
     async def _read_skills_prompt_block(self, *, session_id: str) -> str:
         root = self._workspace_root_for_session(session_id)
+        fugue_workspace = _fugue_workspace_enabled(session_id)
+        if fugue_workspace:
+            root = Path(_fugue_cfg().workspace_mount_path)
         if root is None:
             return ""
 
-        if _session_uses_remote_workspace(session_id) or _fugue_workspace_enabled(session_id):
+        if _session_uses_remote_workspace(session_id) or fugue_workspace:
             try:
                 live, _ = await _ensure_live_session(session_id, allow_create=True)
             except Exception:
@@ -16048,6 +16057,12 @@ class AutomationManager:
             drained.extend(take)
 
         if max_events <= 0:
+            return []
+        # The store's in-memory state is authoritative between loads. With no
+        # events there is nothing to persist; a no-op update writes the entire
+        # automation state to PostgreSQL on every user message.
+        session = self._store.state.sessions.get(session_id)
+        if session is None or not session.system_event_queues.get(thread_id):
             return []
         await self._store.update(_pop)
 
