@@ -66,6 +66,34 @@ class Socket:
 
 
 class RuntimeInitializationTests(unittest.IsolatedAsyncioTestCase):
+    async def test_resume_does_not_request_unused_conversation_history(self):
+        self.manager._rpc = mock.AsyncMock(side_effect=[{"data": []}, {"thread": {"id": "thread-main"}}])
+        await self.manager._ensure_thread_loaded_or_resumed(self.live, "thread-main")
+        self.manager._rpc.assert_has_awaits([
+            mock.call(self.live, "thread/loaded/list", {"limit": 200}),
+            mock.call(self.live, "thread/resume", {"threadId": "thread-main", "excludeTurns": True}),
+        ])
+
+    async def test_loaded_thread_skips_resume(self):
+        self.manager._rpc = mock.AsyncMock(return_value={"data": ["thread-main"]})
+        await self.manager._ensure_thread_loaded_or_resumed(self.live, "thread-main")
+        self.manager._rpc.assert_awaited_once_with(self.live, "thread/loaded/list", {"limit": 200})
+
+    async def test_rpc_timing_does_not_log_prompts_or_responses(self):
+        with self.assertLogs(gateway.latency_log, level="INFO") as logs:
+            task = asyncio.create_task(self.manager._rpc(self.live, "turn/start", {"threadId": "thread-main", "input": [{"text": "private input"}]}))
+            while not self.writer.messages:
+                await asyncio.sleep(0)
+            rid = self.writer.messages[-1]["id"]
+            self.reader.feed_data((json.dumps({"id": rid, "result": {"privateResponse": "private output"}}) + "\n").encode())
+            await task
+        event = json.loads(logs.records[-1].getMessage())
+        self.assertEqual(event["method"], "turn/start")
+        self.assertEqual(event["outcome"], "ok")
+        self.assertGreaterEqual(event["duration_ms"], 0)
+        self.assertNotIn("private input", logs.output[0])
+        self.assertNotIn("private output", logs.output[0])
+
     async def asyncSetUp(self):
         self.writer = Writer()
         self.reader = asyncio.StreamReader()

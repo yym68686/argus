@@ -18,6 +18,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from collections import deque
+from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from pathlib import Path
@@ -45,6 +46,29 @@ except Exception:
 
 
 log = logging.getLogger("argus_gateway")
+latency_log = logging.getLogger("argus_gateway.latency")
+latency_log.setLevel(logging.INFO)
+latency_log.propagate = False
+if not latency_log.handlers:
+    latency_log.addHandler(logging.StreamHandler())
+
+
+@contextmanager
+def _latency_span(stage: str, **fields: Any):
+    started = time.monotonic()
+    outcome = "ok"
+    try:
+        yield
+    except BaseException:
+        outcome = "error"
+        raise
+    finally:
+        duration_ms = round((time.monotonic() - started) * 1000, 2)
+        if stage != "rpc" or fields.get("method") in {"thread/resume", "thread/start", "turn/start"} or duration_ms >= 1000:
+            # Only timing and routing identifiers: never prompts, credentials,
+            # RPC parameters, or response bodies. Keep these facts visible even
+            # when the general application logger inherits WARNING.
+            latency_log.info(json.dumps({"ts": datetime.now(timezone.utc).isoformat(), "ev": "gw.latency", "stage": stage, "outcome": outcome, "duration_ms": duration_ms, **fields}, separators=(",", ":")))
 
 DEFAULT_ARGUS_VERSION = "0.0.0"
 
@@ -15211,19 +15235,20 @@ class AutomationManager:
 
             try:
                 await self._ensure_thread_loaded_or_resumed(live, thread_id)
-                assembled = await self._assemble_turn_input(
-                    session_id,
-                    thread_id,
-                    user_text=user_text,
-                    heartbeat=False,
-                    source_channel=source_channel_norm,
-                    source_chat_key=source_chat_key_norm,
-                    source_telegram_user_id=source_telegram_user_id_norm,
-                    source_username=source_username_norm,
-                    source_first_name=source_first_name_norm,
-                    source_last_name=source_last_name_norm,
-                    local_attachments=local_attachments,
-                )
+                with _latency_span("input_assembly", session_id=session_id, thread_id=thread_id):
+                    assembled = await self._assemble_turn_input(
+                        session_id,
+                        thread_id,
+                        user_text=user_text,
+                        heartbeat=False,
+                        source_channel=source_channel_norm,
+                        source_chat_key=source_chat_key_norm,
+                        source_telegram_user_id=source_telegram_user_id_norm,
+                        source_username=source_username_norm,
+                        source_first_name=source_first_name_norm,
+                        source_last_name=source_last_name_norm,
+                        local_attachments=local_attachments,
+                    )
 
                 input_items: list[dict[str, Any]] = [{"type": "text", "text": assembled}]
                 input_items.extend(self._attachment_input_items(local_attachments))
@@ -16062,21 +16087,22 @@ class AutomationManager:
         await live.complete_initialize_handshake()
 
     async def _rpc(self, live: LiveRuntimeSession, method: str, params: Any) -> Any:
-        rid, fut = await live.reserve_internal_id()
-        try:
-            await live.write_upstream(_jsonrpc_upstream_text({"method": method, "id": rid, "params": params}))
-            resp = await asyncio.wait_for(fut, timeout=120.0)
-        except Exception:
-            async with live.attach_lock:
-                live.pending_internal_requests.pop(str(rid), None)
-            raise
-        if not isinstance(resp, dict):
-            raise RuntimeError("Invalid JSON-RPC response")
-        if "error" in resp and resp["error"] is not None:
-            err = resp["error"]
-            msg = err.get("message") if isinstance(err, dict) else str(err)
-            raise RuntimeError(msg or "RPC error")
-        return resp.get("result")
+        with _latency_span("rpc", session_id=live.session_id, method=method, thread_id=params.get("threadId") if isinstance(params, dict) else None):
+            rid, fut = await live.reserve_internal_id()
+            try:
+                await live.write_upstream(_jsonrpc_upstream_text({"method": method, "id": rid, "params": params}))
+                resp = await asyncio.wait_for(fut, timeout=120.0)
+            except Exception:
+                async with live.attach_lock:
+                    live.pending_internal_requests.pop(str(rid), None)
+                raise
+            if not isinstance(resp, dict):
+                raise RuntimeError("Invalid JSON-RPC response")
+            if "error" in resp and resp["error"] is not None:
+                err = resp["error"]
+                msg = err.get("message") if isinstance(err, dict) else str(err)
+                raise RuntimeError(msg or "RPC error")
+            return resp.get("result")
 
     def _turn_start_params(self, *, session_id: str, thread_id: str, input_items: list[dict[str, Any]], live: LiveRuntimeSession) -> dict[str, Any]:
         return {
@@ -16119,7 +16145,9 @@ class AutomationManager:
             raise ValueError("thread_id must not be empty")
         if await self._is_thread_loaded(live, tid):
             return
-        await self._rpc(live, "thread/resume", {"threadId": tid})
+        # This caller needs the resumed runtime, not hydrated conversation UI
+        # history. Keep all history in Codex while avoiding its unused return.
+        await self._rpc(live, "thread/resume", {"threadId": tid, "excludeTurns": True})
 
     def _cron_resolve_writeback(
         self,

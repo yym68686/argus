@@ -4,6 +4,8 @@ import assert from "node:assert/strict";
 import {
   DEFAULT_TELEGRAM_TYPING_TTL_MS,
   TypingController,
+  SerialQueue,
+  enqueueTelegramMessage,
   buildArgusCliInstallCommand,
   buildNodeDisconnectCommand,
   buildNodeConnectionCommand,
@@ -23,6 +25,65 @@ import {
   telegramTokenRefreshIntervalMs,
   telegramWebhookInfoLogFields
 } from "./index.mjs";
+
+test("directed messages show feedback before a busy queue or runtime can respond", async () => {
+  const queue = new SerialQueue();
+  let unblock;
+  queue.enqueue(() => new Promise((resolve) => { unblock = resolve; }));
+  await Promise.resolve();
+  const actions = [];
+  const typing = new TypingController({ async sendChatAction(action) { actions.push(action); } });
+  const message = { message_id: 7, chat: { id: -100123, type: "supergroup" }, from: { id: 42 }, text: "@sample_bot say test", entities: [{ type: "mention", offset: 0, length: 11 }], message_thread_id: 1 };
+  let handled = false;
+  const done = enqueueTelegramMessage(queue, { typing, message, botUsername: "sample_bot", settings: normalizeChatSettings(null), updateId: 123 }, async () => { handled = true; });
+  try {
+    assert.equal(handled, false);
+    assert.deepEqual(actions, [{ chat_id: -100123, message_thread_id: 1, action: "typing" }]);
+    const key = [...typing.activeByChatKey.keys()][0];
+    // A prior turn completing must not erase feedback for a waiting message.
+    typing.stop(key);
+    assert.equal(typing.activeByChatKey.size, 1);
+    unblock();
+    await done;
+    assert.equal(handled, true);
+    assert.equal(typing.activeByChatKey.size, 0);
+  } finally { typing.stopAll(); unblock(); }
+});
+
+test("message feedback respects chat settings and ignores other conversations", async () => {
+  const messages = [
+    { chat: { id: -123, type: "group" }, from: { id: 42 }, text: "hello everyone" },
+    { chat: { id: -123, type: "group" }, from: { id: 42 }, text: "/start@other_bot" },
+    { chat: { id: 42, type: "private" }, from: { id: 42, is_bot: true }, text: "hello" }
+  ];
+  const actions = [];
+  const typing = new TypingController({ async sendChatAction(action) { actions.push(action); } });
+  try {
+    for (const message of messages) await enqueueTelegramMessage(new SerialQueue(), { typing, message, botUsername: "sample_bot", settings: normalizeChatSettings(null) }, async () => {});
+    for (const setting of [{ sendTyping: false }, { replyToMessages: false }]) {
+      await enqueueTelegramMessage(new SerialQueue(), { typing, message: { chat: { id: 42, type: "private" }, from: { id: 42 }, text: "hello" }, botUsername: "sample_bot", settings: normalizeChatSettings(setting) }, async () => {});
+    }
+    assert.deepEqual(actions, []);
+  } finally { typing.stopAll(); }
+});
+
+test("pending feedback ends on failure and hands off to an active turn on success", async () => {
+  const typing = new TypingController({ async sendChatAction() {} });
+  const context = { typing, message: { chat: { id: 42, type: "private" }, from: { id: 42 }, text: "hello" }, settings: normalizeChatSettings(null) };
+  try {
+    await assert.rejects(enqueueTelegramMessage(new SerialQueue(), context, async () => { throw new Error("runtime unavailable"); }), /runtime unavailable/);
+    assert.equal(typing.activeByChatKey.size, 0);
+    await enqueueTelegramMessage(new SerialQueue(), context, async () => { typing.start("42", { chat_id: 42 }); });
+    assert.equal(typing.activeByChatKey.size, 1);
+    typing.stop("42");
+    assert.equal(typing.activeByChatKey.size, 0);
+    await enqueueTelegramMessage(new SerialQueue(), context, async () => {
+      typing.start("42", { chat_id: 42 });
+      typing.stop("42");
+    });
+    assert.equal(typing.activeByChatKey.size, 0);
+  } finally { typing.stopAll(); }
+});
 
 test("TypingController expires stale typing indicators by default", async () => {
   const originalSetInterval = globalThis.setInterval;

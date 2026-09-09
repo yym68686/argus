@@ -511,6 +511,47 @@ class SerialQueue {
   }
 }
 
+function isPrivateChatType(chatType) {
+  return chatType === "private";
+}
+
+function isGroupChatType(chatType) {
+  return chatType === "group" || chatType === "supergroup";
+}
+
+function enqueueTelegramMessage(queue, { typing, message, botUsername, settings, updateId }, handler) {
+  const receivedAtMs = Date.now();
+  const chatKey = chatKeyFromMessage(message);
+  const fields = { update_id: updateId, chat_key_hash: chatKeyHash(chatKey) };
+  const text = message?.text || message?.caption || "";
+  const slash = parseSlashCommand(String(text).trim(), botUsername);
+  const command = String(text).trim().startsWith("/");
+  const directed = !isGroupChatType(message?.chat?.type) || isTelegramMessageDirectedAtBot(message, botUsername) || Boolean(slash && !slash.forOtherBot);
+  const accepts = !message?.from?.is_bot && !isServiceMessage(message) && !slash?.forOtherBot && directed && (command || settings.replyToMessages);
+  const release = accepts && settings.sendTyping
+    ? typing.hold(chatKey, typingTargetFromMessage(message), { ...fields, received_at_ms: receivedAtMs })
+    : () => {};
+  logEvent("INFO", "tg.message.received", {
+    ...fields,
+    telegram_delivery_lag_ms: Number.isFinite(message?.date) ? Math.max(0, receivedAtMs - message.date * 1000) : null
+  });
+  const trace = async (stage, work) => {
+    const startedAtMs = Date.now();
+    let outcome = "ok";
+    logEvent("INFO", "tg.message.stage.started", { ...fields, stage });
+    try { return await work(); }
+    catch (error) { outcome = "error"; throw error; }
+    finally {
+      logEvent("INFO", "tg.message.stage.finished", { ...fields, stage, outcome, duration_ms: Math.max(0, Date.now() - startedAtMs), since_received_ms: Math.max(0, Date.now() - receivedAtMs) });
+    }
+  };
+  return queue.enqueue(async () => {
+    logEvent("INFO", "tg.message.processing", { ...fields, queue_wait_ms: Math.max(0, Date.now() - receivedAtMs) });
+    try { return await handler(trace); }
+    finally { release(); }
+  });
+}
+
 class CallbackStore {
   constructor({ ttlMs = 30 * 60_000, maxEntries = 5000 } = {}) {
     this.ttlMs = Math.max(10_000, Math.floor(Number(ttlMs)));
@@ -2651,15 +2692,43 @@ class TypingController {
     return out;
   }
 
-  async _sendTyping(target) {
+  async _sendTyping(target, feedback = null) {
+    const startedAtMs = Date.now();
+    let outcome = "ok";
     try {
       await this.tg.sendChatAction({ ...target, action: "typing" });
     } catch {
-      // ignore typing failures
+      outcome = "error";
+    } finally {
+      if (feedback) {
+        const { received_at_ms, ...fields } = feedback;
+        logEvent(outcome === "ok" ? "INFO" : "WARNING", "tg.message.feedback", {
+          ...fields, outcome,
+          dispatch_delay_ms: Math.max(0, startedAtMs - received_at_ms),
+          telegram_duration_ms: Math.max(0, Date.now() - startedAtMs)
+        });
+      }
     }
   }
 
   start(chatKey, target) {
+    this._start(chatKey, target, true);
+  }
+
+  hold(chatKey, target, feedback = null) {
+    const entry = this._start(chatKey, target, false, feedback);
+    if (!entry) return () => {};
+    entry.pending += 1;
+    let released = false;
+    return () => {
+      if (released || this.activeByChatKey.get(chatKey) !== entry) return;
+      released = true;
+      entry.pending -= 1;
+      if (!entry.pending && !entry.keepAlive) this._remove(chatKey);
+    };
+  }
+
+  _start(chatKey, target, keepAlive, feedback = null) {
     if (!isNonEmptyString(chatKey)) return;
     const normalized = this._normalizeTarget(target);
     if (!normalized) return;
@@ -2669,13 +2738,16 @@ class TypingController {
     if (existing) {
       existing.expiresAtMs = expiresAtMs;
       existing.target = normalized;
-      void this._sendTyping(normalized);
-      return;
+      existing.keepAlive ||= keepAlive;
+      void this._sendTyping(normalized, feedback);
+      return existing;
     }
 
     const entry = {
       expiresAtMs,
       target: normalized,
+      pending: 0,
+      keepAlive,
       timer: null
     };
     this.activeByChatKey.set(chatKey, entry);
@@ -2684,16 +2756,24 @@ class TypingController {
       const current = this.activeByChatKey.get(chatKey);
       if (!current) return;
       if (current.expiresAtMs && Date.now() >= current.expiresAtMs) {
-        this.stop(chatKey);
+        this._remove(chatKey);
         return;
       }
       void this._sendTyping(current.target);
     }, this.intervalMs);
 
-    void this._sendTyping(normalized);
+    void this._sendTyping(normalized, feedback);
+    return entry;
   }
 
   stop(chatKey) {
+    const entry = this.activeByChatKey.get(chatKey);
+    if (!entry) return;
+    entry.keepAlive = false;
+    if (!entry.pending) this._remove(chatKey);
+  }
+
+  _remove(chatKey) {
     const entry = this.activeByChatKey.get(chatKey);
     if (!entry) return;
     if (entry.timer) clearInterval(entry.timer);
@@ -2702,7 +2782,7 @@ class TypingController {
 
   stopAll() {
     for (const chatKey of this.activeByChatKey.keys()) {
-      this.stop(chatKey);
+      this._remove(chatKey);
     }
   }
 }
@@ -3351,14 +3431,6 @@ async function main() {
 
   function htmlCode(value) {
     return `<code>${escapeHtml(String(value ?? ""))}</code>`;
-  }
-
-  function isPrivateChatType(chatType) {
-    return chatType === "private";
-  }
-
-  function isGroupChatType(chatType) {
-    return chatType === "group" || chatType === "supergroup";
   }
 
   async function isChatAdmin(chatId, userId) {
@@ -6139,7 +6211,7 @@ async function main() {
       const replyAttachments = extractTelegramAttachmentsFromMessage(message?.reply_to_message).map((attachment) => ({ ...attachment, source: "reply" }));
       const replyText = replyTextRaw || (replyAttachments.length > 0 ? attachmentPlaceholder(replyAttachments) : null);
 
-      queue.enqueue(async () => {
+      enqueueTelegramMessage(queue, { typing, message, botUsername, settings: state.getChatSettings(chatKey), updateId }, async (trace) => {
         const S = uiStrings(locale);
         syncTelegramProfile(message?.from);
         const actorUserId = Number.isFinite(message?.from?.id) ? Math.trunc(message.from.id) : null;
@@ -6675,7 +6747,7 @@ async function main() {
 
           let route;
           try {
-            route = await resolveRouteForChatKey(chatKey);
+            route = await trace("route", () => resolveRouteForChatKey(chatKey));
           } catch (e) {
             if (isGroupChatType(chatType)) {
               const lastWarnAt = unboundWarnedAtByChatKey.get(chatKey) || 0;
@@ -6696,7 +6768,7 @@ async function main() {
           }
 
           try {
-            const channelState = await resolveChannelStateForChatKey(chatKey);
+            const channelState = await trace("channel_check", () => resolveChannelStateForChatKey(chatKey));
             const currentChannel = channelState?.currentChannel && typeof channelState.currentChannel === "object" ? channelState.currentChannel : null;
             if (currentChannel && currentChannel.ready !== true) {
               const promptChannel = resolveChannelKeyPromptTarget(channelState);
@@ -6733,7 +6805,7 @@ async function main() {
           }
 
           const sessionId = route.sessionId;
-          const client = await getClient(sessionId);
+          const client = await trace("runtime_connect", () => getClient(sessionId));
           const hasUserText = isNonEmptyString(text);
           let userText = "";
           if (hasUserText) {
@@ -6758,11 +6830,7 @@ async function main() {
             enqueueTarget = "main";
           } else if (useSharedMainThread) {
             enqueueTarget = "main";
-            threadId = await ensureSessionMainThread(sessionId);
-          }
-
-          if (hasUserText && !useSharedMainThread && chatSettings.sendTyping) {
-            typing.start(chatKey, typingTarget);
+            threadId = await trace("main_thread", () => ensureSessionMainThread(sessionId));
           }
 
           const shouldTrackTurnTarget = useSharedMainThread && isNonEmptyString(threadId);
@@ -6770,13 +6838,13 @@ async function main() {
 
           let res;
           try {
-            res = await client.enqueueInput({
+            res = await trace("enqueue", () => client.enqueueInput({
               text: hasUserText ? userText : "",
               threadId,
               target: enqueueTarget,
               source: telegramSourceFromMessage(message, chatKey),
               telegramAttachments: [...replyAttachments, ...messageAttachments],
-            });
+            }));
           } catch (e) {
             if (shouldTrackTurnTarget) removePendingTurnTarget(sessionId, threadId, chatKey);
             throw e;
@@ -6788,6 +6856,9 @@ async function main() {
             await safeSendMessage({ ...target, text: formatStagedAttachmentsNotice(res, S) });
             return;
           }
+
+          if (chatSettings.sendTyping && res?.queued === true) typing.start(chatKey, typingTarget);
+          logEvent("INFO", "tg.message.accepted", { update_id: updateId, session_id: sessionId, thread_id: res?.threadId, turn_id: res?.turnId, queued: res?.queued === true, started: res?.started === true });
 
           const effectiveThreadId = isNonEmptyString(res?.threadId) ? res.threadId : threadId;
           if (!useSharedMainThread && isNonEmptyString(effectiveThreadId)) {
@@ -6816,6 +6887,8 @@ async function main() {
 }
 
 export {
+  enqueueTelegramMessage,
+  SerialQueue,
   DEFAULT_TELEGRAM_TYPING_TTL_MS,
   TypingController,
   buildArgusCliInstallCommand,
