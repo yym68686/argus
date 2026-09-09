@@ -66,6 +66,17 @@ class Socket:
 
 
 class RuntimeInitializationTests(unittest.IsolatedAsyncioTestCase):
+    async def test_main_thread_resume_failure_does_not_replace_history(self):
+        persisted = SimpleNamespace(main_thread_id="thread-main")
+        self.manager._store.state = SimpleNamespace(sessions={self.live.session_id: persisted})
+        self.manager._ensure_initialized = mock.AsyncMock()
+        self.manager._ensure_thread_loaded_or_resumed = mock.AsyncMock(side_effect=RuntimeError("thread-main already has an active writer"))
+        self.manager._rpc = mock.AsyncMock(return_value={"thread": {"id": "replacement"}})
+        with self.assertRaisesRegex(RuntimeError, "active writer"):
+            await self.manager.ensure_main_thread(self.live.session_id)
+        self.assertEqual(persisted.main_thread_id, "thread-main")
+        self.manager._rpc.assert_not_awaited()
+
     async def test_resume_does_not_request_unused_conversation_history(self):
         self.manager._rpc = mock.AsyncMock(side_effect=[{"data": []}, {"thread": {"id": "thread-main"}}])
         await self.manager._ensure_thread_loaded_or_resumed(self.live, "thread-main")

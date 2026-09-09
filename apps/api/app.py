@@ -15003,7 +15003,11 @@ class AutomationManager:
                     await self._ensure_thread_loaded_or_resumed(live, existing.strip())
                     return existing.strip()
                 except Exception:
-                    log.warning("Failed to resume mainThreadId=%s; will create a new main thread", existing)
+                    # A timeout or another live writer is not evidence that
+                    # conversation history is gone. Preserve the selected
+                    # thread so a later attempt can resume it safely.
+                    log.warning("Failed to resume mainThreadId=%s; preserving the existing main thread", existing)
+                    raise
 
             result = await self._rpc(
                 live,
