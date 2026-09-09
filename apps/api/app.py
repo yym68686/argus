@@ -15921,17 +15921,20 @@ class AutomationManager:
         source_last_name: Optional[str] = None,
         local_attachments: Optional[list[Any]] = None,
     ) -> str:
-        drained = await self._drain_system_events(session_id, thread_id, max_events=20)
+        with _latency_span("drain_system_events", session_id=session_id, thread_id=thread_id):
+            drained = await self._drain_system_events(session_id, thread_id, max_events=20)
         blocks: list[str] = []
 
-        project_context = await self._read_project_context_block(session_id=session_id, include_heartbeat=heartbeat)
+        with _latency_span("project_context", session_id=session_id, thread_id=thread_id):
+            project_context = await self._read_project_context_block(session_id=session_id, include_heartbeat=heartbeat)
         if project_context:
             blocks.append(project_context)
 
         # Heartbeat turns must stay narrowly focused on HEARTBEAT.md + system events.
         # Including the full skills prompt here can accidentally prime irrelevant user-facing output.
         if not heartbeat:
-            skills_block = await self._read_skills_prompt_block(session_id=session_id)
+            with _latency_span("skills_context", session_id=session_id, thread_id=thread_id):
+                skills_block = await self._read_skills_prompt_block(session_id=session_id)
             if skills_block:
                 blocks.append(skills_block)
 
