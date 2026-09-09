@@ -273,3 +273,22 @@ class RuntimeInitializationTests(unittest.IsolatedAsyncioTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+class ShutdownRuntimeSessionTests(unittest.IsolatedAsyncioTestCase):
+    async def test_shutdown_closes_all_upstream_sessions(self):
+        live = SimpleNamespace()
+        with mock.patch.object(gateway.app.state, "sessions", {"sess-a": live}, create=True), mock.patch.object(gateway.app.state, "automation", None, create=True), mock.patch.object(gateway, "_close_live_session", new=mock.AsyncMock()) as close:
+            await gateway._shutdown()
+        close.assert_awaited_once_with("sess-a")
+
+class ActiveWriterRetryTests(unittest.IsolatedAsyncioTestCase):
+    async def test_resume_retries_transient_active_writer(self):
+        store = SimpleNamespace(state=SimpleNamespace(sessions={}), update=mock.AsyncMock())
+        manager = gateway.AutomationManager(state_store=store, home_host_path=None, workspace_host_path=None)
+        live = SimpleNamespace()
+        manager._is_thread_loaded = mock.AsyncMock(return_value=False)
+        manager._rpc = mock.AsyncMock(side_effect=[RuntimeError("thread abc already has an active writer"), {"thread": {"id": "abc"}}])
+        with mock.patch.object(gateway.asyncio, "sleep", new=mock.AsyncMock()) as sleep:
+            await manager._ensure_thread_loaded_or_resumed(live, "abc")
+        self.assertEqual(manager._rpc.await_count, 2)
+        sleep.assert_awaited_once()

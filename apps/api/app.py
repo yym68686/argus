@@ -16172,8 +16172,18 @@ class AutomationManager:
         if await self._is_thread_loaded(live, tid):
             return
         # This caller needs the resumed runtime, not hydrated conversation UI
-        # history. Keep all history in Codex while avoiding its unused return.
-        await self._rpc(live, "thread/resume", {"threadId": tid, "excludeTurns": True})
+        # history. During a rolling gateway handoff an old runtime connection
+        # can still own the Codex writer briefly. Wait for that owner to exit
+        # instead of surfacing a transient error or creating a replacement
+        # conversation with lost history.
+        for attempt in range(30):
+            try:
+                await self._rpc(live, "thread/resume", {"threadId": tid, "excludeTurns": True})
+                return
+            except Exception as exc:
+                if not _is_active_thread_writer_error(exc) or attempt == 29:
+                    raise
+                await asyncio.sleep(min(2.0, 0.25 * (attempt + 1)))
 
     def _cron_resolve_writeback(
         self,
@@ -18409,6 +18419,14 @@ async def _shutdown():
     automation: Optional[AutomationManager] = getattr(app.state, "automation", None)
     if automation is not None:
         await automation.stop()
+    # Close upstream runtime sockets before Uvicorn exits. During a rolling
+    # deployment this releases Codex writer locks for the replacement gateway.
+    sessions = getattr(app.state, "sessions", {})
+    for session_id in list(sessions):
+        try:
+            await _close_live_session(session_id)
+        except Exception:
+            log.exception("Failed to close runtime session during shutdown: %s", session_id)
 
 
 @app.get("/healthz")
@@ -23592,6 +23610,11 @@ def _is_missing_runtime_fs_error(exc: Exception) -> bool:
     if not text:
         return False
     return any(marker in text for marker in ("no such file", "not found", "enoent", "missing"))
+
+
+def _is_active_thread_writer_error(exc: Exception) -> bool:
+    text = str(exc or "").lower()
+    return "already has an active writer" in text or "active writer" in text
 
 
 def _session_uses_remote_workspace(session_id: str) -> bool:
