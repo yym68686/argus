@@ -8340,6 +8340,31 @@ class IsolatedCronTurnContext:
     started_at_ms: int
 
 
+def _tracked_automation_work(fn):
+    @functools.wraps(fn)
+    async def run(self, *args, **kwargs):
+        self._active_work += 1
+        try:
+            return await fn(self, *args, **kwargs)
+        finally:
+            self._active_work -= 1
+    return run
+
+
+def _fugue_drain_started_sync() -> bool:
+    # Local sidecar facts only; never call the control plane or initiate drain.
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    try:
+        with opener.open("http://127.0.0.1:19090/metrics", timeout=1) as response:
+            metrics = response.read(64 * 1024).decode("utf-8")
+        for line in metrics.splitlines():
+            if line.startswith("fugue_app_drain_prestop_requests_total "):
+                return float(line.split()[1]) > 0
+    except (OSError, ValueError):
+        pass
+    return False
+
+
 class AutomationManager:
     def __init__(
         self,
@@ -8354,6 +8379,9 @@ class AutomationManager:
         # After multi-agent support, this is treated as a best-effort fallback only.
         self._workspace_host_path = workspace_host_path
 
+        self._draining = False
+        self._drain_finishing = False
+        self._active_work = 0
         self._lanes: dict[tuple[str, str], ThreadLane] = {}
         self._cron_wakeup = asyncio.Event()
         self._heartbeat_wakeup = asyncio.Event()
@@ -8383,6 +8411,8 @@ class AutomationManager:
         self._tasks.append(asyncio.create_task(self._cron_loop()))
         self._tasks.append(asyncio.create_task(self._heartbeat_loop()))
         self._tasks.append(asyncio.create_task(self._lane_watchdog_loop()))
+        if os.getenv("KUBERNETES_SERVICE_HOST") and _provision_mode() == SESSION_PLACEMENT_KIND_FUGUE:
+            self._tasks.append(asyncio.create_task(self._fugue_drain_loop()))
 
     async def _migrate_linked_telegram_user_profiles(self) -> None:
         removed = 0
@@ -12811,6 +12841,40 @@ class AutomationManager:
             overwrite_existing=True,
         )
 
+    async def _fugue_drain_loop(self) -> None:
+        quiet_since = None
+        while True:
+            await asyncio.sleep(0.5)
+            if not self._draining:
+                if not await asyncio.to_thread(_fugue_drain_started_sync):
+                    continue
+                self._draining = True
+                latency_log.info(json.dumps({"ev": "gw.drain.started"}))
+            if self._has_drain_work():
+                quiet_since = None
+                continue
+            if quiet_since is None:
+                quiet_since = time.monotonic()
+                continue
+            if time.monotonic() - quiet_since < 2:
+                continue
+            self._drain_finishing = True
+            for sid, live in list(getattr(app.state, "sessions", {}).items()):
+                await live.close_attached_websockets(code=1012, reason="Gateway rolling deployment")
+                await _close_live_session(sid)
+            latency_log.info(json.dumps({"ev": "gw.drain.runtime_connections_released"}))
+            return
+
+    def _has_drain_work(self) -> bool:
+        if self._active_work or self._agent_provision_tasks or self._agent_cleanup_tasks:
+            return True
+        if any(lane.busy or lane.lock.locked() or lane.followups for lane in self._lanes.values()):
+            return True
+        for live in getattr(app.state, "sessions", {}).values():
+            if live.pending_internal_requests or live.pending_client_requests or live.pending_server_requests or live.turn_owners_by_thread:
+                return True
+        return False
+
     async def stop(self) -> None:
         for t in self._tasks:
             t.cancel()
@@ -13713,6 +13777,8 @@ class AutomationManager:
     def on_runtime_session_closed(self, session_id: str) -> None:
         # Called when the TCP session to the runtime closes unexpectedly (crash/OOM/restart).
         affected_tids = self._reset_lane_state_for_session(session_id)
+        if self._drain_finishing:
+            return
         try:
             for tid in affected_tids:
                 lane = self.lane(session_id, tid)
@@ -13735,6 +13801,8 @@ class AutomationManager:
                 await asyncio.sleep(2.0)
 
     async def _lane_watchdog_tick(self) -> None:
+        if self._draining:
+            return
         timeout_ms = self._stuck_turn_timeout_ms()
         if timeout_ms <= 0:
             return
@@ -14453,6 +14521,7 @@ class AutomationManager:
                     )
             return
 
+    @_tracked_automation_work
     async def _handle_isolated_cron_turn_completed(
         self,
         *,
@@ -14563,6 +14632,7 @@ class AutomationManager:
             log.exception("Failed to enqueue cron writeback for %s/%s/%s", sid, ctx.job_id, ctx.run_id)
         return
 
+    @_tracked_automation_work
     async def _enforce_cron_retention(
         self,
         *,
@@ -14678,6 +14748,7 @@ class AutomationManager:
 
         await self._store.update(_mark_archived)
 
+    @_tracked_automation_work
     async def _deliver_turn_text(
         self,
         session_id: str,
@@ -15086,6 +15157,7 @@ class AutomationManager:
             await self._store.update(_save_main)
             return thread_id
 
+    @_tracked_automation_work
     async def enqueue_user_input(
         self,
         *,
@@ -15598,6 +15670,7 @@ class AutomationManager:
             }
         return None
 
+    @_tracked_automation_work
     async def _process_lane_after_turn(self, session_id: str, thread_id: str) -> None:
         lane = self.lane(session_id, thread_id)
         if lane.busy:
@@ -16410,7 +16483,10 @@ class AutomationManager:
                 log.exception("Cron loop error")
                 await asyncio.sleep(2.0)
 
+    @_tracked_automation_work
     async def _cron_tick(self) -> float:
+        if self._draining:
+            return 1.0
         st = self._store.state
         if not st.sessions:
             return 5.0
@@ -16430,6 +16506,8 @@ class AutomationManager:
                 continue
 
             for job in sess.cron_jobs:
+                if self._draining:
+                    break
                 if not job.enabled:
                     continue
                 try:
@@ -16556,7 +16634,10 @@ class AutomationManager:
             return False
         return not _is_heartbeat_content_effectively_empty(raw)
 
+    @_tracked_automation_work
     async def _heartbeat_tick(self, *, forced: bool) -> None:
+        if self._draining:
+            return
         if not _provisioner_supports_runtime_automation():
             return
         st = self._store.state
@@ -16568,7 +16649,7 @@ class AutomationManager:
         # agents are active.
         started = 0
         for session_id in sorted(session_ids):
-            if started >= 3:
+            if self._draining or started >= 3:
                 return
 
             now_ms = _now_ms()
@@ -16628,6 +16709,8 @@ class AutomationManager:
                     self._note_session_failure(session_id, what="Heartbeat prepare", err=e)
                     continue
 
+                if self._draining:
+                    return
                 self._prepare_lane_for_new_turn(lane, kind=TURN_KIND_HEARTBEAT)
                 self._mark_lane_busy(lane)
                 try:
@@ -27629,6 +27712,11 @@ async def ws_nodes(ws: WebSocket):
 
 @app.websocket("/ws")
 async def ws_proxy(ws: WebSocket):
+    automation = getattr(app.state, "automation", None)
+    if automation is not None and automation._drain_finishing:
+        await ws.accept()
+        await ws.close(code=1012, reason="Gateway rolling deployment")
+        return
     provided = _extract_token(ws)
     requested_session_raw = (ws.query_params.get("session") or "").strip() or None
     requested_session = _normalize_runtime_session_id(requested_session_raw) if requested_session_raw else None
