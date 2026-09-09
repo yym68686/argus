@@ -1012,6 +1012,55 @@ class LiveRuntimeSession:
     metadata: dict[str, Any] = field(default_factory=dict)
 
     closed: bool = False
+    initialize_future: Optional[asyncio.Future[dict[str, Any]]] = None
+    initialize_send_task: Optional[asyncio.Task[None]] = None
+    handshake_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+
+    async def begin_initialize(self, params: Any) -> asyncio.Future[dict[str, Any]]:
+        # Automation and downstream clients share one upstream connection. Its
+        # handshake belongs to the connection, not to an individual caller.
+        async with self.attach_lock:
+            if self.initialized_result is not None:
+                done = asyncio.get_running_loop().create_future()
+                done.set_result({"result": self.initialized_result})
+                return done
+            if self.initialize_future is not None:
+                return self.initialize_future
+            rid = self.next_upstream_id
+            self.next_upstream_id += 1
+            fut = asyncio.get_running_loop().create_future()
+            # WebSocket-only initialization also uses this future; consume a
+            # close exception even when no automation caller is waiting.
+            fut.add_done_callback(lambda f: None if f.cancelled() else f.exception())
+            self.initialize_future = fut
+            self.pending_initialize_ids.add(str(rid))
+            self.pending_internal_requests[str(rid)] = fut
+            self.initialize_send_task = asyncio.create_task(self._send_initialize(rid, params, fut))
+            self.initialize_send_task.add_done_callback(lambda t: None if t.cancelled() else t.exception())
+        # Cancellation of a client must not interrupt a write already sent to
+        # the server and permit another caller to send a duplicate initialize.
+        await asyncio.shield(self.initialize_send_task)
+        return fut
+
+    async def _send_initialize(self, rid: int, params: Any, fut: asyncio.Future[dict[str, Any]]) -> None:
+        log.info("Runtime initialize started session=%s upstream_request_id=%s", self.session_id, rid)
+        try:
+            await self.write_upstream(_jsonrpc_upstream_text({"method": "initialize", "id": rid, "params": params}))
+        except BaseException as exc:
+            async with self.attach_lock:
+                self.pending_internal_requests.pop(str(rid), None)
+                self.pending_initialize_ids.discard(str(rid))
+                self.initialize_future = None
+            if not fut.done():
+                fut.set_exception(exc)
+            raise
+
+    async def complete_initialize_handshake(self) -> None:
+        async with self.handshake_lock:
+            if self.handshake_done or self.initialized_result is None:
+                return
+            await self.write_upstream(_jsonrpc_upstream_text({"method": "initialized"}))
+            self.handshake_done = True
 
     @property
     def container_id(self) -> str:
@@ -1122,9 +1171,7 @@ class LiveRuntimeSession:
             await self.detach(ws)
             return True
 
-    async def resolve_initialize_waiters(self) -> None:
-        if self.initialized_result is None:
-            return
+    async def resolve_initialize_waiters(self, response: dict[str, Any]) -> None:
         async with self.attach_lock:
             waiters = list(self.initialize_waiters)
             self.initialize_waiters.clear()
@@ -1134,7 +1181,9 @@ class LiveRuntimeSession:
             if ws.client_state != WebSocketState.CONNECTED:
                 continue
             try:
-                await ws.send_text(json.dumps({"id": downstream_id, "result": self.initialized_result}))
+                rewritten = dict(response)
+                rewritten["id"] = downstream_id
+                await ws.send_text(json.dumps(rewritten))
             except Exception:
                 await self.detach(ws)
 
@@ -15997,23 +16046,20 @@ class AutomationManager:
     async def _ensure_initialized(self, live: LiveRuntimeSession) -> None:
         if live.initialized_result is not None and live.handshake_done:
             return
-        # Send initialize and cache result.
-        req = {"method": "initialize", "id": None, "params": {"clientInfo": {"name": "argus_gateway", "title": "Argus Gateway Automation", "version": ARGUS_VERSION}}}
-        rid, fut = await live.reserve_internal_id()
-        req["id"] = rid
+        fut = await live.begin_initialize({"clientInfo": {"name": "argus_gateway", "title": "Argus Gateway Automation", "version": ARGUS_VERSION}})
         try:
-            await live.write_upstream(_jsonrpc_upstream_text(req))
-            resp = await asyncio.wait_for(fut, timeout=30.0)
-        except Exception:
-            async with live.attach_lock:
-                live.pending_internal_requests.pop(str(rid), None)
+            # A caller timing out must not cancel the shared handshake or discard
+            # its eventual reply. The pump caches it for subsequent clients.
+            resp = await asyncio.wait_for(asyncio.shield(fut), timeout=30.0)
+        except TimeoutError:
+            log.warning("Runtime initialize waiter timed out session=%s; upstream handshake remains pending", live.session_id)
             raise
-        if isinstance(resp, dict) and isinstance(resp.get("result"), dict):
-            live.initialized_result = resp["result"]
-        # Complete handshake.
-        if not live.handshake_done:
-            await live.write_upstream(_jsonrpc_upstream_text({"method": "initialized"}))
-            live.handshake_done = True
+        if resp.get("error") is not None:
+            err = resp["error"]
+            raise RuntimeError((err.get("message") if isinstance(err, dict) else str(err)) or "Initialize failed")
+        if not isinstance(resp.get("result"), dict):
+            raise RuntimeError("Invalid initialize response")
+        await live.complete_initialize_handshake()
 
     async def _rpc(self, live: LiveRuntimeSession, method: str, params: Any) -> Any:
         rid, fut = await live.reserve_internal_id()
@@ -21969,12 +22015,18 @@ async def _activate_live_session(live: LiveRuntimeSession) -> LiveRuntimeSession
                     async with live.attach_lock:
                         if rid in live.pending_initialize_ids:
                             live.pending_initialize_ids.discard(rid)
-                            if isinstance(msg.get("result"), dict):
+                            if msg.get("error") is None and isinstance(msg.get("result"), dict):
                                 live.initialized_result = msg["result"]
-                                should_resolve = True
+                            else:
+                                live.initialize_future = None
+                                if msg.get("error") is None:
+                                    msg = {"id": msg.get("id"), "error": {"code": -32603, "message": "Invalid initialize response"}}
+                            should_resolve = True
                         client_turn_start_thread_id = live.pending_client_turn_starts.pop(rid, None)
                     if should_resolve:
-                        await live.resolve_initialize_waiters()
+                        await live.complete_initialize_handshake()
+                        log.info("Runtime initialize reply session=%s upstream_request_id=%s outcome=%s", session_id, rid, "success" if isinstance(msg.get("result"), dict) else "error")
+                        await live.resolve_initialize_waiters(msg)
                     if client_turn_start_thread_id:
                         automation: Optional[AutomationManager] = getattr(app.state, "automation", None)
                         if automation is not None:
@@ -28111,39 +28163,26 @@ async def ws_proxy(ws: WebSocket):
                 if isinstance(msg, dict) and msg.get("method") == "initialize":
                     req_id = msg.get("id")
                     if req_id is None:
-                        await live.write_upstream(_jsonrpc_upstream_text(msg))
+                        # initialize is a request; never send an untracked
+                        # notification that could initialize the shared server.
                         continue
                     cached_result: Optional[dict[str, Any]] = None
-                    forward: Optional[str] = None
                     async with live.attach_lock:
                         if live.initialized_result is not None:
                             cached_result = live.initialized_result
-                        elif live.pending_initialize_ids:
-                            live.initialize_waiters.append((ws, req_id))
                         else:
-                            upstream_id = live.next_upstream_id
-                            live.next_upstream_id += 1
-                            live.pending_client_requests[str(upstream_id)] = (ws, req_id)
-                            live.pending_initialize_ids.add(str(upstream_id))
-                            rewritten = dict(msg)
-                            rewritten["id"] = upstream_id
-                            forward = _jsonrpc_upstream_text(rewritten)
+                            live.initialize_waiters.append((ws, req_id))
                     if cached_result is not None:
                         try:
                             await ws.send_text(json.dumps({"id": req_id, "result": cached_result}))
                         except Exception:
                             pass
                         continue
-                    if forward is None:
-                        continue
-                    await live.write_upstream(forward)
+                    await live.begin_initialize(msg.get("params"))
                     continue
 
                 if isinstance(msg, dict) and msg.get("method") == "initialized":
-                    if live.handshake_done:
-                        continue
-                    await live.write_upstream(_jsonrpc_upstream_text(msg))
-                    live.handshake_done = True
+                    await live.complete_initialize_handshake()
                     continue
 
                 if isinstance(msg, dict) and "id" in msg and "method" not in msg:
