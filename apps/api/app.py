@@ -15699,7 +15699,11 @@ class AutomationManager:
         if root is None:
             return ""
 
-        if _session_uses_remote_workspace(session_id):
+        # Fugue-managed runtimes expose the same workspace through the live
+        # Codex session. Reading it through the control-plane filesystem API
+        # forces a pod lookup and kube exec for every file, adding seconds of
+        # latency. Use the live runtime path for both native and Fugue sessions.
+        if _session_uses_remote_workspace(session_id) or _fugue_workspace_enabled(session_id):
             try:
                 live, _ = await _ensure_live_session(session_id, allow_create=True)
                 await self._sync_workspace_agents_file_for_session(session_id, root)
@@ -15802,7 +15806,7 @@ class AutomationManager:
         if root is None:
             return ""
 
-        if _session_uses_remote_workspace(session_id):
+        if _session_uses_remote_workspace(session_id) or _fugue_workspace_enabled(session_id):
             try:
                 live, _ = await _ensure_live_session(session_id, allow_create=True)
             except Exception:
