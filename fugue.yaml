@@ -77,6 +77,7 @@ services:
     env:
       ARGUS_GATEWAY_HTTP_URL: http://gateway:8080
       ARGUS_GATEWAY_WS_URL: ws://gateway:8080/ws
+      ARGUS_PUBLIC_BASE_URL: https://argus.fugue.pro
       ARGUS_CWD: /workspace
       TELEGRAM_DELIVERY_MODE: webhook
     depends_on:

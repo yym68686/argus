@@ -28,6 +28,7 @@ class FugueManifestTest(unittest.TestCase):
         self.assertIn("public: true", telegram_bot)
         self.assertIn("port: 8080", telegram_bot)
         self.assertIn("TELEGRAM_DELIVERY_MODE: webhook", telegram_bot)
+        self.assertIn("ARGUS_PUBLIC_BASE_URL: https://argus.fugue.pro", telegram_bot)
         self.assertNotIn("STATE_PATH:", telegram_bot)
         self.assertNotIn("persistent_storage:", telegram_bot)
         self.assertNotIn("/data", telegram_bot)
