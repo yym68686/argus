@@ -21870,6 +21870,18 @@ def _docker_create_container_sync(cfg: DockerProvisionConfig, session_id: str):
     # Codex runtime (optional): configure gateway MCP URL for tool access.
     env["ARGUS_CODEX_MCP_URL"] = f"http://{gateway_internal_host}:8080/mcp"
 
+    # Carry log retention policy into dynamically-created runtimes.  These
+    # values are consumed by the startup-only maintenance helper, so they do
+    # not alter an already-running app-server.
+    for name in (
+        "ARGUS_CODEX_LOG_MAX_ROWS",
+        "ARGUS_CODEX_LOG_MAX_ESTIMATED_BYTES",
+        "ARGUS_CODEX_LOG_MAX_VACUUM_PAGES",
+    ):
+        value = os.getenv(name)
+        if value is not None:
+            env[name] = value
+
     # Optional: OpenAI Responses proxy (keeps per-user provider secrets on the gateway).
     openai_master = (os.getenv("ARGUS_OPENAI_TOKEN") or gateway_token or "").strip() or None
     if openai_master:
@@ -22448,6 +22460,15 @@ def _fugue_build_runtime_env(cfg: FugueProvisionConfig, session_id: str) -> dict
     }
     if cfg.runtime_cmd:
         env["APP_SERVER_CMD"] = cfg.runtime_cmd
+
+    for name in (
+        "ARGUS_CODEX_LOG_MAX_ROWS",
+        "ARGUS_CODEX_LOG_MAX_ESTIMATED_BYTES",
+        "ARGUS_CODEX_LOG_MAX_VACUUM_PAGES",
+    ):
+        value = os.getenv(name)
+        if value is not None:
+            env[name] = value
 
     gateway_token = os.getenv("ARGUS_TOKEN") or None
     mcp_master = os.getenv("ARGUS_MCP_TOKEN") or gateway_token

@@ -63,9 +63,10 @@ COPY VERSION /app/VERSION
 COPY docs/templates /app/docs/templates
 
 COPY app_server_tcp_bridge.py /app/app_server_tcp_bridge.py
+COPY scripts/codex_log_maintenance.py /app/codex_log_maintenance.py
 COPY run_app_server.sh /app/run_app_server.sh
 COPY start_runtime.sh /app/start_runtime.sh
-RUN chmod +x /app/app_server_tcp_bridge.py /app/run_app_server.sh /app/start_runtime.sh
+RUN chmod +x /app/app_server_tcp_bridge.py /app/codex_log_maintenance.py /app/run_app_server.sh /app/start_runtime.sh
 
 RUN mkdir -p /app/node-host /app/host-agent-dist
 COPY --from=node-host-builder /out/argus /app/node-host/argus

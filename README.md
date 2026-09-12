@@ -153,6 +153,9 @@ How changes take effect:
 | `ARGUS_DOCKER_NETWORK` | Optional | `argus-runtime-net` | Docker network that spawned runtime containers join. In the bundled Compose file, `gateway` joins both `argus-db-net` and `argus-runtime-net`, while `postgres` only joins `argus-db-net`, so runtime containers cannot resolve or connect to `postgres:5432`. |
 | `ARGUS_RUNTIME_INSTALL_CMD` | Optional | `npm i -g @openai/codex` | **Build-time** install command for the runtime image (`Dockerfile` build arg `APP_SERVER_INSTALL_CMD`). Change this when swapping the bundled runtime; rebuild afterward. |
 | `ARGUS_RUNTIME_CMD` | Optional in Compose, conceptually required in `docker` mode | `codex app-server` | Command executed inside each spawned runtime container. This is what `run_app_server.sh` launches through the TCP bridge. |
+| `ARGUS_CODEX_LOG_MAX_ROWS` | Optional | `20000` | Maximum recent rows retained in each workspace's Codex diagnostic `logs_2.sqlite`. `0` disables the row limit. Cleanup runs before app-server startup. |
+| `ARGUS_CODEX_LOG_MAX_ESTIMATED_BYTES` | Optional | `67108864` (64 MiB) | Maximum estimated bytes retained in `logs_2.sqlite`. The newest row is always retained; `0` disables this limit. |
+| `ARGUS_CODEX_LOG_MAX_VACUUM_PAGES` | Optional | `262144` | Maximum SQLite incremental-vacuum pages reclaimed per runtime startup (one page is normally 4096 bytes). Set `0` to disable compaction while retaining the row/byte pruning behavior. |
 | `ARGUS_CONNECT_TIMEOUT_S` | Optional | `30` | Timeout for runtime bootstrap and TCP connect checks. Also reused as a coarse upper bound for Docker API calls. |
 | `ARGUS_CONTAINER_PREFIX` | Optional | `argus-session` | Prefix for auto-created docker container names. Resulting names look like `argus-session-<sessionId>`. |
 | `ARGUS_RUNTIME_CPUS` | Optional | unset | CPU limit for newly created runtime containers. Use decimal CPU counts such as `1.5` or `2`. |

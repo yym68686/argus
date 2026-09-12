@@ -153,6 +153,9 @@ cp .env.example .env
 | `ARGUS_DOCKER_NETWORK` | 可选 | `argus-net` | gateway 与 runtime 容器加入的 Docker 网络。 |
 | `ARGUS_RUNTIME_INSTALL_CMD` | 可选 | `npm i -g @openai/codex` | runtime 镜像的**构建期**安装命令（对应 `Dockerfile` 的 `APP_SERVER_INSTALL_CMD`）。如果你要切换 bundled runtime，就改这里并重新 build。 |
 | `ARGUS_RUNTIME_CMD` | Compose 下可选；在 `docker` 模式下本质上必须有 | `codex app-server` | 每个 runtime 容器内部真正执行的启动命令，`run_app_server.sh` 会通过 TCP bridge 启动它。 |
+| `ARGUS_CODEX_LOG_MAX_ROWS` | 可选 | `20000` | 每个 workspace 的 Codex 诊断日志 `logs_2.sqlite` 保留的最新行数上限。设为 `0` 可关闭行数限制；清理在 app-server 启动前执行。 |
+| `ARGUS_CODEX_LOG_MAX_ESTIMATED_BYTES` | 可选 | `67108864`（64 MiB） | `logs_2.sqlite` 保留日志的估算大小上限；至少保留最新一行。设为 `0` 可关闭该限制。 |
+| `ARGUS_CODEX_LOG_MAX_VACUUM_PAGES` | 可选 | `262144` | 每次 runtime 启动最多执行的 SQLite 增量回收页数（通常每页 4096 字节）。设为 `0` 可关闭压缩，但仍会按行数/大小清理。 |
 | `ARGUS_CONNECT_TIMEOUT_S` | 可选 | `30` | runtime 启动探测和 TCP 建连的超时时间；Docker API 调用也会把它当作一个粗粒度上限。 |
 | `ARGUS_CONTAINER_PREFIX` | 可选 | `argus-session` | 自动创建的 docker 容器名前缀，最终名字类似 `argus-session-<sessionId>`。 |
 | `ARGUS_RUNTIME_CPUS` | 可选 | 未设置 | 新建 runtime 容器的 CPU 限制，例如 `0.8`、`2`。 |

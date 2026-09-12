@@ -276,6 +276,13 @@ EOF
   mv -f "$tmp_cfg" "$CODEX_HOME_DIR/config.toml"
 fi
 
+# Codex keeps diagnostic logs in a separate SQLite database. It is safe to
+# maintain before app-server starts; stdout must remain reserved for JSONL.
+CODEX_LOG_MAINTENANCE_SCRIPT="${ARGUS_CODEX_LOG_MAINTENANCE_SCRIPT:-/app/codex_log_maintenance.py}"
+if [ -f "$CODEX_LOG_MAINTENANCE_SCRIPT" ]; then
+  python3 "$CODEX_LOG_MAINTENANCE_SCRIPT" "$CODEX_HOME_DIR" >&2 || true
+fi
+
 cd "$APP_WORKSPACE_DIR"
 
 if [ -n "${ARGUS_APP_SERVER_FIRST_LINE_FILE:-}" ]; then

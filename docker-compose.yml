@@ -48,6 +48,10 @@ services:
       ARGUS_WORKSPACE_HOST_PATH: ${ARGUS_WORKSPACE_HOST_PATH:-}
       # Command executed inside each spawned runtime container.
       ARGUS_RUNTIME_CMD: ${ARGUS_RUNTIME_CMD:-codex app-server}
+      # Runtime startup maintenance for workspace-scoped Codex diagnostic logs.
+      ARGUS_CODEX_LOG_MAX_ROWS: ${ARGUS_CODEX_LOG_MAX_ROWS:-20000}
+      ARGUS_CODEX_LOG_MAX_ESTIMATED_BYTES: ${ARGUS_CODEX_LOG_MAX_ESTIMATED_BYTES:-67108864}
+      ARGUS_CODEX_LOG_MAX_VACUUM_PAGES: ${ARGUS_CODEX_LOG_MAX_VACUUM_PAGES:-262144}
       # Optional: require auth for /ws (Authorization: Bearer ... or ?token=...).
       ARGUS_TOKEN: ${ARGUS_TOKEN:-}
       # Optional: OpenAI key held by the gateway (used by /openai proxy; not passed to runtimes).
