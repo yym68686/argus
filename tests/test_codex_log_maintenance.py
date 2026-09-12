@@ -52,6 +52,7 @@ class CodexLogMaintenanceTests(unittest.TestCase):
             self.assertEqual(result.status, "maintained")
             self.assertEqual(result.deleted_rows, 70)
             self.assertGreater(result.reclaimed_pages, 0)
+            self.assertEqual(result.compaction, "vacuum-into")
             self.assertLess(path.stat().st_size, before_size)
             conn = sqlite3.connect(path)
             self.assertEqual(conn.execute("SELECT COUNT(*) FROM logs").fetchone()[0], 10)
@@ -105,6 +106,21 @@ class CodexLogMaintenanceTests(unittest.TestCase):
             self.assertEqual(result.status, "maintained")
             conn = sqlite3.connect(path)
             self.assertEqual(conn.execute("SELECT COUNT(*) FROM logs").fetchone()[0], 1)
+            conn.close()
+
+    def test_incremental_vacuum_uses_each_available_step(self) -> None:
+        with tempfile.TemporaryDirectory() as tempdir:
+            path = pathlib.Path(tempdir) / "logs_2.sqlite"
+            self._create_log_database(path)
+            conn = sqlite3.connect(path)
+            conn.execute("DELETE FROM logs WHERE id < 10")
+            conn.commit()
+            before_pages = conn.execute("PRAGMA page_count").fetchone()[0]
+
+            reclaimed = maintenance._incremental_vacuum(conn, 5)
+
+            self.assertEqual(reclaimed, 5)
+            self.assertEqual(conn.execute("PRAGMA page_count").fetchone()[0], before_pages - 5)
             conn.close()
 
 

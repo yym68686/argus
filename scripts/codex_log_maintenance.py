@@ -13,6 +13,7 @@ from __future__ import annotations
 import os
 import sqlite3
 import sys
+import uuid
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable
@@ -23,7 +24,6 @@ REQUIRED_LOG_COLUMNS = {"id", "feedback_log_body", "estimated_bytes"}
 DEFAULT_MAX_ROWS = 20_000
 DEFAULT_MAX_ESTIMATED_BYTES = 64 * 1024 * 1024
 DEFAULT_MAX_VACUUM_PAGES = 262_144
-VACUUM_BATCH_PAGES = 32_768
 
 
 @dataclass(frozen=True)
@@ -40,6 +40,7 @@ class Result:
     reclaimed_pages: int = 0
     before_bytes: int = 0
     after_bytes: int = 0
+    compaction: str = "none"
 
 
 def _log(message: str) -> None:
@@ -134,19 +135,47 @@ def _incremental_vacuum(conn: sqlite3.Connection, max_pages: int) -> int:
         return 0
     initial_pages = int(conn.execute("PRAGMA page_count").fetchone()[0])
     before_pages = initial_pages
-    remaining = max_pages
-    while remaining > 0:
-        batch = min(remaining, VACUUM_BATCH_PAGES)
-        conn.execute(f"PRAGMA incremental_vacuum({batch})")
+    for _ in range(max_pages):
+        # SQLite performs one incremental-vacuum step for each PRAGMA call,
+        # even when a numeric argument is supplied on the runtimes we support.
+        conn.execute("PRAGMA incremental_vacuum")
         after_pages = int(conn.execute("PRAGMA page_count").fetchone()[0])
         reclaimed = before_pages - after_pages
         if reclaimed <= 0:
             break
         before_pages = after_pages
-        remaining -= min(batch, reclaimed)
-        if reclaimed < batch:
-            break
     return max(0, initial_pages - int(conn.execute("PRAGMA page_count").fetchone()[0]))
+
+
+def _available_bytes(directory: Path) -> int:
+    stats = os.statvfs(directory)
+    return stats.f_bavail * stats.f_frsize
+
+
+def _vacuum_into_replacement(
+    conn: sqlite3.Connection, path: Path, page_count: int, freelist_pages: int
+) -> Path | None:
+    page_size = int(conn.execute("PRAGMA page_size").fetchone()[0])
+    retained_bytes = max(0, page_count - freelist_pages) * page_size
+    # VACUUM INTO builds a compact copy before replacing the source. Reserve
+    # enough room for the retained database plus a fixed margin for SQLite.
+    required_bytes = retained_bytes + 64 * 1024 * 1024
+    if _available_bytes(path.parent) < required_bytes:
+        return None
+
+    temporary_path = path.parent / f".{path.name}.argus-vacuum-{uuid.uuid4().hex}"
+    try:
+        conn.execute("VACUUM INTO ?", (str(temporary_path),))
+        with sqlite3.connect(temporary_path, timeout=5.0) as candidate:
+            if candidate.execute("PRAGMA integrity_check").fetchone()[0] != "ok":
+                raise sqlite3.DatabaseError("VACUUM INTO produced a database that failed integrity_check")
+        return temporary_path
+    except (OSError, sqlite3.Error):
+        try:
+            temporary_path.unlink()
+        except FileNotFoundError:
+            pass
+        return None
 
 
 def maintain_log_database(path: Path, settings: Settings) -> Result:
@@ -180,10 +209,30 @@ def maintain_log_database(path: Path, settings: Settings) -> Result:
         conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
         freelist_pages = int(conn.execute("PRAGMA freelist_count").fetchone()[0])
         page_count_before_vacuum = int(conn.execute("PRAGMA page_count").fetchone()[0])
-        if freelist_pages > 0 and settings.max_vacuum_pages > 0:
-            _incremental_vacuum(conn, settings.max_vacuum_pages)
-        page_count_after_vacuum = int(conn.execute("PRAGMA page_count").fetchone()[0])
-        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        replacement_path = None
+        compaction = "none"
+        if freelist_pages > 0:
+            replacement_path = _vacuum_into_replacement(
+                conn, path, page_count_before_vacuum, freelist_pages
+            )
+        if replacement_path is not None:
+            conn.close()
+            conn = None
+            for stale_sidecar in (Path(f"{path}-wal"), Path(f"{path}-shm")):
+                try:
+                    stale_sidecar.unlink()
+                except FileNotFoundError:
+                    pass
+            os.replace(replacement_path, path)
+            with sqlite3.connect(path, timeout=5.0) as compacted:
+                page_count_after_vacuum = int(compacted.execute("PRAGMA page_count").fetchone()[0])
+            compaction = "vacuum-into"
+        else:
+            if freelist_pages > 0 and settings.max_vacuum_pages > 0:
+                _incremental_vacuum(conn, settings.max_vacuum_pages)
+                compaction = "incremental"
+            page_count_after_vacuum = int(conn.execute("PRAGMA page_count").fetchone()[0])
+            conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
 
         after_bytes = _database_size(path)
         return Result(
@@ -192,6 +241,7 @@ def maintain_log_database(path: Path, settings: Settings) -> Result:
             reclaimed_pages=max(0, page_count_before_vacuum - page_count_after_vacuum),
             before_bytes=before_bytes,
             after_bytes=after_bytes,
+            compaction=compaction,
         )
     except (OSError, sqlite3.Error, ValueError) as exc:
         if conn is not None:
@@ -213,7 +263,7 @@ def main(argv: Iterable[str] | None = None) -> int:
         _log(
             "maintained logs_2.sqlite: "
             f"deleted_rows={result.deleted_rows} reclaimed_pages={result.reclaimed_pages} "
-            f"bytes={result.before_bytes}->{result.after_bytes}"
+            f"bytes={result.before_bytes}->{result.after_bytes} compaction={result.compaction}"
         )
     elif result.status != "absent":
         _log(f"{result.status}; left logs_2.sqlite unchanged")
