@@ -21873,14 +21873,14 @@ def _docker_create_container_sync(cfg: DockerProvisionConfig, session_id: str):
     # Carry log retention policy into dynamically-created runtimes.  These
     # values are consumed by the startup-only maintenance helper, so they do
     # not alter an already-running app-server.
-    for name in (
+    for env_name in (
         "ARGUS_CODEX_LOG_MAX_ROWS",
         "ARGUS_CODEX_LOG_MAX_ESTIMATED_BYTES",
         "ARGUS_CODEX_LOG_MAX_VACUUM_PAGES",
     ):
-        value = os.getenv(name)
+        value = os.getenv(env_name)
         if value is not None:
-            env[name] = value
+            env[env_name] = value
 
     # Optional: OpenAI Responses proxy (keeps per-user provider secrets on the gateway).
     openai_master = (os.getenv("ARGUS_OPENAI_TOKEN") or gateway_token or "").strip() or None
@@ -22461,14 +22461,14 @@ def _fugue_build_runtime_env(cfg: FugueProvisionConfig, session_id: str) -> dict
     if cfg.runtime_cmd:
         env["APP_SERVER_CMD"] = cfg.runtime_cmd
 
-    for name in (
+    for env_name in (
         "ARGUS_CODEX_LOG_MAX_ROWS",
         "ARGUS_CODEX_LOG_MAX_ESTIMATED_BYTES",
         "ARGUS_CODEX_LOG_MAX_VACUUM_PAGES",
     ):
-        value = os.getenv(name)
+        value = os.getenv(env_name)
         if value is not None:
-            env[name] = value
+            env[env_name] = value
 
     gateway_token = os.getenv("ARGUS_TOKEN") or None
     mcp_master = os.getenv("ARGUS_MCP_TOKEN") or gateway_token
