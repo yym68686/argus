@@ -14507,12 +14507,21 @@ class AutomationManager:
                             turn_error_message=turn_error_message,
                         )
                     )
-                if final_text.strip() and str(turn_status_raw or "").strip().lower() != "interrupted":
+                normalized_turn_status = str(turn_status_raw or "").strip().lower()
+                delivery_text = final_text
+                if (
+                    not delivery_text.strip()
+                    and normalized_turn_status == "failed"
+                    and isinstance(turn_error_message, str)
+                    and turn_error_message.strip()
+                ):
+                    delivery_text = turn_error_message.strip()
+                if delivery_text.strip() and normalized_turn_status != "interrupted":
                     asyncio.create_task(
                         self._deliver_turn_text(
                             session_id,
                             thread_id,
-                            final_text,
+                            delivery_text,
                             turn_id=turn_id,
                             turn_kind=turn_kind,
                             source_channel=source_channel,

@@ -91,7 +91,9 @@ type listJob struct {
 type logsPayload struct {
 	JobID string `json:"jobId"`
 
-	Running bool `json:"running"`
+	Running  bool    `json:"running"`
+	ExitCode *int    `json:"exitCode"`
+	Signal   *string `json:"signal"`
 
 	Stdout string `json:"stdout"`
 	Stderr string `json:"stderr"`
@@ -401,6 +403,8 @@ func (s *Store) GetLogs(jobID string, tailBytes int) *logsPayload {
 			return &logsPayload{
 				JobID:           jobID,
 				Running:         true,
+				ExitCode:        nil,
+				Signal:          nil,
 				Stdout:          stdout,
 				Stderr:          stderr,
 				StdoutBytes:     stdoutBytes,
@@ -418,6 +422,8 @@ func (s *Store) GetLogs(jobID string, tailBytes int) *logsPayload {
 	return &logsPayload{
 		JobID:           jobID,
 		Running:         false,
+		ExitCode:        meta.ExitCode,
+		Signal:          meta.Signal,
 		Stdout:          stdout,
 		Stderr:          stderr,
 		StdoutBytes:     meta.StdoutBytes,

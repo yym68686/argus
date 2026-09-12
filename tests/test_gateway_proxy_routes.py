@@ -335,6 +335,71 @@ class GatewayProxyRouteTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(events[0][0], "info")
         self.assertEqual(events[0][2]["reason"], "missing_target")
 
+    async def test_failed_turn_delivers_error_to_telegram_but_interrupted_stays_silent(self) -> None:
+        manager = argus_app.AutomationManager(
+            state_store=InMemoryStateStore(),
+            home_host_path="/tmp",
+            workspace_host_path="/tmp",
+        )
+        try:
+            key = ("sess_1", "thread_1", "turn_failed")
+            entry = manager._get_turn_text_entry(key)
+            entry.update(
+                {
+                    "sourceChannel": "telegram",
+                    "sourceChatKey": "123",
+                    "turnKind": argus_app.TURN_KIND_USER,
+                }
+            )
+            with mock.patch.object(manager, "_deliver_turn_text", new=mock.AsyncMock()) as deliver:
+                manager.on_upstream_notification(
+                    "sess_1",
+                    {
+                        "method": "turn/completed",
+                        "params": {
+                            "threadId": "thread_1",
+                            "turnId": "turn_failed",
+                            "turn": {"status": "failed", "error": {"message": "upstream rate limit"}},
+                        },
+                    },
+                )
+                await asyncio.sleep(0)
+                deliver.assert_awaited_once_with(
+                    "sess_1",
+                    "thread_1",
+                    "upstream rate limit",
+                    turn_id="turn_failed",
+                    turn_kind=argus_app.TURN_KIND_USER,
+                    source_channel="telegram",
+                    source_chat_key="123",
+                )
+
+            key = ("sess_1", "thread_1", "turn_interrupted")
+            entry = manager._get_turn_text_entry(key)
+            entry.update(
+                {
+                    "sourceChannel": "telegram",
+                    "sourceChatKey": "123",
+                    "turnKind": argus_app.TURN_KIND_USER,
+                }
+            )
+            with mock.patch.object(manager, "_deliver_turn_text", new=mock.AsyncMock()) as deliver:
+                manager.on_upstream_notification(
+                    "sess_1",
+                    {
+                        "method": "turn/completed",
+                        "params": {
+                            "threadId": "thread_1",
+                            "turnId": "turn_interrupted",
+                            "turn": {"status": "interrupted", "error": {"message": "cancelled"}},
+                        },
+                    },
+                )
+                await asyncio.sleep(0)
+                deliver.assert_not_awaited()
+        finally:
+            await manager.stop()
+
     async def test_bot_owned_telegram_turn_skips_gateway_delivery(self) -> None:
         manager = argus_app.AutomationManager(
             state_store=InMemoryStateStore(),
