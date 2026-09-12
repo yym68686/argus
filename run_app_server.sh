@@ -280,7 +280,9 @@ fi
 # maintain before app-server starts; stdout must remain reserved for JSONL.
 CODEX_LOG_MAINTENANCE_SCRIPT="${ARGUS_CODEX_LOG_MAINTENANCE_SCRIPT:-/app/codex_log_maintenance.py}"
 if [ -f "$CODEX_LOG_MAINTENANCE_SCRIPT" ]; then
-  python3 "$CODEX_LOG_MAINTENANCE_SCRIPT" "$CODEX_HOME_DIR" >&2 || true
+  # Keep maintenance diagnostics out of the app-server JSONL stream. The
+  # runtime bridge forwards child stderr alongside upstream output.
+  python3 "$CODEX_LOG_MAINTENANCE_SCRIPT" "$CODEX_HOME_DIR" >/dev/null 2>&1 || true
 fi
 
 cd "$APP_WORKSPACE_DIR"
