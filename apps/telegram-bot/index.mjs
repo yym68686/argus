@@ -90,10 +90,21 @@ function normalizeMessagePhase(value) {
   return value.trim().toLowerCase();
 }
 
+function normalizeTurnStatus(value) {
+  if (!isNonEmptyString(value)) return null;
+  return value.trim().toLowerCase();
+}
+
 function shouldDeliverTelegramAgentMessage({ phase, sendCommentary } = {}) {
   const normalizedPhase = normalizeMessagePhase(phase);
   if (normalizedPhase === "final_answer") return true;
   return normalizedPhase === "commentary" && sendCommentary === true;
+}
+
+function shouldDeliverTelegramTurnError({ turnStatus, text, turnErrorMessage } = {}) {
+  return normalizeTurnStatus(turnStatus) === "failed"
+    && !isNonEmptyString(text)
+    && isNonEmptyString(turnErrorMessage);
 }
 
 function normalizeTurnKind(value) {
@@ -1529,6 +1540,7 @@ class ArgusClient {
       this.turnsByKey.delete(key);
       const turn = params.turn && typeof params.turn === "object" ? params.turn : null;
       const turnStatus = isNonEmptyString(turn?.status) ? turn.status : null;
+      const turnErrorMessage = isNonEmptyString(turn?.error?.message) ? turn.error.message : null;
       let finalText = isNonEmptyString(existing.fullText) ? existing.fullText : existing.delta;
       if (!isNonEmptyString(existing.fullText) && isNonEmptyString(finalText)) {
         const commentaryPrefix = Array.isArray(existing.completedCommentaryTexts)
@@ -1541,7 +1553,7 @@ class ArgusClient {
       const cb = this.onTurnCompleted;
       if (typeof cb === "function") {
         try {
-          const res = cb({ sessionId: this.sessionId, threadId, turnId, sourceChatKey, text: finalText, turnStatus, turnKind });
+          const res = cb({ sessionId: this.sessionId, threadId, turnId, sourceChatKey, text: finalText, turnStatus, turnErrorMessage, turnKind });
           if (res && typeof res.then === "function") res.catch(() => {});
         } catch {
           // ignore
@@ -3100,7 +3112,7 @@ async function main() {
         }
       });
     };
-    client.onTurnCompleted = async ({ sessionId, threadId, turnId, sourceChatKey, turnStatus }) => {
+    client.onTurnCompleted = async ({ sessionId, threadId, turnId, sourceChatKey, text, turnStatus, turnErrorMessage }) => {
       if (!isNonEmptyString(sessionId) || !isNonEmptyString(threadId)) return;
       const chatKey = isNonEmptyString(sourceChatKey) ? sourceChatKey : resolveTurnChatKey(sessionId, threadId, turnId);
       logEvent("INFO", "tg.turn.completed", {
@@ -3112,6 +3124,28 @@ async function main() {
       });
       if (!isNonEmptyString(chatKey)) return;
       typing.stop(chatKey);
+      if (shouldDeliverTelegramTurnError({ turnStatus, text, turnErrorMessage })) {
+        const chatSettings = state.getChatSettings(chatKey);
+        await queue.enqueue(async () => {
+          const sendTarget = sendTargetFromChatKey(chatKey);
+          if (!sendTarget) return;
+          const sent = await sendTelegramAssistantMessage({
+            tg,
+            target: sendTarget,
+            text: turnErrorMessage,
+            useRichMarkdown: chatSettings.useRichMarkdown
+          });
+          logEvent(sent ? "INFO" : "WARNING", "tg.turn.error_delivery", {
+            session_id: sessionId,
+            thread_id: threadId,
+            turn_id: turnId,
+            turn_status: normalizeTurnStatus(turnStatus),
+            chat_key_hash: chatKeyHash(chatKey),
+            outcome: sent ? "sent" : "send_failed_or_ignored",
+            text_chars: turnErrorMessage.length
+          });
+        });
+      }
       if (isNonEmptyString(turnId)) {
         turnTargetBySessionThreadTurn.delete(sessionThreadTurnKey(sessionId, threadId, turnId));
       }

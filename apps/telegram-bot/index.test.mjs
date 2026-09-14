@@ -20,6 +20,7 @@ import {
   resolveTelegramBotTokenConfig,
   resolveTelegramWebhookConfig,
   shouldDeliverTelegramAgentMessage,
+  shouldDeliverTelegramTurnError,
   telegramSourceFromMessage,
   telegramTokenHash,
   telegramTokenRefreshIntervalMs,
@@ -195,6 +196,33 @@ test("shouldDeliverTelegramAgentMessage always delivers final answers", () => {
   assert.equal(shouldDeliverTelegramAgentMessage({ phase: "commentary", sendCommentary: true }), true);
   assert.equal(shouldDeliverTelegramAgentMessage({ phase: "commentary", sendCommentary: false }), false);
   assert.equal(shouldDeliverTelegramAgentMessage({ phase: "unknown", sendCommentary: true }), false);
+});
+
+test("shouldDeliverTelegramTurnError delivers failed turn errors but not interruptions", () => {
+  assert.equal(
+    shouldDeliverTelegramTurnError({
+      turnStatus: "failed",
+      text: "",
+      turnErrorMessage: "stream disconnected before completion"
+    }),
+    true
+  );
+  assert.equal(
+    shouldDeliverTelegramTurnError({
+      turnStatus: "failed",
+      text: "partial answer",
+      turnErrorMessage: "stream disconnected before completion"
+    }),
+    false
+  );
+  assert.equal(
+    shouldDeliverTelegramTurnError({
+      turnStatus: "interrupted",
+      text: "",
+      turnErrorMessage: "cancelled"
+    }),
+    false
+  );
 });
 
 test("resolveTelegramWebhookConfig falls back to polling when no webhook URL is available", () => {
