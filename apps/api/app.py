@@ -1036,6 +1036,7 @@ class LiveRuntimeSession:
     metadata: dict[str, Any] = field(default_factory=dict)
 
     closed: bool = False
+    last_upstream_activity_by_thread: dict[str, int] = field(default_factory=dict)
     initialize_future: Optional[asyncio.Future[dict[str, Any]]] = None
     initialize_send_task: Optional[asyncio.Task[None]] = None
     handshake_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
@@ -13813,6 +13814,13 @@ class AutomationManager:
             if not lane.busy:
                 continue
             since = lane.last_progress_at_ms or lane.busy_since_ms or now
+            live = getattr(app.state, "sessions", {}).get(sid)
+            activity_by_thread = getattr(live, "last_upstream_activity_by_thread", None)
+            if isinstance(activity_by_thread, dict):
+                activity_at = activity_by_thread.get(tid)
+                if isinstance(activity_at, int) and activity_at > since:
+                    lane.last_progress_at_ms = activity_at
+                    since = activity_at
             if now - since < timeout_ms:
                 continue
 
@@ -22170,6 +22178,15 @@ async def _activate_live_session(live: LiveRuntimeSession) -> LiveRuntimeSession
                         log.warning("Further malformed upstream frames will be suppressed for session %s", session_id)
                     continue
 
+                params = msg.get("params")
+                activity_thread_id = None
+                if isinstance(params, dict):
+                    raw_activity_thread_id = params.get("threadId")
+                    if isinstance(raw_activity_thread_id, str) and raw_activity_thread_id.strip():
+                        activity_thread_id = raw_activity_thread_id.strip()
+                if activity_thread_id:
+                    live.last_upstream_activity_by_thread[activity_thread_id] = _now_ms()
+
                 should_broadcast = True
                 if "id" in msg and "method" in msg:
                     rid = str(msg.get("id"))
@@ -22232,7 +22249,9 @@ async def _activate_live_session(live: LiveRuntimeSession) -> LiveRuntimeSession
                     if isinstance(params, dict):
                         tid = params.get("threadId")
                         if isinstance(tid, str) and tid.strip():
-                            await live.clear_turn_owner(tid.strip())
+                            normalized_tid = tid.strip()
+                            await live.clear_turn_owner(normalized_tid)
+                            live.last_upstream_activity_by_thread.pop(normalized_tid, None)
 
                 if should_broadcast:
                     await live.broadcast(text)

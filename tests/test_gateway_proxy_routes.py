@@ -45,6 +45,40 @@ class GatewayProxyRouteTests(unittest.IsolatedAsyncioTestCase):
             }
         )
 
+    async def test_lane_watchdog_counts_recent_runtime_activity(self) -> None:
+        manager = argus_app.AutomationManager(
+            state_store=InMemoryStateStore(),
+            home_host_path="/tmp",
+            workspace_host_path="/tmp",
+        )
+        session_id = "sess_watchdog"
+        thread_id = "thread_watchdog"
+        lane = manager.lane(session_id, thread_id)
+        now_ms = argus_app._now_ms()
+        lane.busy = True
+        lane.busy_since_ms = now_ms - 2_000_000
+        lane.last_progress_at_ms = now_ms - 2_000_000
+
+        class LiveSession:
+            last_upstream_activity_by_thread = {thread_id: now_ms - 1_000}
+
+        previous_sessions = getattr(argus_app.app.state, "sessions", None)
+        argus_app.app.state.sessions = {session_id: LiveSession()}
+        try:
+            with mock.patch.object(manager, "_unstick_session", new=mock.AsyncMock()) as unstick:
+                await manager._lane_watchdog_tick()
+                unstick.assert_not_awaited()
+                self.assertEqual(lane.last_progress_at_ms, now_ms - 1_000)
+        finally:
+            if previous_sessions is None:
+                try:
+                    delattr(argus_app.app.state, "sessions")
+                except Exception:
+                    pass
+            else:
+                argus_app.app.state.sessions = previous_sessions
+            await manager.stop()
+
     async def test_openai_compact_proxy_forwards_to_compact_child_path(self) -> None:
         request = self.make_request("/openai/v1/responses/compact", method="POST")
         upstream_payload = {"type": "response.completed", "response": {"id": "resp_1"}}
