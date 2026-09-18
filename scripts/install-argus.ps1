@@ -67,15 +67,18 @@ if (-not $Installed) {
     $Git = Get-Command git -ErrorAction SilentlyContinue
     if ($Git) {
       & $Git.Source clone --depth 1 --branch $Ref "https://github.com/$Repo.git" (Join-Path $Tmp "repo")
+      if ($LASTEXITCODE -ne 0) { throw "Failed to download Argus source (exit $LASTEXITCODE)" }
     } else {
       $Tarball = Join-Path $Tmp "src.tar.gz"
       Invoke-WebRequest -UseBasicParsing -Uri "https://github.com/$Repo/archive/$Ref.tar.gz" -OutFile $Tarball
       New-Item -ItemType Directory -Force -Path (Join-Path $Tmp "repo") | Out-Null
       tar -xzf $Tarball -C (Join-Path $Tmp "repo") --strip-components 1
+      if ($LASTEXITCODE -ne 0) { throw "Failed to extract Argus source (exit $LASTEXITCODE)" }
     }
     Push-Location (Join-Path $Tmp "repo\apps\node-host")
     try {
       & $Go.Source build -trimpath -ldflags "-s -w" -o $BinPath ./cmd/argus
+      if ($LASTEXITCODE -ne 0) { throw "Failed to build Argus (exit $LASTEXITCODE)" }
     } finally {
       Pop-Location
     }
@@ -87,4 +90,5 @@ if (-not $Installed) {
 Add-ToUserPath $BinDir
 Write-Host "Installed argus CLI: $BinPath"
 & $BinPath --help | Out-Null
-exit $LASTEXITCODE
+if ($LASTEXITCODE -ne 0) { throw "Installed Argus failed its health check (exit $LASTEXITCODE)" }
+# Return to the caller so a pasted install-and-connect command can continue.

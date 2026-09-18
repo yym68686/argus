@@ -11,6 +11,7 @@ const DEFAULT_BOT_VERSION = "0.0.0";
 const TELEGRAM_WEBHOOK_PATH = "/telegram/webhook";
 const TELEGRAM_WEBHOOK_BODY_LIMIT_BYTES = 1024 * 1024;
 const ARGUS_CLI_INSTALL_SCRIPT_URL = "https://raw.githubusercontent.com/yym68686/argus/main/scripts/install-argus.sh";
+const ARGUS_CLI_INSTALL_POWERSHELL_URL = "https://raw.githubusercontent.com/yym68686/argus/main/scripts/install-argus.ps1";
 const ARGUS_INITIALIZE_TIMEOUT_MS = 30_000;
 
 function loadBotVersion() {
@@ -699,7 +700,12 @@ function shellDoubleQuote(value) {
   return `"${String(value ?? "").replace(/(["\\$`])/g, "\\$1")}"`;
 }
 
-function buildArgusCliInstallCommand() {
+function powershellQuote(value) {
+  return `'${String(value ?? "").replace(/['\u2018\u2019]/g, "$&$&")}'`;
+}
+
+function buildArgusCliInstallCommand(platform = "posix") {
+  if (platform === "windows") return `irm ${powershellQuote(ARGUS_CLI_INSTALL_POWERSHELL_URL)} | iex`;
   return `curl -fsSL ${shellDoubleQuote(ARGUS_CLI_INSTALL_SCRIPT_URL)} | bash`;
 }
 
@@ -729,14 +735,28 @@ function nodeCommandArgsFromWsUrl(wsUrl) {
   }
 }
 
-function buildNodeConnectionCommand(wsUrl) {
+function buildNodeConnectionCommand(wsUrl, platform = "posix") {
   const raw = stripOuterQuotes(wsUrl);
   if (!isNonEmptyString(raw)) return null;
   const args = nodeCommandArgsFromWsUrl(raw);
   if (args) {
-    return `argus ${args.map(shellWord).join(" ")}`;
+    const quote = platform === "windows" ? powershellQuote : shellWord;
+    return `argus ${args.map(quote).join(" ")}`;
   }
-  return `argus --url ${shellDoubleQuote(raw)}`;
+  return `argus --url ${(platform === "windows" ? powershellQuote : shellDoubleQuote)(raw)}`;
+}
+
+function buildNodeInstallAndConnectCommand(wsUrl, platform = "posix") {
+  const command = buildNodeConnectionCommand(wsUrl, platform);
+  if (!command) return null;
+  if (platform === "windows") {
+    // The installer updates this PowerShell process's PATH before returning.
+    return `& { $ErrorActionPreference = 'Stop'; ${buildArgusCliInstallCommand(platform)}; ${command} }`;
+  }
+  // A failed download must not look like a successful empty Bash script. Use
+  // the installed path so a fresh shell needs no PATH reload or system link.
+  const install = buildArgusCliInstallCommand().replace(/'/g, "'\\''");
+  return `bash -o pipefail -c '${install}' && "\${ARGUS_BIN_DIR:-$HOME/.argus/bin}/argus"${command.slice("argus".length)}`;
 }
 
 function buildNodeLogsCommand() {
@@ -2050,6 +2070,8 @@ function normalizeAvailableModels(models, currentModel) {
     btn_copy_node_reconnect: "Copy Reconnect",
     btn_copy_node_disconnect: "Copy Disconnect",
     btn_copy_argus_install: "Copy Install",
+    btn_copy_node_setup_posix: "Copy macOS / Linux Setup",
+    btn_copy_node_setup_windows: "Copy Windows Setup",
     btn_copy_account_username: "Copy Login",
     btn_copy_account_password: "Copy Password",
     btn_status: "Status",
@@ -2149,6 +2171,9 @@ function normalizeAvailableModels(models, currentModel) {
     node_reconnect_label: "Reconnect command",
     node_disconnect_label: "Disconnect command",
     node_command_hint: "The start command returns immediately. Use the logs command when you want to keep a terminal open and watch connection output.",
+    node_setup_posix_label: "macOS / Linux — Install and connect",
+    node_setup_windows_label: "Windows PowerShell — Install and connect",
+    node_setup_hint: "Copy the entire code block for your system, then paste it into Terminal or Windows PowerShell (not Command Prompt). It installs argus and starts the connection in the background.",
     node_install_label: "Install argus CLI",
     node_install_hint: "Run this once first if argus is not available. After install, run argus from any directory; no ./ prefix is needed.",
     node_status_active: "active",
@@ -2251,6 +2276,8 @@ function normalizeAvailableModels(models, currentModel) {
     btn_copy_node_reconnect: "复制重连命令",
     btn_copy_node_disconnect: "复制断开命令",
     btn_copy_argus_install: "复制安装命令",
+    btn_copy_node_setup_posix: "复制 macOS / Linux 一键连接",
+    btn_copy_node_setup_windows: "复制 Windows 一键连接",
     btn_copy_account_username: "复制登录名",
     btn_copy_account_password: "复制密码",
     btn_status: "状态",
@@ -2350,6 +2377,9 @@ function normalizeAvailableModels(models, currentModel) {
     node_reconnect_label: "重连命令",
     node_disconnect_label: "断开命令",
     node_command_hint: "启动命令会立即返回；需要在终端里持续查看连接输出时，用日志命令。",
+    node_setup_posix_label: "macOS / Linux：安装并连接",
+    node_setup_windows_label: "Windows PowerShell：安装并连接",
+    node_setup_hint: "复制对应系统的完整代码块，粘贴到终端或 Windows PowerShell（非 CMD），即可安装 argus 并在后台连接。",
     node_install_label: "安装 argus 命令行",
     node_install_hint: "如果本机还没有 argus，先执行一次安装命令；安装后任意目录可直接运行 argus，不需要加 ./。",
     node_status_active: "活跃",
@@ -4476,7 +4506,8 @@ async function main() {
     const lines = [];
     const rows = [];
     let nodeCommand = null;
-    let nodeInstallCommand = null;
+    let nodeSetupPosixCommand = null;
+    let nodeSetupWindowsCommand = null;
     let nodeLogsCommand = null;
     let nodeReconnectCommand = null;
     let nodeDisconnectCommand = null;
@@ -4550,6 +4581,13 @@ async function main() {
               nodeLogsCommand = buildNodeLogsCommand();
               nodeReconnectCommand = buildNodeReconnectCommand();
               nodeDisconnectCommand = buildNodeDisconnectCommand();
+              nodeSetupPosixCommand = buildNodeInstallAndConnectCommand(wsUrl);
+              nodeSetupWindowsCommand = buildNodeInstallAndConnectCommand(wsUrl, "windows");
+              lines.push(escapeHtml(S.node_setup_hint));
+              lines.push(`${escapeHtml(S.node_setup_posix_label)}:
+<pre><code class="language-bash">${escapeHtml(nodeSetupPosixCommand)}</code></pre>`);
+              lines.push(`${escapeHtml(S.node_setup_windows_label)}:
+<pre><code class="language-powershell">${escapeHtml(nodeSetupWindowsCommand)}</code></pre>`);
               lines.push(`${escapeHtml(S.node_command_label)}:
 <pre><code>${escapeHtml(command)}</code></pre>`);
               lines.push(escapeHtml(S.node_command_hint));
@@ -4559,10 +4597,6 @@ async function main() {
 <pre><code>${escapeHtml(nodeReconnectCommand)}</code></pre>`);
               lines.push(`${escapeHtml(S.node_disconnect_label)}:
 <pre><code>${escapeHtml(nodeDisconnectCommand)}</code></pre>`);
-              nodeInstallCommand = buildArgusCliInstallCommand();
-              lines.push(`${escapeHtml(S.node_install_label)}:
-<pre><code>${escapeHtml(nodeInstallCommand)}</code></pre>`);
-              lines.push(escapeHtml(S.node_install_hint));
             }
           }
         } catch (e) {
@@ -4582,8 +4616,10 @@ async function main() {
     }
 
     if (reveal && isNonEmptyString(nodeCommand)) {
-      const copyInstallButton = copyTextButton(S.btn_copy_argus_install, nodeInstallCommand);
-      if (copyInstallButton) rows.push([copyInstallButton]);
+      const copyPosixSetupButton = copyTextButton(S.btn_copy_node_setup_posix, nodeSetupPosixCommand);
+      const copyWindowsSetupButton = copyTextButton(S.btn_copy_node_setup_windows, nodeSetupWindowsCommand);
+      if (copyPosixSetupButton) rows.push([copyPosixSetupButton]);
+      if (copyWindowsSetupButton) rows.push([copyWindowsSetupButton]);
       const copyCommandButton = copyTextButton(S.btn_copy_node_command, nodeCommand);
       if (copyCommandButton) rows.push([copyCommandButton]);
       const copyLogsButton = copyTextButton(S.btn_copy_node_logs, nodeLogsCommand);
@@ -6926,6 +6962,7 @@ export {
   DEFAULT_TELEGRAM_TYPING_TTL_MS,
   TypingController,
   buildArgusCliInstallCommand,
+  buildNodeInstallAndConnectCommand,
   buildNodeDisconnectCommand,
   buildNodeConnectionCommand,
   buildNodeLogsCommand,
@@ -6937,6 +6974,7 @@ export {
   isTelegramGetUpdatesWebhookConflict,
   isTelegramMessageDirectedAtBot,
   shouldDeliverTelegramAgentMessage,
+  shouldDeliverTelegramTurnError,
   normalizeChatSettingKey,
   normalizeChatSettings,
   normalizeTelegramDeliveryMode,
