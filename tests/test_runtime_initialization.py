@@ -66,6 +66,25 @@ class Socket:
 
 
 class RuntimeInitializationTests(unittest.IsolatedAsyncioTestCase):
+    async def test_provision_failure_reports_storage_cause_before_initialize(self):
+        ws = Socket()
+        failure = RuntimeError("Unschedulable: 1 node(s) did not have enough free storage")
+        with mock.patch.object(gateway, "_ensure_live_session", new=mock.AsyncMock(side_effect=failure)):
+            await gateway.ws_proxy(ws)
+        status = ws.outgoing.get_nowait()
+        error = ws.outgoing.get_nowait()
+        self.assertEqual(status["method"], "argus/runtime/status")
+        self.assertEqual(status["params"]["phase"], "provisioning")
+        self.assertEqual(error["method"], "argus/runtime/error")
+        self.assertEqual(error["params"]["errorClass"], "runtime_storage_capacity_unavailable")
+        self.assertIn("存储空间不足", error["params"]["message"])
+        self.assertEqual(self.writer.messages, [])
+
+    async def test_disconnected_provision_failure_does_not_raise_asgi_error(self):
+        ws = Socket()
+        ws.send_text = mock.AsyncMock(side_effect=gateway.WebSocketDisconnect())
+        await gateway._send_runtime_provision_failure(ws, self.live.session_id, RuntimeError("private detail"))
+
     async def test_main_thread_resume_failure_does_not_replace_history(self):
         persisted = SimpleNamespace(main_thread_id="thread-main")
         self.manager._store.state = SimpleNamespace(sessions={self.live.session_id: persisted})

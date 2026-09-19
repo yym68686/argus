@@ -13,6 +13,7 @@ const TELEGRAM_WEBHOOK_BODY_LIMIT_BYTES = 1024 * 1024;
 const ARGUS_CLI_INSTALL_SCRIPT_URL = "https://raw.githubusercontent.com/yym68686/argus/main/scripts/install-argus.sh";
 const ARGUS_CLI_INSTALL_POWERSHELL_URL = "https://raw.githubusercontent.com/yym68686/argus/main/scripts/install-argus.ps1";
 const ARGUS_INITIALIZE_TIMEOUT_MS = 30_000;
+const ARGUS_PROVISION_TIMEOUT_MS = 240_000;
 
 function loadBotVersion() {
   const override = typeof process.env.ARGUS_VERSION === "string" ? process.env.ARGUS_VERSION.trim() : "";
@@ -1018,17 +1019,21 @@ function createTurnTextEntry() {
 }
 
 class ArgusClient {
-  constructor({ gatewayHttpUrl, gatewayWsUrl, token, cwd }) {
+  constructor({ gatewayHttpUrl, gatewayWsUrl, token, cwd, initializeTimeoutMs = ARGUS_INITIALIZE_TIMEOUT_MS, provisionTimeoutMs = ARGUS_PROVISION_TIMEOUT_MS }) {
     this.gatewayHttpUrl = gatewayHttpUrl.replace(/\/+$/, "");
     this.gatewayWsUrl = gatewayWsUrl;
     this.token = token || null;
     this.cwd = cwd;
+    this.initializeTimeoutMs = initializeTimeoutMs;
+    this.provisionTimeoutMs = provisionTimeoutMs;
 
     this.sessionId = null;
     this.ws = null;
     this.nextId = 1;
     this.pending = new Map();
     this.initialized = false;
+    this.runtimeProvisioning = false;
+    this.runtimeError = null;
 
     this._connecting = null;
     this._onSessionId = null;
@@ -1275,11 +1280,20 @@ class ArgusClient {
       const sidPromise = new Promise((resolve, reject) => {
         this._onSessionId = { resolve, reject };
       });
-      await this._connect(null);
-      const sid = await Promise.race([
-        sidPromise,
-        new Promise((_, reject) => setTimeout(() => reject(new Error("Timed out waiting for session id")), 15000))
-      ]);
+      // The server can fail before _connect's open continuation runs.
+      sidPromise.catch(() => {});
+      let timer;
+      let sid;
+      try {
+        await this._connect(null);
+        sid = await Promise.race([
+          sidPromise,
+          new Promise((_, reject) => { timer = setTimeout(() => reject(new Error("Timeout waiting for runtime provisioning")), this.provisionTimeoutMs); })
+        ]);
+      } finally {
+        clearTimeout(timer);
+        this._onSessionId = null;
+      }
       this.sessionId = sid;
       await this.initialize();
       return sid;
@@ -1301,6 +1315,8 @@ class ArgusClient {
     }
 
     this.initialized = false;
+    this.runtimeProvisioning = false;
+    this.runtimeError = null;
     this.nextId = 1;
     for (const [, p] of this.pending) p.reject(new Error("reconnecting"));
     this.pending.clear();
@@ -1309,6 +1325,33 @@ class ArgusClient {
     log("Connecting to gateway WS:", redactUrlSecrets(url));
     const ws = new WebSocket(url);
     this.ws = ws;
+
+    // Install handlers before open: readiness/failure can immediately follow
+    // the upgrade response, before the open promise continuation runs.
+    ws.on("message", (data) => {
+      if (this.ws !== ws) return;
+      const text = typeof data === "string" ? data : data.toString("utf-8");
+      this._handleWire(text);
+    });
+    // The open waiter removes its error listener once connected. Keep an error
+    // handler for transport failures until close rejects pending requests.
+    ws.on("error", () => {});
+    ws.on("close", (code, reason) => {
+      if (this.ws !== ws) return;
+      this.initialized = false;
+      this.ws = null;
+      const detail = reason ? reason.toString() : "";
+      const err = this.runtimeError || new Error(`WebSocket closed (${code}${detail ? `: ${detail}` : ""})`);
+      for (const [, p] of this.pending) p.reject(err);
+      this.pending.clear();
+      this._onSessionId?.reject(err);
+      this._onSessionId = null;
+      this.turnsByKey.clear();
+      const cb = this.onDisconnected;
+      if (typeof cb === "function") {
+        try { cb(); } catch { /* ignore */ }
+      }
+    });
 
     await new Promise((resolve, reject) => {
       const cleanup = () => {
@@ -1335,27 +1378,6 @@ class ArgusClient {
       ws.on("close", onClose);
     });
 
-    ws.on("message", (data) => {
-      const text = typeof data === "string" ? data : data.toString("utf-8");
-      this._handleWire(text);
-    });
-
-    ws.on("close", () => {
-      this.initialized = false;
-      this.ws = null;
-      const err = new Error("WebSocket closed");
-      for (const [, p] of this.pending) p.reject(err);
-      this.pending.clear();
-      this.turnsByKey.clear();
-      const cb = this.onDisconnected;
-      if (typeof cb === "function") {
-        try {
-          cb();
-        } catch {
-          // ignore
-        }
-      }
-    });
   }
 
   _send(obj) {
@@ -1367,22 +1389,21 @@ class ArgusClient {
   rpc(method, params, { timeoutMs, onSent } = {}) {
     const id = this.nextId++;
     const req = { jsonrpc: "2.0", method, id, ...(params !== undefined ? { params } : {}) };
-    this._send(req);
-    if (typeof onSent === "function") {
-      try {
-        onSent(id);
-      } catch {
-        // ignore
-      }
-    }
     const ms = clampNumber(timeoutMs, 120000);
     return new Promise((resolve, reject) => {
-      const t = setTimeout(() => {
-        if (!this.pending.has(id)) return;
-        this.pending.delete(id);
-        reject(new Error(`Timeout waiting for ${method} (${id})`));
-      }, ms);
-      this.pending.set(id, {
+      let t;
+      const armTimeout = () => {
+        clearTimeout(t);
+        const provisioning = method === "initialize" && this.runtimeProvisioning;
+        t = setTimeout(() => {
+          if (!this.pending.has(id)) return;
+          this.pending.delete(id);
+          reject(new Error(provisioning ? "Timeout waiting for runtime provisioning" : `Timeout waiting for ${method} (${id})`));
+        }, provisioning ? this.provisionTimeoutMs : ms);
+      };
+      const pending = {
+        method,
+        armTimeout,
         resolve: (v) => {
           clearTimeout(t);
           resolve(v);
@@ -1391,13 +1412,25 @@ class ArgusClient {
           clearTimeout(t);
           reject(e);
         }
-      });
+      };
+      this.pending.set(id, pending);
+      armTimeout();
+      try {
+        this._send(req);
+        if (typeof onSent === "function") {
+          try { onSent(id); } catch { /* ignore */ }
+        }
+      } catch (error) {
+        this.pending.delete(id);
+        pending.reject(error);
+      }
     });
   }
 
   async initialize() {
     if (this.initialized) return;
-    await this.rpc("initialize", { clientInfo: { name: "argus_tg_bot", title: "Argus Telegram Bot", version: BOT_VERSION } }, { timeoutMs: ARGUS_INITIALIZE_TIMEOUT_MS });
+    if (this.runtimeError) throw this.runtimeError;
+    await this.rpc("initialize", { clientInfo: { name: "argus_tg_bot", title: "Argus Telegram Bot", version: BOT_VERSION } }, { timeoutMs: this.initializeTimeoutMs });
     this._send({ jsonrpc: "2.0", method: "initialized" });
     this.initialized = true;
   }
@@ -1469,7 +1502,25 @@ class ArgusClient {
   }
 
   _handleNotification(msg) {
+    if (msg.method === "argus/runtime/status" && msg.params?.phase === "provisioning") {
+      if (!this.runtimeProvisioning) {
+        this.runtimeProvisioning = true;
+        for (const p of this.pending.values()) if (p.method === "initialize") p.armTimeout();
+      }
+      return;
+    }
+    if (msg.method === "argus/runtime/error") {
+      this.runtimeError = new Error(msg.params?.message || "Runtime provisioning failed");
+      for (const p of this.pending.values()) p.reject(this.runtimeError);
+      this.pending.clear();
+      this._onSessionId?.reject(this.runtimeError);
+      this._onSessionId = null;
+      return;
+    }
     if (isArgusSessionMessage(msg)) {
+      const wasProvisioning = this.runtimeProvisioning;
+      this.runtimeProvisioning = false;
+      if (wasProvisioning) for (const p of this.pending.values()) if (p.method === "initialize") p.armTimeout();
       const sid = msg.params?.id;
       if (isNonEmptyString(sid)) {
         if (!this.sessionId) log("Gateway assigned sessionId:", sid);
@@ -6957,6 +7008,7 @@ async function main() {
 }
 
 export {
+  ArgusClient,
   enqueueTelegramMessage,
   SerialQueue,
   DEFAULT_TELEGRAM_TYPING_TTL_MS,

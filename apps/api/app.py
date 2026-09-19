@@ -17955,6 +17955,8 @@ def _runtime_error_category(exc: BaseException) -> str:
         return category.strip()
     if _is_manifest_missing_error_text(str(exc)):
         return "runtime_image_digest_missing"
+    if "did not have enough free storage" in str(exc).lower():
+        return "runtime_storage_capacity_unavailable"
     return "runtime_provision_failed"
 
 
@@ -18015,7 +18017,25 @@ def _runtime_provision_ws_close_reason(exc: BaseException) -> str:
     category = _runtime_error_category(exc)
     if category == "runtime_image_digest_missing":
         return "Runtime image digest missing"
+    if category == "runtime_storage_capacity_unavailable":
+        return "Runtime storage capacity unavailable"
     return "Runtime provisioning failed"
+
+
+async def _send_runtime_provision_failure(ws: WebSocket, session_id: str, exc: BaseException) -> None:
+    category = _runtime_error_category(exc)
+    message = {
+        "runtime_storage_capacity_unavailable": "运行环境暂时无法启动：存储空间不足，请联系管理员。",
+        "runtime_image_digest_missing": "运行环境暂时无法启动：镜像不可用，请联系管理员。",
+    }.get(category, "运行环境暂时无法启动，请稍后重试或联系管理员。")
+    try:
+        await ws.send_text(json.dumps({"method": "argus/runtime/error", "params": {
+            "sessionId": session_id, "errorClass": category, "message": message,
+        }}))
+        await ws.close(code=1011, reason=_runtime_provision_ws_close_reason(exc))
+    except (WebSocketDisconnect, RuntimeError, OSError):
+        # The caller may already have disconnected during provisioning.
+        pass
 
 
 async def _ensure_live_session(session_id: str, *, allow_create: bool) -> tuple[LiveRuntimeSession, bool]:
@@ -23177,6 +23197,22 @@ def _fugue_wait_for_app_ready_sync(
         operation_id = str(status.get("last_operation_id") or app_data.get("last_operation_id") or "").strip()
         if operation_id:
             last_operation_id = operation_id
+            # Workload-scoped credentials can read app status but may not read
+            # /operations. Its embedded failure is authoritative only when it
+            # belongs to the current operation, never an older failed release.
+            failed = status.get("last_failed_operation")
+            if (
+                isinstance(failed, dict)
+                and failed.get("id") == operation_id
+                and (not recovery_operation_id or operation_id == recovery_operation_id)
+                and _fugue_operation_detail(failed)
+            ):
+                detail = _fugue_operation_detail(failed)
+                message = f"Fugue app {app_id} last operation {operation_id} failed: {detail}"
+                if _is_manifest_missing_error_text(message):
+                    raise FugueRuntimeImageMissingError(message, runtime_app_id=app_id,
+                                                       operation_id=operation_id, last_message=detail)
+                raise RuntimeError(message)
             try:
                 operation_data = _fugue_get_operation_sync(cfg, operation_id)
             except Exception as e:
@@ -27863,7 +27899,11 @@ async def ws_proxy(ws: WebSocket):
                     return
             if isinstance(requested_placement, SessionPlacement):
                 await _persist_session_placement(session_id, requested_placement)
-            live, created = await _ensure_live_session(session_id, allow_create=allow_create)
+            await ws.send_text(json.dumps({"method": "argus/runtime/status", "params": {
+                "sessionId": session_id, "phase": "provisioning",
+            }}))
+            with _latency_span("runtime_provision", session_id=session_id):
+                live, created = await _ensure_live_session(session_id, allow_create=allow_create)
         except KeyError:
             await ws.close(code=1008, reason="Unknown session")
             return
@@ -27875,7 +27915,7 @@ async def ws_proxy(ws: WebSocket):
                 _runtime_error_category(e),
                 str(e),
             )
-            await ws.close(code=1011, reason=_runtime_provision_ws_close_reason(e))
+            await _send_runtime_provision_failure(ws, session_id, e)
             return
 
         await live.attach(ws)

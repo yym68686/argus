@@ -1103,6 +1103,48 @@ class RuntimeSessionProvisioningTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(ready, app_data)
         get_operation.assert_not_called()
 
+    async def test_fugue_wait_uses_current_embedded_failure_without_operation_permission(self) -> None:
+        cfg = argus_app.FugueProvisionConfig(
+            base_url="https://fugue.invalid", token="workload-token", project_id="project_test",
+            runtime_id="runtime_test", gateway_internal_host="gateway.internal",
+            runtime_cmd="codex serve", connect_timeout_s=1.0,
+        )
+        blocked = {
+            "id": "app_test",
+            "status": {
+                "phase": "deploying", "last_operation_id": "op_failed",
+                "last_failed_operation": {
+                    "id": "op_failed", "completed_at": "2026-01-01T00:00:00Z",
+                    "error_message": "Unschedulable: 1 node(s) did not have enough free storage",
+                },
+            },
+        }
+        with (
+            mock.patch.object(argus_app, "_fugue_get_app_sync", return_value=blocked),
+            mock.patch.object(argus_app, "_fugue_get_operation_sync", side_effect=RuntimeError("403")),
+            mock.patch.object(argus_app.time, "time", side_effect=[0.0, 61.0]),
+            mock.patch.object(argus_app.time, "sleep") as sleep,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "did not have enough free storage"):
+                argus_app._fugue_wait_for_app_ready_sync(cfg, "app_test")
+        sleep.assert_not_called()
+
+    async def test_fugue_wait_ignores_old_embedded_failure_during_new_deploy(self) -> None:
+        cfg = argus_app.FugueProvisionConfig(
+            base_url="https://fugue.invalid", token="workload-token", project_id="project_test",
+            runtime_id="runtime_test", gateway_internal_host="gateway.internal",
+            runtime_cmd="codex serve", connect_timeout_s=1.0,
+        )
+        pending = {"status": {"phase": "deploying", "last_operation_id": "op_new",
+                   "last_failed_operation": {"id": "op_old", "error_message": "old failure"}}}
+        ready = {"status": {"phase": "deployed"}, "internal_service": {"host": "runtime.internal", "port": 7777}}
+        with (
+            mock.patch.object(argus_app, "_fugue_get_app_sync", side_effect=[pending, ready]),
+            mock.patch.object(argus_app, "_fugue_get_operation_sync", side_effect=RuntimeError("403")),
+            mock.patch.object(argus_app.time, "sleep"),
+        ):
+            self.assertEqual(argus_app._fugue_wait_for_app_ready_sync(cfg, "app_test"), ready)
+
     async def test_fugue_wait_for_app_ready_timeout_includes_operation_context(self) -> None:
         cfg = argus_app.FugueProvisionConfig(
             base_url="https://fugue.invalid",
