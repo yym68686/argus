@@ -1070,6 +1070,15 @@ class LiveRuntimeSession:
     async def _send_initialize(self, rid: int, params: Any, fut: asyncio.Future[dict[str, Any]]) -> None:
         log.info("Runtime initialize started session=%s upstream_request_id=%s", self.session_id, rid)
         try:
+            # This connection also serves gateway-owned RPCs such as
+            # thread/resume.excludeTurns. Negotiate their capability even when
+            # a stable-only downstream client wins the shared handshake.
+            # Copy valid parameters so the caller's capabilities are unchanged;
+            # leave malformed inputs for the runtime to validate as before.
+            if isinstance(params, dict):
+                capabilities = params.get("capabilities")
+                if capabilities is None or isinstance(capabilities, dict):
+                    params = {**params, "capabilities": {**(capabilities or {}), "experimentalApi": True}}
             await self.write_upstream(_jsonrpc_upstream_text({"method": "initialize", "id": rid, "params": params}))
         except BaseException as exc:
             async with self.attach_lock:

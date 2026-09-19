@@ -154,12 +154,63 @@ class RuntimeInitializationTests(unittest.IsolatedAsyncioTestCase):
     def respond(self, request, **payload):
         self.reader.feed_data((json.dumps({"id": request["id"], **payload}) + "\n").encode())
 
-    def connect(self, rid=1):
+    def connect(self, rid=1, params=None):
         ws = Socket()
-        ws.incoming.put_nowait({"id": rid, "method": "initialize", "params": {"clientInfo": {"name": "test-client", "version": "1"}}})
+        if params is None:
+            params = {"clientInfo": {"name": "test-client", "version": "1"}}
+        ws.incoming.put_nowait({"id": rid, "method": "initialize", "params": params})
         task = asyncio.create_task(gateway.ws_proxy(ws))
         self.sockets.append((ws, task))
         return ws
+
+    async def check_experimental_resume(self, initialize_request):
+        # Model the upstream protocol gate so a successful initialize alone
+        # cannot make this regression pass.
+        opted_in = initialize_request["params"].get("capabilities", {}).get("experimentalApi") is True
+        self.respond(initialize_request, result={"userAgent": "test/1"})
+        resume = asyncio.create_task(self.manager._ensure_thread_loaded_or_resumed(self.live, "thread-main"))
+        await self.wait_for_requests(3)  # initialize, initialized, loaded/list
+        self.respond(self.writer.messages[-1], result={"data": []})
+        await self.wait_for_requests(4)
+        request = self.writer.messages[-1]
+        self.assertEqual(request["method"], "thread/resume")
+        self.assertTrue(request["params"]["excludeTurns"])
+        if opted_in:
+            self.respond(request, result={"thread": {"id": "thread-main", "turns": []}})
+        else:
+            self.respond(request, error={"code": -32600, "message": "thread/resume.excludeTurns requires experimentalApi capability"})
+        await resume
+
+    async def test_automation_first_negotiates_experimental_resume(self):
+        initialize = asyncio.create_task(self.manager._ensure_initialized(self.live))
+        await self.wait_for_requests(1)
+        try:
+            await self.check_experimental_resume(self.writer.messages[0])
+        finally:
+            await initialize
+        ws = self.connect(61)
+        self.assertIn("result", await ws.response(61))
+        self.assertEqual(sum(m["method"] == "initialize" for m in self.writer.messages), 1)
+
+    async def test_websocket_first_negotiates_gateway_capabilities(self):
+        ws = self.connect(62)
+        await self.wait_for_requests(1)
+        await self.check_experimental_resume(self.writer.messages[0])
+        self.assertIn("result", await ws.response(62))
+        await self.manager._ensure_initialized(self.live)
+        self.assertEqual(sum(m["method"] == "initialize" for m in self.writer.messages), 1)
+
+    async def test_gateway_opt_in_preserves_other_client_parameters(self):
+        params = {"clientInfo": {"name": "stable-client", "version": "1"}, "capabilities": {"experimentalApi": False, "optOutNotificationMethods": ["item/agentMessage/delta"]}}
+        original = json.loads(json.dumps(params))
+        ws = self.connect(63, params=params)
+        await self.wait_for_requests(1)
+        request = self.writer.messages[0]
+        await self.check_experimental_resume(request)
+        self.assertIn("result", await ws.response(63))
+        self.assertEqual(request["params"]["clientInfo"], original["clientInfo"])
+        self.assertEqual(request["params"]["capabilities"]["optOutNotificationMethods"], original["capabilities"]["optOutNotificationMethods"])
+        self.assertEqual(params, original)
 
     async def test_late_internal_initialize_success_survives_caller_timeout(self):
         wait_for = asyncio.wait_for
