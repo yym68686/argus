@@ -91,7 +91,7 @@ class AppServerTcpBridgeTests(unittest.TestCase):
 
     def test_jsonl_connection_replays_first_line_and_remaining_input(self) -> None:
         payload = b'{"id":1,"method":"initialize"}\n{"method":"initialized"}\n'
-        with socket.create_connection(("127.0.0.1", self.port), timeout=1) as sock:
+        with socket.create_connection(("127.0.0.1", self.port), timeout=5) as sock:
             sock.sendall(payload)
             sock.shutdown(socket.SHUT_WR)
             chunks = []

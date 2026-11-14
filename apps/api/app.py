@@ -1,9 +1,11 @@
 import asyncio
 import base64
 import codecs
+import errno
 import functools
 import hashlib
 import hmac
+import http.client
 import json
 import logging
 import os
@@ -11,6 +13,7 @@ import re
 import secrets
 import shlex
 import sqlite3
+import socket
 import threading
 import time
 import uuid
@@ -245,6 +248,75 @@ def _text_hash(raw: Any) -> Optional[str]:
 
 class UpstreamSessionClosedError(RuntimeError):
     pass
+
+
+class RuntimeStorageFullError(RuntimeError):
+    category = "runtime_storage_full"
+
+    def __init__(self) -> None:
+        super().__init__("运行环境存储空间已满，请扩容或清理后重试。")
+
+
+class TelegramAttachmentError(RuntimeError):
+    def __init__(self, stage: str, reason: str) -> None:
+        self.stage = stage
+        self.reason = reason
+        stage_text = {
+            "get_file": "获取 Telegram 附件信息",
+            "download": "下载 Telegram 附件",
+            "save": "保存 Telegram 附件",
+            "runtime": "连接附件工作区",
+        }.get(stage, "处理 Telegram 附件")
+        detail = {
+            "network": "网络连接中断或超时，有限重试后仍失败，请稍后重发",
+            "service": "Telegram 服务暂时不可用，有限重试后仍失败，请稍后重发",
+            "storage_full": "存储空间已满，请扩容或清理后重试",
+            "permission": "工作区没有写入权限，请联系管理员",
+            "too_large": "附件超过大小限制，请缩小文件后重发",
+            "configuration": "机器人或工作区尚未正确配置，请联系管理员",
+            "invalid": "附件信息无效或已不可用，请重新上传",
+            "too_many": "单条消息最多处理 8 个附件，请分批重发",
+        }.get(reason, "操作失败，请稍后重发或联系管理员")
+        # Do not expose URLs, bot tokens, file IDs or remote exception text.
+        super().__init__(f"{stage_text}失败：{detail}。本条消息（含文字）未提交给模型，请重发完整消息。")
+
+
+def _telegram_attachment_failure_reason(exc: BaseException) -> str:
+    seen: set[int] = set()
+    current: Any = exc
+    while isinstance(current, BaseException) and id(current) not in seen:
+        seen.add(id(current))
+        if isinstance(current, urllib.error.HTTPError):
+            return "service" if current.code == 429 or 500 <= current.code < 600 else "invalid"
+        if isinstance(current, (TimeoutError, ConnectionError, http.client.IncompleteRead)):
+            return "network"
+        if isinstance(current, socket.gaierror) and current.errno == socket.EAI_AGAIN:
+            return "network"
+        if isinstance(current, OSError):
+            if current.errno in (errno.ENOSPC, errno.EDQUOT):
+                return "storage_full"
+            if current.errno in (errno.EACCES, errno.EPERM, errno.EROFS):
+                return "permission"
+            if current.errno in (errno.ENETUNREACH, errno.EHOSTUNREACH, errno.ETIMEDOUT):
+                return "network"
+        if "telegram file too large" in str(current).lower():
+            return "too_large"
+        current = current.reason if isinstance(current, urllib.error.URLError) and isinstance(current.reason, BaseException) else current.__cause__
+    return "unknown"
+
+
+def _telegram_attachment_read_with_retry_sync(fn: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
+    # Only read-only Telegram metadata/download operations use this wrapper.
+    # Never retry turn submission, message delivery or remote workspace writes.
+    for attempt in range(3):
+        try:
+            return fn(*args, **kwargs)
+        except Exception as exc:
+            reason = _telegram_attachment_failure_reason(exc)
+            if attempt == 2 or reason not in {"network", "service"}:
+                raise
+            log.info("Telegram attachment read retry attempt=%s reason=%s", attempt + 2, reason)
+            time.sleep(0.25 * (2 ** attempt))
 
 
 def _normalize_runtime_host_id(raw: Any) -> str:
@@ -1040,6 +1112,7 @@ class LiveRuntimeSession:
     initialize_future: Optional[asyncio.Future[dict[str, Any]]] = None
     initialize_send_task: Optional[asyncio.Task[None]] = None
     handshake_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    startup_error: Optional[RuntimeError] = None
 
     async def begin_initialize(self, params: Any) -> asyncio.Future[dict[str, Any]]:
         # Automation and downstream clients share one upstream connection. Its
@@ -1106,6 +1179,8 @@ class LiveRuntimeSession:
 
     async def attach(self, ws: WebSocket) -> None:
         async with self.attach_lock:
+            if self.closed:
+                raise self.startup_error or UpstreamSessionClosedError("Upstream session closed")
             self.attached_wss.add(ws)
             if self.request_handler_ws is None or self.request_handler_ws.client_state != WebSocketState.CONNECTED:
                 self.request_handler_ws = ws
@@ -1292,6 +1367,8 @@ class LiveRuntimeSession:
         except Exception:
             writer_closing = False
         if self.closed or writer_closing:
+            if self.startup_error is not None:
+                raise self.startup_error
             raise UpstreamSessionClosedError(f"Upstream session {self.session_id} is closed")
         if not text.endswith("\n"):
             text += "\n"
@@ -2200,11 +2277,11 @@ def _telegram_download_file_to_path_sync(token: str, file_path: str, dest: Path,
     url = f"https://api.telegram.org/file/bot{token.strip()}/{file_path.lstrip('/')}"
     req = urllib.request.Request(url, method="GET")
     total = 0
+    tmp = dest.with_suffix(dest.suffix + ".tmp")
 
     try:
         with urllib.request.urlopen(req, timeout=60) as resp:
             dest.parent.mkdir(parents=True, exist_ok=True)
-            tmp = dest.with_suffix(dest.suffix + ".tmp")
             with tmp.open("wb") as f:
                 while True:
                     chunk = resp.read(1024 * 64)
@@ -2224,6 +2301,12 @@ def _telegram_download_file_to_path_sync(token: str, file_path: str, dest: Path,
         raise RuntimeError(f"Telegram file download failed: HTTP {e.code} {raw}".strip()) from e
     except Exception as e:
         raise RuntimeError(f"Telegram file download failed: {e}") from e
+    finally:
+        # A failed/oversized download must not leave partial files behind.
+        try:
+            tmp.unlink(missing_ok=True)
+        except OSError:
+            log.warning("Could not remove partial Telegram attachment download")
 
 
 def _telegram_download_file_bytes_sync(token: str, file_path: str, *, max_bytes: int) -> bytes:
@@ -15227,7 +15310,7 @@ class AutomationManager:
             )
             local_attachments = self._merge_staged_attachment_dicts(staged)
             if not local_attachments:
-                raise RuntimeError("Failed to save Telegram attachments")
+                raise TelegramAttachmentError("get_file", "invalid")
 
         if not text_has_content:
             if not local_attachments:
@@ -15407,32 +15490,39 @@ class AutomationManager:
 
         token = self.get_effective_telegram_bot_token()
         if not token:
-            return []
+            raise TelegramAttachmentError("get_file", "configuration")
+
+        def failure(stage: str, exc: BaseException) -> TelegramAttachmentError:
+            reason = _telegram_attachment_failure_reason(exc)
+            if isinstance(exc, RuntimeStorageFullError) or (stage == "save" and "no space left on device" in str(exc).lower()):
+                reason = "storage_full"
+            log.warning("Telegram attachment failed session=%s stage=%s reason=%s", session_id, stage, reason)
+            return TelegramAttachmentError(stage, reason)
 
         root = self._workspace_root_for_session(session_id)
         if root is None and _session_uses_remote_workspace(session_id):
             try:
                 await _ensure_live_session(session_id, allow_create=True)
-            except Exception:
-                return []
+            except Exception as exc:
+                raise failure("runtime", exc) from exc
             root = self._workspace_root_for_session(session_id)
         if root is None:
-            return []
+            raise TelegramAttachmentError("save", "configuration")
         use_remote_workspace = _session_uses_remote_workspace(session_id)
         live: Optional[LiveRuntimeSession] = None
         if use_remote_workspace:
             try:
                 live, _ = await _ensure_live_session(session_id, allow_create=True)
-            except Exception:
-                return []
+            except Exception as exc:
+                raise failure("runtime", exc) from exc
 
         chat_part = _sanitize_path_part(source_chat_key or session_id or "unknown", fallback="unknown")
         base_dir = root / "inbox" / "telegram" / chat_part
         if not use_remote_workspace:
             try:
                 base_dir.mkdir(parents=True, exist_ok=True)
-            except Exception:
-                pass
+            except Exception as exc:
+                raise failure("save", exc) from exc
 
         mime_to_ext = {
             "image/png": ".png",
@@ -15464,12 +15554,14 @@ class AutomationManager:
             }
         )
 
-        for idx, ref in enumerate(telegram_attachments[:8], start=1):
+        if len(telegram_attachments) > 8:
+            raise TelegramAttachmentError("get_file", "too_many")
+        for idx, ref in enumerate(telegram_attachments, start=1):
             if not isinstance(ref, dict):
-                continue
+                raise TelegramAttachmentError("get_file", "invalid")
             file_id = ref.get("fileId") or ref.get("file_id")
             if not isinstance(file_id, str) or not file_id.strip():
-                continue
+                raise TelegramAttachmentError("get_file", "invalid")
             file_id = file_id.strip()
             if file_id in seen:
                 continue
@@ -15494,20 +15586,17 @@ class AutomationManager:
             mime_type = ref.get("mimeType") or ref.get("mime_type")
 
             try:
-                info = await asyncio.to_thread(_telegram_get_file_sync, token, file_id)
+                info = await asyncio.to_thread(_telegram_attachment_read_with_retry_sync, _telegram_get_file_sync, token, file_id)
             except Exception as e:
-                log.warning("Telegram getFile failed for fileId=%s: %s", file_id, str(e))
-                continue
+                raise failure("get_file", e) from e
 
             file_path = info.get("file_path") if isinstance(info, dict) else None
             if not isinstance(file_path, str) or not file_path.strip():
-                log.warning("Telegram getFile missing file_path for fileId=%s", file_id)
-                continue
+                raise TelegramAttachmentError("get_file", "invalid")
 
             file_size = info.get("file_size") if isinstance(info, dict) else None
             if isinstance(file_size, int) and file_size > TELEGRAM_MAX_DOWNLOAD_BYTES:
-                log.warning("Telegram file too large for fileId=%s size=%s", file_id, file_size)
-                continue
+                raise TelegramAttachmentError("download", "too_large")
 
             ext = Path(file_path).suffix.lower()
             if not ext and isinstance(file_name, str) and file_name.strip():
@@ -15534,19 +15623,23 @@ class AutomationManager:
             if use_remote_workspace and live is not None:
                 try:
                     payload = await asyncio.to_thread(
+                        _telegram_attachment_read_with_retry_sync,
                         _telegram_download_file_bytes_sync,
                         token,
                         file_path,
                         max_bytes=TELEGRAM_MAX_DOWNLOAD_BYTES,
                     )
                     downloaded_size = len(payload)
+                except Exception as e:
+                    raise failure("download", e) from e
+                try:
                     await _live_fs_write_bytes(live, str(dest), payload)
                 except Exception as e:
-                    log.warning("Telegram remote download failed for fileId=%s: %s", file_id, str(e))
-                    continue
+                    raise failure("save", e) from e
             else:
                 try:
                     downloaded_size = await asyncio.to_thread(
+                        _telegram_attachment_read_with_retry_sync,
                         _telegram_download_file_to_path_sync,
                         token,
                         file_path,
@@ -15554,8 +15647,8 @@ class AutomationManager:
                         max_bytes=TELEGRAM_MAX_DOWNLOAD_BYTES,
                     )
                 except Exception as e:
-                    log.warning("Telegram download failed for fileId=%s: %s", file_id, str(e))
-                    continue
+                    reason = _telegram_attachment_failure_reason(e)
+                    raise failure("save" if reason in {"storage_full", "permission"} else "download", e) from e
 
             rel = None
             try:
@@ -15564,9 +15657,12 @@ class AutomationManager:
                 rel = str(dest)
             rel_norm = _normalize_workspace_relative_path(rel)
             if not rel_norm:
-                continue
+                raise TelegramAttachmentError("save", "invalid")
             if not use_remote_workspace:
-                await _sync_session_workspace_file(session_id, root, dest)
+                try:
+                    await _sync_session_workspace_file(session_id, root, dest)
+                except Exception as e:
+                    raise failure("save", e) from e
             out.append(
                 PersistedStagedAttachment(
                     path=rel_norm,
@@ -17953,6 +18049,17 @@ def _runtime_error_category(exc: BaseException) -> str:
     category = getattr(exc, "category", None)
     if isinstance(category, str) and category.strip():
         return category.strip()
+    # Provisioning can fail before a live session exists (e.g. Docker create).
+    # Only classify explicit OS errors; never infer a cause from a TCP close.
+    seen: set[int] = set()
+    cause: Optional[BaseException] = exc
+    while cause is not None and id(cause) not in seen:
+        seen.add(id(cause))
+        if isinstance(cause, OSError) and cause.errno in (errno.ENOSPC, errno.EDQUOT):
+            return "runtime_storage_full"
+        if "no space left on device" in str(cause).lower():
+            return "runtime_storage_full"
+        cause = cause.__cause__
     if _is_manifest_missing_error_text(str(exc)):
         return "runtime_image_digest_missing"
     if "did not have enough free storage" in str(exc).lower():
@@ -18019,19 +18126,26 @@ def _runtime_provision_ws_close_reason(exc: BaseException) -> str:
         return "Runtime image digest missing"
     if category == "runtime_storage_capacity_unavailable":
         return "Runtime storage capacity unavailable"
+    if category == "runtime_storage_full":
+        return "Runtime storage full"
     return "Runtime provisioning failed"
 
 
-async def _send_runtime_provision_failure(ws: WebSocket, session_id: str, exc: BaseException) -> None:
+def _runtime_failure_notification(session_id: str, exc: BaseException) -> dict[str, Any]:
     category = _runtime_error_category(exc)
     message = {
+        "runtime_storage_full": "运行环境存储空间已满，请扩容或清理后重试。",
         "runtime_storage_capacity_unavailable": "运行环境暂时无法启动：存储空间不足，请联系管理员。",
         "runtime_image_digest_missing": "运行环境暂时无法启动：镜像不可用，请联系管理员。",
     }.get(category, "运行环境暂时无法启动，请稍后重试或联系管理员。")
+    return {"method": "argus/runtime/error", "params": {
+        "sessionId": session_id, "errorClass": category, "message": message,
+    }}
+
+
+async def _send_runtime_provision_failure(ws: WebSocket, session_id: str, exc: BaseException) -> None:
     try:
-        await ws.send_text(json.dumps({"method": "argus/runtime/error", "params": {
-            "sessionId": session_id, "errorClass": category, "message": message,
-        }}))
+        await ws.send_text(json.dumps(_runtime_failure_notification(session_id, exc)))
         await ws.close(code=1011, reason=_runtime_provision_ws_close_reason(exc))
     except (WebSocketDisconnect, RuntimeError, OSError):
         # The caller may already have disconnected during provisioning.
@@ -22176,6 +22290,14 @@ async def _activate_live_session(live: LiveRuntimeSession) -> LiveRuntimeSession
                 try:
                     msg: Any = json.loads(text)
                 except Exception:
+                    # Before initialization, retain a concrete OS diagnostic if
+                    # the process subsequently exits. A normal JSON-RPC payload
+                    # (including model text) is never used for this inference.
+                    if live.initialized_result is None and re.search(
+                        r"^(?:awk|cat|mkdir|mktemp|cp|mv|sh|/[^:]+|OSError)(?::|\[).*\b(?:No space left on device|Disk quota exceeded)\b",
+                        text.strip(),
+                    ):
+                        live.startup_error = RuntimeStorageFullError()
                     live.non_json_lines_dropped += 1
                     preview = text.strip()
                     if len(preview) > 240:
@@ -22239,6 +22361,7 @@ async def _activate_live_session(live: LiveRuntimeSession) -> LiveRuntimeSession
                             live.pending_initialize_ids.discard(rid)
                             if msg.get("error") is None and isinstance(msg.get("result"), dict):
                                 live.initialized_result = msg["result"]
+                                live.startup_error = None
                             else:
                                 live.initialize_future = None
                                 if msg.get("error") is None:
@@ -22289,6 +22412,11 @@ async def _activate_live_session(live: LiveRuntimeSession) -> LiveRuntimeSession
         except Exception as e:
             log.exception("Pump failed for session %s: %s", session_id, str(e))
         finally:
+            if live.startup_error is not None:
+                _event_log(
+                    "warning", "gw.runtime.startup_failed", session_id=session_id,
+                    provider=live.provider, error_class=_runtime_error_category(live.startup_error),
+                )
             try:
                 live.closed = True
                 live.writer.close()
@@ -22298,7 +22426,7 @@ async def _activate_live_session(live: LiveRuntimeSession) -> LiveRuntimeSession
                 async with live.attach_lock:
                     for fut in live.pending_internal_requests.values():
                         if not fut.done():
-                            fut.set_exception(RuntimeError("Session closed"))
+                            fut.set_exception(live.startup_error or RuntimeError("Session closed"))
                     live.pending_internal_requests.clear()
             except Exception:
                 pass
@@ -22310,11 +22438,14 @@ async def _activate_live_session(live: LiveRuntimeSession) -> LiveRuntimeSession
             except Exception:
                 pass
             try:
+                if live.startup_error is not None:
+                    await live.broadcast(json.dumps(_runtime_failure_notification(session_id, live.startup_error)))
                 await live.broadcast(json.dumps({"method": "argus/session_closed", "params": {"id": session_id}}))
             except Exception:
                 pass
             try:
-                await live.close_attached_websockets(code=1011, reason="Upstream session closed")
+                reason = _runtime_provision_ws_close_reason(live.startup_error) if live.startup_error else "Upstream session closed"
+                await live.close_attached_websockets(code=1011, reason=reason)
             except Exception:
                 pass
             try:
@@ -27918,7 +28049,14 @@ async def ws_proxy(ws: WebSocket):
             await _send_runtime_provision_failure(ws, session_id, e)
             return
 
-        await live.attach(ws)
+        try:
+            await live.attach(ws)
+        except RuntimeStorageFullError as exc:
+            await _send_runtime_provision_failure(ws, session_id, exc)
+            return
+        except UpstreamSessionClosedError:
+            await ws.close(code=1011, reason="Upstream session closed")
+            return
 
         try:
             try:
@@ -28482,11 +28620,14 @@ async def ws_proxy(ws: WebSocket):
                     await live.write_upstream(_jsonrpc_upstream_text(msg))
                     continue
                 await live.write_upstream(text)
-        except UpstreamSessionClosedError:
+        except (UpstreamSessionClosedError, RuntimeStorageFullError) as exc:
             log.info("Session %s upstream closed while proxying websocket traffic", session_id)
             if ws.client_state == WebSocketState.CONNECTED:
                 try:
-                    await ws.close(code=1011, reason="Upstream session closed")
+                    if isinstance(exc, RuntimeStorageFullError):
+                        await _send_runtime_provision_failure(ws, session_id, exc)
+                    else:
+                        await ws.close(code=1011, reason="Upstream session closed")
                 except Exception:
                     pass
         finally:

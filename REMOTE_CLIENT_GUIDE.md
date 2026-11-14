@@ -434,6 +434,8 @@ python3 -m pip install websockets
 
 - 托管 runtime 的启动与 Codex 初始化是两个阶段。网关接受连接后可先发送 `argus/runtime/status`（`params.phase="provisioning"`）；收到 `argus/session` 表示 runtime 已连接，此时才开始计算上游 `initialize` 的超时。容器启动也必须有独立的有界超时，Telegram bot 默认最多等待 240 秒。
 - `argus/runtime/error` 表示容器启动失败：`params.errorClass` 是稳定分类，`params.message` 是可直接展示的说明。客户端应以该原因结束待处理请求；随后网关会关闭连接。`runtime_storage_capacity_unavailable` 表示调度器确认持久化存储不足，与模型或 API Key 无关。不要把它替换成笼统的初始化超时。
+- `runtime_storage_full` 表示 runtime 初始化前输出了明确的磁盘写满诊断，随后连接退出。客户端应展示“运行环境存储空间已满，请扩容或清理后重试”，不要用通用 `1011` 覆盖它。这不代表网关会自动扩容、删除文件或重建工作区；其他断线也不能据此推断为磁盘满。
+- Telegram 附件的获取信息、下载、保存错误会分别报告。只对只读获取/下载的瞬时网络错误及临时服务错误最多尝试三次；不重试模型提交、消息发送或远程文件写入。附件有任何失败时整条消息（包括文字）不提交给模型，用户应按提示重发完整消息；不静默忽略失败附件。
 - `GET /healthz` 404：你连到的不是 FastAPI 网关（端口被别的服务占了或反代配置错误）
 - WebSocket `1006`：网络中断/代理拦截/服务端异常中止（看网关 logs 最快）
 - WebSocket `1008`：Unauthorized（token 不对/没带 token）

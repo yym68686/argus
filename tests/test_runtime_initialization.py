@@ -1,4 +1,5 @@
 import asyncio
+import errno
 import importlib.util
 import json
 import pathlib
@@ -66,6 +67,97 @@ class Socket:
 
 
 class RuntimeInitializationTests(unittest.IsolatedAsyncioTestCase):
+    async def test_provisioning_disk_full_reports_safe_cause_without_raw_secrets(self):
+        for failure in [
+            OSError(errno.ENOSPC, "private-path secret-token"),
+            OSError(errno.EDQUOT, "private-path secret-token"),
+            RuntimeError("Docker create: no space left on device private-path secret-token"),
+        ]:
+            with self.subTest(failure=type(failure).__name__):
+                ws = Socket()
+                with mock.patch.object(gateway, "_ensure_live_session", new=mock.AsyncMock(side_effect=failure)):
+                    await gateway.ws_proxy(ws)
+                frames = []
+                while not ws.outgoing.empty():
+                    frames.append(ws.outgoing.get_nowait())
+                error = next(x for x in frames if x.get("method") == "argus/runtime/error")
+                self.assertEqual(error["params"]["errorClass"], "runtime_storage_full")
+                self.assertNotIn("private-path", json.dumps(frames))
+                self.assertNotIn("secret-token", json.dumps(frames))
+
+    async def test_quota_failure_at_startup_is_storage_full(self):
+        self.reader.feed_data(b"cat: write error: Disk quota exceeded\n")
+        self.reader.feed_eof()
+        with self.assertLogs(gateway.log, level="WARNING") as logs:
+            await self.live.pump_task
+        self.assertIsInstance(self.live.startup_error, gateway.RuntimeStorageFullError)
+        self.assertTrue(any("gw.runtime.startup_failed" in line and self.live.session_id in line for line in logs.output))
+
+    async def test_startup_close_before_attach_reports_same_cause(self):
+        self.reader.feed_data(b"cat: write error: No space left on device\n")
+        self.reader.feed_eof()
+        await self.live.pump_task
+        ws = Socket()
+        await gateway.ws_proxy(ws)
+        frames = []
+        while not ws.outgoing.empty():
+            frames.append(ws.outgoing.get_nowait())
+        errors = [x for x in frames if x.get("method") == "argus/runtime/error"]
+        self.assertEqual(errors[0]["params"]["errorClass"], "runtime_storage_full")
+
+    async def test_successful_initialization_clears_earlier_startup_diagnostic(self):
+        self.reader.feed_data(b"cat: write error: No space left on device\n")
+        task = asyncio.create_task(self.manager._ensure_initialized(self.live))
+        await self.wait_for_requests(1)
+        self.respond(self.writer.messages[0], result={"userAgent": "fixture"})
+        await task
+        self.assertIsNone(self.live.startup_error)
+
+    async def test_startup_disk_full_reaches_websocket_and_pending_rpc(self):
+        ws = Socket()
+        ws.close = mock.AsyncMock()
+        await self.live.attach(ws)
+        request = asyncio.create_task(self.manager._rpc(self.live, "initialize", {}))
+        while not self.writer.messages:
+            await asyncio.sleep(0)
+        self.reader.feed_data(b'awk: write failure (No space left on device)\ncat: write error: No space left on device\n')
+        self.reader.feed_eof()
+        with self.assertRaises(gateway.RuntimeStorageFullError):
+            await request
+        await self.live.pump_task
+        frames = []
+        while not ws.outgoing.empty():
+            frames.append(ws.outgoing.get_nowait())
+        errors = [x for x in frames if x.get("method") == "argus/runtime/error"]
+        self.assertEqual(len(errors), 1)
+        self.assertEqual(errors[0]["params"]["errorClass"], "runtime_storage_full")
+        self.assertIn("扩容或清理", errors[0]["params"]["message"])
+        ws.close.assert_awaited_once_with(code=1011, reason="Runtime storage full")
+        self.assertFalse(gateway._is_unrecoverable_runtime_manifest_failure(self.live.startup_error))
+
+    async def test_unrelated_tcp_close_is_not_misclassified_as_storage_full(self):
+        ws = Socket()
+        ws.close = mock.AsyncMock()
+        await self.live.attach(ws)
+        self.reader.feed_data(b"some unrelated startup warning\n")
+        self.reader.feed_eof()
+        await self.live.pump_task
+        self.assertIsNone(self.live.startup_error)
+        ws.close.assert_awaited_once_with(code=1011, reason="Upstream session closed")
+
+    async def test_valid_json_text_does_not_classify_storage_failure(self):
+        self.reader.feed_data((json.dumps({"method": "notice", "params": {"text": "cat: write error: No space left on device"}}) + "\n").encode())
+        self.reader.feed_eof()
+        await self.live.pump_task
+        self.assertIsNone(self.live.startup_error)
+
+    async def test_post_initialize_diagnostic_does_not_poison_session_close(self):
+        self.live.initialized_result = {"userAgent": "fixture"}
+        self.reader.feed_data(b"cat: write error: No space left on device\n")
+        self.reader.feed_eof()
+        await self.live.pump_task
+        self.assertIsNone(self.live.startup_error)
+
     async def test_provision_failure_reports_storage_cause_before_initialize(self):
         ws = Socket()
         failure = RuntimeError("Unschedulable: 1 node(s) did not have enough free storage")

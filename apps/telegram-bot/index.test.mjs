@@ -1,7 +1,10 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { once } from "node:events";
+import { WebSocketServer } from "ws";
 
 import {
+  ArgusClient,
   DEFAULT_TELEGRAM_TYPING_TTL_MS,
   TypingController,
   SerialQueue,
@@ -26,6 +29,55 @@ import {
   telegramTokenRefreshIntervalMs,
   telegramWebhookInfoLogFields
 } from "./index.mjs";
+
+test("runtime storage error is retained instead of a generic close error", () => {
+  const client = new ArgusClient({ gatewayHttpUrl: "http://fixture", gatewayWsUrl: "ws://fixture/ws", token: "fixture", cwd: "/workspace" });
+  let rejected;
+  client.pending.set(1, { reject: (error) => { rejected = error; } });
+  const message = "运行环境存储空间已满，请扩容或清理后重试。";
+  client._handleNotification({ method: "argus/runtime/error", params: { errorClass: "runtime_storage_full", message } });
+  assert.equal(client.runtimeError.message, message);
+  assert.equal(client.runtimeError.errorClass, "runtime_storage_full");
+  assert.equal(rejected, client.runtimeError);
+  assert.equal(client.pending.size, 0);
+});
+
+test("real socket startup failure keeps the useful error across close and recovers on reconnect", async () => {
+  const server = new WebSocketServer({ host: "127.0.0.1", port: 0 });
+  await once(server, "listening");
+  let attempts = 0;
+  server.on("connection", (ws) => {
+    if (++attempts === 1) {
+      ws.send(JSON.stringify({ method: "argus/runtime/error", params: {
+        errorClass: "runtime_storage_full", message: "运行环境存储空间已满，请扩容或清理后重试。"
+      } }));
+      ws.close(1011, "Runtime storage full");
+    } else {
+      ws.on("message", (data) => {
+        const msg = JSON.parse(data);
+        if (msg.method === "initialize") ws.send(JSON.stringify({ id: msg.id, result: { userAgent: "fixture" } }));
+      });
+    }
+  });
+  const client = new ArgusClient({ gatewayHttpUrl: "http://fixture", gatewayWsUrl: `ws://127.0.0.1:${server.address().port}/ws`, cwd: "/workspace" });
+  try {
+    await assert.rejects(client.connectToSession("fixture"), (error) => {
+      assert.equal(error.errorClass, "runtime_storage_full");
+      assert.match(error.message, /存储空间已满/);
+      return true;
+    });
+    // A follow-up RPC must not replace the saved cause with 'not connected'.
+    await assert.rejects(client.rpc("thread/list", {}), /存储空间已满/);
+    const first = client.ws;
+    if (first && first.readyState !== 3) await once(first, "close");
+    await client.connectToSession("fixture");
+    assert.equal(client.runtimeError, null);
+    assert.equal(client.initialized, true);
+  } finally {
+    for (const ws of server.clients) ws.terminate();
+    await new Promise((resolve) => server.close(resolve));
+  }
+});
 
 test("directed messages show feedback before a busy queue or runtime can respond", async () => {
   const queue = new SerialQueue();

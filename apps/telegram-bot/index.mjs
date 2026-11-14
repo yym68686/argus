@@ -1371,7 +1371,7 @@ class ArgusClient {
       const onClose = (code, reason) => {
         cleanup();
         const text = reason ? reason.toString() : "";
-        reject(new Error(`WebSocket closed (${code}${text ? `: ${text}` : ""})`));
+        reject(this.runtimeError || new Error(`WebSocket closed (${code}${text ? `: ${text}` : ""})`));
       };
       ws.on("open", onOpen);
       ws.on("error", onError);
@@ -1381,6 +1381,7 @@ class ArgusClient {
   }
 
   _send(obj) {
+    if (this.runtimeError) throw this.runtimeError;
     const ws = this.ws;
     if (!ws || ws.readyState !== WebSocket.OPEN) throw new Error("Not connected to gateway");
     ws.send(JSON.stringify(obj));
@@ -1511,6 +1512,7 @@ class ArgusClient {
     }
     if (msg.method === "argus/runtime/error") {
       this.runtimeError = new Error(msg.params?.message || "Runtime provisioning failed");
+      this.runtimeError.errorClass = msg.params?.errorClass || "runtime_provision_failed";
       for (const p of this.pending.values()) p.reject(this.runtimeError);
       this.pending.clear();
       this._onSessionId?.reject(this.runtimeError);
