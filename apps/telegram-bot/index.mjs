@@ -1,4 +1,5 @@
 import process from "node:process";
+import { AsyncLocalStorage } from "node:async_hooks";
 import crypto from "node:crypto";
 import http from "node:http";
 import { readFileSync } from "node:fs";
@@ -13,6 +14,8 @@ const TELEGRAM_WEBHOOK_BODY_LIMIT_BYTES = 1024 * 1024;
 const GROUP_NODE_START_PREFIX = "ng_";
 const ARGUS_INITIALIZE_TIMEOUT_MS = 30_000;
 const ARGUS_PROVISION_TIMEOUT_MS = 240_000;
+const TELEGRAM_CALLBACK_ANSWER_TIMEOUT_MS = 4_000;
+const callbackTiming = new AsyncLocalStorage();
 
 function loadBotVersion() {
   const override = typeof process.env.ARGUS_VERSION === "string" ? process.env.ARGUS_VERSION.trim() : "";
@@ -531,10 +534,60 @@ function isGroupChatType(chatType) {
   return chatType === "group" || chatType === "supergroup";
 }
 
+function enqueueTelegramCallback(queue, { callbackQuery, updateId }, handler) {
+  const received = performance.now();
+  const fields = {
+    update_id: updateId,
+    chat_key_hash: chatKeyHash(chatKeyFromMessage(callbackQuery?.message)),
+    chat_type: isGroupChatType(callbackQuery?.message?.chat?.type) ? "group"
+      : isPrivateChatType(callbackQuery?.message?.chat?.type) ? "private" : "other"
+  };
+  logEvent("INFO", "tg.callback.received", fields);
+  return queue.enqueue(() => callbackTiming.run({ fields, received }, async () => {
+    const started = performance.now();
+    const queueWaitMs = Math.round(started - received);
+    logEvent("INFO", "tg.callback.processing", { ...fields, queue_wait_ms: queueWaitMs });
+    let outcome = "ok";
+    try {
+      await handler(callbackQuery);
+    } catch (error) {
+      outcome = "error";
+      throw error;
+    } finally {
+      logEvent("INFO", "tg.callback.finished", {
+        ...fields, queue_wait_ms: queueWaitMs, outcome,
+        duration_ms: Math.round(performance.now() - started),
+        since_received_ms: Math.round(performance.now() - received)
+      });
+    }
+  }));
+}
+
+async function traceCallbackStage(stage, operation, work) {
+  const timing = callbackTiming.getStore();
+  if (!timing) return await work();
+  const started = performance.now();
+  let outcome = "ok";
+  try {
+    return await work();
+  } catch (error) {
+    outcome = error?.name === "TimeoutError" ? "timeout" : "error";
+    throw error;
+  } finally {
+    const ended = performance.now();
+    logEvent("INFO", "tg.callback.stage", {
+      ...timing.fields, stage, operation, outcome,
+      duration_ms: Math.round(ended - started),
+      since_received_ms: Math.round(ended - timing.received)
+    });
+  }
+}
+
 function enqueueTelegramMessage(queue, { typing, message, botUsername, settings, updateId }, handler) {
   const receivedAtMs = Date.now();
   const chatKey = chatKeyFromMessage(message);
-  const fields = { update_id: updateId, chat_key_hash: chatKeyHash(chatKey) };
+  const traceId = crypto.randomBytes(16).toString("hex");
+  const fields = { update_id: updateId, chat_key_hash: chatKeyHash(chatKey), trace_id: traceId };
   const text = message?.text || message?.caption || "";
   const slash = parseSlashCommand(String(text).trim(), botUsername);
   const command = String(text).trim().startsWith("/");
@@ -559,7 +612,7 @@ function enqueueTelegramMessage(queue, { typing, message, botUsername, settings,
   };
   return queue.enqueue(async () => {
     logEvent("INFO", "tg.message.processing", { ...fields, queue_wait_ms: Math.max(0, Date.now() - receivedAtMs) });
-    try { return await handler(trace); }
+    try { return await handler(trace, traceId); }
     finally { release(); }
   });
 }
@@ -610,13 +663,17 @@ class TelegramApi {
     this.base = `https://api.telegram.org/bot${token}`;
   }
 
-  async call(method, params) {
+  async call(method, params, { signal } = {}) {
     const res = await fetch(`${this.base}/${method}`, {
       method: "POST",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify(params ?? {})
+      body: JSON.stringify(params ?? {}),
+      signal
     });
-    const data = await res.json().catch(() => null);
+    const data = await res.json().catch(() => {
+      if (signal?.aborted) throw signal.reason;
+      return null;
+    });
     if (!data || typeof data !== "object") {
       throw new Error(`Telegram ${method} failed: bad response`);
     }
@@ -671,7 +728,7 @@ class TelegramApi {
   }
 
   async answerCallbackQuery(params) {
-    return await this.call("answerCallbackQuery", params);
+    return await this.call("answerCallbackQuery", params, { signal: AbortSignal.timeout(TELEGRAM_CALLBACK_ANSWER_TIMEOUT_MS) });
   }
 
   async getChatMember(params) {
@@ -1078,19 +1135,21 @@ class ArgusClient {
   }
 
   async _httpJson(method, pathName, body) {
-    const url = `${this.gatewayHttpUrl}${pathName}`;
-    const headers = { "content-type": "application/json" };
-    if (this.token) headers.authorization = `Bearer ${this.token}`;
-    const res = await fetch(url, {
-      method,
-      headers,
-      body: body ? JSON.stringify(body) : undefined
+    return await traceCallbackStage("gateway", pathName.split("?", 1)[0], async () => {
+      const url = `${this.gatewayHttpUrl}${pathName}`;
+      const headers = { "content-type": "application/json" };
+      if (this.token) headers.authorization = `Bearer ${this.token}`;
+      const res = await fetch(url, {
+        method,
+        headers,
+        body: body ? JSON.stringify(body) : undefined
+      });
+      if (!res.ok) {
+        const text = await res.text().catch(() => "");
+        throw new Error(`Gateway ${method} ${pathName} failed: ${res.status} ${text}`.trim());
+      }
+      return await res.json();
     });
-    if (!res.ok) {
-      const text = await res.text().catch(() => "");
-      throw new Error(`Gateway ${method} ${pathName} failed: ${res.status} ${text}`.trim());
-    }
-    return await res.json();
   }
 
   async listSessions() {
@@ -1144,9 +1203,9 @@ class ArgusClient {
     });
   }
 
-  async automationAgentList(chatKey) {
+  async automationAgentList(chatKey, { identityOnly = false } = {}) {
     if (!isNonEmptyString(chatKey)) throw new Error("Missing chatKey");
-    return await this._httpJson("POST", "/automation/agent/list", { chatKey });
+    return await this._httpJson("POST", "/automation/agent/list", identityOnly ? { chatKey, identityOnly } : { chatKey });
   }
 
   async automationAgentResolve(chatKey, { includeModels = false } = {}) {
@@ -1470,7 +1529,7 @@ class ArgusClient {
     await this.rpc("thread/resume", { threadId });
   }
 
-  async enqueueInput({ text, threadId, target, source, telegramAttachments }) {
+  async enqueueInput({ text, threadId, target, source, telegramAttachments, traceId }) {
     const attachments = Array.isArray(telegramAttachments) ? telegramAttachments : [];
     const hasText = isNonEmptyString(text);
     if (!hasText && attachments.length === 0) throw new Error("Missing text");
@@ -1478,6 +1537,7 @@ class ArgusClient {
     if (attachments.length > 0) params.telegramAttachments = attachments;
     if (isNonEmptyString(threadId)) params.threadId = threadId;
     if (isNonEmptyString(target)) params.target = target;
+    if (isNonEmptyString(traceId)) params.traceId = traceId;
     if (source && typeof source === "object" && !Array.isArray(source)) {
       const channel = source.channel;
       const chatKey = source.chatKey;
@@ -3505,7 +3565,7 @@ async function main() {
 
   async function resolveUserIdForChatKey(chatKey, fallbackUserId = null) {
     try {
-      const data = await argusHttp.automationAgentList(chatKey);
+      const data = await argusHttp.automationAgentList(chatKey, { identityOnly: true });
       const resolved = Number(data?.userId);
       if (Number.isFinite(resolved) && resolved > 0) return Math.trunc(resolved);
     } catch {
@@ -3614,7 +3674,7 @@ async function main() {
 
   async function safeEditMessageText(params) {
     try {
-      return await tg.editMessageText(params);
+      return await traceCallbackStage("edit", "editMessageText", () => tg.editMessageText(params));
     } catch (e) {
       log("editMessageText failed:", e instanceof Error ? e.message : String(e));
       return null;
@@ -3649,7 +3709,7 @@ async function main() {
     const params = { callback_query_id: id };
     if (isNonEmptyString(text)) params.text = text;
     try {
-      return await tg.answerCallbackQuery(params);
+      return await traceCallbackStage("ack", "answerCallbackQuery", () => tg.answerCallbackQuery(params));
     } catch {
       return null;
     }
@@ -4016,13 +4076,15 @@ async function main() {
     return { text: lines.join("\n"), replyMarkup };
   }
 
-  async function resolveGroupActorContext(chatKey, actorUserId) {
-    const route = await resolveRouteForChatKey(chatKey);
-    const resolvedActorUserId = await resolveUserIdForChatKey(privateChatKeyForUserId(actorUserId), actorUserId);
+  async function resolveGroupActorContext(chatKey, actorUserId, { includeChannel = true } = {}) {
+    const [route, resolvedActorUserId] = await Promise.all([
+      resolveRouteForChatKey(chatKey),
+      resolveUserIdForChatKey(privateChatKeyForUserId(actorUserId), actorUserId)
+    ]);
     const actorChatKey = privateChatKeyForUserId(resolvedActorUserId);
     const ownsCurrentAgent = isNonEmptyString(route?.agentId) && canActorManageAgent(route.agentId, resolvedActorUserId);
     let currentChannel = null;
-    if (ownsCurrentAgent && isNonEmptyString(actorChatKey)) {
+    if (includeChannel && ownsCurrentAgent && isNonEmptyString(actorChatKey)) {
       try {
         const channelState = await resolveChannelStateForChatKey(actorChatKey);
         currentChannel = channelState?.currentChannel || null;
@@ -4039,6 +4101,8 @@ async function main() {
       route
     };
   }
+
+  const resolveGroupNodeActorContext = (chatKey, actorUserId) => resolveGroupActorContext(chatKey, actorUserId, { includeChannel: false });
 
   async function renderPrivateMainMenu(chatKey, { notice, locale } = {}) {
     const S = uiStrings(locale);
@@ -4712,7 +4776,7 @@ async function main() {
     let handoff = null;
     if (handoffId) {
       try {
-        handoff = await resolveGroupNodeHandoff(callbacks.get(handoffId), telegramUserId, resolveGroupActorContext);
+        handoff = await resolveGroupNodeHandoff(callbacks.get(handoffId), telegramUserId, resolveGroupNodeActorContext);
       } catch {
         // Group may have been unbound, or the actor may no longer resolve.
       }
@@ -5014,7 +5078,7 @@ async function main() {
 
   async function renderGroupNodeMenu(chatKey, actorUserId, { locale } = {}) {
     try {
-      const ctx = await resolveGroupActorContext(chatKey, actorUserId);
+      const ctx = await resolveGroupNodeActorContext(chatKey, actorUserId);
       if (!ctx.ownsCurrentAgent) {
         return renderGroupOwnerOnlyView(chatKey, { error: uiStrings(locale).msg_group_owner_only, locale });
       }
@@ -5246,6 +5310,12 @@ async function main() {
     };
 
     const action = payload.action;
+    const timing = callbackTiming.getStore();
+    if (timing) timing.fields.action = action;
+    const editNodeMenu = async (render) => {
+      const view = await traceCallbackStage("render", "node_menu", render);
+      await editMenuMessage({ chatId, messageId, view });
+    };
     try {
       if (action === "close") {
         await answerOnce();
@@ -5700,36 +5770,33 @@ async function main() {
       }
 
       if (action === "p:node") {
-        await answerOnce();
-        await editMenuMessage({ chatId, messageId, view: await renderNodeOverview(chatKey, { locale }) });
+        void answerOnce();
+        await editNodeMenu(() => renderNodeOverview(chatKey, { locale }));
         return;
       }
 
       if (action === "p:node_connect") {
-        await answerOnce();
-        const view = await renderPrivateNodeConnection(chatKey, actorUserId, {
+        void answerOnce();
+        await editNodeMenu(() => renderPrivateNodeConnection(chatKey, actorUserId, {
           locale, mode: payload.mode, handoffId: payload.handoffId
-        });
-        await editMenuMessage({ chatId, messageId, view });
+        }));
         return;
       }
 
       if (action === "p:node_manage") {
-        await answerOnce();
-        const view = await renderPrivateNodeManage(chatKey, { locale, page: payload.page });
-        await editMenuMessage({ chatId, messageId, view });
+        void answerOnce();
+        await editNodeMenu(() => renderPrivateNodeManage(chatKey, { locale, page: payload.page }));
         return;
       }
 
       if (action === "p:node_local") {
-        await answerOnce();
-        const view = renderPrivateNodeLocalCommands(chatKey, { locale, page: payload.page });
-        await editMenuMessage({ chatId, messageId, view });
+        void answerOnce();
+        await editNodeMenu(() => renderPrivateNodeLocalCommands(chatKey, { locale, page: payload.page }));
         return;
       }
 
       if (action === "p:node_pause" || action === "p:node_resume") {
-        await answerOnce();
+        void answerOnce();
         const { nodeId, page } = payload;
         let error;
         let notice;
@@ -5743,8 +5810,7 @@ async function main() {
         } catch (e) {
           error = formatGatewayErrorForUser(e, { locale });
         }
-        const view = await renderPrivateNodeManage(chatKey, { page, notice, error, locale });
-        await editMenuMessage({ chatId, messageId, view });
+        await editNodeMenu(() => renderPrivateNodeManage(chatKey, { page, notice, error, locale }));
         return;
       }
 
@@ -6198,9 +6264,8 @@ async function main() {
       }
 
       if (action === "g:node" && isGroupChatType(chatType)) {
-        await answerOnce();
-        const view = await renderGroupNodeMenu(chatKey, actorUserId, { locale });
-        await editMenuMessage({ chatId, messageId, view });
+        void answerOnce();
+        await editNodeMenu(() => renderGroupNodeMenu(chatKey, actorUserId, { locale }));
         return;
       }
 
@@ -6351,9 +6416,7 @@ async function main() {
 
       const callbackQuery = upd?.callback_query;
       if (callbackQuery && typeof callbackQuery === "object") {
-        queue.enqueue(async () => {
-          await handleCallbackQuery(callbackQuery);
-        });
+        enqueueTelegramCallback(queue, { callbackQuery, updateId }, handleCallbackQuery);
         continue;
       }
 
@@ -6384,7 +6447,7 @@ async function main() {
       const replyAttachments = extractTelegramAttachmentsFromMessage(message?.reply_to_message).map((attachment) => ({ ...attachment, source: "reply" }));
       const replyText = replyTextRaw || (replyAttachments.length > 0 ? attachmentPlaceholder(replyAttachments) : null);
 
-      enqueueTelegramMessage(queue, { typing, message, botUsername, settings: state.getChatSettings(chatKey), updateId }, async (trace) => {
+      enqueueTelegramMessage(queue, { typing, message, botUsername, settings: state.getChatSettings(chatKey), updateId }, async (trace, traceId) => {
         const S = uiStrings(locale);
         syncTelegramProfile(message?.from);
         const actorUserId = Number.isFinite(message?.from?.id) ? Math.trunc(message.from.id) : null;
@@ -7031,6 +7094,7 @@ async function main() {
               text: hasUserText ? userText : "",
               threadId,
               target: enqueueTarget,
+              traceId,
               source: telegramSourceFromMessage(message, chatKey),
               telegramAttachments: [...replyAttachments, ...messageAttachments],
             }));
@@ -7047,7 +7111,7 @@ async function main() {
           }
 
           if (chatSettings.sendTyping && res?.queued === true) typing.start(chatKey, typingTarget);
-          logEvent("INFO", "tg.message.accepted", { update_id: updateId, session_id: sessionId, thread_id: res?.threadId, turn_id: res?.turnId, queued: res?.queued === true, started: res?.started === true });
+          logEvent("INFO", "tg.message.accepted", { update_id: updateId, trace_id: traceId, session_id: sessionId, thread_id: res?.threadId, turn_id: res?.turnId, queued: res?.queued === true, started: res?.started === true });
 
           const effectiveThreadId = isNonEmptyString(res?.threadId) ? res.threadId : threadId;
           if (!useSharedMainThread && isNonEmptyString(effectiveThreadId)) {

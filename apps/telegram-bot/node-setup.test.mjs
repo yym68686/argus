@@ -8,6 +8,7 @@ import { buildNodeInstallAndConnectCommand } from "./index.mjs";
 
 const trickyToken = "token ' with $dollar $(touch INJECTED) `tick` ; & end";
 const wsUrl = `wss://example.com/nodes/ws?token=${encodeURIComponent(trickyToken)}`;
+const publicBaseUrl = "https://argus.example.com";
 
 for (const failure of [false, true]) {
   test(`POSIX install-and-connect ${failure ? "stops after download failure" : "uses the fresh install and preserves literal arguments"}`, () => {
@@ -20,7 +21,7 @@ for (const failure of [false, true]) {
       writeFileSync(script, installer);
       writeFileSync(join(dir, "curl"), failure ? "#!/bin/sh\nexit 22\n" : "#!/bin/sh\ncat \"$ARGUS_TEST_INSTALLER\"\n", { mode: 0o755 });
       const output = join(dir, "args");
-      const result = spawnSync("bash", ["-c", buildNodeInstallAndConnectCommand(wsUrl)], {
+      const result = spawnSync("bash", ["-c", buildNodeInstallAndConnectCommand(wsUrl, publicBaseUrl)], {
         cwd: dir, encoding: "utf8",
         env: { ...process.env, PATH: `${dir}:/usr/bin:/bin`, ARGUS_BIN_DIR: binDir, ARGUS_TEST_OUTPUT: output, ARGUS_TEST_INSTALLER: script }
       });
@@ -40,7 +41,7 @@ for (const failure of [false, "download", "health"]) {
     try {
       const output = join(dir, "args.json");
       const harness = join(dir, "harness.ps1");
-      const command = buildNodeInstallAndConnectCommand(wsUrl, "windows");
+      const command = buildNodeInstallAndConnectCommand(wsUrl, publicBaseUrl, "windows");
       // No network or real installation: execute the real installer with an
       // in-memory drive and mock native binary, retaining its control flow.
       writeFileSync(harness, `
@@ -57,7 +58,8 @@ function Invoke-WebRequest { param($Uri, $OutFile, [switch]$UseBasicParsing)
 function Test-ArgusHealth { $global:LASTEXITCODE = [int]$env:ARGUS_TEST_EXIT }
 $healthPath = Join-Path $env:ARGUS_BIN_DIR 'argus.exe'
 Set-Alias -Name $healthPath -Value Test-ArgusHealth
-function argus { ConvertTo-Json -InputObject @($args) -Compress | Set-Content -LiteralPath $env:ARGUS_TEST_OUTPUT }
+function Connect-ArgusFixture { ConvertTo-Json -InputObject @($args) -Compress | Set-Content -LiteralPath $env:ARGUS_TEST_OUTPUT }
+Set-Alias -Name "$HOME/.argus/bin/argus.exe" -Value Connect-ArgusFixture
 ${command}
 `);
       const result = spawnSync(pwsh, ["-NoProfile", "-NonInteractive", "-File", harness], {
@@ -74,8 +76,8 @@ ${command}
 
 test("install-and-connect preserves custom URL paths and rejects empty URLs", () => {
   const custom = "wss://example.com/custom/ws?token=abc&session=123";
-  assert.match(buildNodeInstallAndConnectCommand(custom), /--url/);
-  assert.ok(buildNodeInstallAndConnectCommand(custom, "windows").includes(`'${custom}'`));
-  assert.equal(buildNodeInstallAndConnectCommand(""), null);
-  assert.equal(buildNodeInstallAndConnectCommand("", "windows"), null);
+  assert.match(buildNodeInstallAndConnectCommand(custom, publicBaseUrl), /--url/);
+  assert.ok(buildNodeInstallAndConnectCommand(custom, publicBaseUrl, "windows").includes(`'${custom}'`));
+  assert.equal(buildNodeInstallAndConnectCommand("", publicBaseUrl), null);
+  assert.equal(buildNodeInstallAndConnectCommand("", publicBaseUrl, "windows"), null);
 });

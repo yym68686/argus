@@ -30,6 +30,28 @@ class InMemoryStateStore:
 
 
 class GatewayProxyRouteTests(unittest.IsolatedAsyncioTestCase):
+    async def test_agent_identity_only_reuses_access_checks_without_model_or_channel_lookup(self):
+        request = mock.Mock(json=mock.AsyncMock(return_value={"chatKey": "22", "identityOnly": True}))
+        automation = mock.Mock()
+        automation.resolve_owner_user_id_for_private_chat_key.return_value = 44
+        automation.can_user_access_agent_id.return_value = True
+        with (
+            mock.patch.object(argus_app, "_http_require_token") as require_token,
+            mock.patch.object(argus_app, "_get_automation_or_500", return_value=automation),
+            mock.patch.object(argus_app, "_automation_model_payload") as model_payload,
+        ):
+            result = await argus_app.automation_agent_list(request)
+            self.assertEqual(result, {"ok": True, "userId": 44})
+            require_token.assert_called_once_with(request)
+            automation.can_user_access_agent_id.assert_called_once_with(user_id=44, agent_id="u44-main")
+            automation.list_channels_for_user.assert_not_called()
+            automation.list_agents_for_user.assert_not_called()
+            model_payload.assert_not_called()
+            automation.can_user_access_agent_id.return_value = False
+            with self.assertRaises(argus_app.HTTPException) as caught:
+                await argus_app.automation_agent_list(request)
+            self.assertEqual(caught.exception.status_code, 400)
+
     def make_request(self, path: str, method: str = "GET"):
         return argus_app.Request(
             {

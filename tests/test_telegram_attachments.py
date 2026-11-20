@@ -167,5 +167,53 @@ class AttachmentStagingTests(unittest.IsolatedAsyncioTestCase):
         self.manager._rpc.assert_not_awaited()
 
 
+class PendingAttachmentLatencyTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.db = pathlib.Path(self.tmp.name) / "state.sqlite3"
+        self.store = gateway.AutomationStateStore(self.db)
+        self.manager = gateway.AutomationManager(state_store=self.store, home_host_path=None, workspace_host_path=None)
+
+    async def consume(self):
+        return await self.manager._consume_pending_telegram_attachments(session_id="session", chat_key="chat")
+
+    async def test_absent_attachments_neither_wait_for_lock_nor_write(self):
+        self.store.state.sessions["session"] = gateway.PersistedSessionAutomation()
+        backend = self.store._backend
+        with mock.patch.object(backend, "_write_state_sync") as write:
+            async with backend._lock:
+                self.assertEqual(await asyncio.wait_for(self.consume(), timeout=0.5), [])
+            write.assert_not_called()
+
+    async def test_concurrent_consumers_write_once_and_leave_other_chat_untouched(self):
+        attachment = gateway.PersistedStagedAttachment(path="inbox/fixture.txt")
+        await self.manager._append_pending_telegram_attachments(session_id="session", chat_key="chat", attachments=[attachment])
+        await self.manager._append_pending_telegram_attachments(session_id="session", chat_key="other", attachments=[attachment])
+        backend = self.store._backend
+        with mock.patch.object(backend, "_write_state_sync", wraps=backend._write_state_sync) as write:
+            async with backend._lock:
+                tasks = [asyncio.create_task(self.consume()) for _ in range(2)]
+                await asyncio.sleep(0)
+                self.assertFalse(any(task.done() for task in tasks))
+            results = await asyncio.gather(*tasks)
+            self.assertEqual(sorted(map(len, results)), [0, 1])
+            self.assertEqual(next(result for result in results if result)[0]["path"], "inbox/fixture.txt")
+            write.assert_called_once()
+        reloaded = await gateway.AutomationStateStore(self.db).load()
+        self.assertEqual(list(reloaded.sessions["session"].pending_telegram_attachments_by_chat), ["other"])
+
+    async def test_postgres_skips_only_explicit_opt_in_noop(self):
+        backend = gateway._PostgresAutomationStateStore(
+            "postgresql://localhost/fixture", sqlite_state_path=None, legacy_state_path=None,
+        )
+        with mock.patch.object(backend, "_write_state_sync") as write:
+            await backend.update(lambda _: False, skip_unchanged=True)
+            write.assert_not_called()
+            await backend.update(lambda _: False)
+            await backend.update(lambda _: True, skip_unchanged=True)
+            self.assertEqual(write.call_count, 2)
+
+
 if __name__ == "__main__":
     unittest.main()

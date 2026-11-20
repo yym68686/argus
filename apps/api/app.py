@@ -21,7 +21,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from collections import deque
-from contextlib import contextmanager
+from contextlib import asynccontextmanager, contextmanager, nullcontext
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from pathlib import Path
@@ -72,6 +72,20 @@ def _latency_span(stage: str, **fields: Any):
             # RPC parameters, or response bodies. Keep these facts visible even
             # when the general application logger inherits WARNING.
             latency_log.info(json.dumps({"ts": datetime.now(timezone.utc).isoformat(), "ev": "gw.latency", "stage": stage, "outcome": outcome, "duration_ms": duration_ms, **fields}, separators=(",", ":")))
+
+
+def _optional_latency_span(stage: str, fields: Optional[dict[str, Any]]):
+    return _latency_span(stage, **fields) if fields is not None else nullcontext()
+
+
+@asynccontextmanager
+async def _automation_state_write_lock(lock: asyncio.Lock, fields: Optional[dict[str, Any]]):
+    with _optional_latency_span("automation_state_lock", fields):
+        await lock.acquire()
+    try:
+        yield
+    finally:
+        lock.release()
 
 DEFAULT_ARGUS_VERSION = "0.0.0"
 
@@ -5661,11 +5675,14 @@ class _SQLiteAutomationStateStore:
             except Exception:
                 log.exception("Failed to save automation state to %s", str(self._path))
 
-    async def update(self, fn) -> PersistedGatewayAutomationState:
-        async with self._lock:
-            fn(self._state)
+    async def update(self, fn, *, skip_unchanged: bool = False, latency_fields: Optional[dict[str, Any]] = None) -> PersistedGatewayAutomationState:
+        async with _automation_state_write_lock(self._lock, latency_fields):
+            changed = fn(self._state)
+            if skip_unchanged and changed is False:
+                return self._state
             try:
-                await asyncio.to_thread(self._write_state_sync, self._state)
+                with _optional_latency_span("automation_state_write", latency_fields):
+                    await asyncio.to_thread(self._write_state_sync, self._state)
             except Exception:
                 log.exception("Failed to save automation state to %s", str(self._path))
             return self._state
@@ -7054,10 +7071,12 @@ class _PostgresAutomationStateStore:
         async with self._lock:
             await asyncio.to_thread(self._write_state_sync, self._state)
 
-    async def update(self, fn) -> PersistedGatewayAutomationState:
-        async with self._lock:
-            fn(self._state)
-            await asyncio.to_thread(self._write_state_sync, self._state)
+    async def update(self, fn, *, skip_unchanged: bool = False, latency_fields: Optional[dict[str, Any]] = None) -> PersistedGatewayAutomationState:
+        async with _automation_state_write_lock(self._lock, latency_fields):
+            changed = fn(self._state)
+            if not skip_unchanged or changed is not False:
+                with _optional_latency_span("automation_state_write", latency_fields):
+                    await asyncio.to_thread(self._write_state_sync, self._state)
             return self._state
 
     def _load_sync(self) -> tuple[PersistedGatewayAutomationState, bool, Optional[Path]]:
@@ -7880,9 +7899,9 @@ class AutomationStateStore:
             )
             await self._backend.save()
 
-    async def update(self, fn) -> PersistedGatewayAutomationState:
+    async def update(self, fn, *, skip_unchanged: bool = False, latency_fields: Optional[dict[str, Any]] = None) -> PersistedGatewayAutomationState:
         try:
-            return await self._backend.update(fn)
+            return await self._backend.update(fn, skip_unchanged=skip_unchanged, latency_fields=latency_fields)
         except Exception:
             if not isinstance(self._backend, _PostgresAutomationStateStore):
                 raise
@@ -7891,7 +7910,8 @@ class AutomationStateStore:
                 state=getattr(self._backend, "state", PersistedGatewayAutomationState()),
                 loaded_from_disk_ok=getattr(self._backend, "loaded_from_disk_ok", False),
             )
-            await self._backend.save()
+            with _optional_latency_span("automation_state_fallback_write", latency_fields):
+                await self._backend.save()
             return self._backend.state
 
 
@@ -12887,26 +12907,35 @@ class AutomationManager:
         await self._store.update(_append)
         return merged_result
 
-    async def _consume_pending_telegram_attachments(self, *, session_id: str, chat_key: str) -> list[dict[str, Any]]:
+    async def _consume_pending_telegram_attachments(
+        self, *, session_id: str, chat_key: str, latency_fields: Optional[dict[str, Any]] = None,
+    ) -> list[dict[str, Any]]:
         sid = session_id.strip() if isinstance(session_id, str) else ""
         ck = chat_key.strip() if isinstance(chat_key, str) else ""
         if not sid or not ck:
             return []
 
+        # The in-memory state is mutated on this event loop. There is no
+        # suspension between this read and returning on the empty path.
+        # A real removal is rechecked under the same lock used by staging.
+        sess = self._store.state.sessions.get(sid)
+        if sess is None or ck not in sess.pending_telegram_attachments_by_chat:
+            return []
+
         out: list[dict[str, Any]] = []
 
-        def _pop(st: PersistedGatewayAutomationState) -> None:
+        def _pop(st: PersistedGatewayAutomationState) -> bool:
             nonlocal out
             sess = st.sessions.get(sid)
-            if sess is None:
-                return
-            raw_items = sess.pending_telegram_attachments_by_chat.pop(ck, None)
-            if not isinstance(raw_items, list) or not raw_items:
-                return
-            out = self._merge_staged_attachment_dicts(raw_items)
-            st.version = max(int(getattr(st, "version", 1) or 1), AUTOMATION_STATE_VERSION)
+            if sess is None or ck not in sess.pending_telegram_attachments_by_chat:
+                return False
+            raw_items = sess.pending_telegram_attachments_by_chat.pop(ck)
+            if isinstance(raw_items, list) and raw_items:
+                out = self._merge_staged_attachment_dicts(raw_items)
+                st.version = max(int(getattr(st, "version", 1) or 1), AUTOMATION_STATE_VERSION)
+            return True
 
-        await self._store.update(_pop)
+        await self._store.update(_pop, skip_unchanged=True, latency_fields=latency_fields)
         return out
 
     async def _ensure_workspace_files_at(self, root: Path) -> None:
@@ -15281,6 +15310,7 @@ class AutomationManager:
         source_last_name: Optional[str] = None,
         telegram_attachments: Optional[list[dict[str, Any]]] = None,
         defer_if_no_text: bool = False,
+        trace_id: Optional[str] = None,
     ) -> dict[str, Any]:
         if telegram_attachments is not None and not isinstance(telegram_attachments, list):
             telegram_attachments = None
@@ -15299,14 +15329,20 @@ class AutomationManager:
         source_first_name_norm = _normalize_telegram_profile_text(source_first_name)
         source_last_name_norm = _normalize_telegram_profile_text(source_last_name)
         is_telegram_source = _is_telegram_source_channel(source_channel_norm)
+        trace_fields = None
+        if is_telegram_source:
+            trace_fields = {"operation": "tg_enqueue"}
+            if isinstance(trace_id, str) and re.fullmatch(r"[a-f0-9]{32}", trace_id):
+                trace_fields["trace_id"] = trace_id
 
         local_attachments: list[dict[str, Any]] = []
         if telegram_attachments and is_telegram_source:
-            staged = await self._stage_telegram_attachments(
-                session_id=session_id,
-                source_chat_key=source_chat_key_norm,
-                telegram_attachments=telegram_attachments,
-            )
+            with _optional_latency_span("tg_enqueue_stage_attachments", trace_fields):
+                staged = await self._stage_telegram_attachments(
+                    session_id=session_id,
+                    source_chat_key=source_chat_key_norm,
+                    telegram_attachments=telegram_attachments,
+                )
             local_attachments = self._merge_staged_attachment_dicts(staged)
             if not local_attachments:
                 raise TelegramAttachmentError("get_file", "invalid")
@@ -15336,17 +15372,21 @@ class AutomationManager:
 
         pending_attachments: list[dict[str, Any]] = []
         if is_telegram_source and source_chat_key_norm:
-            pending_attachments = await self._consume_pending_telegram_attachments(
-                session_id=session_id,
-                chat_key=source_chat_key_norm,
-            )
+            with _optional_latency_span("tg_enqueue_pending_attachments", trace_fields):
+                pending_attachments = await self._consume_pending_telegram_attachments(
+                    session_id=session_id,
+                    chat_key=source_chat_key_norm,
+                    latency_fields=trace_fields,
+                )
         local_attachments = self._merge_staged_attachment_dicts([*pending_attachments, *local_attachments])
 
-        live, _ = await _ensure_live_session(session_id, allow_create=True)
-        await self._ensure_initialized(live)
+        with _optional_latency_span("tg_enqueue_runtime_ready", trace_fields):
+            live, _ = await _ensure_live_session(session_id, allow_create=True)
+            await self._ensure_initialized(live)
 
         if target == "main" or not (isinstance(thread_id, str) and thread_id.strip()):
-            thread_id = await self.ensure_main_thread(session_id)
+            with _optional_latency_span("tg_enqueue_main_thread", trace_fields):
+                thread_id = await self.ensure_main_thread(session_id)
         else:
             thread_id = thread_id.strip()
 
@@ -15418,8 +15458,9 @@ class AutomationManager:
             self._mark_lane_busy(lane)
 
             try:
-                await self._ensure_thread_loaded_or_resumed(live, thread_id)
-                with _latency_span("input_assembly", session_id=session_id, thread_id=thread_id):
+                with _optional_latency_span("tg_enqueue_thread_ready", trace_fields):
+                    await self._ensure_thread_loaded_or_resumed(live, thread_id)
+                with _latency_span("input_assembly", session_id=session_id, thread_id=thread_id, **(trace_fields or {})):
                     assembled = await self._assemble_turn_input(
                         session_id,
                         thread_id,
@@ -15437,11 +15478,12 @@ class AutomationManager:
                 input_items: list[dict[str, Any]] = [{"type": "text", "text": assembled}]
                 input_items.extend(self._attachment_input_items(local_attachments))
 
-                resp = await self._rpc(
-                    live,
-                    "turn/start",
-                    self._turn_start_params(session_id=session_id, thread_id=thread_id, input_items=input_items, live=live),
-                )
+                with _optional_latency_span("tg_enqueue_turn_start", trace_fields):
+                    resp = await self._rpc(
+                        live,
+                        "turn/start",
+                        self._turn_start_params(session_id=session_id, thread_id=thread_id, input_items=input_items, live=live),
+                    )
                 turn_id = None
                 if isinstance(resp, dict):
                     turn = resp.get("turn")
@@ -15459,12 +15501,13 @@ class AutomationManager:
                         source_channel=source_channel_norm,
                         source_chat_key=source_chat_key_norm,
                     )
-                await self._touch_last_active_target(
-                    session_id=session_id,
-                    thread_id=thread_id,
-                    source_channel=source_channel_norm,
-                    source_chat_key=source_chat_key_norm,
-                )
+                with _optional_latency_span("tg_enqueue_touch_last_active", trace_fields):
+                    await self._touch_last_active_target(
+                        session_id=session_id,
+                        thread_id=thread_id,
+                        source_channel=source_channel_norm,
+                        source_chat_key=source_chat_key_norm,
+                    )
                 return {
                     "ok": True,
                     "threadId": thread_id,
@@ -25581,6 +25624,9 @@ async def automation_agent_list(request: Request):
     if not automation.can_user_access_agent_id(user_id=user_id, agent_id=main_id):
         raise HTTPException(status_code=400, detail="Not initialized (run /start)")
 
+    if body.get("identityOnly") is True:
+        return {"ok": True, "userId": user_id}
+
     st = automation._store.state
     bound = st.chat_bindings.get(chat_key) if isinstance(getattr(st, "chat_bindings", None), dict) else None
     current_agent_id = bound if isinstance(bound, str) and bound.strip() else None
@@ -28474,6 +28520,7 @@ async def ws_proxy(ws: WebSocket):
                                 source_last_name=source_last_name,
                                 telegram_attachments=telegram_attachments,
                                 defer_if_no_text=defer_if_no_text,
+                                trace_id=params.get("traceId"),
                             )
                             if has_id:
                                 await ws.send_text(json.dumps({"id": req_id, "result": res}))
