@@ -10,8 +10,7 @@ import WebSocket from "ws";
 const DEFAULT_BOT_VERSION = "0.0.0";
 const TELEGRAM_WEBHOOK_PATH = "/telegram/webhook";
 const TELEGRAM_WEBHOOK_BODY_LIMIT_BYTES = 1024 * 1024;
-const ARGUS_CLI_INSTALL_SCRIPT_URL = "https://raw.githubusercontent.com/yym68686/argus/main/scripts/install-argus.sh";
-const ARGUS_CLI_INSTALL_POWERSHELL_URL = "https://raw.githubusercontent.com/yym68686/argus/main/scripts/install-argus.ps1";
+const GROUP_NODE_START_PREFIX = "ng_";
 const ARGUS_INITIALIZE_TIMEOUT_MS = 30_000;
 const ARGUS_PROVISION_TIMEOUT_MS = 240_000;
 
@@ -705,9 +704,24 @@ function powershellQuote(value) {
   return `'${String(value ?? "").replace(/['\u2018\u2019]/g, "$&$&")}'`;
 }
 
-function buildArgusCliInstallCommand(platform = "posix") {
-  if (platform === "windows") return `irm ${powershellQuote(ARGUS_CLI_INSTALL_POWERSHELL_URL)} | iex`;
-  return `curl -fsSL ${shellDoubleQuote(ARGUS_CLI_INSTALL_SCRIPT_URL)} | bash`;
+function publicHttpOrigin(value) {
+  try {
+    const url = new URL(stripOuterQuotes(value));
+    if (["http:", "https:"].includes(url.protocol) && !url.username && !url.password &&
+        url.pathname === "/" && !url.search && !url.hash) return url.origin;
+  } catch {
+    // Misconfigured or missing public origin.
+  }
+  return null;
+}
+
+function buildArgusCliInstallCommand(publicBaseUrl, platform = "posix") {
+  const origin = publicHttpOrigin(publicBaseUrl);
+  if (!origin) return null;
+  if (platform === "windows") {
+    return `& ([scriptblock]::Create((irm ${powershellQuote(`${origin}/argus/install.ps1`)})))`;
+  }
+  return `curl -fsSL ${shellDoubleQuote(`${origin}/argus/install.sh`)} | bash`;
 }
 
 function shellWord(value) {
@@ -747,16 +761,16 @@ function buildNodeConnectionCommand(wsUrl, platform = "posix") {
   return `argus --url ${(platform === "windows" ? powershellQuote : shellDoubleQuote)(raw)}`;
 }
 
-function buildNodeInstallAndConnectCommand(wsUrl, platform = "posix") {
+function buildNodeInstallAndConnectCommand(wsUrl, publicBaseUrl, platform = "posix") {
   const command = buildNodeConnectionCommand(wsUrl, platform);
-  if (!command) return null;
+  const install = buildArgusCliInstallCommand(publicBaseUrl, platform);
+  if (!command || !install) return null;
   if (platform === "windows") {
-    // The installer updates this PowerShell process's PATH before returning.
-    return `& { $ErrorActionPreference = 'Stop'; ${buildArgusCliInstallCommand(platform)}; ${command} }`;
+    // Use the exact artifact we just installed, even if PATH contains an older Argus.
+    return `& { $ErrorActionPreference='Stop'; ${install}; & "$HOME/.argus/bin/argus.exe"${command.slice("argus".length)} }`;
   }
   // A failed download must not look like a successful empty Bash script. Use
   // the installed path so a fresh shell needs no PATH reload or system link.
-  const install = buildArgusCliInstallCommand().replace(/'/g, "'\\''");
   return `bash -o pipefail -c '${install}' && "\${ARGUS_BIN_DIR:-$HOME/.argus/bin}/argus"${command.slice("argus".length)}`;
 }
 
@@ -799,6 +813,7 @@ function deriveWsUrlWithToken(wsUrl, token) {
   if (!isNonEmptyString(raw)) return null;
   try {
     const u = new URL(raw);
+    if (u.username || u.password || u.hash) return null;
     if (u.protocol === "http:" || u.protocol === "https:") {
       return deriveWsUrlFromBase(raw, u.pathname || "/nodes/ws", token);
     }
@@ -813,13 +828,19 @@ function deriveWsUrlWithToken(wsUrl, token) {
   }
 }
 
-function derivePublicNodeWsUrl({ publicNodeWsUrl, publicBaseUrl, fallbackBaseUrl, pathName, token }) {
+function derivePublicNodeWsUrl({ publicNodeWsUrl, publicBaseUrl, pathName, token }) {
   const direct = stripOuterQuotes(publicNodeWsUrl);
   if (isNonEmptyString(direct)) {
-    return deriveWsUrlWithToken(direct, token) || direct;
+    return deriveWsUrlWithToken(direct, token);
   }
-  const base = stripOuterQuotes(publicBaseUrl) || fallbackBaseUrl;
-  return deriveWsUrlFromBase(base, pathName, token);
+  return deriveWsUrlFromBase(publicHttpOrigin(publicBaseUrl), pathName, token);
+}
+
+async function resolveGroupNodeHandoff(handoff, telegramUserId, resolveContext) {
+  if (handoff?.action !== "node:dm" || !Number.isSafeInteger(telegramUserId) ||
+      telegramUserId <= 0 || handoff.telegramUserId !== telegramUserId) return null;
+  const ctx = await resolveContext(handoff.chatKey, telegramUserId);
+  return ctx?.ownsCurrentAgent && ctx.route?.sessionId === handoff.sessionId ? handoff : null;
 }
 
 function redactUrlSecrets(rawUrl) {
@@ -2117,14 +2138,19 @@ function normalizeAvailableModels(models, currentModel) {
     btn_node_token: "Node Management",
     btn_pause_node: "Pause",
     btn_resume_node: "Resume",
-    btn_show_node_token: "Show Token",
+    btn_node_connect: "Connect a Node",
+    btn_node_manage: "Manage Nodes",
+    btn_node_dm: "Continue in Private Chat",
+    btn_node_posix: "macOS / Linux",
+    btn_node_windows: "Windows (PowerShell)",
+    btn_node_installed: "Argus Already Installed",
+    btn_node_advanced: "Advanced Connection",
+    btn_node_hide: "Hide Command",
+    btn_node_copy_url: "Copy Connection URL",
     btn_copy_node_command: "Copy Command",
     btn_copy_node_logs: "Copy Logs",
     btn_copy_node_reconnect: "Copy Reconnect",
     btn_copy_node_disconnect: "Copy Disconnect",
-    btn_copy_argus_install: "Copy Install",
-    btn_copy_node_setup_posix: "Copy macOS / Linux Setup",
-    btn_copy_node_setup_windows: "Copy Windows Setup",
     btn_copy_account_username: "Copy Login",
     btn_copy_account_password: "Copy Password",
     btn_status: "Status",
@@ -2213,27 +2239,32 @@ function normalizeAvailableModels(models, currentModel) {
 
     delete_warning: "This will remove the agent from the list and delete its runtime container. The workspace will be archived.",
 
-    node_warning: "WARNING: token is sensitive; rotate if leaked.",
+    node_warning: "Contains a private connection credential. Do not share the command, URL or screenshots.",
     node_pause_hint: "Paused nodes stay connected, but new non-process commands are blocked.",
-    node_default_note: "The default node stays connected and cannot be paused.",
-    node_connected_label: "Connected nodes",
+    node_connected_count: "Connected nodes: {count}",
+    node_command_count: "Supported commands: {count}",
     node_none_connected: "No nodes are currently connected for this session.",
-    node_token_label: "Connection token",
     node_command_label: "Start command (background)",
     node_logs_label: "Logs command (blocks)",
     node_reconnect_label: "Reconnect command",
     node_disconnect_label: "Disconnect command",
-    node_command_hint: "The start command returns immediately. Use the logs command when you want to keep a terminal open and watch connection output.",
     node_setup_posix_label: "macOS / Linux — Install and connect",
     node_setup_windows_label: "Windows PowerShell — Install and connect",
-    node_setup_hint: "Copy the entire code block for your system, then paste it into Terminal or Windows PowerShell (not Command Prompt). It installs argus and starts the connection in the background.",
-    node_install_label: "Install argus CLI",
-    node_install_hint: "Run this once first if argus is not available. After install, run argus from any directory; no ./ prefix is needed.",
-    node_status_active: "active",
+    node_setup_choose: "Choose your operating system to get one command.",
+    node_setup_hint: "Copy the full block into Terminal or Windows PowerShell (not Command Prompt). Argus connects in the background.",
+    node_installed_hint: "Copy the command into a terminal with Argus already installed. It connects in the background.",
+    node_local_title: "Local Node Commands",
+    node_local_commands: "Run these on the machine where Argus is connected.",
+    node_group_dm_hint: "Connection commands are available only in private chat.",
+    node_group_connection: "Connecting to the node for the original group or topic.",
+    node_group_dm_missing: "The private-chat link is unavailable. Refresh the menu and try again.",
+    node_group_link_invalid: "This link expired or no longer points to a node you manage. Open a fresh link from the group menu.",
+    node_public_url_missing: "A public Argus URL is not configured. Ask the server administrator to check the public URL settings.",
+    node_token_unavailable: "The connection credential is unavailable. Try again or contact the server administrator.",
+    node_status_active: "online",
     node_status_paused: "paused",
-    node_status_default: "default",
+    node_status_default: "Default node",
     node_status_not_connected: "not connected",
-    node_press_reveal: "Press Show Token to fetch the current session token.",
 
     group_bind_first: "Bind this group to an agent first. All topics will use it by default.",
 
@@ -2323,14 +2354,19 @@ function normalizeAvailableModels(models, currentModel) {
     btn_node_token: "节点管理",
     btn_pause_node: "暂停",
     btn_resume_node: "恢复",
-    btn_show_node_token: "显示 Token",
+    btn_node_connect: "连接新节点",
+    btn_node_manage: "管理节点",
+    btn_node_dm: "去私聊连接",
+    btn_node_posix: "macOS / Linux",
+    btn_node_windows: "Windows（PowerShell）",
+    btn_node_installed: "已安装 Argus",
+    btn_node_advanced: "高级连接",
+    btn_node_hide: "隐藏命令",
+    btn_node_copy_url: "复制连接地址",
     btn_copy_node_command: "复制命令",
     btn_copy_node_logs: "复制日志命令",
     btn_copy_node_reconnect: "复制重连命令",
     btn_copy_node_disconnect: "复制断开命令",
-    btn_copy_argus_install: "复制安装命令",
-    btn_copy_node_setup_posix: "复制 macOS / Linux 一键连接",
-    btn_copy_node_setup_windows: "复制 Windows 一键连接",
     btn_copy_account_username: "复制登录名",
     btn_copy_account_password: "复制密码",
     btn_status: "状态",
@@ -2419,27 +2455,32 @@ function normalizeAvailableModels(models, currentModel) {
 
     delete_warning: "将从列表中移除该 agent，并删除其 runtime 容器；workspace 会被归档。",
 
-    node_warning: "注意：token 很敏感；泄露请立刻轮换。",
+    node_warning: "此处包含连接凭据，请勿分享命令、链接或截图。",
     node_pause_hint: "暂停后节点仍保持连接，但新的非 process.* 命令会被阻止。",
-    node_default_note: "默认节点会保持连接，且不可暂停。",
-    node_connected_label: "已连接节点",
+    node_connected_count: "已连接节点：{count}",
+    node_command_count: "支持命令：{count} 条",
     node_none_connected: "当前 session 下还没有已连接节点。",
-    node_token_label: "连接 Token",
     node_command_label: "启动命令（后台）",
     node_logs_label: "日志命令（阻塞）",
     node_reconnect_label: "重连命令",
     node_disconnect_label: "断开命令",
-    node_command_hint: "启动命令会立即返回；需要在终端里持续查看连接输出时，用日志命令。",
     node_setup_posix_label: "macOS / Linux：安装并连接",
     node_setup_windows_label: "Windows PowerShell：安装并连接",
-    node_setup_hint: "复制对应系统的完整代码块，粘贴到终端或 Windows PowerShell（非 CMD），即可安装 argus 并在后台连接。",
-    node_install_label: "安装 argus 命令行",
-    node_install_hint: "如果本机还没有 argus，先执行一次安装命令；安装后任意目录可直接运行 argus，不需要加 ./。",
-    node_status_active: "活跃",
+    node_setup_choose: "选择系统后即可复制一条连接命令。",
+    node_setup_hint: "复制完整代码块到终端或 Windows PowerShell（非 CMD），Argus 会在后台连接。",
+    node_installed_hint: "在已安装 Argus 的终端中粘贴命令，Argus 会在后台连接。",
+    node_local_title: "本机节点命令",
+    node_local_commands: "在运行 Argus 的机器上执行以下命令。",
+    node_group_dm_hint: "连接命令仅在私聊中提供。",
+    node_group_connection: "正在连接原群聊或话题绑定的节点。",
+    node_group_dm_missing: "暂时无法生成私聊链接，请刷新菜单后重试。",
+    node_group_link_invalid: "链接已失效，或原群聊不再绑定到你管理的节点。请从群菜单重新打开。",
+    node_public_url_missing: "未配置有效的 Argus 公网地址，请联系管理员检查公网地址配置。",
+    node_token_unavailable: "暂时无法获取连接凭据，请重试或联系管理员。",
+    node_status_active: "在线",
     node_status_paused: "已暂停",
-    node_status_default: "默认",
+    node_status_default: "默认节点",
     node_status_not_connected: "未连接",
-    node_press_reveal: "点击“显示 Token”获取当前 session 的 token。",
 
     group_bind_first: "请先把当前群聊绑定到某个 agent；绑定后所有 topic 默认共用它。",
 
@@ -3816,6 +3857,19 @@ async function main() {
     return labels.join(" • ");
   }
 
+  function nodePlatformLabel(value) {
+    if (!isNonEmptyString(value)) return null;
+    const platform = value.toLowerCase();
+    if (platform === "linux") return "Linux";
+    if (platform === "darwin") return "macOS";
+    if (platform === "windows") return "Windows";
+    return trimMenuLabel(value, 24);
+  }
+
+  function nodeVersionLabel(value) {
+    return isNonEmptyString(value) ? `v${trimMenuLabel(value.replace(/^v/i, ""), 24)}` : null;
+  }
+
   function trimMenuLabel(text, maxLen = 20) {
     const value = String(text || "").trim();
     if (value.length <= maxLen) return value;
@@ -3904,11 +3958,7 @@ async function main() {
     ["p:setting_toggle", "g:setting_toggle"],
     ["p:rename_cancel", "g:rename_cancel"],
     ["p:delete_cancel", "g:delete_cancel"],
-    ["p:delete_confirm", "g:delete_confirm"],
-    ["p:node", "g:node"],
-    ["p:node_reveal", "g:node_reveal"],
-    ["p:node_pause", "g:node_pause"],
-    ["p:node_resume", "g:node_resume"]
+    ["p:delete_confirm", "g:delete_confirm"]
   ]);
 
   function remapViewCallbacks(view, transformPayload) {
@@ -4554,136 +4604,168 @@ async function main() {
     return await renderChatSettingsMenu(chatKey, { ...opts, forGroup: true });
   }
 
-  async function renderPrivateNodeMenu(chatKey, { reveal = false, notice, error, locale } = {}) {
+  async function renderNodeOverview(chatKey, { locale, forGroup = false, dmUrl, expectedSessionId } = {}) {
     const S = uiStrings(locale);
-    const lines = [];
+    const lines = [`<b>${escapeHtml(S.title_node_token)}</b>`];
     const rows = [];
-    let nodeCommand = null;
-    let nodeSetupPosixCommand = null;
-    let nodeSetupWindowsCommand = null;
-    let nodeLogsCommand = null;
-    let nodeReconnectCommand = null;
-    let nodeDisconnectCommand = null;
-    lines.push(`<b>${escapeHtml(S.title_node_token)}</b>`);
-    if (isNonEmptyString(notice)) lines.push(`<i>${escapeHtml(notice)}</i>`);
-
     try {
       const res = await argusHttp.automationNodeList(chatKey);
-      const sid = isNonEmptyString(res?.sessionId) ? res.sessionId : null;
-      const defaultNodeId = isNonEmptyString(res?.defaultNodeId) ? res.defaultNodeId : null;
-      const defaultNodeConnected = Boolean(res?.defaultNodeConnected);
       const nodes = Array.isArray(res?.nodes) ? res.nodes : [];
+      const defaultNode = nodes.find((node) => node?.nodeId === res?.defaultNodeId);
+      const status = !res?.defaultNodeConnected ? S.node_status_not_connected
+        : defaultNode?.paused ? S.node_status_paused : S.node_status_active;
+      const summary = [S.node_status_default, status, nodePlatformLabel(defaultNode?.platform), nodeVersionLabel(defaultNode?.version)];
+      lines.push(escapeHtml(summary.filter(Boolean).join(" · ")));
+      lines.push(escapeHtml(formatTemplate(S.node_connected_count, { count: nodes.length })));
 
-      lines.push(`sessionId: ${htmlCode(sid || "(none)")}`);
-      lines.push(`${escapeHtml(S.label_current)} ${escapeHtml(S.label_node)}: ${htmlCode(defaultNodeId || "(none)")}`);
-      lines.push(`${escapeHtml(S.label_status)}: ${escapeHtml(defaultNodeConnected ? S.node_status_active : S.node_status_not_connected)}`);
-      lines.push(escapeHtml(S.node_default_note));
-      lines.push(escapeHtml(S.node_pause_hint));
-      lines.push("");
-      lines.push(`<b>${escapeHtml(S.node_connected_label)}</b>`);
-
-      if (nodes.length) {
-        for (const [index, node] of nodes.entries()) {
-          const extra = [];
-          if (isNonEmptyString(node?.platform)) extra.push(String(node.platform));
-          if (isNonEmptyString(node?.version)) extra.push(`v${node.version}`);
-          if (Array.isArray(node?.commands) && node.commands.length) extra.push(`${node.commands.length} cmds`);
-          lines.push(`${index + 1}. ${escapeHtml(nodeDisplayName(node))}`);
-          lines.push(`${escapeHtml(S.label_node)}: ${htmlCode(node?.nodeId || "(unknown)")}`);
-          lines.push(`${escapeHtml(S.label_status)}: ${escapeHtml(nodeStatusText(node, { locale }))}${extra.length ? ` • ${escapeHtml(extra.join(" • "))}` : ""}`);
+      if (forGroup) {
+        if (dmUrl && res?.sessionId === expectedSessionId) {
+          lines.push(escapeHtml(S.node_group_dm_hint));
+          rows.push([urlButton(S.btn_node_dm, dmUrl)]);
+        } else {
+          lines.push(escapeHtml(S.node_group_dm_missing));
         }
       } else {
-        lines.push(escapeHtml(S.node_none_connected));
-      }
-
-      for (const node of nodes) {
-        if (!node?.canPause || !isNonEmptyString(node?.nodeId)) continue;
-        const label = trimMenuLabel(nodeDisplayName(node));
         rows.push([
-          cbButton(
-            node?.paused ? `${S.btn_resume_node} · ${label}` : `${S.btn_pause_node} · ${label}`,
-            { action: node?.paused ? "p:node_resume" : "p:node_pause", chatKey, nodeId: node.nodeId, reveal }
-          )
+          cbButton(S.btn_node_connect, { action: "p:node_connect", chatKey }),
+          cbButton(S.btn_node_manage, { action: "p:node_manage", chatKey })
         ]);
-      }
-
-      if (reveal) {
-        lines.push("");
-        lines.push(`<b>${escapeHtml(S.node_token_label)}</b>`);
-        lines.push(escapeHtml(S.node_warning));
-        try {
-          const tokenRes = await argusHttp.automationNodeToken(chatKey);
-          const token = isNonEmptyString(tokenRes?.token) ? tokenRes.token : null;
-          const pathName = isNonEmptyString(tokenRes?.path) ? tokenRes.path : "/nodes/ws";
-          const wsUrl = derivePublicNodeWsUrl({
-            publicNodeWsUrl: publicNodeWsUrlRaw,
-            publicBaseUrl: publicBaseUrlRaw,
-            fallbackBaseUrl: gatewayHttpUrl,
-            pathName,
-            token
-          });
-          lines.push(`path: ${htmlCode(pathName)}`);
-          lines.push(`token:
-<pre><code>${escapeHtml(token || "(none)")}</code></pre>`);
-          if (wsUrl) {
-            lines.push(`wsUrl:
-<pre><code>${escapeHtml(wsUrl)}</code></pre>`);
-            const command = buildNodeConnectionCommand(wsUrl);
-            if (command) {
-              nodeCommand = command;
-              nodeLogsCommand = buildNodeLogsCommand();
-              nodeReconnectCommand = buildNodeReconnectCommand();
-              nodeDisconnectCommand = buildNodeDisconnectCommand();
-              nodeSetupPosixCommand = buildNodeInstallAndConnectCommand(wsUrl);
-              nodeSetupWindowsCommand = buildNodeInstallAndConnectCommand(wsUrl, "windows");
-              lines.push(escapeHtml(S.node_setup_hint));
-              lines.push(`${escapeHtml(S.node_setup_posix_label)}:
-<pre><code class="language-bash">${escapeHtml(nodeSetupPosixCommand)}</code></pre>`);
-              lines.push(`${escapeHtml(S.node_setup_windows_label)}:
-<pre><code class="language-powershell">${escapeHtml(nodeSetupWindowsCommand)}</code></pre>`);
-              lines.push(`${escapeHtml(S.node_command_label)}:
-<pre><code>${escapeHtml(command)}</code></pre>`);
-              lines.push(escapeHtml(S.node_command_hint));
-              lines.push(`${escapeHtml(S.node_logs_label)}:
-<pre><code>${escapeHtml(nodeLogsCommand)}</code></pre>`);
-              lines.push(`${escapeHtml(S.node_reconnect_label)}:
-<pre><code>${escapeHtml(nodeReconnectCommand)}</code></pre>`);
-              lines.push(`${escapeHtml(S.node_disconnect_label)}:
-<pre><code>${escapeHtml(nodeDisconnectCommand)}</code></pre>`);
-            }
-          }
-        } catch (e) {
-          lines.push(escapeHtml(formatGatewayErrorForUser(e, { locale })));
-        }
-      } else {
-        lines.push("");
-        lines.push(escapeHtml(S.node_press_reveal));
       }
     } catch (e) {
       lines.push(escapeHtml(formatGatewayErrorForUser(e, { locale })));
     }
+    rows.push([
+      cbButton(S.btn_refresh, { action: forGroup ? "g:node" : "p:node", chatKey }),
+      cbButton(S.btn_back, { action: forGroup ? "g:main" : "p:main", chatKey })
+    ]);
+    return { text: lines.join("\n"), replyMarkup: kb(rows) };
+  }
 
-    if (isNonEmptyString(error)) {
-      lines.push("");
-      lines.push(`<b>${escapeHtml(S.label_error)}:</b> ${escapeHtml(error)}`);
+  async function renderPrivateNodeManage(chatKey, { locale, page: pageRaw, notice, error } = {}) {
+    const S = uiStrings(locale);
+    const lines = [`<b>${escapeHtml(S.btn_node_manage)}</b>`];
+    const rows = [];
+    if (notice) lines.push(`<i>${escapeHtml(notice)}</i>`);
+    if (error) lines.push(escapeHtml(error));
+    let page = 0;
+    try {
+      const res = await argusHttp.automationNodeList(chatKey);
+      const nodes = Array.isArray(res?.nodes) ? res.nodes : [];
+      const pageSize = 6;
+      const lastPage = Math.max(0, Math.ceil(nodes.length / pageSize) - 1);
+      page = Math.max(0, Math.min(lastPage, Number.isInteger(pageRaw) ? pageRaw : 0));
+      if (!nodes.length) lines.push(escapeHtml(S.node_none_connected));
+      for (const node of nodes.slice(page * pageSize, (page + 1) * pageSize)) {
+        const label = nodeDisplayName(node);
+        const details = [nodeStatusText(node, { locale }), nodePlatformLabel(node?.platform), nodeVersionLabel(node?.version)];
+        lines.push("", `<b>${escapeHtml(trimMenuLabel(label, 80))}</b> · ${escapeHtml(details.filter(Boolean).join(" · "))}`);
+        lines.push(`${escapeHtml(S.label_node)}: ${htmlCode(node?.nodeId || "(unknown)")}`);
+        lines.push(escapeHtml(formatTemplate(S.node_command_count, { count: Array.isArray(node?.commands) ? node.commands.length : 0 })));
+        if (node?.canPause && isNonEmptyString(node?.nodeId)) {
+          rows.push([cbButton(
+            `${node.paused ? S.btn_resume_node : S.btn_pause_node} · ${trimMenuLabel(label)}`,
+            { action: node.paused ? "p:node_resume" : "p:node_pause", chatKey, nodeId: node.nodeId, page }
+          )]);
+        }
+      }
+      if (rows.length) lines.push("", escapeHtml(S.node_pause_hint));
+      if (lastPage > 0) {
+        lines.push("", `${escapeHtml(S.label_page)}: ${page + 1}/${lastPage + 1}`);
+        const navigation = [];
+        if (page > 0) navigation.push(cbButton(S.btn_prev, { action: "p:node_manage", chatKey, page: page - 1 }));
+        if (page < lastPage) navigation.push(cbButton(S.btn_next, { action: "p:node_manage", chatKey, page: page + 1 }));
+        rows.push(navigation);
+      }
+    } catch (e) {
+      lines.push(escapeHtml(formatGatewayErrorForUser(e, { locale })));
+    }
+    rows.push([cbButton(S.node_local_title, { action: "p:node_local", chatKey, page })]);
+    rows.push([
+      cbButton(S.btn_refresh, { action: "p:node_manage", chatKey, page }),
+      cbButton(S.btn_back, { action: "p:node", chatKey })
+    ]);
+    return { text: lines.join("\n"), replyMarkup: kb(rows) };
+  }
+
+  function renderPrivateNodeLocalCommands(chatKey, { locale, page } = {}) {
+    const S = uiStrings(locale);
+    const lines = [`<b>${escapeHtml(S.node_local_title)}</b>`, escapeHtml(S.node_local_commands)];
+    const rows = [];
+    const commands = [
+      [S.node_logs_label, S.btn_copy_node_logs, buildNodeLogsCommand()],
+      [S.node_reconnect_label, S.btn_copy_node_reconnect, buildNodeReconnectCommand()],
+      [S.node_disconnect_label, S.btn_copy_node_disconnect, buildNodeDisconnectCommand()]
+    ];
+    for (const [label, button, command] of commands) {
+      lines.push(escapeHtml(label), `<pre><code>${escapeHtml(command)}</code></pre>`);
+      rows.push([copyTextButton(button, command)]);
+    }
+    rows.push([cbButton(S.btn_back, { action: "p:node_manage", chatKey, page })]);
+    return { text: lines.join("\n"), replyMarkup: kb(rows) };
+  }
+
+  async function renderPrivateNodeConnection(chatKey, telegramUserId, { locale, mode, handoffId } = {}) {
+    const S = uiStrings(locale);
+    const lines = [`<b>${escapeHtml(S.btn_node_connect)}</b>`];
+    const rows = [];
+    const back = cbButton(S.btn_back, { action: handoffId ? "p:main" : "p:node", chatKey });
+    let handoff = null;
+    if (handoffId) {
+      try {
+        handoff = await resolveGroupNodeHandoff(callbacks.get(handoffId), telegramUserId, resolveGroupActorContext);
+      } catch {
+        // Group may have been unbound, or the actor may no longer resolve.
+      }
+      if (!handoff) return { text: escapeHtml(S.node_group_link_invalid), replyMarkup: kb([[back]]) };
+      lines.push(escapeHtml(S.node_group_connection));
     }
 
-    if (reveal && isNonEmptyString(nodeCommand)) {
-      const copyPosixSetupButton = copyTextButton(S.btn_copy_node_setup_posix, nodeSetupPosixCommand);
-      const copyWindowsSetupButton = copyTextButton(S.btn_copy_node_setup_windows, nodeSetupWindowsCommand);
-      if (copyPosixSetupButton) rows.push([copyPosixSetupButton]);
-      if (copyWindowsSetupButton) rows.push([copyWindowsSetupButton]);
-      const copyCommandButton = copyTextButton(S.btn_copy_node_command, nodeCommand);
-      if (copyCommandButton) rows.push([copyCommandButton]);
-      const copyLogsButton = copyTextButton(S.btn_copy_node_logs, nodeLogsCommand);
-      const copyReconnectButton = copyTextButton(S.btn_copy_node_reconnect, nodeReconnectCommand);
-      const copyDisconnectButton = copyTextButton(S.btn_copy_node_disconnect, nodeDisconnectCommand);
-      if (copyLogsButton || copyReconnectButton) rows.push([copyLogsButton, copyReconnectButton].filter(Boolean));
-      if (copyDisconnectButton) rows.push([copyDisconnectButton]);
+    const choose = (label, nextMode) => cbButton(label, { action: "p:node_connect", chatKey, mode: nextMode, handoffId });
+    if (!mode) {
+      lines.push(escapeHtml(S.node_setup_choose));
+      rows.push([choose(S.btn_node_posix, "posix"), choose(S.btn_node_windows, "windows")]);
+      rows.push([choose(S.btn_node_installed, "installed"), choose(S.btn_node_advanced, "advanced")]);
+      rows.push([back]);
+    } else {
+      try {
+        const install = mode === "posix" || mode === "windows";
+        if ((install || !publicNodeWsUrlRaw) && !publicHttpOrigin(publicBaseUrlRaw)) {
+          lines.push(escapeHtml(S.node_public_url_missing));
+        } else {
+          const tokenRes = await argusHttp.automationNodeToken(handoff?.chatKey || chatKey);
+          const token = tokenRes?.token;
+          const wsUrl = isNonEmptyString(token) && derivePublicNodeWsUrl({
+            publicNodeWsUrl: publicNodeWsUrlRaw,
+            publicBaseUrl: publicBaseUrlRaw,
+            pathName: tokenRes.path || "/nodes/ws",
+            token
+          });
+          if (handoff && tokenRes?.sessionId !== handoff.sessionId) {
+            lines.push(escapeHtml(S.node_group_link_invalid));
+          } else if (!isNonEmptyString(token)) {
+            lines.push(escapeHtml(S.node_token_unavailable));
+          } else if (!wsUrl) {
+            lines.push(escapeHtml(S.node_public_url_missing));
+          } else {
+            const label = mode === "posix" ? S.node_setup_posix_label
+              : mode === "windows" ? S.node_setup_windows_label
+              : mode === "advanced" ? S.btn_node_advanced : S.node_command_label;
+            const value = install ? buildNodeInstallAndConnectCommand(wsUrl, publicBaseUrlRaw, mode)
+              : mode === "advanced" ? wsUrl : buildNodeConnectionCommand(wsUrl);
+            const language = mode === "windows" ? ' class="language-powershell"'
+              : mode === "posix" ? ' class="language-bash"' : "";
+            lines.push(`<b>${escapeHtml(label)}</b>`, escapeHtml(S.node_warning));
+            if (mode !== "advanced") lines.push(escapeHtml(mode === "installed" ? S.node_installed_hint : S.node_setup_hint));
+            lines.push(`<pre><code${language}>${escapeHtml(value)}</code></pre>`);
+            const copy = copyTextButton(mode === "advanced" ? S.btn_node_copy_url : S.btn_copy_node_command, value);
+            if (copy) rows.push([copy]);
+          }
+        }
+      } catch {
+        lines.push(escapeHtml(S.node_token_unavailable));
+      }
+      rows.push([choose(S.btn_node_hide)]);
     }
-    rows.push([cbButton(S.btn_refresh, { action: reveal ? "p:node_reveal" : "p:node", chatKey })]);
-    if (!reveal) rows.push([cbButton(S.btn_show_node_token, { action: "p:node_reveal", chatKey })]);
-    rows.push([cbButton(S.btn_back, { action: "p:main", chatKey })]);
 
     return { text: lines.join("\n"), replyMarkup: kb(rows) };
   }
@@ -4930,14 +5012,21 @@ async function main() {
     }
   }
 
-  async function renderGroupNodeMenu(chatKey, actorUserId, { reveal = false, notice, error, locale } = {}) {
+  async function renderGroupNodeMenu(chatKey, actorUserId, { locale } = {}) {
     try {
       const ctx = await resolveGroupActorContext(chatKey, actorUserId);
       if (!ctx.ownsCurrentAgent) {
         return renderGroupOwnerOnlyView(chatKey, { error: uiStrings(locale).msg_group_owner_only, locale });
       }
-      const view = await renderPrivateNodeMenu(chatKey, { reveal, notice, error, locale });
-      return remapPrivateViewToGroup(view, chatKey);
+      const username = normalizeTelegramBotUsername(botUsername);
+      let dmUrl = null;
+      if (/^[a-z0-9_]+$/.test(username) && Number.isSafeInteger(actorUserId) && actorUserId > 0) {
+        const handoffId = callbacks.register({
+          action: "node:dm", chatKey, sessionId: ctx.route.sessionId, telegramUserId: actorUserId
+        }, { ttlMs: 10 * 60_000 });
+        dmUrl = `https://t.me/${username}?start=${GROUP_NODE_START_PREFIX}${handoffId}`;
+      }
+      return await renderNodeOverview(chatKey, { locale, forGroup: true, dmUrl, expectedSessionId: ctx.route.sessionId });
     } catch (e) {
       return renderGroupOwnerOnlyView(chatKey, { error: formatGatewayErrorForUser(e, { locale }), locale });
     }
@@ -5605,49 +5694,56 @@ async function main() {
         return;
       }
 
+      if (action.startsWith("p:node") && !isPrivateChatType(chatType)) {
+        await answerOnce(S.msg_use_start_in_dm);
+        return;
+      }
+
       if (action === "p:node") {
         await answerOnce();
-        const view = await renderPrivateNodeMenu(chatKey, { reveal: false, locale });
+        await editMenuMessage({ chatId, messageId, view: await renderNodeOverview(chatKey, { locale }) });
+        return;
+      }
+
+      if (action === "p:node_connect") {
+        await answerOnce();
+        const view = await renderPrivateNodeConnection(chatKey, actorUserId, {
+          locale, mode: payload.mode, handoffId: payload.handoffId
+        });
         await editMenuMessage({ chatId, messageId, view });
         return;
       }
 
-      if (action === "p:node_reveal") {
+      if (action === "p:node_manage") {
         await answerOnce();
-        const view = await renderPrivateNodeMenu(chatKey, { reveal: true, locale });
+        const view = await renderPrivateNodeManage(chatKey, { locale, page: payload.page });
+        await editMenuMessage({ chatId, messageId, view });
+        return;
+      }
+
+      if (action === "p:node_local") {
+        await answerOnce();
+        const view = renderPrivateNodeLocalCommands(chatKey, { locale, page: payload.page });
         await editMenuMessage({ chatId, messageId, view });
         return;
       }
 
       if (action === "p:node_pause" || action === "p:node_resume") {
         await answerOnce();
-        const nodeId = payload.nodeId;
-        const reveal = Boolean(payload.reveal);
-        if (!isNonEmptyString(nodeId)) {
-          const view = await renderPrivateNodeMenu(chatKey, { reveal, error: S.msg_unsupported_cb, locale });
-          await editMenuMessage({ chatId, messageId, view });
-          return;
-        }
+        const { nodeId, page } = payload;
+        let error;
+        let notice;
         try {
           if (action === "p:node_pause") {
             await argusHttp.automationNodePause(chatKey, nodeId);
           } else {
             await argusHttp.automationNodeResume(chatKey, nodeId);
           }
+          notice = formatTemplate(action === "p:node_pause" ? S.notice_node_paused : S.notice_node_resumed, { nodeId });
         } catch (e) {
-          const view = await renderPrivateNodeMenu(chatKey, {
-            reveal,
-            error: formatGatewayErrorForUser(e, { locale }),
-            locale
-          });
-          await editMenuMessage({ chatId, messageId, view });
-          return;
+          error = formatGatewayErrorForUser(e, { locale });
         }
-        const notice = formatTemplate(
-          action === "p:node_pause" ? S.notice_node_paused : S.notice_node_resumed,
-          { nodeId }
-        );
-        const view = await renderPrivateNodeMenu(chatKey, { reveal, notice, locale });
+        const view = await renderPrivateNodeManage(chatKey, { page, notice, error, locale });
         await editMenuMessage({ chatId, messageId, view });
         return;
       }
@@ -6101,55 +6197,9 @@ async function main() {
         return;
       }
 
-      if (action === "g:node") {
+      if (action === "g:node" && isGroupChatType(chatType)) {
         await answerOnce();
-        const view = await renderGroupNodeMenu(chatKey, actorUserId, { reveal: false, locale });
-        await editMenuMessage({ chatId, messageId, view });
-        return;
-      }
-
-      if (action === "g:node_reveal") {
-        await answerOnce();
-        const view = await renderGroupNodeMenu(chatKey, actorUserId, { reveal: true, locale });
-        await editMenuMessage({ chatId, messageId, view });
-        return;
-      }
-
-      if (action === "g:node_pause" || action === "g:node_resume") {
-        await answerOnce();
-        const nodeId = payload.nodeId;
-        const reveal = Boolean(payload.reveal);
-        if (!isNonEmptyString(nodeId)) {
-          const view = await renderGroupNodeMenu(chatKey, actorUserId, { reveal, error: S.msg_unsupported_cb, locale });
-          await editMenuMessage({ chatId, messageId, view });
-          return;
-        }
-        const owned = await getOwnedGroupActorContext();
-        if (!owned.ok) {
-          const view = await renderGroupNodeMenu(chatKey, actorUserId, { reveal, error: owned.error, locale });
-          await editMenuMessage({ chatId, messageId, view });
-          return;
-        }
-        try {
-          if (action === "g:node_pause") {
-            await argusHttp.automationNodePause(chatKey, nodeId);
-          } else {
-            await argusHttp.automationNodeResume(chatKey, nodeId);
-          }
-        } catch (e) {
-          const view = await renderGroupNodeMenu(chatKey, actorUserId, {
-            reveal,
-            error: formatGatewayErrorForUser(e, { locale }),
-            locale
-          });
-          await editMenuMessage({ chatId, messageId, view });
-          return;
-        }
-        const notice = formatTemplate(
-          action === "g:node_pause" ? S.notice_node_paused : S.notice_node_resumed,
-          { nodeId }
-        );
-        const view = await renderGroupNodeMenu(chatKey, actorUserId, { reveal, notice, locale });
+        const view = await renderGroupNodeMenu(chatKey, actorUserId, { locale });
         await editMenuMessage({ chatId, messageId, view });
         return;
       }
@@ -6418,6 +6468,22 @@ async function main() {
               }
               let linkNotice = null;
               const startPayload = isNonEmptyString(slash.args) ? slash.args.trim() : "";
+              if (startPayload.startsWith(GROUP_NODE_START_PREFIX)) {
+                const view = await renderPrivateNodeConnection(chatKey, actorUserId, {
+                  locale, handoffId: startPayload.slice(GROUP_NODE_START_PREFIX.length) || "-"
+                });
+                const sent = await safeSendMessage({
+                  ...target,
+                  text: view.text,
+                  parse_mode: "HTML",
+                  disable_web_page_preview: true,
+                  reply_markup: view.replyMarkup
+                });
+                scheduleMenuAutoDelete({
+                  chatId: target.chat_id, menuMessageId: sent?.message_id, commandMessageId: message?.message_id
+                });
+                return;
+              }
               const profile = telegramProfileFromUser(message?.from);
               if (startPayload.startsWith("tgl_")) {
                 try {
@@ -7025,6 +7091,7 @@ export {
   deriveTelegramWebhookSecret,
   deriveTelegramWebhookUrl,
   derivePublicNodeWsUrl,
+  resolveGroupNodeHandoff,
   isTelegramGetUpdatesWebhookConflict,
   isTelegramMessageDirectedAtBot,
   shouldDeliverTelegramAgentMessage,

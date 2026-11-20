@@ -1,6 +1,10 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { once } from "node:events";
+import { spawnSync } from "node:child_process";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { WebSocketServer } from "ws";
 
 import {
@@ -10,6 +14,7 @@ import {
   SerialQueue,
   enqueueTelegramMessage,
   buildArgusCliInstallCommand,
+  buildNodeInstallAndConnectCommand,
   buildNodeDisconnectCommand,
   buildNodeConnectionCommand,
   buildNodeLogsCommand,
@@ -22,6 +27,7 @@ import {
   normalizeChatSettings,
   resolveTelegramBotTokenConfig,
   resolveTelegramWebhookConfig,
+  resolveGroupNodeHandoff,
   shouldDeliverTelegramAgentMessage,
   shouldDeliverTelegramTurnError,
   telegramSourceFromMessage,
@@ -482,11 +488,67 @@ test("buildNodeConnectionCommand renders a shell-safe copyable command", () => {
   assert.equal(buildNodeConnectionCommand(""), null);
 });
 
-test("buildArgusCliInstallCommand renders the GitHub installer command", () => {
+test("install-and-connect uses the configured public origin without credentials in the download URL", () => {
+  const origin = "https://argus.example.com";
+  const wsUrl = "wss://argus.example.com/nodes/ws?token=argus-node-v1.fixture.secret";
   assert.equal(
-    buildArgusCliInstallCommand(),
-    'curl -fsSL "https://raw.githubusercontent.com/yym68686/argus/main/scripts/install-argus.sh" | bash'
+    buildArgusCliInstallCommand(`${origin}/`),
+    'curl -fsSL "https://argus.example.com/argus/install.sh" | bash'
   );
+  const posix = buildNodeInstallAndConnectCommand(wsUrl, origin);
+  assert.match(posix, /bash -o pipefail .*argus\.example\.com\/argus\/install\.sh/);
+  assert.match(posix, /--gateway https:\/\/argus\.example\.com --token argus-node-v1\.fixture\.secret$/);
+  const windows = buildNodeInstallAndConnectCommand(wsUrl, origin, "windows");
+  assert.match(windows, /irm 'https:\/\/argus\.example\.com\/argus\/install\.ps1'/);
+  assert.match(windows, /"\$HOME\/\.argus\/bin\/argus\.exe" '--gateway' 'https:\/\/argus\.example\.com' '--token' 'argus-node-v1\.fixture\.secret'/);
+  const liveShape = "wss://argus.fugue.pro/nodes/ws?token=argus-node-v1.000000000000.AAAAAAAAAAAAAAAAAAAAAAAAAAA";
+  assert.ok(buildNodeInstallAndConnectCommand(liveShape, "https://argus.fugue.pro", "windows").length <= 256);
+  for (const base of [undefined, "ws://gateway:8080", `${origin}/other`, `${origin}/?token=x`, "https://user:pass@argus.example.com"]) {
+    assert.equal(buildNodeInstallAndConnectCommand(wsUrl, base), null);
+  }
+});
+
+test("POSIX setup only connects after the installation succeeds", (t) => {
+  const binDir = mkdtempSync(join(tmpdir(), "argus-node-install-"));
+  t.after(() => rmSync(binDir, { recursive: true, force: true }));
+  const command = buildNodeInstallAndConnectCommand("wss://argus.example.com/nodes/ws?token=test-token", "https://argus.example.com");
+  const run = (fixture) => spawnSync("bash", ["-c", `
+    curl() {
+      ${fixture}
+    }
+    export -f curl
+    ${command}
+  `], { env: { ...process.env, ARGUS_BIN_DIR: binDir }, encoding: "utf8" });
+  const fakeInstaller = String.raw`
+    test "$1" = "-fsSL" && test "$2" = "https://argus.example.com/argus/install.sh" || return 42
+    cat <<'INSTALLER'
+cat > "$ARGUS_BIN_DIR/argus" <<'ARGUS'
+#!/usr/bin/env bash
+printf 'connected %s\n' "$*"
+ARGUS
+chmod +x "$ARGUS_BIN_DIR/argus"
+INSTALLER
+  `;
+  const success = run(fakeInstaller);
+  assert.equal(success.status, 0, success.stderr);
+  assert.match(success.stdout, /connected --gateway https:\/\/argus\.example\.com --token test-token/);
+  const failed = run("return 22");
+  assert.equal(failed.status, 22);
+  assert.equal(failed.stdout, "");
+});
+
+test("group node handoff rechecks the same actor and original topic session", async () => {
+  const handoff = { action: "node:dm", chatKey: "-100123:42", telegramUserId: 22, sessionId: "original" };
+  const owner = async (key, actor) => {
+    assert.equal(key, "-100123:42");
+    assert.equal(actor, 22);
+    return { ownsCurrentAgent: true, route: { sessionId: "original" } };
+  };
+  assert.equal(await resolveGroupNodeHandoff(handoff, 22, owner), handoff);
+  assert.equal(await resolveGroupNodeHandoff(handoff, 23, owner), null);
+  assert.equal(await resolveGroupNodeHandoff(null, 22, owner), null);
+  assert.equal(await resolveGroupNodeHandoff(handoff, 22, async () => ({ ownsCurrentAgent: false, route: { sessionId: "original" } })), null);
+  assert.equal(await resolveGroupNodeHandoff(handoff, 22, async () => ({ ownsCurrentAgent: true, route: { sessionId: "rebound" } })), null);
 });
 
 test("node lifecycle commands are short copyable commands", () => {
@@ -517,4 +579,7 @@ test("derivePublicNodeWsUrl prefers the public base url for copy commands", () =
     }),
     "wss://example.com/custom/ws?token=abc123"
   );
+  assert.equal(derivePublicNodeWsUrl({ fallbackBaseUrl: "http://gateway:8080", token: "abc123" }), null);
+  assert.equal(derivePublicNodeWsUrl({ publicNodeWsUrl: "invalid URL", token: "abc123" }), null);
+  assert.equal(derivePublicNodeWsUrl({ publicNodeWsUrl: "wss://user:pass@example.com/nodes/ws", token: "abc123" }), null);
 });

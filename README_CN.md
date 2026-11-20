@@ -212,7 +212,7 @@ cp .env.example .env
 | `NEXT_PUBLIC_ARGUS_WS_URL` | 可选 | 未设置 | 可选 Web UI 的**构建期** WebSocket 预设地址。修改后需要重新 build `web`。常见示例：`ws://127.0.0.1:8080/ws?token=...`。如果页面本身跑在 HTTPS 下，但预设仍然是 `ws://`，前端会自动改用当前页面同源的 `wss://`，同时保留原来的路径和 query。当前 compose 方案里通常可以留空。 |
 | `TELEGRAM_BOT_TOKEN` | `docker compose --profile tg ...` 时必需 | 未设置 | 从 `@BotFather` 获取的 bot token；缺失时 Telegram bot 服务会直接退出。 |
 | `TELEGRAM_DRAFT_STREAMING` | 可选 | `auto` | 控制 gateway 在私聊里是否发送实时草稿。接受形式：`auto` / `on` / `true`、`force` / `always`、`off`。 |
-| `ARGUS_PUBLIC_BASE_URL` | 可选但推荐 | 未设置 | Telegram 节点复制命令使用的公共 gateway 基础 URL。设置后，bot 会显示类似 `argus --host <公网 IP 或域名>:8080 --token ...` 的命令，而不是 Docker 内部的 `gateway` 主机名。 |
+| `ARGUS_PUBLIC_BASE_URL` | Telegram 一键安装并连接所必需 | 未设置 | Argus 公网入口，例如 `https://argus.example.com`。Bot 使用同域的 `/argus/install.sh` 和 `/argus/install.ps1`，不会回退到集群内部地址。 |
 | `ARGUS_PUBLIC_NODE_WS_URL` | 可选 | 未设置 | 如果对外暴露的 `/nodes/ws` 路径不是默认值，可直接覆盖完整地址。 |
 | `ARGUS_GATEWAY_WS_URL` | 可选 | bundled compose 下默认 `ws://gateway:8080/ws` | `apps/telegram-bot` 的内部 WebSocket 地址；当它不在默认 Compose 拓扑里运行时再显式指定。 |
 | `ARGUS_GATEWAY_HTTP_URL` | 可选 | bundled compose 下默认 `http://gateway:8080` | `apps/telegram-bot` 的内部 HTTP base URL。WS / HTTP 分流或自动推导不正确时再显式指定。 |
