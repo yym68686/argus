@@ -680,7 +680,10 @@ if [ "${{ARGUS_INSTALL_SYSTEM_LINK:-1}}" != "0" ]; then
   fi
 fi
 
-"$BIN_PATH" --help >/dev/null
+if ! health_check="$("$BIN_PATH" --help 2>&1)"; then
+  printf 'Installed Argus failed its health check:\\n%s\\n' "$health_check" >&2
+  exit 1
+fi
 echo "Installed argus CLI: $BIN_PATH"
 """
 

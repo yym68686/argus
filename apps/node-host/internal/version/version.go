@@ -10,6 +10,7 @@ import (
 const fallbackVersion = "0.0.0"
 
 var (
+	buildVersion   string // Set by the gateway's distribution build.
 	currentVersion string
 	loadOnce       sync.Once
 )
@@ -27,6 +28,9 @@ func UserAgent() string {
 
 func detect() string {
 	if v := normalize(os.Getenv("ARGUS_VERSION")); v != "" {
+		return v
+	}
+	if v := normalize(buildVersion); v != "" {
 		return v
 	}
 	if exe, err := os.Executable(); err == nil {
