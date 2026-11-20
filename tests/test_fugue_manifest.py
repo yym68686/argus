@@ -62,6 +62,8 @@ class FugueManifestTest(unittest.TestCase):
         self.assertIn("AuthorizedKeysFile /root/.ssh/authorized_keys", dockerfile)
         self.assertIn("AllowUsers root", dockerfile)
         self.assertIn("EXPOSE 22", dockerfile)
+        exposed_ports = [line.split()[1] for line in dockerfile.splitlines() if line.startswith("EXPOSE ")]
+        self.assertEqual(exposed_ports[-1], "80")
         self.assertIn('CMD ["/app/start_web.sh"]', dockerfile)
         self.assertIn("FUGUE_SSH_SESSION_ENV_CONFIG", start_web)
         self.assertIn("Include $FUGUE_SSH_SESSION_ENV_CONFIG", start_web)

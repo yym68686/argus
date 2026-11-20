@@ -46,7 +46,8 @@ COPY nginx.conf.template /etc/nginx/templates/default.conf.template
 COPY start_web.sh /app/start_web.sh
 RUN chmod +x /app/start_web.sh
 
-EXPOSE 80
 EXPOSE 22
+# Fugue's Dockerfile source sync uses the last EXPOSE for the HTTP service.
+EXPOSE 80
 
 CMD ["/app/start_web.sh"]
