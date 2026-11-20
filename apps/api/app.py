@@ -680,14 +680,8 @@ if [ "${{ARGUS_INSTALL_SYSTEM_LINK:-1}}" != "0" ]; then
   fi
 fi
 
-if command -v argus >/dev/null 2>&1; then
-  ARGUS_CMD="$(command -v argus)"
-else
-  ARGUS_CMD="$BIN_PATH"
-fi
-
-echo "Installed argus CLI: $ARGUS_CMD"
-"$ARGUS_CMD" --help >/dev/null
+"$BIN_PATH" --help >/dev/null
+echo "Installed argus CLI: $BIN_PATH"
 """
 
 
@@ -786,9 +780,11 @@ if (-not (($env:Path -split ';') | Where-Object {{ $_.TrimEnd('\\') -ieq $BinDir
   $env:Path = "$BinDir;$env:Path"
 }}
 
-Write-Host "Installed argus CLI: $BinPath"
 & $BinPath --help | Out-Null
-exit $LASTEXITCODE
+if ($LASTEXITCODE -ne 0) {{
+  throw "Installed Argus failed its health check (exit $LASTEXITCODE)"
+}}
+Write-Host "Installed argus CLI: $BinPath"
 """
 
 

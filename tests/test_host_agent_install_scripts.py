@@ -25,6 +25,7 @@ class HostAgentInstallScriptTests(unittest.TestCase):
         self.assertIn('linux:x86_64|linux:amd64)', script)
         self.assertIn('ARGUS_LINK_PATH="${ARGUS_LINK_PATH:-/usr/local/bin/argus}"', script)
         self.assertIn('curl -fsSL "${ARGUS_GATEWAY_BASE}/host-agent/download/${TARGET}"', script)
+        self.assertIn('"$BIN_PATH" --help', script)
         self.assertNotIn("ARGUS_ENROLL_TOKEN", script)
 
     def test_shell_installer_installs_system_argus_command(self) -> None:
@@ -51,7 +52,19 @@ class HostAgentInstallScriptTests(unittest.TestCase):
         self.assertIn("$GatewayBaseUrl = 'https://argus.example.com'", script)
         self.assertIn('[Environment]::SetEnvironmentVariable("Path", $NewUserPath, "User")', script)
         self.assertIn('Invoke-WebRequest -UseBasicParsing -Uri "$GatewayBaseUrl/host-agent/download/$Target"', script)
+        self.assertIn("if ($LASTEXITCODE -ne 0)", script)
+        self.assertIn('throw "Installed Argus failed its health check', script)
+        self.assertNotRegex(script, r"(?m)^\s*exit\b")
         self.assertNotIn("$EnrollToken", script)
+
+    def test_web_proxies_only_the_public_cli_installer_paths(self) -> None:
+        config = (ROOT / "apps/web/nginx.conf.template").read_text()
+        for path in ("/argus/install.sh", "/argus/install.ps1"):
+            with self.subTest(path=path):
+                self.assertIn(
+                    f"location = {path} {{\n    proxy_pass ${{ARGUS_GATEWAY_HTTP_URL}}{path};",
+                    config,
+                )
 
 
 if __name__ == "__main__":
